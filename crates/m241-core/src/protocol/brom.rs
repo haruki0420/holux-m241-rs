@@ -4,11 +4,43 @@
 //! the chip echoes every byte it receives before answering. The count field is
 //! in *units*, not bytes: words for `0xA1`/`0xA2`/`0xA4`, dwords for `0xAF`.
 //!
-//! # Measured constants
+//! # Where the constants come from
 //!
-//! These were established on a retail M-241 (V1.13, MT3318) and must not be
-//! re-derived without new hardware evidence. They are recorded in
-//! `docs/dev/03-hardware-facts.md`.
+//! The values in this module are not all of the same kind, and reading them as
+//! if they were is how a working value gets treated as a hardware limit. Two
+//! headings separate them; every constant repeats its own label on its doc
+//! comment.
+//!
+//! ## Established on hardware
+//!
+//! Read off a retail M-241 (V1.13, MT3318) and recorded in
+//! `docs/dev/03-hardware-facts.md`. Do not re-derive these without new
+//! evidence.
+//!
+//! * [`BASE_ADDR_FIRMWARE`] — where flash answers through the BootROM.
+//! * [`BASE_ADDR_FIRMWARE_MT333X`] — the address that does *not* answer here,
+//!   which is what pinned the base above down.
+//! * [`BOOT_SYNC`] / [`BOOT_REPLY`] — the four probes and their replies.
+//! * [`PMTK180_COMMAND`] — the entry route while NMEA is streaming.
+//! * [`DEFAULT_NMEA_BAUD`] / [`DEFAULT_BOOTROM_BAUD`] — the two rates measured.
+//!
+//! ## Not established on hardware here
+//!
+//! These are working values with a different origin, and each says which:
+//!
+//! * `Vendor tooling:` — read out of the vendor utility rather than measured.
+//!   See `docs/dev/04-prior-art.md` for how much weight that carries.
+//!   [`BASE_ADDR_DA`].
+//! * `Reference implementation:` — taken from the previous Python client. It
+//!   worked, which is not the same as measured: no experiment established it.
+//!   [`BASE_ADDR_FIRMWARE_M3318`], [`WRITE_CHUNK`], [`DUMP_CHUNK`].
+//! * `Vendor images:` — decoded from the released firmware files in the local
+//!   `holux/` drop and checked byte for byte; not a wire measurement.
+//!   [`FIRMWARE_SIZE_OFFSET`].
+//!
+//! `Other chip:` appears on [`BASE_ADDR_FIRMWARE_MT333X`] as well: the address
+//! belongs to a different MediaTek part and is kept only so a probe can rule it
+//! out.
 //!
 //! # Frame layout
 //!
@@ -26,46 +58,86 @@ use crate::protocol::port::Transport;
 
 /// Flash is visible at this address through the BootROM on the M-241.
 ///
-/// Measured: reading `0x20000000` returns `42 20 02 02` repeatedly (unmapped
+/// `Measured:` reading `0x20000000` returns `42 20 02 02` repeatedly (unmapped
 /// bus), while `0x00200000` returns the firmware's `18 f0 9f e5` vector table.
 pub const BASE_ADDR_FIRMWARE: u32 = 0x0020_0000;
 
 /// The MT3318's linear view of the same flash, used by the Download Agent.
+///
+/// `Reference implementation:` both prior clients use `0x0` as the view the DA
+/// writes through, with flash at [`BASE_ADDR_FIRMWARE`] being the BootROM's
+/// view of the same bytes. This crate has not addressed flash through the linear
+/// view at all — every read this project measured went through the BootROM
+/// address above — so the value is carried over, not re-established.
 pub const BASE_ADDR_FIRMWARE_M3318: u32 = 0x0000_0000;
 
-/// MT333x-style probe address. Kept for other parts; unmapped on the M-241.
+/// MT333x-style probe address. Unmapped on the M-241; kept to rule it out.
+///
+/// `Other chip:` this is the flash window some MT333x parts use, not the
+/// MT3318's. `Measured:` on this part it reads back `42 20 02 02` (an unmapped
+/// bus, not flash), which is how the M-241's own base was identified; see
+/// `docs/dev/03-hardware-facts.md`.
 pub const BASE_ADDR_FIRMWARE_MT333X: u32 = 0x2000_0000;
 
 /// Where the Download Agent must be loaded.
 ///
-/// `0x0010_0000`–`0x0010_07FF` is the BootROM's own stack/scratch region;
-/// writing there kills the chip. Confirmed by `push 0x100800` appearing exactly
-/// once in `HoluxLoggerUtility.exe`.
+/// `Vendor tooling:` `push 0x100800` appears exactly once in
+/// `HoluxLoggerUtility.exe`; `0x0010_0000`–`0x0010_07FF` below it is the
+/// BootROM's own stack/scratch region, and writing there kills the chip. The
+/// load address itself is corroborated by both prior clients
+/// (`docs/dev/04-prior-art.md`), not re-measured here.
 pub const BASE_ADDR_DA: u32 = 0x0010_0800;
 
 /// The four sync probe bytes, in order.
+///
+/// `Measured:` on a freshly reset retail unit the first `0xA0` draws `0x5F`
+/// only after 36 attempts; the three replies that follow are as below.
 pub const BOOT_SYNC: [u8; 4] = [0xA0, 0x0A, 0x50, 0x05];
 
 /// The reply each sync probe must draw.
+///
+/// `Measured:` same session as [`BOOT_SYNC`] — `0xA0`→`0x5F`, `0x0A`→`0xF5`,
+/// `0x50`→`0xAF`, `0x05`→`0xFA`.
 pub const BOOT_REPLY: [u8; 4] = [0x5F, 0xF5, 0xAF, 0xFA];
 
 /// `$PMTK180*3B` with its terminator: the only reliable way into BootROM on a
 /// running firmware.
+///
+/// `Measured:` sending it at 38400 while NMEA is still streaming stops the
+/// stream and makes the chip listen for `0xA0`; sending it with arguments, or
+/// after the stream has stopped, is silently ignored.
 pub const PMTK180_COMMAND: &[u8] = b"$PMTK180*3B\r\n";
 
 /// The M-241's NMEA baud rate, used to send `$PMTK180`.
+///
+/// `Measured:` the retail unit streams `$GPGGA` and friends at 38400 8N1.
 pub const DEFAULT_NMEA_BAUD: u32 = 38_400;
 
 /// The BootROM's own baud rate.
+///
+/// `Measured:` after `$PMTK180*3B` the chip answers the `0xA0` probe at 115200;
+/// that is the rate the retail unit's BootROM was entered at and dumped from.
 pub const DEFAULT_BOOTROM_BAUD: u32 = 115_200;
 
-/// Payload bytes per `0xA1` serial chunk, matching the reference tooling.
+/// Payload bytes per `0xA1` serial chunk.
+///
+/// `Reference implementation:` the previous Python client streams ten bytes per
+/// chunk because the reference tooling did. No experiment here established 10
+/// as a limit — it is a working value, not a measured maximum.
 pub const WRITE_CHUNK: usize = 10;
 
 /// Bytes per read command while dumping.
+///
+/// `Reference implementation:` a full dump needs around 100 round trips at this
+/// size in both prior clients. It is a chosen size, not a device maximum.
 pub const DUMP_CHUNK: usize = 0x1000;
 
 /// Offset of the firmware-size field, relative to the firmware base.
+///
+/// `Vendor images:` both released images store the length there as a
+/// little-endian `u32` equal to the file size minus four (406,616 for the
+/// 406,620-byte V1.13 file). Verified against `holux/` locally; not a hardware
+/// measurement.
 pub const FIRMWARE_SIZE_OFFSET: u32 = 0xF4;
 
 pub const OPCODE_WRITE16: u8 = 0xA1;
