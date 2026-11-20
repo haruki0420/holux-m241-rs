@@ -47,8 +47,8 @@ code implements them.
 
 | Claim | Nekoba | This project | Verdict |
 |---|---|---|---|
-| `0xD3` replies with two bytes: ACK plus a status byte | reads two bytes, checks only `r[0] == 0x5A` and ignores the status (`scripts/mtk_proto.py`, `_set_mem_block`) | documented as measured in `docs/dev/03-hardware-facts.md` | both prior implementations read two bytes; the measurement is v1's. The two-byte read is settled, the status byte's meaning is not |
-| A non-zero `0xD3` status means failure | never inspects it: reads two bytes and only checks the ACK (`scripts/mtk_proto.py`, `_set_mem_block`) | **v1 implements the claim** — the second byte is read and anything other than `0x00` (or a second `0x5A`) is raised as an error (`src/m241/protocol/da.py`, `_begin_write`); this project repeats it in the specification and calls the status byte's meaning an open question | the two prior implementations **disagree**; only `0x00` was ever observed, so the claim is **hypothesis** — a non-zero byte could equally be a warning |
+| `0xD3` replies with two bytes: ACK plus a status byte | reads two bytes, checks only `r[0] == 0x5A` and ignores the status (`scripts/mtk_proto.py`, `_set_mem_block`) | documented as measured in `docs/dev/03-hardware-facts.md`; the disassembly shows the reply is two bytes only on acceptance (section 4.1 of `docs/reference/01-da-protocol.md`) | both prior implementations read two bytes; the measurement is v1's, and it is a success-path measurement. The second byte is always `0x00` — it is not a result code |
+| A non-zero `0xD3` status means failure | never inspects it: reads two bytes and only checks the ACK (`scripts/mtk_proto.py`, `_set_mem_block`) | **v1 implements the claim** — the second byte is read and anything other than `0x00` (or a second `0x5A`) is raised as an error (`src/m241/protocol/da.py`, `_begin_write`) | **refuted by the disassembly**: the status cell is written only with zero, and a refusal sends no second byte at all — it is a single `0xA5`. v1's check can never fire on a successful command; after a refusal it reads the first byte of the next reply as the status |
 | WRITE16's echo trails by one byte | hit the same phenomenon: the last chunk's echo is read with a short timeout and a mismatch is printed as a warning and ignored (`scripts/mtk_proto.py`, `write16`) | documented in `AGENTS.md` §4.2; no write path exists here yet to implement it in | two independent implementations meeting the same asymmetry is strong corroboration; the exact N−1 rule is **measured by v1** |
 | Reads carry no checksum trailer; `0xA4` is separate | every read is followed by a separate `0xA4` round trip (`read16`, `read32`); no trailer is ever consumed | documented in `AGENTS.md` §4.3; `0xA4` is a distinct opcode with a word count (`OPCODE_CHECKSUM` and `Frame::for_bytes` in `crates/m241-core/src/protocol/brom.rs`), though no method issues it yet | **measured by v1**, corroborated by a second implementation that would have desynchronised if a trailer existed |
 | `0xD3` is one ten-byte frame, not split header/begin/end | one `struct.pack(">BBLL", 0xD3, 1, start, end)` in a single write (`_set_mem_block`) | documented in `docs/reference/01-da-protocol.md` | **measured by v1**, corroborated by Nekoba |
@@ -192,10 +192,12 @@ reconstructed from the repository.
    removed, which is recoverable but indistinguishable from a brick at the time.
 2. **An erase range taken from user input.** `--start-addr` defaults to `0x0` and
    goes straight into the `0xD3` range, while the help text for the same flag says
-   the main firmware lives at `0x200000`. A wrong value erases the reset vector.
-   Nekoba's quick-start even passes it explicitly; v1 has the same flag. This
-   project's rule is the opposite: the range is a hard-coded constant checked
-   against an expected value, never derived from an argument (`AGENTS.md` §2.2).
+   the main firmware lives at `0x200000`. `0xD3` only records that range, but the
+   `0xD5` write that follows erases every sector it covers — so a wrong value
+   erases the reset vector. Nekoba's quick-start even passes it explicitly; v1 has
+   the same flag. This project's rule is the opposite: the range is a hard-coded
+   constant checked against an expected value, never derived from an argument
+   (`AGENTS.md` §2.2).
 3. **No read-back after the write.** Nekoba stops at the restart; v1 documents the
    same choice (v1's CLI reference page says: "There is no read-back
    or compare after the write"). A write that every packet accepted can still be
@@ -278,9 +280,10 @@ filenames in `.gitignore`.
 
 ## What stays open
 
-The disagreements above are resolved by the disassembly, not by argument. Until
-`docs/reference/01-da-protocol.md` is filled in, the following remain hypotheses
-regardless of how many prior implementations agree: the meaning of a non-zero
-`0xD3` status, whether `0xD3`'s range selects sectors, the argument forms of
-`0xD2` and `0xD9`, and whether the DA verifies a packet's sum itself. The list is
-in that page's "What the disassembly has to answer" table.
+The disagreements above are resolved by the disassembly, not by argument, and
+`docs/reference/01-da-protocol.md` now carries the answers: the non-zero `0xD3`
+status does not exist, `0xD3`'s range is in bytes (with an even-start / odd-end
+constraint), `0xD2` takes a baud index plus an echo count and needs a further
+`0xC0` / `0x5A` handshake, `0xD9` takes no argument, and the DA verifies the
+packet sum itself. What remains unmeasured there is the hardware behaviour of the
+read path and the two final `0x5A` bytes; that page's §7 lists it.

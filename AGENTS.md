@@ -69,12 +69,28 @@ The entry routine therefore checks for NMEA first and returns a tri-state:
 
 Do not "simplify" that tri-state away.
 
-### 2.2 `0xD3` erases the range it covers
+### 2.2 `0xD5` erases every sector the recorded range touches
 
-The DA erases whole sectors when you set a memory range. A range starting at `0`
-erases the start of the firmware image, including the reset vector, and the unit
-stops booting. The range must be a hard-coded constant checked against an
-expected value, never derived from user input.
+`0xD3` only records a range: the handler runs `0x00101F98`–`0x00102034` and calls
+no flash driver, so on its own it writes nothing and erases nothing. The erase
+is inside `0xD5`, per sector, immediately before that sector is programmed
+(`0x0010251C`–`0x0010252C` calls the driver's sector erase, `FUN_00100D5C`).
+
+The danger is unchanged: a range that starts at `0` and is then written with
+`0xD5` erases the start of the firmware image, including the reset vector, and
+the unit stops booting.
+
+`0xD4` is a second, separate erase command: it erases a range outright and
+interleaves `0x04 <percent>` progress frames before its final byte
+(`docs/reference/01-da-protocol.md` §5.4). It is destructive on its own and is
+not part of the write sequence.
+
+Rules:
+
+* the range must be a hard-coded constant, not a value derived from user input;
+* refuse to run if that constant is anything unexpected;
+* verify a known-intact marker before erasing;
+* require an explicit confirmation: type `WRITE` at the prompt, or pass `--yes`.
 
 ### 2.3 Take a dump before writing anything
 
@@ -92,7 +108,7 @@ See §6.
 |---|---|---|
 | Firmware base (BootROM view) | `0x00200000` | `0x20000000` returns `42 20 02 02` (unmapped bus); `0x00200000` returns `18 f0 9f e5 …` |
 | DA load address | `0x00100800` | `0x100000`–`0x1007FF` is BootROM scratch; writing there kills the chip |
-| DA info report | `>BHBLHHHHL`, 20 bytes, starts `0xC0` | DA v3.8.4 answers `C0 03 08 49 …` |
+| DA info report | `>BHBLHHHHL`, 20 bytes, starts `0xC0` | DA v3.8.4 answers `C0 03 08 49 …`; the four middle `H` fields are mfr `0x00C2`, device `0x22BA`, then two zeros — ids, not geometry, and the trailing `L` comes from RAM |
 | Flash on the retail unit | 512 KiB, MX29LV400CB, mfr `0xC2`, device `0x22BA`, DA id `0x49` | DA info report |
 | Firmware image size | 406,620 bytes (`0x6345C`) | read back and hashed |
 | NMEA | 38400 8N1, `$GPGGA/$GPGSA/$GPGSV/$GPRMC/$GPVTG` at 1 Hz | |
@@ -104,11 +120,34 @@ log area is not that chip. Unresolved; see `docs/dev/06-open-questions.md`.
 
 ## 4. The protocol gotchas that cost the most time
 
-### 4.1 `0xD3` replies with two bytes
+### 4.1 `0xD3` replies with two bytes on success, one on refusal
 
-ACK plus a status byte. Reading only the ACK leaves the status byte in the
-buffer, shifting every later frame by one, so the next command times out and it
-looks like the `0xD5` step is broken.
+Success is `5A 00`. The ACK is loaded at `0x0010201C` and sent at `0x00102020`;
+the second byte is read back at `0x00102024` from the status cell that
+`0x00102018` had just written, with the zero loaded at `0x00102004`, and is
+tail-call sent at `0x00102034`. That cell is written **nowhere else, and only
+with zero**, so the status is a fixed success marker, not a result code, and no
+non-zero value exists.
+
+A refusal is a **single** `A5`: the failure path jumps to `0x0010202C` with `A5`
+in `r0`, skipping both the ACK send and the status load, and the one shared tail
+call at `0x00102034` sends that single byte. Both fixed-length reads are wrong in
+one direction:
+
+* always reading one byte leaves the `0x00` in the buffer, shifting every later
+  frame by one — the next command times out, and it looks like the `0xD5` step
+  is broken;
+* always reading two bytes consumes the first byte of the next reply after a
+  refusal.
+
+Read one byte; read the second only when the first is `0x5A`.
+
+A refused `0xD3` also **leaves the previously recorded ranges in the table**, so
+`A5` does not mean "nothing is recorded".
+
+The refusal path is read from the instruction sequence, not from a device:
+⚠️ 未検証 — no `0xD3` was ever refused on hardware, so the single-byte reply has
+never been observed.
 
 ### 4.2 WRITE16's echo trails by one byte
 
@@ -197,7 +236,6 @@ Recorded in `docs/dev/06-open-questions.md`. Do not fabricate answers:
   held 212 KB of log plus a 406 KB image.
 * Whether a Japanese-language firmware SKU exists.
 * Bluetooth SPP was never exercised.
-* The `0xD3` status byte's meaning beyond `0x00` = success.
 
 ## 8. Review and fix: three stages, three different agents
 

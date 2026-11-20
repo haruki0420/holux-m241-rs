@@ -20,10 +20,37 @@ If you change a constant, change the line, and say what new measurement moved it
 |---|---|---|
 | Info report | `>BHBLHHHHL`, 20 bytes, starts `0xC0` | DA v3.8.4 answers `C0 03 08 49 …` |
 | DA version | `0x0308` | the report's second field |
-| Flash on the retail unit | 512 KiB, MX29LV400CB | report: `flash_size = 0x80000`, id `0x49`, mfr `0xC2`, device `0x22BA` |
-| `0xD3` reply | two bytes: ACK plus status | reading one leaves the status byte in the buffer and shifts every later frame |
+| Flash on the retail unit | 512 KiB, MX29LV400CB | report: total-bytes field `0x80000`, region id `0x49`, mfr `0xC2`, device `0x22BA` |
+| `0xD3` reply, accepted | two bytes: `5A 00` | reading one leaves the status byte in the buffer and shifts every later frame |
+| `0xD3` reply, refused | **one** byte: `A5` | the failure path at `0x0010202C` skips both sends of the success path and reaches the shared tail call once; instruction sequence only, ⚠️ 未検証 — no refusal was ever seen on hardware |
+| `0xD3` on refusal | records nothing from the refused command, but **keeps the ranges recorded by earlier ones** | the handler returns before overwriting the range table |
 | WRITE16 echo | trails by one byte | after N bytes only N−1 echoes exist; the final byte's echo never arrives |
-| Write sequence | `0xD3` range, `0xD5` write, `0x100`-byte packets each + sum-of-bytes → `0x69`, then two `0x5A` | the only sequence that completed on hardware |
+| Write sequence | `0xD3` records the range, `0xD5` erases and writes: `0x100`-byte packets each + sum-of-bytes → `0x69`, then two `0x5A` | the only sequence that completed on hardware |
+
+The 20-byte info report is `>BHBLHHHHL`, but the field name "block geometry" that
+layout suggests is wrong: the four middle `H` fields are **not** flash geometry.
+
+| Offset | Bytes | Meaning |
+|---|---|---|
+| `0x00` | `C0` | banner marker |
+| `0x01`–`0x02` | `03 08` | DA version `0x0308` |
+| `0x03` | `49` | region id |
+| `0x04`–`0x07` | `00 08 00 00` | total bytes the DA reports, `0x80000` (512 KiB) — the only geometry in the banner |
+| `0x08`–`0x09` | `00 C2` | region entry `+0x0E`: manufacturer id `0xC2` (MX29LV400CB) |
+| `0x0A`–`0x0B` | `22 BA` | region entry `+0x10`: device id `0x22BA` |
+| `0x0C`–`0x0D` | `00 00` | region entry `+0x12`: `0x0000` on the retail part, meaning not established |
+| `0x0E`–`0x0F` | `00 00` | region entry `+0x14`: `0x0000` on the retail part, meaning not established |
+| `0x10`–`0x13` | `?? ?? ?? ??` | u32 copied at run time from a RAM cell outside the DA image; **not statically determinable** |
+
+The block geometry (`0x2000`, `0x10000`, `0x3F`…) lives in the sector descriptor
+the region table entry points at and is never transmitted — see
+`docs/reference/01-da-protocol.md` §2 and §6. Reading the four `H` fields as
+size / block count was an error in earlier notes.
+
+Because the trailing u32 comes from RAM, those four bytes cannot be predicted
+from the image and must not be compared against a recorded constant. ⚠️ 未検証
+what fills that cell. On the measured unit the report began
+`C0 03 08 49 00 08 00 00 00 C2 22 BA 00 00 00 00`.
 
 ## Firmware image
 

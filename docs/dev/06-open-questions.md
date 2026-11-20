@@ -3,6 +3,12 @@
 Recorded so nobody fabricates an answer. Each of these is a real gap, not a
 placeholder for work already done.
 
+One question has been answered and removed: the `0xD3` status byte, which used to
+be §3. `docs/reference/01-da-protocol.md` §4.1 carries the answer — the byte is
+always `0x00`, and it is not sent at all when the command is refused. That page
+still says "§3" when it closes the question; the number is the old one, before
+this renumbering.
+
 ## 1. Where does the log actually live?
 
 The DA reports a **512 KiB** flash part (MX29LV400CB) while a unit was measured
@@ -22,19 +28,11 @@ Japanese; firmware does not.
 
 Treat as closed unless an image turns up that contains Japanese strings.
 
-## 3. What does the `0xD3` status byte mean beyond `0x00`?
-
-`0x00` is success. No non-zero value was ever observed, because every write this
-project performed succeeded.
-
-What would settle it: a deliberate failure (write to a protected range) on a unit
-that is already a soft brick.
-
-## 4. Was Bluetooth SPP ever exercised?
+## 3. Was Bluetooth SPP ever exercised?
 
 No. Every hardware session went over USB.
 
-## 5. Can the reset-line entry be made safe?
+## 4. Can the reset-line entry be made safe?
 
 `MtkBootRom` refuses to assert DTR/RTS when it cannot tell whether NMEA is
 flowing. That refusal is correct but means a unit that answers neither NMEA nor
