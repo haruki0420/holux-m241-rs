@@ -25,7 +25,10 @@ pub enum Error {
     /// The serial port could not be opened, or was not found.
     Port { message: String },
     /// The chip did not answer a command in time.
-    Timeout { what: String, timeout: Duration },
+    Timeout {
+        what: String,
+        timeout: TimeoutDuration,
+    },
     /// The bytes coming back are not what the protocol says they must be.
     ///
     /// `offset` is `None` when the failure has no position in an image: an echo
@@ -223,14 +226,17 @@ impl From<serialport::Error> for Error {
     }
 }
 
-/// A duration whose `Debug` prints `500ms`, not `Duration { secs: 0, nanos: … }`.
+/// A timeout whose `Debug` prints `500ms`, not `Duration { secs: 0, nanos: … }`.
+///
+/// Named `TimeoutDuration` rather than `Duration` so it cannot be mistaken for
+/// [`std::time::Duration`] at a use site that has both in scope.
 ///
 /// [`Error::Timeout`]'s message embeds this, and a raw `Duration` debug in a
 /// user-facing message is worse than useless.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Duration(std::time::Duration);
+pub struct TimeoutDuration(std::time::Duration);
 
-impl Duration {
+impl TimeoutDuration {
     /// Wrap a standard duration.
     #[must_use]
     pub const fn from_std(value: std::time::Duration) -> Self {
@@ -244,7 +250,7 @@ impl Duration {
     }
 }
 
-impl fmt::Debug for Duration {
+impl fmt::Debug for TimeoutDuration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.0.subsec_millis() == 0 {
             write!(f, "{}s", self.0.as_secs())
@@ -254,7 +260,7 @@ impl fmt::Debug for Duration {
     }
 }
 
-impl From<std::time::Duration> for Duration {
+impl From<std::time::Duration> for TimeoutDuration {
     fn from(value: std::time::Duration) -> Self {
         Self(value)
     }
@@ -266,6 +272,17 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_timeout_wrapper_does_not_shadow_the_standard_duration() {
+        // Both names are in scope here, which is exactly the ambiguity the old
+        // `Duration` name created: `std::time::Duration` had to be written out
+        // in full at every use site.
+        let std_timeout = std::time::Duration::from_millis(500);
+        let wrapped = TimeoutDuration::from(std_timeout);
+        assert_eq!(wrapped.as_std(), std_timeout);
+        assert_eq!(TimeoutDuration::from_std(std_timeout), wrapped);
+    }
 
     #[test]
     fn an_offset_reaches_the_display_string_in_hex() {
