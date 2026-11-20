@@ -51,10 +51,12 @@ Should 10 件、Could 2 件。全文は各修正担当への指示に転記し�
 
 | 修正ストリーム | 範囲 | 検証ストリーム | 検証の状態 |
 |---|---|---|---|
-| `fix/fix-core` | `crates/m241-core/src/` 全体 | 未割当 | 未検証 |
-| `fix/fix-gui` | `crates/m241-gui/` | 未割当 | 未検証 |
-| `fix/fix-cli` | `crates/m241-cli/`（core の `Error::Safety` 追加後） | 未割当 | 未検証 |
-| `fix/fix-docs` | `docs/`、`AGENTS.md`、`tools/` | 未割当 | 未検証 |
+| `fix/fix-core` | `crates/m241-core/src/` 全体 | verify-merged | 不合格 |
+| `fix/fix-gui` | `crates/m241-gui/` | verify-merged | 合格 |
+| `fix/fix-cli` | `crates/m241-cli/`（core の `Error::Safety` 追加後） | verify-merged | 合格 |
+| `fix/fix-docs` | `docs/`、`AGENTS.md`、`tools/` | verify-merged | 合格 |
+
+不合格の理由: `fix/fix-core` — Must 2 の引用行（`crates/m241-core/src/protocol/brom.rs` の sync プローブ側 `Framing`）に検出テストが無く、`offset: None` を `Some(0)` に戻す変異が全テストを通過する（エコー側のテストだけでは引用行を守れない）。
 
 検証ストリームは、修正ストリームに**参加していない**エージェントが担当する
 （[`09-review-protocol.md`](09-review-protocol.md) の三段構成）。検証担当が読むのは
@@ -143,3 +145,83 @@ erase succeeded (`0x00102560`)」と、消去が 2 つ目の `5A` の**前**だ�
 
 **合格**。指摘 5 点はすべてコード上で解消され、追加 4 テストは対応する変異で
 実際に落ち、既存テストの弱体化も無い。
+
+---
+
+## 2026-11-20 / 修正 4 本の独立検証（`fix/fix-*`）
+
+対象: 可読性レビューの Must 8 件と仕様検収の指摘に対する 4 本の修正
+（`fix/fix-core` / `fix/fix-gui` / `fix/fix-cli` / `fix/fix-docs`）。
+検証は修正に参加していない担当が行い、読んだのは指摘リスト・差分・テストだけ。
+修正範囲は `git diff b818676..52f023e`（23 ファイル、+1098/−203）。検証中の
+main は `e58c5d3` → `5d6ad74` → `19e07c6` と進んだが、いずれも本節の対象外の
+追加（AGENTS.md の追記、simulator の修正）で、4 本の修正内容は変わっていない。
+
+### A. 可読性 Must 8 件
+
+| # | 指摘 | 解消 | 検出するテスト | 根拠 | 判定 |
+|---|---|---|---|---|---|
+| 1 | `PatchPlan::apply` が `before` を読まない | 解消 | `types::tests::a_plan_whose_before_byte_is_absent_from_the_image_is_refused`（`before` チェックを消す変異で落ちる） | `types.rs:197-225`（判定 `:211`） | 合格 |
+| 2 | エコー不一致に偽の `offset: 0` | 一部 | エコー側は `brom::tests::an_echo_mismatch_does_not_claim_to_be_at_offset_zero` が守る。**sync プローブ側は検出テストが無い** | `brom.rs:312`（エコー）、`brom.rs:266`（sync、テスト無し）。指摘が引く `brom.rs:194` は base の sync プローブ側 | **不合格** |
+| 3 | `Io.path` が `"<unbound>"` | 解消 | `error::tests::a_bare_io_error_prints_no_placeholder_path`（`From<io::Error>` を `Some("<unbound>")` に戻す変異で落ちる） | `error.rs:72-73` / `:113-116` / `:211-225`、テスト `:411` | 合格 |
+| 4 | `damaged_blocks` が同名別物 | 解消 | `types::tests::the_summary_counts_the_damaged_blocks_the_track_listed` | `types.rs:92`（`Vec<u32>`）/ `:131`（`damaged_block_count`）/ `:146` | 合格 |
+| 5 | 存在しない `tests/design_invariants.rs` を根拠に | 解消 | 文言の機械検証は無い。参照先は実在する検査に置換 | `theme.rs:7` が `tools/check_design.py` を指す。`design_gate.rs:200` が `check.sh` への配線を固定 | 合格 |
+| 6 | `m241-gui` の `m241-core` 未使用依存 | 解消 | 専用テスト無し（`clippy -D warnings` が実質の検出） | `52f023e` で依存を削除、その後 `3393eff` で画面が実際に `m241_core::` を使うため再追加（`screens/common.rs:12`、`connect.rs:15`）。HEAD では未使用でない | 合格 |
+| 7 | 「実機で確立した定数」の混在 | 解消 | 文言ポリシーのテストは無し。各定数に由来ラベル | `brom.rs:7-43`（`## Established on hardware` / `## Not established on hardware here`）、各定数 `:63`/`:72`/`:80`/`:89`/`:109`/`:114`/`:120`/`:127`/`:133`/`:141` | 合格 |
+| 8 | `frame.rs` の往復テストが恒等写像でも通る | 解消 | `word_reversal_restores_the_vector_table_from_the_wire`、`word_reversal_of_a_single_dword_is_spelled_out`（恒等写像に変異させると 3 件落ちる） | `frame.rs:37-45`（実装）、テスト `:87`/`:105` | 合格 |
+
+### B. 仕様検収の指摘（終了コード 5 の producer）
+
+| 項目 | 確認方法 | 結果 |
+|---|---|---|
+| 終了コード 5 に producer があるか | `Error::Safety` を追加し、`exit_code_for` に `=> 5`（`main.rs:217`）。`every_documented_exit_code_has_a_producer`（`:448`）、`a_safety_refusal_is_exit_code_five`（`:494`） | 合格 |
+| 網羅 match か（`_ => 1` の温存が無いか） | `Error` に `Probe` variant を追加 → core 側 2 か所を直すと **`main.rs:212` の `exit_code_for` が E0004 でコンパイル失敗** | 合格 |
+| 未実装エラーの文言が利用者向けか | 実バイナリ実行で `fw flash` / `log geotag` が「このビルドでは `m241 fw flash` は未実装です。`m241 --help` で使えるコマンドを確認してください。」（exit 1）。`--help`/`--version` は 0、不正引数は 2 | 合格（`main.rs:177-182`） |
+
+### C. 新たに入った問題
+
+1. **Must 2 の検出漏れ**（上記 A#2）。sync プローブ側の `offset: None` を `Some(0)` に
+   戻す変異が **全 254 テストを通過**する。sync 系テストは
+   `sync_accepts_the_four_documented_replies`（`brom.rs:448`）と
+   `sync_rejects_a_complemented_reply_it_does_not_know`（`:456`）の 2 件だけで、
+   どちらも 2 バイト目以降の不一致（`framing` の分岐）を通らない。
+2. **`--quiet` フラグが指摘外で削除されている**。base `main.rs:44-46` の
+   `quiet: bool` は未使用（`let _ = (cli.quiet, cli.verbose)`）で、docs にも
+   記載が無いため仕様違反ではないが、指摘リストに無い変更。実害は
+   `m241 --quiet …` が exit 2 になること。
+3. `theme.rs:3` は「Two rules」と書くが、`tools/check_design.py` が機械強制する
+   規則は 3 つ（amber の出現位置、角丸トークン、状態色のラベル併記）。
+   軽微な文言のずれ。
+4. 消されたテストは**無い**（`git diff b818676..52f023e --name-status` に `D` 無し、
+   テスト数 58 → 78）。弱められたアサーションも確認範囲では無い。
+   `render.rs` の `shapes > 0` は base から据え置きで、テーマ再適用テストは
+   逆に強化されている（`render.rs:140` が style/text_styles/panel_fill を比較）。
+5. `design_invariants.rs` は base に存在しない（`git cat-file -e
+   b818676:crates/m241-gui/tests/design_invariants.rs` が不成立）。指摘 5 は
+   `52f023e` 時点では「存在しないファイル」→「別ファイル」の置換に留まったが、
+   `3393eff` が実ファイルを追加したため HEAD では解消している。
+
+### D. ゲート
+
+`./tools/check.sh` = **5/5**（HEAD `19e07c6`、fmt / clippy / test / docs / design、
+23〜25 秒）。`cargo test --workspace` は **254 件全緑**。
+
+### E. 変異テスト（すべて `git checkout -- <file>` で戻し、都度 `git status` を確認）
+
+| 変異 | 落ちたテスト | 期待どおり |
+|---|---|---|
+| `reverse_words32` を恒等写像に | `word_reversal_restores_…` ほか frame の 3 件 | はい |
+| `PatchPlan::apply` の `before` チェックを削除 | `a_plan_whose_before_byte_is_absent_…` 1 件 | はい |
+| `Error::Probe` variant を追加 | core 2 か所を直した後 cli 側が E0004（コンパイル失敗） | はい |
+| エコー側 `offset: None` → `Some(0)` | `an_echo_mismatch_does_not_claim_…` 1 件 | はい |
+| **sync プローブ側 `offset: None` → `Some(0)`** | **0 件（全 254 緑）** | **いいえ（検出漏れ）** |
+| `From<io::Error>` の `path` を `Some("<unbound>")` に | `a_bare_io_error_prints_no_placeholder_path` 1 件 | はい |
+| `tools/check_design.py` の `main` を常に 0 に | `design_gate` の 4 件 | はい |
+| `theme.rs` の doc のパスを存在しない名前に | 0 件（docs ゲートは Rust ソース内のパスを見ない） | いいえ（指摘 5 の再発は機械検出されない） |
+
+### 判定
+
+**不合格**（`fix/fix-core`）。Must 8 件のうち 7 件は解消し、それぞれ検出テストが
+変異で実際に落ちることを確認した。残る 1 件（Must 2）はコードは両方の site で
+直っているが、指摘が引用した sync プローブ側に検出テストが無く、退行を止められない。
+`fix/fix-gui` / `fix/fix-cli` / `fix/fix-docs` は合格。
