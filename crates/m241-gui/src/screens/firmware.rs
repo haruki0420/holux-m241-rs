@@ -120,6 +120,19 @@ impl StepMarker {
         }
     }
 
+    /// Whether the marker is a filled dot (`true`) or an open ring (`false`).
+    ///
+    /// Held alongside [`Self::radius`] so the three states' shape distinction has
+    /// one source of truth that [`FirmwareScreen::step_row`] consumes and the unit
+    /// tests assert on directly.
+    #[must_use]
+    fn is_filled(self) -> bool {
+        match self {
+            Self::Done | Self::Current => true,
+            Self::Ahead => false,
+        }
+    }
+
     /// The colour of the marker.
     #[must_use]
     fn colour(self) -> Color32 {
@@ -513,14 +526,14 @@ impl FirmwareScreen {
             // unreached one were the same ring in two shades, which is the
             // colour-is-the-only-signal failure §3 forbids.
             let marker = StepMarker::of(step, self.step);
-            if marker == StepMarker::Ahead {
+            if marker.is_filled() {
+                painter.circle_filled(center, marker.radius(), marker.colour());
+            } else {
                 painter.circle_stroke(
                     center,
                     marker.radius(),
                     Stroke::new(metric::HAIRLINE, marker.colour()),
                 );
-            } else {
-                painter.circle_filled(center, marker.radius(), marker.colour());
             }
             painter.text(
                 center + Vec2::new(0.0, space::M),
@@ -664,7 +677,8 @@ impl FirmwareScreen {
 
     /// Step 2: rewrite the constant in a file. Real work, no device.
     fn patch_step(&mut self, ui: &mut Ui) {
-        common::panel(ui, "書き換え", |ui| {
+        let sample = self.sample;
+        common::sample_panel(ui, "書き換え", sample, |ui| {
             ui.label(
                 RichText::new("PC の中のファイルだけを書き換えます。本体には触れません。")
                     .size(size::UI)
@@ -810,8 +824,13 @@ impl FirmwareScreen {
 
     /// Step 3: write to the device. The only destructive act in the product.
     fn flash_step(&mut self, ui: &mut Ui) {
-        let (_border, title) = Destructive::WriteStep.voice();
-        common::panel_with_border(ui, title, Destructive::WriteStep.voice().0, |ui| {
+        let (border, voice_title) = Destructive::WriteStep.voice();
+        let title = if self.sample {
+            format!("{voice_title}／{}", common::SAMPLE_WORD)
+        } else {
+            String::from(voice_title)
+        };
+        common::panel_with_border(ui, &title, border, |ui| {
             ui.label(
                 RichText::new(
                     "本体のファームを上書きします。失敗すると使えなくなる場合があります。",
@@ -976,7 +995,6 @@ impl FirmwareScreen {
         if !self.sample {
             return;
         }
-        common::sample_marker(ui);
         // The sample runs the real planner against a synthesised image, so what is
         // drawn is the real diff table rather than a hand-written one. If the planner
         // changes, the sample changes with it.
@@ -1176,9 +1194,22 @@ mod tests {
             markers,
             [StepMarker::Done, StepMarker::Current, StepMarker::Ahead]
         );
-        // Filled, filled-but-bigger, open ring: three shapes from two primitives.
+        // Filled dot, larger filled dot, open ring: three shapes from two primitives.
+        assert!(markers[0].is_filled(), "Done must be a filled dot");
+        assert!(markers[1].is_filled(), "Current must be a filled dot");
+        assert!(!markers[2].is_filled(), "Ahead must be an open ring");
         assert_eq!(markers[0].radius(), markers[2].radius());
         assert!(markers[1].radius() > markers[0].radius());
+
+        let shapes = markers.map(|marker| (marker.radius().to_bits(), marker.is_filled()));
+        for (index, left) in shapes.iter().enumerate() {
+            for right in shapes.iter().skip(index + 1) {
+                assert_ne!(
+                    left, right,
+                    "two step markers share the same (radius, filled) shape: {shapes:?}"
+                );
+            }
+        }
     }
 
     #[test]

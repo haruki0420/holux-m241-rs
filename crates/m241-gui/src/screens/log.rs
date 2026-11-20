@@ -88,9 +88,13 @@ impl LogScreen {
 
     /// Draw the screen body. The rail is drawn by the shell, not here.
     pub fn ui(&mut self, ui: &mut Ui) {
-        // The export bar is pinned: it is the reason the screen exists, and at
-        // 1024×640 it used to be the part that fell off the bottom.
-        common::footer(ui, "m241-log-export", |ui| self.export_bar(ui));
+        if !self.track.points.is_empty() {
+            // The export bar is pinned: it is the reason the screen exists, and at
+            // 1024×640 it used to be the part that fell off the bottom. Omitted
+            // when there is no track yet so the empty state does not offer to
+            // export nothing.
+            common::footer(ui, "m241-log-export", |ui| self.export_bar(ui));
+        }
 
         common::scrolling(ui, "m241-log-body", |ui| {
             common::heading(

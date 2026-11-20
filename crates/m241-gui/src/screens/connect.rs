@@ -188,27 +188,18 @@ impl ConnectScreen {
         common::sample_panel(ui, "デバイス", sample, |ui| {
             if sample {
                 let info = sample_device();
-                egui::Grid::new("m241-device-figures")
-                    .num_columns(2)
-                    .spacing([space::L, space::S])
-                    .show(ui, |ui| {
-                        for (label, value) in [
-                            ("firmware", info.release.clone()),
-                            ("build", info.build.clone()),
-                            ("model", info.model.clone()),
-                            ("flash", String::from("512 KiB")),
-                            ("日付", format!("{} 日ずれ", 7168)),
-                        ] {
-                            ui.label(RichText::new(label).size(size::CAPTION).color(theme::MUTE));
-                            ui.label(
-                                RichText::new(value)
-                                    .size(size::UI)
-                                    .color(theme::INK)
-                                    .monospace(),
-                            );
-                            ui.end_row();
-                        }
-                    });
+                // One figure per row with the value on the panel's right edge,
+                // matching `log_panel` beside it (DESIGN.md §2, §5: right-aligned
+                // figures).
+                for (label, value) in [
+                    ("firmware", info.release),
+                    ("build", info.build),
+                    ("model", info.model),
+                    ("flash", String::from("512 KiB")),
+                    ("日付", format!("{} 日ずれ", 7168)),
+                ] {
+                    common::figure_line(ui, label, &value);
+                }
             } else {
                 // No device: say what is missing, in the order to check it
                 // (DESIGN.md §6, "No port found").
@@ -235,11 +226,9 @@ impl ConnectScreen {
         common::sample_panel(ui, "ログ", sample, |ui| {
             if sample {
                 let summary = sample_summary();
-                // One figure per row with the value on the panel's right edge. The
-                // review found this panel's numbers bunched into its left third with
-                // ragged right edges, a column of notes rather than a table of
-                // measurements; the device panel beside it already used figure lines,
-                // so the two panels' figures did not even line up with each other.
+                // One figure per row with the value on the panel's right edge,
+                // matching `device_panel` beside it so both side-by-side panels
+                // share the same label-left / value-right alignment (DESIGN.md §2, §5).
                 for (label, value) in [
                     ("使用量", common::bytes(212_860)),
                     ("点数", summary.records.to_string()),

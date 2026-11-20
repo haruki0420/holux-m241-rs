@@ -23,6 +23,7 @@ use m241_core::log::ParseReport;
 use m241_core::{LogSummary, Track, TrackPoint};
 use m241_gui::screens::Screen;
 use m241_gui::screens::firmware::{DumpState, Step};
+use m241_gui::widgets::rail;
 use m241_gui::{App, theme};
 
 /// Drive one full pass and return the number of tessellated shapes.
@@ -50,6 +51,41 @@ fn render_at(ctx: &Context, app: &mut App, width: f32, height: f32) -> usize {
     let shapes = output.shapes.len();
     output.drop_without_applying_deltas();
     shapes
+}
+
+/// Drive two passes so immediate-mode layout settles, returning the second pass's shapes.
+fn render_shapes_at(ctx: &Context, app: &mut App, width: f32, height: f32) -> Vec<egui::Shape> {
+    let input = RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(width, height),
+        )),
+        ..RawInput::default()
+    };
+    let first = ctx.run_ui(input.clone(), |ui| {
+        app.draw(ui);
+    });
+    first.drop_without_applying_deltas();
+    let second = ctx.run_ui(input, |ui| {
+        app.draw(ui);
+    });
+    let shapes = second
+        .shapes
+        .iter()
+        .map(|clipped| clipped.shape.clone())
+        .collect();
+    second.drop_without_applying_deltas();
+    shapes
+}
+
+/// Flatten nested `Shape::Vec` trees into a single slice of leaf shapes.
+fn flatten_shapes<'a>(shapes: &'a [egui::Shape], out: &mut Vec<&'a egui::Shape>) {
+    for shape in shapes {
+        match shape {
+            egui::Shape::Vec(children) => flatten_shapes(children, out),
+            other => out.push(other),
+        }
+    }
 }
 
 fn context() -> Context {
@@ -432,6 +468,226 @@ fn amber_appears_in_the_write_step_and_nowhere_else() {
             !image.contains_colour(theme::DANGER, 6),
             "{} has amber on it; amber means danger and lives on the firmware screen",
             screen.label()
+        );
+    }
+}
+
+#[test]
+fn the_rail_keeps_its_fixed_width_across_every_screen() {
+    // Regression test for pinning `egui::Panel::left("rail")` to `rail::WIDTH`:
+    // reverting `.exact_size(rail::WIDTH)` to `.resizable(false)` lets the rail
+    // drift to egui's default / content-sized width and shifts the heading on
+    // navigation (DESIGN.md §4).
+    for (width, height) in [(1280.0, 800.0), (1024.0, 640.0)] {
+        for screen in Screen::ALL {
+            let ctx = context();
+            let mut app = App::default();
+            app.select(screen);
+            let shapes = render_shapes_at(&ctx, &mut app, width, height);
+            let mut flat = Vec::new();
+            flatten_shapes(&shapes, &mut flat);
+
+            let rail_rect = flat
+                .iter()
+                .filter_map(|shape| match shape {
+                    egui::Shape::Rect(rect)
+                        if rect.fill == theme::RAIL
+                            && rect.rect.left().abs() < 0.5
+                            && rect.rect.height() > 100.0 =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .next()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "could not find the rail panel rect on {} at {width}×{height}",
+                        screen.label()
+                    )
+                });
+
+            assert!(
+                (rail_rect.width() - rail::WIDTH).abs() < 0.5,
+                "{} at {width}×{height}: rail width was {:.2}pt, expected {:.2}pt",
+                screen.label(),
+                rail_rect.width(),
+                rail::WIDTH
+            );
+        }
+    }
+}
+
+#[test]
+fn an_empty_log_omits_the_export_footer_until_a_track_exists() {
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Log);
+
+    let empty_shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    let mut flat = Vec::new();
+    flatten_shapes(&empty_shapes, &mut flat);
+    let has_export_when_empty = flat.iter().any(|shape| match shape {
+        egui::Shape::Text(text) => text.galley.job.text.contains("書き出す"),
+        _ => false,
+    });
+    assert!(
+        !has_export_when_empty,
+        "an empty log screen must not render the export footer"
+    );
+
+    app.log_mut().show_sample();
+    let loaded_shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    flat.clear();
+    flatten_shapes(&loaded_shapes, &mut flat);
+    let has_export_when_loaded = flat.iter().any(|shape| match shape {
+        egui::Shape::Text(text) => text.galley.job.text.contains("書き出す"),
+        _ => false,
+    });
+    assert!(
+        has_export_when_loaded,
+        "a populated log screen must render the export footer"
+    );
+}
+
+#[test]
+fn the_firmware_sample_renders_one_sample_banner_and_captions_its_panels() {
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Firmware);
+    app.firmware_mut()
+        .show_sample()
+        .expect("the sample image must be recognised");
+
+    for (step, expected_caption) in [
+        (Step::Patch, "書き換え／見本"),
+        (Step::Flash, "書き込み／見本"),
+    ] {
+        app.firmware_mut().set_step(step);
+        let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+        let mut flat = Vec::new();
+        flatten_shapes(&shapes, &mut flat);
+
+        let texts: Vec<&str> = flat
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        let banner_count = texts
+            .iter()
+            .filter(|text| **text == "見本 — 実機から読んだ値ではありません")
+            .count();
+        assert_eq!(
+            banner_count, 1,
+            "{step:?} rendered {banner_count} sample banners instead of 1"
+        );
+        assert!(
+            texts.contains(&expected_caption),
+            "{step:?} is missing sample panel caption {expected_caption}"
+        );
+    }
+}
+
+#[test]
+fn the_firmware_step_row_paints_distinct_circle_primitives() {
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Firmware);
+    app.firmware_mut().set_step(Step::Patch);
+
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    let mut flat = Vec::new();
+    flatten_shapes(&shapes, &mut flat);
+
+    let circles: Vec<&egui::epaint::CircleShape> = flat
+        .iter()
+        .filter_map(|shape| match shape {
+            egui::Shape::Circle(circle) => Some(circle),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        circles.len(),
+        3,
+        "expected three step-row markers, found {}",
+        circles.len()
+    );
+    let done = circles
+        .iter()
+        .find(|circle| circle.fill == theme::DATA)
+        .expect("missing filled Done marker");
+    let current = circles
+        .iter()
+        .find(|circle| circle.fill == theme::INK)
+        .expect("missing filled Current marker");
+    let ahead = circles
+        .iter()
+        .find(|circle| circle.fill == egui::Color32::TRANSPARENT && circle.stroke.width > 0.0)
+        .expect("missing open-ring Ahead marker");
+
+    assert!((done.radius - theme::metric::POINT_DOT).abs() < 0.01);
+    assert!((ahead.radius - theme::metric::POINT_DOT).abs() < 0.01);
+    assert!(
+        current.radius > done.radius,
+        "Current marker radius {} must exceed Done radius {}",
+        current.radius,
+        done.radius
+    );
+}
+
+#[test]
+fn the_connect_panels_align_their_figures_to_the_right_edge() {
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Connect);
+    app.connect_mut().show_sample();
+
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    let mut flat = Vec::new();
+    flatten_shapes(&shapes, &mut flat);
+
+    let find_right_edge = |needle: &str| -> f32 {
+        flat.iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Text(text) if text.galley.job.text == needle => {
+                    Some(text.galley.rect.translate(text.pos.to_vec2()).right())
+                }
+                _ => None,
+            })
+            .next()
+            .unwrap_or_else(|| panic!("missing sample figure {needle:?}"))
+    };
+
+    // Device panel values of different widths must share the same right edge
+    // (figure_line), not a left-aligned Grid column.
+    let device_edges = [
+        find_right_edge("B-core_1.20"),
+        find_right_edge("0043"),
+        find_right_edge("01017-00F"),
+        find_right_edge("512 KiB"),
+    ];
+    for edge in &device_edges[1..] {
+        assert!(
+            (edge - device_edges[0]).abs() < 1.0,
+            "device panel figures are not right-aligned: {device_edges:?}"
+        );
+    }
+
+    // Log panel values beside it must also share one right edge.
+    let log_edges = [
+        find_right_edge("212,860 B"),
+        find_right_edge("10399"),
+        find_right_edge("11/14 → 11/15"),
+        find_right_edge("有効"),
+    ];
+    for edge in &log_edges[1..] {
+        assert!(
+            (edge - log_edges[0]).abs() < 1.0,
+            "log panel figures are not right-aligned: {log_edges:?}"
         );
     }
 }

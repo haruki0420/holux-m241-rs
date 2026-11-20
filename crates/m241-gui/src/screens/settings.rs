@@ -40,7 +40,7 @@ const ROWS: [Row; 5] = [
     Row {
         label: "テーマ",
         value: "暗色のみ",
-        note: "明色テーマは未検証 — DESIGN.md §9 で未設計",
+        note: "明色テーマは未設計のため暗色テーマのみ対応",
     },
     Row {
         label: "言語",
@@ -134,6 +134,19 @@ mod tests {
         // product to reach for an amber warning, which is exactly why this is asserted.
         for row in &ROWS {
             assert!(!row.note.contains("危険") && !row.note.contains("注意"));
+        }
+    }
+
+    #[test]
+    fn no_row_exposes_internal_document_names() {
+        // User-facing copy must not leak repository file names or spec sections.
+        for row in &ROWS {
+            for field in [row.label, row.value, row.note] {
+                assert!(
+                    !field.contains(".md") && !field.contains('§'),
+                    "settings copy exposed an internal reference: {field}"
+                );
+            }
         }
     }
 }
