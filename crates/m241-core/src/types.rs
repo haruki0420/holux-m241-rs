@@ -124,8 +124,11 @@ pub struct LogSummary {
     pub records: usize,
     /// Records that carry a position.
     pub fixes: usize,
-    /// Blocks whose header checksum did not match.
-    pub damaged_blocks: usize,
+    /// How many blocks had a header checksum that did not match.
+    ///
+    /// A count, not the list: [`Track::damaged_blocks`] is the list, and the two
+    /// sharing a name made `summary.damaged_blocks` read as if it were one.
+    pub damaged_block_count: usize,
     /// First timestamp, as Unix seconds.
     pub started_at: Option<u32>,
     /// Last timestamp, as Unix seconds.
@@ -140,7 +143,7 @@ impl LogSummary {
         Self {
             records: track.points.len(),
             fixes: track.fix_count(),
-            damaged_blocks: track.damaged_blocks.len(),
+            damaged_block_count: track.damaged_blocks.len(),
             started_at: span.map(|(start, _)| start),
             ended_at: span.map(|(_, end)| end),
         }
@@ -347,6 +350,20 @@ mod tests {
         assert_eq!(track.time_span(), None);
         assert!(track.is_empty());
         assert_eq!(LogSummary::of(&track), LogSummary::default());
+    }
+
+    #[test]
+    fn the_summary_counts_the_damaged_blocks_the_track_listed() {
+        // The summary carries the count and the track carries the list: the two
+        // must not be confused for one another, which is why the summary field
+        // is `damaged_block_count` and not `damaged_blocks`.
+        let track = Track {
+            points: Vec::new(),
+            damaged_blocks: vec![3, 17, 42],
+        };
+        let summary = LogSummary::of(&track);
+        assert_eq!(summary.damaged_block_count, 3);
+        assert_eq!(summary.damaged_block_count, track.damaged_blocks.len());
     }
 
     #[test]
