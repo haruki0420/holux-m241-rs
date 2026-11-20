@@ -259,18 +259,21 @@ pub fn patch(options: &PatchOptions, session: Session<'_>) -> Result<()> {
     fileio::ensure_distinct(&options.source, output)?;
 
     if !report.plan.changes_anything() {
-        // Already patched. Nothing is written: rewriting the file would only
-        // produce a copy of the input, and the point of the plan is to say what
-        // changes.
-        if options.json {
-            return session.console.json(&plan_document(&report, None));
-        }
-        print_plan(session.console, &report);
-        session.console.note(
-            "nothing to do; the image was left as it is. The device is never touched by this \
-             command.",
-        );
-        return Ok(());
+        // `docs/reference/02-cli.md` lists an already-patched image among the
+        // things a real run refuses. A dry run is a query, so it still answers
+        // above; a run that would write nothing is a mistake worth stopping —
+        // the user is about to flash an image they think this command changed.
+        return Err(Error::Firmware {
+            message: format!(
+                "the image is already patched, so there is nothing to write: {}",
+                report
+                    .plan
+                    .no_op_reason
+                    .as_deref()
+                    .unwrap_or("the plan is empty")
+            ),
+            offset: Some(EFFECTIVE_EPOCH_OFFSET),
+        });
     }
 
     let patched = report.plan.apply(&bytes)?;
@@ -569,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_of_an_already_patched_image_changes_nothing_and_says_why() {
+    fn patch_of_an_already_patched_image_is_refused_and_says_why() {
         let scratch = Scratch::new("patch-repeat");
         let source = scratch.join("stock.bin");
         let patched_path = scratch.join("fixed.bin");
@@ -589,28 +592,44 @@ mod tests {
         )
         .expect("first patch");
 
+        // `docs/reference/02-cli.md` says a real run refuses an already-patched
+        // image: the user is about to flash something they believe this command
+        // changed, so stopping is the only answer that cannot mislead.
         let console = RecordingConsole::default();
         let session = Session::new(&links, &console, &AutoConfirm);
-        patch(
+        let err = patch(
             &PatchOptions {
-                source: patched_path,
+                source: patched_path.clone(),
                 output: Some(again.clone()),
                 dry_run: false,
                 json: false,
             },
             session,
         )
-        .expect("second run is a no-op, not a failure");
-        assert!(!again.exists(), "a no-op writes nothing");
+        .expect_err("an already-patched image is a refusal");
+        assert!(matches!(err, Error::Firmware { .. }), "got {err}");
+        assert!(format!("{err}").contains("already patched"), "got {err}");
+        assert_eq!(crate::exit::exit_code_for(&err), 4);
+        assert!(!again.exists(), "a refusal writes nothing");
+
+        // A dry run is a query, not a write, so it still answers — and says the
+        // same thing without failing.
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        patch(
+            &PatchOptions {
+                source: patched_path,
+                output: None,
+                dry_run: true,
+                json: false,
+            },
+            session,
+        )
+        .expect("a dry run of an already-patched image still answers");
         assert!(
             console.stdout().contains("already patched"),
             "got {}",
             console.stdout()
-        );
-        assert!(
-            console.stderr().contains("nothing to do"),
-            "got {}",
-            console.stderr()
         );
     }
 
