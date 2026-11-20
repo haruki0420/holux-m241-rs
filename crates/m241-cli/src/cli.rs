@@ -90,7 +90,30 @@ pub enum DeviceCommand {
     /// Ask the logger for its firmware version and model.
     Info(InfoOptions),
     /// Diagnose the environment and the device.
-    Doctor,
+    Doctor(DoctorOptions),
+}
+
+#[derive(Debug, Default, Args)]
+pub struct DoctorOptions {
+    /// Probe the logger at this serial port (or `auto` for the only likely cable).
+    #[arg(long, value_name = "PORT|auto")]
+    pub port: Option<String>,
+
+    /// Inspect a folder of Holux files (read-only, bounded depth) by SHA-256 and size.
+    #[arg(long, value_name = "DIR")]
+    pub from_drop: Option<PathBuf>,
+
+    /// Copy only an identified `DA_v3.8.4.bin` from `--from-drop` into this directory.
+    #[arg(long, requires = "from_drop", value_name = "DIR")]
+    pub extract_to: Option<PathBuf>,
+
+    /// Allow overwriting an existing `DA_v3.8.4.bin` under `--extract-to`.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Print one JSON object instead of labelled diagnostic lines.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Default, Args)]
@@ -189,7 +212,52 @@ pub enum LogCommand {
     /// Erase the track log on the device (destructive).
     Erase,
     /// Write capture coordinates into photos' EXIF data.
-    Geotag,
+    Geotag(LogGeotagOptions),
+}
+
+#[derive(Debug, Args)]
+pub struct LogGeotagOptions {
+    /// The raw dump `m241 log download` wrote.
+    #[arg(value_name = "LOG")]
+    pub log: PathBuf,
+
+    /// One or more photo files or directories to geotag.
+    #[arg(required = true, num_args = 1.., value_name = "PHOTOS")]
+    pub photos: Vec<PathBuf>,
+
+    /// Largest accepted difference between photo capture time and track point, in seconds.
+    #[arg(
+        long,
+        default_value_t = m241_core::log::geotag::DEFAULT_MAX_GAP_SECONDS,
+        value_name = "SECONDS"
+    )]
+    pub max_gap: u32,
+
+    /// Days to add to every track timestamp, or `auto` to detect a WNRO-shifted log.
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        value_parser = cal::parse_offset,
+        default_value = "auto"
+    )]
+    pub utc_offset_days: OffsetSpec,
+
+    /// Camera clock offset from UTC in minutes (for example `540` for UTC+9) when EXIF `DateTimeOriginal` is in local time.
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        default_value_t = 0,
+        value_name = "MINUTES"
+    )]
+    pub tz_offset_minutes: i32,
+
+    /// Print the plan and modify no photos.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Print one JSON object instead of labelled lines.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -253,7 +321,58 @@ pub enum NmeaCommand {
     /// Repair the dates in a captured NMEA file or stream.
     Repair(RepairOptions),
     /// Relay a live NMEA stream with corrected dates.
-    Proxy,
+    Proxy(ProxyOptions),
+}
+
+#[derive(Debug, Args)]
+pub struct ProxyOptions {
+    /// Serial port, or `auto` to pick the only likely cable.
+    #[arg(long, default_value = "auto")]
+    pub port: String,
+
+    /// Serial baud rate of the live NMEA stream.
+    #[arg(long, default_value_t = m241_core::protocol::pmtk::NMEA_BAUD)]
+    pub baud: u32,
+
+    /// Days to add to every date, or `auto` to fix only stale dates.
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        value_parser = cal::parse_offset,
+        default_value = "auto"
+    )]
+    pub offset_days: OffsetSpec,
+
+    /// Relay repaired NMEA lines to standard output (default when `--bind` is omitted).
+    #[arg(long)]
+    pub stdout: bool,
+
+    /// Bind a TCP server relaying repaired NMEA lines to connected clients.
+    #[arg(long, value_name = "HOST:PORT")]
+    pub bind: Option<String>,
+
+    /// Allow `--bind` to listen on a non-loopback address.
+    #[arg(long)]
+    pub allow_non_loopback: bool,
+
+    /// Stop after relaying this many lines.
+    #[arg(long, value_name = "N")]
+    pub max_lines: Option<usize>,
+}
+
+impl Default for ProxyOptions {
+    /// The defaults clap uses, so a test builds the same command the parser does.
+    fn default() -> Self {
+        Self {
+            port: String::from("auto"),
+            baud: m241_core::protocol::pmtk::NMEA_BAUD,
+            offset_days: OffsetSpec::Auto,
+            stdout: false,
+            bind: None,
+            allow_non_loopback: false,
+            max_lines: None,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -327,12 +446,98 @@ mod tests {
             vec!["m241", "log", "download", "-o", "track.bin"],
             vec!["m241", "log", "read", "track.bin"],
             vec!["m241", "log", "erase"],
-            vec!["m241", "log", "geotag"],
+            vec!["m241", "log", "geotag", "track.bin", "photo.jpg"],
             vec!["m241", "nmea", "repair"],
             vec!["m241", "nmea", "proxy"],
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?} failed: {e}"));
         }
+    }
+
+    #[test]
+    fn non_destructive_subcommand_flags_parse_with_documented_defaults() {
+        let cli = Cli::try_parse_from(["m241", "device", "doctor"]).expect("doctor defaults");
+        let Command::Device {
+            command: DeviceCommand::Doctor(doctor),
+        } = cli.command
+        else {
+            panic!("expected device doctor");
+        };
+        assert_eq!(doctor.port, None);
+        assert_eq!(doctor.from_drop, None);
+        assert_eq!(doctor.extract_to, None);
+        assert!(!doctor.force);
+        assert!(!doctor.json);
+
+        let err = Cli::try_parse_from(["m241", "device", "doctor", "--extract-to", "vendor"])
+            .expect_err("--extract-to requires --from-drop");
+        assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
+
+        let cli =
+            Cli::try_parse_from(["m241", "log", "geotag", "track.bin", "a.jpg", "photos_dir"])
+                .expect("log geotag defaults");
+        let Command::Log {
+            command: LogCommand::Geotag(geotag),
+        } = cli.command
+        else {
+            panic!("expected log geotag");
+        };
+        assert_eq!(geotag.log, PathBuf::from("track.bin"));
+        assert_eq!(
+            geotag.photos,
+            vec![PathBuf::from("a.jpg"), PathBuf::from("photos_dir")]
+        );
+        assert_eq!(
+            geotag.max_gap,
+            m241_core::log::geotag::DEFAULT_MAX_GAP_SECONDS
+        );
+        assert_eq!(geotag.utc_offset_days, OffsetSpec::Auto);
+        assert_eq!(geotag.tz_offset_minutes, 0);
+        assert!(!geotag.dry_run);
+        assert!(!geotag.json);
+
+        let cli = Cli::try_parse_from([
+            "m241",
+            "log",
+            "geotag",
+            "track.bin",
+            "a.jpg",
+            "--max-gap",
+            "120",
+            "--utc-offset-days",
+            "7168",
+            "--tz-offset-minutes",
+            "-300",
+            "--dry-run",
+            "--json",
+        ])
+        .expect("log geotag custom flags");
+        let Command::Log {
+            command: LogCommand::Geotag(geotag),
+        } = cli.command
+        else {
+            panic!("expected log geotag");
+        };
+        assert_eq!(geotag.max_gap, 120);
+        assert_eq!(geotag.utc_offset_days, OffsetSpec::Days(7_168));
+        assert_eq!(geotag.tz_offset_minutes, -300);
+        assert!(geotag.dry_run);
+        assert!(geotag.json);
+
+        let cli = Cli::try_parse_from(["m241", "nmea", "proxy"]).expect("nmea proxy defaults");
+        let Command::Nmea {
+            command: NmeaCommand::Proxy(proxy),
+        } = cli.command
+        else {
+            panic!("expected nmea proxy");
+        };
+        assert_eq!(proxy.port, "auto");
+        assert_eq!(proxy.baud, m241_core::protocol::pmtk::NMEA_BAUD);
+        assert_eq!(proxy.offset_days, OffsetSpec::Auto);
+        assert!(!proxy.stdout);
+        assert_eq!(proxy.bind, None);
+        assert!(!proxy.allow_non_loopback);
+        assert_eq!(proxy.max_lines, None);
     }
 
     #[test]

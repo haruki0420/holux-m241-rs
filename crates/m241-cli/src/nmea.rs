@@ -1,11 +1,12 @@
-//! `m241 nmea repair`: fix the dates in a captured NMEA stream.
+//! `m241 nmea repair` and `m241 nmea proxy`: fix dates in NMEA streams.
 //!
 //! Pure text in, text out. The M-241's firmware converts GPS time with the 1980
 //! epoch constant and never accounts for the second week-number rollover, so
-//! every date it emits is 7168 days in the past. This command rewrites the date
-//! field of `$GPRMC` and `$GPZDA`, recomputes the sentence checksum, and passes
-//! every other byte through unchanged — including the device's own plain-text
-//! debug banners, which are not sentences at all.
+//! every date it emits is 7168 days in the past. `repair` rewrites the date
+//! field of `$GPRMC` and `$GPZDA` in a captured file or stdin, recomputes the
+//! sentence checksum, and passes every other byte through unchanged. `proxy`
+//! reads a live NMEA stream from the serial port and relays repaired lines to
+//! stdout and/or a loopback TCP server.
 //!
 //! # Why the sentence is not re-rendered from scratch
 //!
@@ -14,14 +15,20 @@
 //! not know about. Only the fields that carry a date are replaced, in place, and
 //! the checksum is recomputed from the result.
 
+use std::io::Write as _;
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs as _};
 use std::path::Path;
 
-use m241_core::Result;
+use m241_core::protocol::pmtk::MAX_LINE_BYTES;
+use m241_core::protocol::port::Transport;
+use m241_core::{Error, Result};
 
 use crate::Session;
 use crate::cal::{self, OffsetSpec};
-use crate::cli::RepairOptions;
+use crate::cli::{ProxyOptions, RepairOptions};
 use crate::fileio;
+use crate::link;
+use crate::output::Console;
 
 /// Where the `ddmmyy` date sits in a `$GPRMC` field list that includes the
 /// address at index 0.
@@ -220,6 +227,169 @@ fn split_ending(line: &str) -> (&str, &str) {
 /// XOR of every byte between `$` and `*`.
 fn xor_checksum(body: &str) -> u8 {
     body.as_bytes().iter().fold(0u8, |acc, byte| acc ^ byte)
+}
+
+/// Relay a live NMEA stream from the logger with repaired dates.
+///
+/// Defaults to relaying to stdout when `--bind` is omitted. When `--bind` is
+/// given, resolves the bind address and refuses any non-loopback IP with
+/// [`Error::Safety`] (exit code 5) before binding or opening the serial port,
+/// unless `--allow-non-loopback` is passed.
+///
+/// # Errors
+///
+/// * [`Error::Safety`] when `--bind` resolves to a non-loopback address without
+///   `--allow-non-loopback` (exit code 5);
+/// * [`Error::State`] when `--bind` is invalid;
+/// * [`Error::Io`] when binding or accepting on the TCP socket fails;
+/// * [`Error::Port`] when the serial port cannot be resolved or opened.
+pub fn proxy(options: &ProxyOptions, session: Session<'_>) -> Result<()> {
+    proxy_with_hook(options, session, |_| {})
+}
+
+/// Inner entry point with a post-bind hook so tests can connect to `127.0.0.1:0`.
+fn proxy_with_hook(
+    options: &ProxyOptions,
+    session: Session<'_>,
+    on_bound: impl FnOnce(SocketAddr),
+) -> Result<()> {
+    let listener = match &options.bind {
+        Some(spec) => Some(bind_checked_listener(spec, options.allow_non_loopback)?),
+        None => None,
+    };
+    if let Some(listener) = &listener {
+        let local_addr = listener
+            .local_addr()
+            .map_err(|source| Error::io("tcp listener local_addr", source))?;
+        session
+            .console
+            .note(&format!("relaying repaired NMEA on tcp://{local_addr}"));
+        on_bound(local_addr);
+    }
+
+    let relay_stdout = options.stdout || options.bind.is_none();
+    let port = link::resolve(session.links, &options.port)?;
+    let mut transport = session.links.open(&port, options.baud)?;
+    session.console.note(&format!(
+        "reading live NMEA from {port} at {} baud",
+        options.baud
+    ));
+
+    proxy_transport(
+        &mut transport,
+        listener.as_ref(),
+        relay_stdout,
+        options.offset_days,
+        options.max_lines,
+        session.console,
+    )
+}
+
+/// Resolve `bind_spec`, enforce the loopback-only safety gate, and bind a non-blocking TCP listener.
+fn bind_checked_listener(bind_spec: &str, allow_non_loopback: bool) -> Result<TcpListener> {
+    let addrs: Vec<SocketAddr> = bind_spec
+        .to_socket_addrs()
+        .map_err(|err| Error::State(format!("invalid --bind address {bind_spec:?}: {err}")))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(Error::State(format!(
+            "--bind address {bind_spec:?} resolved to no socket addresses"
+        )));
+    }
+    if !allow_non_loopback
+        && let Some(non_loopback) = addrs.iter().find(|addr| !addr.ip().is_loopback())
+    {
+        return Err(Error::Safety {
+            reason: format!(
+                "refusing to bind NMEA proxy to non-loopback address {non_loopback} ({bind_spec}); \
+                 pass --allow-non-loopback to expose the stream on a network interface"
+            ),
+        });
+    }
+    let listener = TcpListener::bind(addrs.as_slice())
+        .map_err(|source| Error::io(format!("bind {bind_spec}"), source))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|source| Error::io(format!("configure {bind_spec}"), source))?;
+    Ok(listener)
+}
+
+/// Read lines from `transport`, repair dates via [`repair_line`], and relay to stdout/TCP.
+fn proxy_transport(
+    transport: &mut dyn Transport,
+    listener: Option<&TcpListener>,
+    relay_stdout: bool,
+    offset: OffsetSpec,
+    max_lines: Option<usize>,
+    console: &dyn Console,
+) -> Result<()> {
+    if max_lines == Some(0) {
+        return Ok(());
+    }
+
+    let mut clients: Vec<TcpStream> = Vec::new();
+    if let Some(listener) = listener {
+        accept_pending_clients(listener, &mut clients);
+    }
+
+    let mut pending: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 256];
+    let mut lines_relayed = 0usize;
+
+    loop {
+        let count = transport.read(&mut chunk)?;
+        if let Some(listener) = listener {
+            accept_pending_clients(listener, &mut clients);
+        }
+        if count == 0 {
+            std::thread::yield_now();
+            continue;
+        }
+        if let Some(received) = chunk.get(..count) {
+            pending.extend_from_slice(received);
+        }
+
+        while let Some(newline_pos) = pending.iter().position(|&byte| byte == b'\n') {
+            let raw: Vec<u8> = pending.drain(..=newline_pos).collect();
+            let line = String::from_utf8_lossy(&raw);
+            let (repaired, _changed) = repair_line(&line, offset);
+
+            if relay_stdout {
+                console.text(&repaired);
+            }
+            broadcast_line(&mut clients, repaired.as_bytes());
+
+            lines_relayed += 1;
+            if max_lines.is_some_and(|limit| lines_relayed >= limit) {
+                return Ok(());
+            }
+        }
+
+        if pending.len() >= MAX_LINE_BYTES {
+            // Drop an unterminated fragment so baud mismatch or noise cannot
+            // grow the line buffer without bound.
+            pending.clear();
+        }
+    }
+}
+
+/// Accept any queued TCP connections without blocking the serial stream loop.
+fn accept_pending_clients(listener: &TcpListener, clients: &mut Vec<TcpStream>) {
+    loop {
+        match listener.accept() {
+            Ok((stream, _peer)) => {
+                let _ = stream.set_nonblocking(false);
+                clients.push(stream);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(_) => break,
+        }
+    }
+}
+
+/// Write `bytes` to every connected TCP client, dropping clients that disconnected.
+fn broadcast_line(clients: &mut Vec<TcpStream>, bytes: &[u8]) {
+    clients.retain_mut(|stream| stream.write_all(bytes).is_ok() && stream.flush().is_ok());
 }
 
 #[cfg(test)]
@@ -504,5 +674,167 @@ mod tests {
             "got {}",
             console.stderr()
         );
+    }
+
+    #[derive(Debug)]
+    struct StreamFakeTransport {
+        data: std::collections::VecDeque<u8>,
+        baud: u32,
+    }
+
+    impl StreamFakeTransport {
+        fn new(lines: &[&str]) -> Self {
+            let mut data = std::collections::VecDeque::new();
+            for line in lines {
+                data.extend(line.as_bytes());
+            }
+            Self { data, baud: 0 }
+        }
+    }
+
+    impl Transport for StreamFakeTransport {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+            let mut count = 0usize;
+            for slot in buf.iter_mut() {
+                let Some(byte) = self.data.pop_front() else {
+                    break;
+                };
+                *slot = byte;
+                count += 1;
+            }
+            Ok(count)
+        }
+
+        fn write_all(&mut self, _buf: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn clear_input(&mut self) -> Result<()> {
+            self.data.clear();
+            Ok(())
+        }
+
+        fn set_baud(&mut self, baud: u32) -> Result<()> {
+            self.baud = baud;
+            Ok(())
+        }
+
+        fn set_control_lines(&mut self, _asserted: bool) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct StreamFakeLinks {
+        lines: Vec<String>,
+    }
+
+    impl crate::Links for StreamFakeLinks {
+        fn ports(&self) -> Result<Vec<crate::link::PortEntry>> {
+            Ok(vec![crate::link::PortEntry {
+                name: String::from("SIM0"),
+                cable: Some(crate::link::Cable::Cp210x),
+                likely: true,
+                description: None,
+            }])
+        }
+
+        fn open(&self, _name: &str, baud: u32) -> Result<crate::link::Opened> {
+            let refs: Vec<&str> = self.lines.iter().map(String::as_str).collect();
+            let mut transport = StreamFakeTransport::new(&refs);
+            transport.set_baud(baud)?;
+            Ok(crate::link::Opened::new(Box::new(transport)))
+        }
+    }
+
+    #[test]
+    fn proxy_relays_repaired_rmc_and_zda_and_untouched_gga_to_stdout() {
+        let gga = "$GPGGA,022127.54,3540.87416,N,13946.02750,E,1,08,0.9,80.0,M,0.0,M,,*00\r\n";
+        let broken_zda = "$GPZDA,022127.54,17,09,2006,00,00*00\r\n";
+        let (fixed_zda, zda_changed) = repair_line(broken_zda, OffsetSpec::Auto);
+        assert!(zda_changed);
+
+        let links = StreamFakeLinks {
+            lines: vec![
+                format!("{BROKEN_RMC}\r\n"),
+                String::from(gga),
+                String::from(broken_zda),
+            ],
+        };
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        proxy(
+            &ProxyOptions {
+                max_lines: Some(3),
+                ..ProxyOptions::default()
+            },
+            Session::new(&links, &console, &confirm),
+        )
+        .expect("proxy to stdout");
+
+        assert_eq!(console.stdout(), format!("{FIXED_RMC}\r\n{gga}{fixed_zda}"));
+    }
+
+    #[test]
+    fn proxy_refuses_non_loopback_bind_without_allow_flag() {
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        let err = proxy(
+            &ProxyOptions {
+                bind: Some(String::from("0.0.0.0:10110")),
+                allow_non_loopback: false,
+                max_lines: Some(0),
+                ..ProxyOptions::default()
+            },
+            Session::new(&links, &console, &confirm),
+        )
+        .expect_err("non-loopback bind must be refused");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        assert_eq!(crate::exit::exit_code_for(&err), 5);
+    }
+
+    #[test]
+    fn proxy_relays_repaired_lines_over_loopback_tcp_socket() {
+        use std::io::Read as _;
+
+        let gga = "$GPGGA,022127.54,3540.87416,N,13946.02750,E,1,08,0.9,80.0,M,0.0,M,,*00\r\n";
+        let links = StreamFakeLinks {
+            lines: vec![format!("{BROKEN_RMC}\r\n"), String::from(gga)],
+        };
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        let mut client_slot: Option<TcpStream> = None;
+
+        proxy_with_hook(
+            &ProxyOptions {
+                bind: Some(String::from("127.0.0.1:0")),
+                max_lines: Some(2),
+                ..ProxyOptions::default()
+            },
+            Session::new(&links, &console, &confirm),
+            |addr| {
+                let stream = TcpStream::connect(addr).expect("connect to loopback proxy");
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .expect("set read timeout");
+                client_slot = Some(stream);
+            },
+        )
+        .expect("tcp proxy");
+
+        // When --bind is set without --stdout, stdout stays empty.
+        assert_eq!(console.stdout(), "");
+
+        let mut client = client_slot.expect("client connected in hook");
+        let mut received = String::new();
+        client
+            .read_to_string(&mut received)
+            .expect("read tcp stream");
+        assert_eq!(received, format!("{FIXED_RMC}\r\n{gga}"));
     }
 }

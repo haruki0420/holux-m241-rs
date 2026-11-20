@@ -1,16 +1,20 @@
-//! `m241 log download`, `m241 log info`, and `m241 log read`.
+//! `m241 log download`, `m241 log info`, `m241 log read`, and `m241 log geotag`.
 //!
 //! Downloading talks PMTK182 to the logger and saves the raw flash blocks;
 //! `info` summarises a dump without converting it so the user can check damage
 //! before exporting; `read` converts a dump to GPX, KML, CSV, NMEA or JSON,
-//! optionally shifting WNRO-stale timestamps.
+//! optionally shifting WNRO-stale timestamps; `geotag` matches photos by capture
+//! time and writes GPS EXIF tags.
 
+use std::path::PathBuf;
+
+use m241_core::log::geotag::{self, CaptureTime, GeotagOptions, GeotagPlan};
 use m241_core::log::{ParseReport, export, parse_dump};
-use m241_core::{LogSummary, Result, Track};
+use m241_core::{Error, LogSummary, Result, Track};
 
 use crate::Session;
 use crate::cal::OffsetSpec;
-use crate::cli::{DownloadOptions, LogInfoOptions, LogReadOptions};
+use crate::cli::{DownloadOptions, LogGeotagOptions, LogInfoOptions, LogReadOptions};
 use crate::fileio;
 use crate::link;
 use crate::output::Console;
@@ -112,18 +116,7 @@ pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
     let summary = report.summary(&track);
     warn_about_damage(session.console, &summary, &report);
 
-    let shift = track_days(&track).map_or(0, |days| options.utc_offset_days.shift_for(days));
-    if shift != 0 {
-        shift_track(&mut track, shift);
-        let reason = if matches!(options.utc_offset_days, OffsetSpec::Auto) {
-            "the log was written by a unit whose clock is still on the old GPS epoch"
-        } else {
-            "--utc-offset-days"
-        };
-        session.console.note(&format!(
-            "shifted every timestamp by {shift:+} days: {reason}"
-        ));
-    }
+    let _shift = apply_utc_offset(&mut track, options.utc_offset_days, session.console);
 
     match &options.output {
         Some(path) => {
@@ -163,6 +156,23 @@ fn shift_track(track: &mut Track, days: i32) {
     for point in &mut track.points {
         point.utc = point.utc.map(|utc| crate::cal::shift_seconds(utc, days));
     }
+}
+
+/// Apply `--utc-offset-days` (`auto` or explicit) to `track` and return the applied day shift.
+fn apply_utc_offset(track: &mut Track, spec: OffsetSpec, console: &dyn Console) -> i32 {
+    let shift = track_days(track).map_or(0, |days| spec.shift_for(days));
+    if shift != 0 {
+        shift_track(track, shift);
+        let reason = if matches!(spec, OffsetSpec::Auto) {
+            "the log was written by a unit whose clock is still on the old GPS epoch"
+        } else {
+            "--utc-offset-days"
+        };
+        console.note(&format!(
+            "shifted every timestamp by {shift:+} days: {reason}"
+        ));
+    }
+    shift
 }
 
 /// Summarise a dumped track log.
@@ -246,6 +256,209 @@ fn parse_document(report: &ParseReport) -> serde_json::Value {
         "bad_checksums": report.bad_checksums,
         "truncated_records": report.truncated_records,
         "used_bytes": report.used_bytes,
+    })
+}
+
+/// Match photos to track points by capture time and write GPS EXIF tags.
+///
+/// # Errors
+///
+/// * [`Error::Io`] when `<LOG>`, a directory, or a photo cannot be read or replaced;
+/// * [`Error::Log`] when `<LOG>` is not a valid M-241 dump.
+pub fn geotag(options: &LogGeotagOptions, session: Session<'_>) -> Result<()> {
+    let bytes = fileio::read(&options.log)?;
+    let (mut track, report) = parse_dump(&bytes)?;
+    let summary = report.summary(&track);
+    warn_about_damage(session.console, &summary, &report);
+
+    let offset_days = apply_utc_offset(&mut track, options.utc_offset_days, session.console);
+    let photo_paths = expand_photo_inputs(&options.photos)?;
+
+    let tz_delta_seconds = i64::from(options.tz_offset_minutes) * 60;
+    let mut matching_track = track;
+    if tz_delta_seconds != 0 {
+        shift_track_seconds(&mut matching_track, tz_delta_seconds);
+    }
+
+    let geotag_options = GeotagOptions {
+        max_gap_seconds: options.max_gap,
+    };
+    let mut plans = geotag::plan(&photo_paths, &matching_track, &geotag_options)?;
+    if tz_delta_seconds != 0 {
+        for plan in &mut plans {
+            if let Some(point) = &mut plan.point {
+                point.utc = point
+                    .utc
+                    .map(|utc| shift_timestamp_seconds(utc, -tz_delta_seconds));
+            }
+        }
+    }
+
+    let written_paths = if options.dry_run {
+        Vec::new()
+    } else {
+        geotag::apply(&plans)?
+    };
+    let matched_count = plans.iter().filter(|plan| plan.will_write()).count();
+    let skipped_count = plans.len().saturating_sub(matched_count);
+    let written_count = if options.dry_run {
+        0
+    } else {
+        written_paths.len()
+    };
+
+    if options.json {
+        return session.console.json(&geotag_document(
+            options,
+            offset_days,
+            &plans,
+            matched_count,
+            written_count,
+            skipped_count,
+        ));
+    }
+
+    for plan in &plans {
+        if let Some(point) = &plan.point {
+            let action = if options.dry_run { "plan" } else { "tag" };
+            session.console.result(&format!(
+                "{:<8}: {} -> {:.6}, {:.6} ({}, gap {} s)",
+                action,
+                plan.photo.display(),
+                point.latitude.unwrap_or(0.0),
+                point.longitude.unwrap_or(0.0),
+                timestamp(point.utc),
+                plan.gap_seconds.unwrap_or(0),
+            ));
+        } else {
+            let reason = plan.skipped.as_deref().unwrap_or("skipped");
+            session.console.result(&format!(
+                "{:<8}: {} ({reason})",
+                "skip",
+                plan.photo.display()
+            ));
+        }
+    }
+    session
+        .console
+        .result(&format!("{:<8}: {offset_days}", "offset"));
+    session
+        .console
+        .result(&format!("{:<8}: {matched_count}", "matched"));
+    session
+        .console
+        .result(&format!("{:<8}: {written_count}", "written"));
+    session
+        .console
+        .result(&format!("{:<8}: {skipped_count}", "skipped"));
+    if options.dry_run {
+        session
+            .console
+            .note("dry run: no photos were modified. Drop --dry-run to write GPS EXIF tags.");
+    }
+    Ok(())
+}
+
+/// Expand photo file and directory arguments into a flat list of regular file paths.
+///
+/// Directories have their immediate regular file entries collected and sorted
+/// deterministically by path; explicit file paths stay in the order given.
+fn expand_photo_inputs(inputs: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut photos = Vec::new();
+    for input in inputs {
+        if input.is_dir() {
+            let entries = std::fs::read_dir(input)
+                .map_err(|source| Error::io(input.display().to_string(), source))?;
+            let mut children = Vec::new();
+            for entry in entries {
+                let entry =
+                    entry.map_err(|source| Error::io(input.display().to_string(), source))?;
+                let file_type = entry
+                    .file_type()
+                    .map_err(|source| Error::io(entry.path().display().to_string(), source))?;
+                if file_type.is_file() {
+                    children.push(entry.path());
+                }
+            }
+            children.sort();
+            photos.extend(children);
+        } else {
+            photos.push(input.clone());
+        }
+    }
+    Ok(photos)
+}
+
+/// Shift every timestamp in `track` by `delta_seconds`, clamping to `u32`.
+fn shift_track_seconds(track: &mut Track, delta_seconds: i64) {
+    for point in &mut track.points {
+        point.utc = point
+            .utc
+            .map(|utc| shift_timestamp_seconds(utc, delta_seconds));
+    }
+}
+
+/// Shift one Unix timestamp by `delta_seconds`, clamped to `0..=u32::MAX`.
+fn shift_timestamp_seconds(utc: u32, delta_seconds: i64) -> u32 {
+    let shifted = i64::from(utc) + delta_seconds;
+    let clamped = shifted.clamp(0, i64::from(u32::MAX));
+    u32::try_from(clamped).unwrap_or(utc)
+}
+
+/// Render `m241 log geotag --json` as a single JSON object.
+fn geotag_document(
+    options: &LogGeotagOptions,
+    offset_days: i32,
+    plans: &[GeotagPlan],
+    matched_count: usize,
+    written_count: usize,
+    skipped_count: usize,
+) -> serde_json::Value {
+    let entries: Vec<serde_json::Value> = plans
+        .iter()
+        .map(|plan| {
+            let status = if plan.will_write() {
+                if options.dry_run {
+                    "planned"
+                } else {
+                    "written"
+                }
+            } else {
+                "skipped"
+            };
+            let capture_utc = plan.capture_time.map(CaptureTime::utc);
+            let capture_source = plan.capture_time.map(|capture| match capture {
+                CaptureTime::Exif(_) => "exif",
+                CaptureTime::FileModified(_) => "mtime",
+            });
+            let matched_utc = plan.point.and_then(|point| point.utc);
+            serde_json::json!({
+                "photo": plan.photo.display().to_string(),
+                "status": status,
+                "will_write": plan.will_write(),
+                "skip_reason": plan.skipped,
+                "capture_utc": capture_utc,
+                "capture_iso": capture_utc.map(export::utc_iso),
+                "capture_source": capture_source,
+                "matched_utc": matched_utc,
+                "matched_iso": matched_utc.map(export::utc_iso),
+                "gap_seconds": plan.gap_seconds,
+                "latitude": plan.point.and_then(|point| point.latitude),
+                "longitude": plan.point.and_then(|point| point.longitude),
+                "height_m": plan.point.and_then(|point| point.height_m),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "log": options.log.display().to_string(),
+        "dry_run": options.dry_run,
+        "offset_days": offset_days,
+        "tz_offset_minutes": options.tz_offset_minutes,
+        "max_gap_seconds": options.max_gap,
+        "matched": matched_count,
+        "written": written_count,
+        "skipped": skipped_count,
+        "plans": entries,
     })
 }
 
@@ -1000,5 +1213,218 @@ mod tests {
             "got {}",
             nmea_console.stdout()
         );
+    }
+
+    /// Build a minimal valid JPEG containing an APP1 Exif block with `DateTimeOriginal`.
+    fn synthetic_jpeg_with_datetime(datetime: &str) -> Vec<u8> {
+        let mut tiff = Vec::new();
+        // Little-endian TIFF header: "II", 42, IFD0 at offset 8.
+        tiff.extend_from_slice(b"II");
+        tiff.extend_from_slice(&42u16.to_le_bytes());
+        tiff.extend_from_slice(&8u32.to_le_bytes());
+
+        // IFD0 at offset 8: 1 entry (ExifIFDPointer), next IFD = 0.
+        // IFD0 size = 2 + 12 + 4 = 18 bytes -> ends at offset 26.
+        let exif_ifd_offset = 26u32;
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x8769u16.to_le_bytes()); // EXIF_IFD_POINTER
+        tiff.extend_from_slice(&4u16.to_le_bytes()); // LONG
+        tiff.extend_from_slice(&1u32.to_le_bytes());
+        tiff.extend_from_slice(&exif_ifd_offset.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+
+        // Exif SubIFD at offset 26: 1 entry (DateTimeOriginal), next IFD = 0.
+        // SubIFD size = 2 + 12 + 4 = 18 bytes -> ends at offset 44.
+        let mut dt_bytes = datetime.as_bytes().to_vec();
+        dt_bytes.push(0);
+        let value_offset = 44u32;
+        tiff.extend_from_slice(&1u16.to_le_bytes());
+        tiff.extend_from_slice(&0x9003u16.to_le_bytes()); // DATE_TIME_ORIGINAL
+        tiff.extend_from_slice(&2u16.to_le_bytes()); // ASCII
+        tiff.extend_from_slice(&(dt_bytes.len() as u32).to_le_bytes());
+        tiff.extend_from_slice(&value_offset.to_le_bytes());
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend_from_slice(&dt_bytes);
+
+        let mut app1 = Vec::from(b"Exif\0\0".as_slice());
+        app1.extend_from_slice(&tiff);
+        let app1_len = (app1.len() + 2) as u16;
+
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
+        jpeg.extend_from_slice(&app1_len.to_be_bytes());
+        jpeg.extend_from_slice(&app1);
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+        jpeg
+    }
+
+    fn format_exif_utc(utc: u32) -> String {
+        let days = i64::from(utc / 86_400);
+        let secs = utc % 86_400;
+        let (year, month, day) = crate::cal::civil_from_days(days);
+        format!(
+            "{year:04}:{month:02}:{day:02} {:02}:{:02}:{:02}",
+            secs / 3_600,
+            (secs % 3_600) / 60,
+            secs % 60
+        )
+    }
+
+    #[test]
+    fn geotag_dry_run_leaves_photo_untouched_and_apply_writes_with_wnro_auto_shift() {
+        let scratch = Scratch::new("geotag-wnro");
+        let stale_utc = (crate::cal::days_from_civil(2006, 9, 17) * 86_400 + 3600) as u32;
+        let shifted_utc = crate::cal::shift_seconds(stale_utc, crate::cal::WNRO_DAYS);
+
+        let log_path = scratch.join("stale.bin");
+        fileio::write(&log_path, &dump_with_timestamps(&[stale_utc])).expect("write dump");
+
+        let original_jpeg = synthetic_jpeg_with_datetime(&format_exif_utc(shifted_utc));
+        let photo_path = scratch.join("shot.jpg");
+        fileio::write(&photo_path, &original_jpeg).expect("write jpeg");
+
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+
+        // Dry run must leave the JPEG byte-for-byte unchanged.
+        let dry_console = RecordingConsole::default();
+        geotag(
+            &LogGeotagOptions {
+                log: log_path.clone(),
+                photos: vec![photo_path.clone()],
+                max_gap: 300,
+                utc_offset_days: OffsetSpec::Auto,
+                tz_offset_minutes: 0,
+                dry_run: true,
+                json: true,
+            },
+            Session::new(&links, &dry_console, &confirm),
+        )
+        .expect("dry run");
+        assert_eq!(
+            fileio::read(&photo_path).expect("photo"),
+            original_jpeg,
+            "dry-run must not touch the JPEG on disk"
+        );
+        let dry_doc: serde_json::Value =
+            serde_json::from_str(&dry_console.stdout()).expect("one JSON object");
+        assert_eq!(dry_doc["dry_run"], true);
+        assert_eq!(dry_doc["offset_days"], crate::cal::WNRO_DAYS);
+        assert_eq!(dry_doc["written"], 0);
+        assert_eq!(dry_doc["skipped"], 0);
+        assert_eq!(dry_doc["plans"][0]["status"], "planned");
+
+        // Real run writes GPS EXIF tags verified by exif::read_gps.
+        let apply_console = RecordingConsole::default();
+        geotag(
+            &LogGeotagOptions {
+                log: log_path,
+                photos: vec![photo_path.clone()],
+                max_gap: 300,
+                utc_offset_days: OffsetSpec::Auto,
+                tz_offset_minutes: 0,
+                dry_run: false,
+                json: false,
+            },
+            Session::new(&links, &apply_console, &confirm),
+        )
+        .expect("apply geotag");
+        let tagged = fileio::read(&photo_path).expect("tagged photo");
+        assert_ne!(tagged, original_jpeg);
+        let gps = m241_core::log::exif::read_gps(&tagged)
+            .expect("parse exif")
+            .expect("gps tags written");
+        assert!((gps.latitude.expect("lat") - 35.681_236).abs() < 1e-4);
+        assert!((gps.longitude.expect("lon") - 139.767_13).abs() < 1e-4);
+        assert!(apply_console.stdout().contains("written : 1"));
+    }
+
+    #[test]
+    fn geotag_expands_directories_handles_skips_and_applies_tz_offset() {
+        let scratch = Scratch::new("geotag-dir");
+        let track_utc = 1_700_000_000u32;
+        let log_path = write_dump(&scratch, "track.bin", 2);
+
+        let photos_dir = scratch.join("photos");
+        let nested_dir = photos_dir.join("nested");
+        std::fs::create_dir_all(&nested_dir).expect("create dir");
+
+        // Camera clock set to UTC+9 (540 minutes ahead of UTC).
+        let local_camera_utc = track_utc + 540 * 60;
+        let good_photo = photos_dir.join("01_good.jpg");
+        fileio::write(
+            &good_photo,
+            &synthetic_jpeg_with_datetime(&format_exif_utc(local_camera_utc)),
+        )
+        .expect("write good jpg");
+
+        // Photo taken outside max_gap.
+        let far_photo = photos_dir.join("02_far.jpg");
+        fileio::write(
+            &far_photo,
+            &synthetic_jpeg_with_datetime(&format_exif_utc(local_camera_utc + 1000)),
+        )
+        .expect("write far jpg");
+
+        // Non-JPEG file in the same directory must be skipped cleanly.
+        let png_file = photos_dir.join("03_note.png");
+        fileio::write(&png_file, b"\x89PNG\r\n\x1a\n").expect("write png");
+
+        // Subdirectory file must NOT be collected (only immediate regular files).
+        let nested_bytes = synthetic_jpeg_with_datetime(&format_exif_utc(local_camera_utc));
+        let nested_photo = nested_dir.join("ignored.jpg");
+        fileio::write(&nested_photo, &nested_bytes).expect("write nested");
+
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        geotag(
+            &LogGeotagOptions {
+                log: log_path,
+                photos: vec![photos_dir],
+                max_gap: 300,
+                utc_offset_days: OffsetSpec::Days(0),
+                tz_offset_minutes: 540,
+                dry_run: false,
+                json: true,
+            },
+            Session::new(&links, &console, &confirm),
+        )
+        .expect("geotag directory");
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(doc["offset_days"], 0);
+        assert_eq!(doc["written"], 1);
+        assert_eq!(doc["skipped"], 2);
+        let plans = doc["plans"].as_array().expect("plans array");
+        assert_eq!(plans.len(), 3, "only immediate regular files are included");
+        assert_eq!(plans[0]["status"], "written");
+        // matched_utc must be true UTC (not shifted by camera tz offset!).
+        assert_eq!(plans[0]["matched_utc"], track_utc);
+        assert_eq!(plans[1]["status"], "skipped");
+        assert_eq!(plans[2]["status"], "skipped");
+        assert!(
+            plans[2]["skip_reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not a JPEG")
+        );
+
+        let good_gps =
+            m241_core::log::exif::read_gps(&fileio::read(&good_photo).expect("read good"))
+                .expect("read exif")
+                .expect("gps tags written");
+        assert!((good_gps.latitude.expect("lat") - 35.681_236).abs() < 1e-4);
+
+        // Nested photo was not touched.
+        assert_eq!(
+            fileio::read(&nested_photo).expect("read nested"),
+            nested_bytes
+        );
+        let nested_gps = m241_core::log::exif::read_gps(&nested_bytes)
+            .expect("read exif")
+            .expect("exif present without gps");
+        assert_eq!(nested_gps.latitude, None);
+        assert_eq!(nested_gps.longitude, None);
     }
 }

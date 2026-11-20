@@ -235,7 +235,7 @@ pub(crate) fn run_with(
         Command::Device { command } => match command {
             DeviceCommand::Ports(options) => device::ports(&options, session)?,
             DeviceCommand::Info(options) => device::info(&options, session)?,
-            DeviceCommand::Doctor => return Err(not_implemented("device doctor").into()),
+            DeviceCommand::Doctor(options) => device::doctor(&options, session)?,
         },
         Command::Fw { command } => match command {
             FwCommand::Dump(options) => fw::dump(&options, session)?,
@@ -247,11 +247,11 @@ pub(crate) fn run_with(
             LogCommand::Download(options) => logcmd::download(&options, session)?,
             LogCommand::Read(options) => logcmd::read(&options, session)?,
             LogCommand::Erase => return Err(not_implemented("log erase").into()),
-            LogCommand::Geotag => return Err(not_implemented("log geotag").into()),
+            LogCommand::Geotag(options) => logcmd::geotag(&options, session)?,
         },
         Command::Nmea { command } => match command {
             NmeaCommand::Repair(options) => nmea::repair(&options, session)?,
-            NmeaCommand::Proxy => return Err(not_implemented("nmea proxy").into()),
+            NmeaCommand::Proxy(options) => nmea::proxy(&options, session)?,
         },
     }
     Ok(())
@@ -307,11 +307,8 @@ mod tests {
     /// lines are the ones `docs/reference/02-cli.md` documents.
     fn unimplemented_commands() -> Vec<(Command, &'static str)> {
         vec![
-            (parsed(&["device", "doctor"]), "device doctor"),
             (parsed(&["fw", "flash"]), "fw flash"),
             (parsed(&["log", "erase"]), "log erase"),
-            (parsed(&["log", "geotag"]), "log geotag"),
-            (parsed(&["nmea", "proxy"]), "nmea proxy"),
         ]
     }
 
@@ -347,16 +344,7 @@ mod tests {
             .iter()
             .map(|(_command, name)| *name)
             .collect();
-        assert_eq!(
-            names,
-            vec![
-                "device doctor",
-                "fw flash",
-                "log erase",
-                "log geotag",
-                "nmea proxy",
-            ]
-        );
+        assert_eq!(names, vec!["fw flash", "log erase"]);
     }
 
     #[test]
