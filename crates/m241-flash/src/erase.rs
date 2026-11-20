@@ -60,8 +60,11 @@ pub struct BackupProof {
 impl BackupProof {
     /// Record that `dump` — the log as it was read off the device — is on disk.
     ///
-    /// The empty dump is accepted: a device whose log is empty has nothing to
-    /// lose, and refusing there would push a caller towards bypassing the check.
+    /// This constructor is infallible and records `dump.len()` verbatim,
+    /// including `0` for an empty slice. [`LogEraser::erase`] refuses a proof
+    /// whose [`Self::saved_bytes`] is `0` with [`Error::Safety`] before
+    /// sending anything on the wire, so an empty or un-taken backup cannot
+    /// trigger `$PMTK182,6`.
     #[must_use]
     pub fn of_bytes(dump: &[u8]) -> Self {
         Self {
@@ -130,17 +133,30 @@ impl<T: Transport> LogEraser<T> {
             });
         }
         let body = format!("PMTK182,{ERASE_SUBCOMMAND}");
-        // The prefix stops at `$PMTK001,`: narrowing it to the expected command
-        // would make the `command != 182` check below unreachable, and that
-        // check is what catches a desynchronised line answering with the
-        // acknowledgement of an earlier `$PMTK182` command.
+        // Wait for the first `$PMTK001,` reply and verify both the command
+        // number (182) and the subcommand (6). Checking only `command == 182`
+        // would accept a stale `$PMTK001,182,5,3` (log-stop ACK) as if the
+        // erase had succeeded.
         let reply = self.await_reply(&body, "$PMTK001,")?;
-        let ack = pmtk::parse_ack(&pmtk::parse_sentence(&reply)?)?;
+        let sentence = pmtk::parse_sentence(&reply)?;
+        let ack = pmtk::parse_ack(&sentence)?;
         if ack.command != PMTK_LOG_COMMAND {
             return Err(Error::Framing {
                 what: format!(
                     "acknowledgement was for command {}, not {PMTK_LOG_COMMAND}",
                     ack.command
+                ),
+                offset: None,
+            });
+        }
+        let subcommand = (sentence.fields.len() == 3)
+            .then(|| sentence.field(1).and_then(|field| field.parse::<u8>().ok()))
+            .flatten();
+        if subcommand != Some(ERASE_SUBCOMMAND) {
+            return Err(Error::Framing {
+                what: format!(
+                    "acknowledgement was for $PMTK182 subcommand {:?}, not {ERASE_SUBCOMMAND} ({reply})",
+                    sentence.field(1)
                 ),
                 offset: None,
             });
@@ -342,6 +358,30 @@ mod tests {
         let err = eraser
             .erase(BackupProof::of_bytes(&dump()))
             .expect_err("wrong command");
+        assert!(matches!(err, Error::Framing { .. }), "got {err}");
+    }
+
+    #[test]
+    fn a_log_stop_acknowledgement_is_not_accepted_as_erase_success() {
+        // `$PMTK001,182,5,3` acknowledges `$PMTK182,5` (logging stop), not
+        // `$PMTK182,6` (erase). Accepting any `command == 182` ACK would treat
+        // a stale stop reply as erase success.
+        let mut eraser = LogEraser::new(Stub::answering("PMTK001,182,5,3"))
+            .with_reply_timeout(Duration::from_millis(30));
+        let err = eraser
+            .erase(BackupProof::of_bytes(&dump()))
+            .expect_err("subcommand 5 is log stop, not erase");
+        assert!(matches!(err, Error::Framing { .. }), "got {err}");
+        assert!(err.is_fatal(), "a mismatched ACK must not be retried");
+    }
+
+    #[test]
+    fn a_pmtk182_acknowledgement_without_a_subcommand_is_a_framing_error() {
+        let mut eraser = LogEraser::new(Stub::answering("PMTK001,182,3"))
+            .with_reply_timeout(Duration::from_millis(30));
+        let err = eraser
+            .erase(BackupProof::of_bytes(&dump()))
+            .expect_err("missing subcommand");
         assert!(matches!(err, Error::Framing { .. }), "got {err}");
     }
 
