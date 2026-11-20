@@ -212,7 +212,7 @@ pub fn run_with(session: Session<'_>, command: Command) -> Result<()> {
     match command {
         Command::Device { command } => match command {
             DeviceCommand::Ports(options) => device::ports(&options, session),
-            DeviceCommand::Info(options) => not_implemented_args("device info", &options),
+            DeviceCommand::Info(options) => device::info(&options, session),
             DeviceCommand::Doctor => Err(not_implemented("device doctor")),
         },
         Command::Fw { command } => match command {
@@ -292,7 +292,6 @@ mod tests {
     /// lines are the ones `docs/reference/02-cli.md` documents.
     fn unimplemented_commands() -> Vec<(Command, &'static str)> {
         vec![
-            (parsed(&["device", "info"]), "device info"),
             (parsed(&["device", "doctor"]), "device doctor"),
             (parsed(&["fw", "dump", "-o", "stock.bin"]), "fw dump"),
             (
@@ -348,7 +347,6 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "device info",
                 "device doctor",
                 "fw dump",
                 "fw patch",
