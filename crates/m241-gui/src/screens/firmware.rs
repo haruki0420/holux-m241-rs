@@ -81,6 +81,67 @@ impl Step {
     }
 }
 
+/// How one step's marker is drawn: a shape first, a colour second.
+///
+/// The review found the reached and unreached markers told apart by lightness
+/// alone — two identical rings, one a shade brighter — which is exactly the
+/// "colour is never the only signal" failure DESIGN.md §3 forbids. The three
+/// states are now three shapes (filled, larger filled, open ring) *and* three
+/// colours, so the row still reads in monochrome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepMarker {
+    /// A finished step: a filled dot.
+    Done,
+    /// The step the wizard is on: the same dot, larger.
+    Current,
+    /// A step not started: an open ring.
+    Ahead,
+}
+
+impl StepMarker {
+    /// Which marker a step gets, given the step the wizard is on.
+    #[must_use]
+    fn of(step: Step, current: Step) -> Self {
+        if step == current {
+            Self::Current
+        } else if step.index() < current.index() {
+            Self::Done
+        } else {
+            Self::Ahead
+        }
+    }
+
+    /// Radius of the dot or ring.
+    #[must_use]
+    fn radius(self) -> f32 {
+        match self {
+            Self::Current => metric::POINT_DOT + 1.0,
+            Self::Done | Self::Ahead => metric::POINT_DOT,
+        }
+    }
+
+    /// The colour of the marker.
+    #[must_use]
+    fn colour(self) -> Color32 {
+        match self {
+            Self::Current => theme::INK,
+            Self::Done => theme::DATA,
+            Self::Ahead => theme::RULE,
+        }
+    }
+
+    /// The label is never the divider colour: a rule is a hairline and cannot
+    /// carry a word (§3), so the words are ink for the current step and mute
+    /// for the others.
+    #[must_use]
+    fn label_colour(self) -> Color32 {
+        match self {
+            Self::Current => theme::INK,
+            Self::Done | Self::Ahead => theme::MUTE,
+        }
+    }
+}
+
 /// The three places amber may appear (DESIGN.md §3).
 ///
 /// One variant per permitted use, and [`Self::voice`] is the only function that
@@ -448,33 +509,25 @@ impl FirmwareScreen {
             let Some(center) = positions.get(step.index()).copied() else {
                 continue;
             };
-            let reached = step.index() <= self.step.index();
-            let colour = if step == self.step {
-                theme::INK
-            } else if reached {
-                theme::DATA
-            } else {
-                theme::RULE
-            };
-            if step == self.step {
-                painter.circle_filled(center, metric::POINT_DOT + 1.0, colour);
-            } else {
+            // Shape first, colour second: the review found a reached step and an
+            // unreached one were the same ring in two shades, which is the
+            // colour-is-the-only-signal failure §3 forbids.
+            let marker = StepMarker::of(step, self.step);
+            if marker == StepMarker::Ahead {
                 painter.circle_stroke(
                     center,
-                    metric::POINT_DOT,
-                    Stroke::new(metric::HAIRLINE, colour),
+                    marker.radius(),
+                    Stroke::new(metric::HAIRLINE, marker.colour()),
                 );
+            } else {
+                painter.circle_filled(center, marker.radius(), marker.colour());
             }
             painter.text(
                 center + Vec2::new(0.0, space::M),
                 egui::Align2::CENTER_TOP,
                 format!("{} {}", step.index() + 1, step.label()),
                 egui::FontId::proportional(size::CAPTION),
-                if step == self.step {
-                    theme::INK
-                } else {
-                    theme::MUTE
-                },
+                marker.label_colour(),
             );
         }
     }
@@ -1109,6 +1162,33 @@ mod tests {
         let screen = screen();
         assert_eq!(screen.step(), Step::Dump);
         assert_eq!(screen.dump_state(), &DumpState::Idle);
+    }
+
+    #[test]
+    fn the_step_markers_are_told_apart_by_shape_not_only_by_colour() {
+        // The invariant that survives a monochrome screenshot: shape, before colour.
+        let markers = [
+            StepMarker::of(Step::Dump, Step::Patch),
+            StepMarker::of(Step::Patch, Step::Patch),
+            StepMarker::of(Step::Flash, Step::Patch),
+        ];
+        assert_eq!(
+            markers,
+            [StepMarker::Done, StepMarker::Current, StepMarker::Ahead]
+        );
+        // Filled, filled-but-bigger, open ring: three shapes from two primitives.
+        assert_eq!(markers[0].radius(), markers[2].radius());
+        assert!(markers[1].radius() > markers[0].radius());
+    }
+
+    #[test]
+    fn a_step_label_is_never_a_rule_colour() {
+        // RULE clears about 1.5:1 on the ground: fine for a hairline, not for text.
+        for step in Step::ALL {
+            for current in Step::ALL {
+                assert_ne!(StepMarker::of(step, current).label_colour(), theme::RULE);
+            }
+        }
     }
 
     #[test]
