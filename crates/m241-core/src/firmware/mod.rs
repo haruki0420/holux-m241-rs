@@ -1,6 +1,14 @@
-//! Firmware images: header parsing, profiles, and the WNRO patch.
+//! Firmware images: the MTK/Holux header, and the GPS epoch constant it carries.
 //!
-//! Placeholder; the profile table and patch plan land with the core work tree.
+//! [`image`] only decodes an image: it parses the header and reads the epoch
+//! constant, and never writes a byte. The profile table and the patch-plan types
+//! are [`crate::types::FirmwareProfile`], [`crate::types::PatchPlan`] and
+//! [`crate::types::PatchEdit`] in [`crate::types`], because the CLI and the GUI
+//! both handle a plan before any image is opened.
+//!
+//! The rest of the patch path (identify an image, build a plan, write it back)
+//! lands with the work tree that owns it. [`crate::types::PatchPlan::apply`] is
+//! the part that already exists here.
 
 pub mod image;
 
