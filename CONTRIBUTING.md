@@ -24,8 +24,10 @@ recovery instructions have to survive it.
 `docs/reference/01-da-protocol.md` before any code implements them. Two things
 follow:
 
-- A change to `crates/m241-core/src/protocol/da.rs` needs a citation into that
-  document, naming the function and the instruction range it came from.
+- A change to `crates/m241-flash/src/da.rs` needs a citation into that
+  document, naming the function and the instruction range it came from. The DA
+  is in `m241-flash` rather than `m241-core` so a binary that only reads cannot
+  link it.
 - The previous Python implementation and the upstream project are **hypotheses**.
   Where they disagree with the disassembly, the disassembly wins, and the
   disagreement is recorded in `docs/dev/04-prior-art.md` so it is not re-litigated.

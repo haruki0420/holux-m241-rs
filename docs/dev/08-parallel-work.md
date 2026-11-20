@@ -22,7 +22,7 @@
 | E | GUI 3画面（接続・ログ・ファーム） | `crates/m241-gui/src/screens/*` | D（型が要る。スタブで開始可） |
 | F | 写真ジオタグ（EXIF 自前実装） | `crates/m241-core/src/log/` 配下に exif / geotag を追加 | D | <!-- path-check: ignore -->
 
-**A が終わるまで flash の実装は始めない。** `protocol/da.rs` は A の成果物を
+**A が終わるまで flash の実装は始めない。** `m241-flash/src/da.rs` は A の成果物を
 引用できない限り書かない、が現行のルール（`CONTRIBUTING.md`）。
 
 **E は D の型に依存する。** D が先に型（`DeviceInfo`、`TrackPoint` など）を

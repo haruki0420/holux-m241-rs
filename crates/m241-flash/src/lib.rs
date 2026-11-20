@@ -43,8 +43,10 @@
     )
 )]
 
+pub mod da;
 pub mod erase;
 
+pub use da::DownloadAgent;
 pub use erase::{BackupProof, ERASE_SUBCOMMAND, LogEraser};
 
 /// Version of the crate, taken from `Cargo.toml` at build time.

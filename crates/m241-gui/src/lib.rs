@@ -11,10 +11,10 @@
 //! would apply.
 //!
 //! What the screens do *not* do yet is drive the device: the session layer that
-//! would read a firmware image or download a log is not written, and
-//! `m241_core::protocol::DownloadAgent` refuses by design until the vendor binary
-//! has been disassembled. Those paths are visible on the screens as disabled
-//! controls labelled 未検証, never as buttons that quietly do nothing.
+//! would read a firmware image or download a log is not written, and the write
+//! path lives in `m241-flash`, which this crate deliberately does not depend on.
+//! Those paths are visible on the screens as disabled controls labelled 未検証,
+//! never as buttons that quietly do nothing.
 //!
 //! Exposed as a library so integration tests can drive the real [`App`] through
 //! `egui`'s headless context. A GUI that compiles is not a GUI that works.

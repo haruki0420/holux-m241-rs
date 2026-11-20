@@ -57,7 +57,9 @@ Holux のファームウェアイメージ、ダウンロードエージェン�
 食い違っており、どちらも同じ不完全な理解の上に書かれている。どちらかを移植するのではなく、
 このプロジェクトは `DA_v3.8.4.bin` を逆アセンブルし、コマンド体系を
 [`docs/reference/01-da-protocol.md`](docs/reference/01-da-protocol.md) に記録してから実装する。
-`crates/m241-core/src/protocol/da.rs` は現時点では処理を拒否し、その理由を返す。
+ダウンロードエージェントのドライバは読み取り側とは別クレートの
+`crates/m241-flash/src/da.rs` にあり、現時点では処理を拒否してその理由を返す。
+読み取り専用の `m241-core` は書き込みコードを持たない。
 
 どこから何を取り入れたか、どの主張がまだ仮説かは
 [`docs/dev/04-prior-art.md`](docs/dev/04-prior-art.md) に書いてある。

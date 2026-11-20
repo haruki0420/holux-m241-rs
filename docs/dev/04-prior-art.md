@@ -101,7 +101,7 @@ known profile **or** every byte that differs from `--backup` falls inside the
 patch offsets; the image fits the flash size the DA reports; the user typed
 `WRITE` (`docs/reference/02-cli.md` §`m241 fw flash`, `AGENTS.md` §2.3,
 `CONTRIBUTING.md` safety-gate table) — plus a read-back after the write. **It is
-not implemented.** `crates/m241-core/src/protocol/da.rs` refuses to operate and
+not implemented.** `crates/m241-flash/src/da.rs` refuses to operate and
 `crates/m241-cli/src/main.rs` returns "not implemented" for `fw flash`; the
 offline gates that *are* code are the profile and epoch checks in
 `crates/m241-core/src/firmware/patch.rs`.
