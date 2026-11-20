@@ -98,6 +98,13 @@ impl LogScreen {
                 "ログ",
                 "吸い出したログを地図に描き、写真の時刻と突き合わせて GPX に書き出します。",
             );
+            // The review's fourth finding: this screen showed sample coordinates and
+            // sample speeds with no marking at all. The band is under the heading and
+            // above every figure, so it cannot be scrolled or cropped away from them.
+            if self.sample {
+                ui.add_space(space::S);
+                common::sample_marker(ui);
+            }
             ui.add_space(space::L);
 
             if self.track.points.is_empty() {
@@ -185,7 +192,7 @@ impl LogScreen {
     /// The 集計 figures: distance, duration, average speed.
     fn summary_block(&self, ui: &mut Ui) {
         let summary = LogSummary::of(&self.track);
-        ui.label(RichText::new("集計").size(size::CAPTION).color(theme::MUTE));
+        common::block_title(ui, "集計", self.sample);
         common::hairline(ui);
         ui.add_space(space::XS);
         for (label, value) in [
@@ -219,11 +226,7 @@ impl LogScreen {
     /// The left rail block: days, photos, totals. Subordinate to the tab rail: the
     /// same staircase rhythm, no fill (DESIGN.md §5).
     fn rail_block(&mut self, ui: &mut Ui) {
-        ui.label(
-            RichText::new("トラック")
-                .size(size::CAPTION)
-                .color(theme::MUTE),
-        );
+        common::block_title(ui, "トラック", self.sample);
         common::hairline(ui);
         ui.add_space(space::XS);
         for (day, count) in self.days() {
@@ -257,7 +260,8 @@ impl LogScreen {
 
     /// 地図: the track painted from latitude and longitude.
     fn map_panel(&mut self, ui: &mut Ui) {
-        common::panel(ui, "地図", |ui| {
+        let sample = self.sample;
+        common::sample_panel(ui, "地図", sample, |ui| {
             let height = metric::PLOT;
             let (rect, response) =
                 ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
@@ -387,7 +391,8 @@ impl LogScreen {
 
     /// 選択した点: the figures for one record, right-aligned in a ruled block.
     fn selected_panel(&mut self, ui: &mut Ui) {
-        common::panel(ui, "選択した点", |ui| {
+        let sample = self.sample;
+        common::sample_panel(ui, "選択した点", sample, |ui| {
             let Some(point) = self.selected.and_then(|index| self.track.points.get(index)) else {
                 common::status_line(ui, Status::Info, "点を選んでください");
                 return;
@@ -431,11 +436,7 @@ impl LogScreen {
     /// `show_rows` keeps the frame cost independent of the length.
     fn point_table(&mut self, ui: &mut Ui) {
         let shown = self.visible_indices();
-        ui.label(
-            RichText::new("点の一覧")
-                .size(size::CAPTION)
-                .color(theme::MUTE),
-        );
+        common::block_title(ui, "点の一覧", self.sample);
         common::hairline(ui);
         egui::ScrollArea::vertical()
             .id_salt("m241-log-points")

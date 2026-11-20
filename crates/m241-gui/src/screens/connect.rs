@@ -57,6 +57,13 @@ impl ConnectScreen {
                 "Holux M-241",
                 "ファームの日付が 19.6 年ずれています。端末をつなぎ、まずファームを吸い出してください。",
             );
+            // The sample band sits under the heading, above every figure: it cannot
+            // be scrolled away from the numbers it qualifies, and a crop that keeps
+            // the figures keeps the word too.
+            if self.sample {
+                ui.add_space(space::S);
+                common::sample_marker(ui);
+            }
 
             // Lazy first enumeration: asking the OS for ports every frame would spin a
             // udev walk at 60 Hz for a list that changes when a cable moves.
@@ -174,11 +181,10 @@ impl ConnectScreen {
     }
 
     fn device_panel(&mut self, ui: &mut Ui) {
-        common::panel(ui, "デバイス", |ui| {
-            if self.sample {
+        let sample = self.sample;
+        common::sample_panel(ui, "デバイス", sample, |ui| {
+            if sample {
                 let info = sample_device();
-                common::sample_marker(ui);
-                ui.add_space(space::S);
                 egui::Grid::new("m241-device-figures")
                     .num_columns(2)
                     .spacing([space::L, space::S])
@@ -222,8 +228,9 @@ impl ConnectScreen {
     }
 
     fn log_panel(&mut self, ui: &mut Ui) {
-        common::panel(ui, "ログ", |ui| {
-            if self.sample {
+        let sample = self.sample;
+        common::sample_panel(ui, "ログ", sample, |ui| {
+            if sample {
                 let summary = sample_summary();
                 egui::Grid::new("m241-log-figures")
                     .num_columns(2)

@@ -347,6 +347,10 @@ impl FirmwareScreen {
                 "ファームを書き換える",
                 "本体のファームを吸い出し、日付定数を書き換えて書き戻します。",
             );
+            if self.sample {
+                ui.add_space(space::S);
+                common::sample_marker(ui);
+            }
             ui.add_space(space::L);
             self.step_row(ui);
             ui.add_space(space::L);
