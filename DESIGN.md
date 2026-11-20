@@ -307,12 +307,16 @@ When the shell exists:
 
 Three checks are mechanical and belong in CI, not in a human pass:
 
-```rust
-// tests/design_invariants.rs
-// 1. Amber is used only inside the destructive module.
-// 2. No egui Shape carries a corner radius other than RADIUS.
-// 3. Every status colour is paired with a text label.
+```text
+tools/check_design.py
+  1. Amber is used only inside the destructive module.
+  2. No egui Shape carries a corner radius other than RADIUS.
+  3. Every status colour is paired with a text label.
 ```
+
+`crates/m241-gui/tests/design_gate.rs` drives that script against planted
+violations, so a broken regex fails the test suite rather than silently passing
+everything.
 
 The amber inventory is the important one: grep the GUI crate for `tokens::DANGER`
 and assert every use site is in `screens::firmware` and none of them is a hover,

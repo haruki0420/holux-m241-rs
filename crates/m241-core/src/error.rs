@@ -25,11 +25,24 @@ pub enum Error {
     /// The serial port could not be opened, or was not found.
     Port { message: String },
     /// The chip did not answer a command in time.
-    Timeout { what: String, timeout: Duration },
+    Timeout {
+        what: String,
+        timeout: TimeoutDuration,
+    },
     /// The bytes coming back are not what the protocol says they must be.
-    Framing { what: String, offset: Offset },
+    ///
+    /// `offset` is `None` when the failure has no position in an image: an echo
+    /// that does not match or a sync probe answered with the wrong byte is a
+    /// desynchronised line, not a bad byte at a known place. Printing a made-up
+    /// `0x0` there would send the reader looking at the start of a file.
+    Framing {
+        what: String,
+        offset: Option<Offset>,
+    },
     /// The chip refused a command with its own negative acknowledgement.
     Rejected { what: String },
+    /// A destructive action was refused because a safety condition was not met.
+    Safety { reason: String },
     /// The image cannot be parsed.
     Firmware {
         message: String,
@@ -50,8 +63,14 @@ pub enum Error {
     /// The caller asked for something the current state does not allow.
     State(String),
     /// A file could not be read or written.
+    ///
+    /// `path` is the file the caller was working on. It is `None` when the error
+    /// came from a bare [`std::io::Error`], which carries no path: the serial
+    /// port, for instance, is mapped from `serialport::Error` and its own errors
+    /// go through [`Error::Port`]. Display then reads `i/o: …` rather than
+    /// inventing a placeholder path.
     Io {
-        path: String,
+        path: Option<String>,
         source: std::io::Error,
     },
 }
@@ -72,9 +91,10 @@ impl fmt::Display for Error {
                 write!(f, "no reply from the device within {timeout:?}: {what}")
             }
             Self::Framing { what, offset } => {
-                write!(f, "framing error: {what} (at 0x{offset:X})")
+                write!(f, "framing error: {}", with_offset(what, *offset))
             }
             Self::Rejected { what } => write!(f, "the device rejected {what}"),
+            Self::Safety { reason } => write!(f, "refused: {reason}"),
             Self::Firmware { message, offset } => {
                 write!(f, "firmware image: {}", with_offset(message, *offset))
             }
@@ -90,7 +110,10 @@ impl fmt::Display for Error {
             }
             Self::Nmea { message } => write!(f, "NMEA sentence: {message}"),
             Self::State(message) => f.write_str(message),
-            Self::Io { path, source } => write!(f, "i/o on {path}: {source}"),
+            Self::Io { path, source } => match path {
+                Some(path) => write!(f, "i/o on {path}: {source}"),
+                None => write!(f, "i/o: {source}"),
+            },
         }
     }
 }
@@ -124,7 +147,10 @@ impl Error {
                 message,
                 offset: Some(offset),
             },
-            Self::Framing { what, .. } => Self::Framing { what, offset },
+            Self::Framing { what, .. } => Self::Framing {
+                what,
+                offset: Some(offset),
+            },
             other => other,
         }
     }
@@ -146,6 +172,7 @@ impl Error {
             Self::Rejected { .. } => {
                 Some("本体を再起動し、書き込みに失敗したなら自分のバックアップを書き戻してください")
             }
+            Self::Safety { .. } => None,
             Self::Firmware { .. } => Some("自分の個体から吸い出したイメージか確認してください"),
             Self::Profile { .. } => Some("`m241 fw patch --dry-run` で検出結果を確認してください"),
             Self::Log { .. } => Some("`m241 log info` でブロックヘッダを確認してください"),
@@ -159,22 +186,42 @@ impl Error {
     ///
     /// A timeout is retryable. A framing error usually is not: the line is
     /// desynchronised and retrying makes it worse. A rejected write is fatal
-    /// because the device state is now undefined.
+    /// because the device state is now undefined. A safety refusal is fatal
+    /// because retrying it unchanged would ask for the same dangerous action
+    /// again.
     #[must_use]
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,
-            Self::Framing { .. } | Self::Rejected { .. } | Self::Firmware { .. }
+            Self::Framing { .. }
+                | Self::Rejected { .. }
+                | Self::Safety { .. }
+                | Self::Firmware { .. }
         )
+    }
+}
+
+impl Error {
+    /// Wrap an I/O error with the file it happened on.
+    ///
+    /// Prefer this over [`Error::from`] whenever the path is known: `i/o on
+    /// backup/stock.bin: permission denied` names the file to fix, and a bare
+    /// `i/o: permission denied` does not.
+    #[must_use]
+    pub fn io(path: impl Into<String>, source: std::io::Error) -> Self {
+        Self::Io {
+            path: Some(path.into()),
+            source,
+        }
     }
 }
 
 impl From<std::io::Error> for Error {
     fn from(source: std::io::Error) -> Self {
-        Self::Io {
-            path: String::from("<unbound>"),
-            source,
-        }
+        // A bare `io::Error` carries no path. Guessing one (`<unbound>`) put a
+        // placeholder in front of the user; `None` lets Display print the OS's
+        // wording alone.
+        Self::Io { path: None, source }
     }
 }
 
@@ -188,14 +235,17 @@ impl From<serialport::Error> for Error {
     }
 }
 
-/// A duration whose `Debug` prints `500ms`, not `Duration { secs: 0, nanos: … }`.
+/// A timeout whose `Debug` prints `500ms`, not `Duration { secs: 0, nanos: … }`.
+///
+/// Named `TimeoutDuration` rather than `Duration` so it cannot be mistaken for
+/// [`std::time::Duration`] at a use site that has both in scope.
 ///
 /// [`Error::Timeout`]'s message embeds this, and a raw `Duration` debug in a
 /// user-facing message is worse than useless.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Duration(std::time::Duration);
+pub struct TimeoutDuration(std::time::Duration);
 
-impl Duration {
+impl TimeoutDuration {
     /// Wrap a standard duration.
     #[must_use]
     pub const fn from_std(value: std::time::Duration) -> Self {
@@ -209,7 +259,7 @@ impl Duration {
     }
 }
 
-impl fmt::Debug for Duration {
+impl fmt::Debug for TimeoutDuration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.0.subsec_millis() == 0 {
             write!(f, "{}s", self.0.as_secs())
@@ -219,7 +269,7 @@ impl fmt::Debug for Duration {
     }
 }
 
-impl From<std::time::Duration> for Duration {
+impl From<std::time::Duration> for TimeoutDuration {
     fn from(value: std::time::Duration) -> Self {
         Self(value)
     }
@@ -231,6 +281,17 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_timeout_wrapper_does_not_shadow_the_standard_duration() {
+        // Both names are in scope here, which is exactly the ambiguity the old
+        // `Duration` name created: `std::time::Duration` had to be written out
+        // in full at every use site.
+        let std_timeout = std::time::Duration::from_millis(500);
+        let wrapped = TimeoutDuration::from(std_timeout);
+        assert_eq!(wrapped.as_std(), std_timeout);
+        assert_eq!(TimeoutDuration::from_std(std_timeout), wrapped);
+    }
 
     #[test]
     fn an_offset_reaches_the_display_string_in_hex() {
@@ -306,7 +367,7 @@ mod tests {
         assert!(
             Error::Framing {
                 what: String::from("echo"),
-                offset: 3
+                offset: Some(3)
             }
             .hint()
             .is_some()
@@ -314,12 +375,59 @@ mod tests {
     }
 
     #[test]
-    fn an_io_error_keeps_its_source_chain() {
-        let err = Error::Io {
-            path: String::from("backup/stock.bin"),
-            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+    fn a_framing_error_without_a_position_prints_no_coordinates() {
+        // An echo mismatch has no offset into an image; it must not pretend to
+        // be at 0x0, which would send the reader to the start of a file.
+        let err = Error::Framing {
+            what: String::from("echo was [0xA2], expected [0xA1]"),
+            offset: None,
         };
+        let text = format!("{err}");
+        assert!(!text.contains("0x0"), "got {text}");
+        assert!(!text.contains("at "), "got {text}");
+        assert!(text.contains("echo was"), "got {text}");
+    }
+
+    #[test]
+    fn a_framing_error_that_names_an_offset_still_prints_it() {
+        let err = Error::Framing {
+            what: String::from("data does not match the block header"),
+            offset: Some(0x1F4),
+        };
+        assert!(format!("{err}").contains("at 0x1F4"), "got {err}");
+    }
+
+    #[test]
+    fn an_io_error_keeps_its_source_chain() {
+        let err = Error::io(
+            "backup/stock.bin",
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
         assert!(std::error::Error::source(&err).is_some());
         assert!(format!("{err}").contains("backup/stock.bin"));
+    }
+
+    #[test]
+    fn a_bare_io_error_prints_no_placeholder_path() {
+        // `Error::from(io::Error)` has no path to name. It used to print
+        // "i/o on <unbound>: …", which reads as a real file name.
+        let err = Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let text = format!("{err}");
+        assert!(!text.contains("<unbound>"), "got {text}");
+        assert!(!text.contains("i/o on "), "got {text}");
+        assert!(text.starts_with("i/o: "), "got {text}");
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn an_io_error_with_a_path_names_the_file() {
+        let err = Error::io(
+            "backup/stock.bin",
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert!(
+            format!("{err}").starts_with("i/o on backup/stock.bin: "),
+            "got {err}"
+        );
     }
 }

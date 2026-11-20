@@ -13,9 +13,13 @@ name = "m241-gui"
 path = "src/main.rs"
 
 [dependencies]
-m241-core.workspace = true
 egui.workspace = true
 eframe.workspace = true
+
+# `m241-core` joins this list when the GUI first performs real work: reading a
+# firmware image, listing a log, driving a session. Declared before then it is
+# an unused dependency, and an unused dependency is a warning that hides the
+# real one. The shell today owns navigation and tokens only.
 
 # walkers (map tiles) is deliberately not a dependency yet: it fetches tiles over
 # the network at runtime and cannot be exercised headlessly. The Log screen draws
