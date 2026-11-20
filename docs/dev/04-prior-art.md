@@ -123,8 +123,9 @@ the exit status is 0 (`:105-119`).
 **This project.** Two measured profiles — 406,312 bytes (V1.12) and 406,620
 (V1.13) — matched by exact hash **or** by structure: size, family string, device
 type and version marker (`identify` in `crates/m241-core/src/firmware/profiles.rs`),
-with the header's declared length as an independent completeness check
-(`declared_size` and `is_complete_dump` in `crates/m241-core/src/firmware/patch.rs`).
+with the header's declared length available as a completeness cross-check
+(`declared_size` in `crates/m241-core/src/firmware/patch.rs`; note the field holds
+the file size **minus four**, so it is not equal to the image length).
 An unexpected byte is a refusal, never a skip.
 
 **Verdict: the two tools are written for different image conventions.** Verified
