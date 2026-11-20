@@ -4,7 +4,7 @@ This page is the only place a claim may move from 未検証 to verified. Every o
 document points here.
 
 `✅` measured on a retail M-241 · `⚠️` not measured on hardware · `🧪` covered by
-the simulator and tests only.
+the simulator and tests only — see §3 for what that is and is not worth.
 
 ## 1. The hardware session (2026-11-15)
 
@@ -43,13 +43,44 @@ figure on this page.
 ## 3. The simulator
 
 `crates/m241-core` is exercised by a fake device that models the chip's own
-behaviour: echo, the checksums, the 16-bit pair swap, the 20-byte DA report, and
-the delay before a read's data arrives. It is not a mock: it drives the real
-client code paths, which is what makes a protocol regression fail loudly instead
-of corrupting a unit.
+behaviour: echo, the checksums, the 16-bit pair swap, the two read widths, and
+the PMTK command/reply framing. It is not a mock: it drives the real client code
+paths. The Download Agent is no longer modelled there — it belongs to the write
+crate, and its fake lives in `crates/m241-flash/src/simulator.rs`.
 
-🧪 marks a claim that is covered this way. It is weaker than ✅ and the documents
-say so at the point of use, not only here.
+**It is not a proof of correctness, and 🧪 never means "verified".**
+
+The reason is a circular reference. The simulator and the client share the same
+functions: the fake swaps 16-bit pairs with the crate's own `swap_pairs`, and the
+client undoes it with the same function. If that function's notion of the byte
+order is wrong, both halves are wrong in the same direction and the round trip
+still passes. The same holds for the checksum, the frame layout and every
+constant that is read from the crate rather than written out twice. A test that
+passes therefore shows the two halves agree; it does not show either half agrees
+with the device.
+
+What the simulator *is* good for is a **regression test**: it catches the
+refactor that quietly changes behaviour, because the behaviour it compares
+against was recorded from a version that was checked another way. That is a real
+job — most of the protocol's costliest bugs were regressions, not first attempts
+— but it is a different job from establishing that the first attempt was right.
+
+Correctness is carried by three things instead:
+
+1. **The citation.** Every protocol constant points at a measurement in
+   [`03-hardware-facts.md`](03-hardware-facts.md) or at a function and
+   instruction range in [`../reference/01-da-protocol.md`](../reference/01-da-protocol.md).
+   A constant that cannot be cited is a guess and is labelled as one.
+2. **The hardware run.** Section 1 is the only place a claim becomes ✅. A
+   command that never ran against a unit stays ⚠️ no matter how green the suite
+   is.
+3. **The review.** [`11-safety-review.md`](11-safety-review.md) fixes the
+   questions a diff is read against, and `tools/check_safety.py` turns the ones
+   that can be mechanical — the read/write crate split — into a gate.
+
+🧪 marks a claim covered only by the simulator and tests. It is weaker than ✅ and
+the documents say so at the point of use, not only here. Treat it as "this is
+pinned, so it will not drift unnoticed", never as "this is known to be right".
 
 ## 4. How to close a gap
 

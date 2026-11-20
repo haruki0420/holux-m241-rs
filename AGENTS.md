@@ -11,8 +11,8 @@ expensive to learn so it does not have to be rediscovered.
 ./tools/check.sh
 ```
 
-It runs five gates: formatting, lint, the workspace tests, the docs link check
-and the design invariant check. It prints one line per gate.
+It runs six gates: formatting, lint, the workspace tests, the docs link check,
+the design invariant check and the safety check. It prints one line per gate.
 
 The design gate (`tools/check_design.py`) is not cosmetic. It checks three
 invariants mechanically: amber appears only in the destructive module, a corner
@@ -20,6 +20,15 @@ radius is always `theme::RADIUS`, and a status colour always sits beside a text
 label. It fails the build when one is broken. Those three rules each encode a
 decision from `DESIGN.md`, and a rule enforced only by review holds until the
 reviewer is busy.
+
+The safety gate (`tools/check_safety.py`) is the other mechanical one, and it is
+what keeps reading and writing apart. `m241-core` reads; `m241-flash` writes.
+The gate fails if a destructive command (`$PMTK182,6`, `0xD3`, `0xD5`, `0xD9`) or a
+write-shaped identifier appears in `m241-core`, if its dependency tree contains
+`m241-flash`, or if `set_control_lines` is named outside the BootROM entry path.
+A binary built from `m241-core` therefore cannot link a write routine, and that
+is a compile-time fact rather than a review finding. See
+[`docs/dev/11-safety-review.md`](docs/dev/11-safety-review.md).
 
 **Long commands go in the background.** A first `cargo build` of the GUI pulls
 in `wgpu` and takes several minutes. Do not block a turn on it.

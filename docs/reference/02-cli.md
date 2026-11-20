@@ -84,6 +84,9 @@ Erases the track log. **Destructive.** Requires confirmation or `--yes`, and
 `--require-backup FILE` refuses unless the log you meant to keep is already on
 disk.
 
+The command lives in the `m241-flash` crate, not in `m241-core`: a binary that
+only reads cannot link it. See [`11-safety-review.md`](../dev/11-safety-review.md).
+
 ## `m241 log geotag`
 
 Matches photos to track points by capture time and writes GPS EXIF data, with a

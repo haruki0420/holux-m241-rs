@@ -78,6 +78,7 @@ JTAG を持たない、生産終了から年数が経つ機器のファームウ
 | [`docs/dev/05-verification.md`](docs/dev/05-verification.md) | 何を検証済みで、何が未検証か |
 | [`docs/dev/04-prior-art.md`](docs/dev/04-prior-art.md) | どこから何を持ってきたか |
 | [`docs/dev/06-open-questions.md`](docs/dev/06-open-questions.md) | まだ答えの出ていない問い |
+| [`docs/dev/11-safety-review.md`](docs/dev/11-safety-review.md) | 読み取りと書き込みの分離、書き込み・読み取り経路のレビュー観点 |
 | [`docs/reference/02-cli.md`](docs/reference/02-cli.md) | コマンド体系と終了コード |
 | [`DESIGN.md`](DESIGN.md) | 画面の設計（方向、トークン、各画面） |
 | [`PRODUCT.md`](PRODUCT.md) | 誰のためのもので、何をしてはいけないか |
