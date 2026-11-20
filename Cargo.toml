@@ -36,6 +36,13 @@ indexing_slicing = "warn"
 print_stdout = "warn"
 print_stderr = "warn"
 
+# Dev builds are for checking, not for running: debug info on this workspace
+# costs ~3 GB per worktree and the parallel streams each get one. Line tables
+# without full type info keep backtraces readable at a quarter of the size.
+# Bump to 1 locally when you actually need to debug something.
+[profile.dev]
+debug = 0
+
 [profile.release]
 lto = "thin"
 strip = "symbols"
