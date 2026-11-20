@@ -1,7 +1,7 @@
 # レビュー記録
 
 [`09-review-protocol.md`](09-review-protocol.md) の手順で行ったレビューの結果。
-対象・日付・指摘・対応を 1 レビュー 1 節で残す。
+対象・日付・指摘・対応・検証を 1 レビュー 1 節で残す。
 
 同じ指摘が 3 回出たら、レビューではなく仕組み（lint、テスト、テンプレート）で塞ぐ。
 
@@ -49,9 +49,15 @@ Should 10 件、Could 2 件。全文は各修正担当への指示に転記し�
 レビューする**三段構成にした（実装 → 修正 → 検証）。理由: 指摘した本人が直すと、
 直したつもりの箇所を同じ思い込みで読み直す。
 
-| 修正ストリーム | 範囲 |
-|---|---|
-| `fix/fix-core` | `crates/m241-core/src/` 全体 |
-| `fix/fix-gui` | `crates/m241-gui/` |
-| `fix/fix-cli` | `crates/m241-cli/`（core の `Error::Safety` 追加後） |
-| `fix/fix-docs` | `docs/`、`AGENTS.md`、`tools/` |
+| 修正ストリーム | 範囲 | 検証ストリーム | 検証の状態 |
+|---|---|---|---|
+| `fix/fix-core` | `crates/m241-core/src/` 全体 | 未割当 | 未検証 |
+| `fix/fix-gui` | `crates/m241-gui/` | 未割当 | 未検証 |
+| `fix/fix-cli` | `crates/m241-cli/`（core の `Error::Safety` 追加後） | 未割当 | 未検証 |
+| `fix/fix-docs` | `docs/`、`AGENTS.md`、`tools/` | 未割当 | 未検証 |
+
+検証ストリームは、修正ストリームに**参加していない**エージェントが担当する
+（[`09-review-protocol.md`](09-review-protocol.md) の三段構成）。検証担当が読むのは
+指摘リストと修正の差分とテストだけで、修正者の説明は読まない。合格条件は
+「指摘がすべて解消 / 新たな問題を入れていない / `./tools/check.sh` が 5/5」の 3 つ。
+状態は `未検証` → `合格` / `不合格` で更新する。
