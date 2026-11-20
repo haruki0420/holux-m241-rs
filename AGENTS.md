@@ -12,7 +12,14 @@ expensive to learn so it does not have to be rediscovered.
 ```
 
 It runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-`cargo test --workspace` and the docs link check, and prints one line per gate.
+`cargo test --workspace`, the docs link check and the design invariant check, and
+prints one line per gate.
+
+The design gate (`tools/check_design.py`) is not cosmetic. It fails the build if
+amber appears outside the destructive module, if a corner radius is written as a
+literal instead of `theme::RADIUS`, or if a status colour is used without a text
+label beside it. Those three rules each encode a decision from `DESIGN.md`, and a
+rule enforced only by review holds until the reviewer is busy.
 
 **Long commands go in the background.** A first `cargo build` of the GUI pulls
 in `wgpu` and takes several minutes. Do not block a turn on it.

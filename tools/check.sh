@@ -9,6 +9,7 @@ gates=(
   "clippy|cargo clippy --all-targets -- -D warnings"
   "test|cargo test --workspace"
   "docs|python3 tools/check_docs.py"
+  "design|python3 tools/check_design.py"
 )
 
 failed=0

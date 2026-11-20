@@ -40,6 +40,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Docs links
         run: python3 tools/check_docs.py
+      - name: Design invariants
+        run: python3 tools/check_design.py
 
   test:
     name: test (${{ matrix.os }})
