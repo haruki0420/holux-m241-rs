@@ -33,6 +33,9 @@ pub mod geotag;
 pub mod parse;
 pub mod record;
 
+#[cfg(test)]
+mod fixture;
+
 pub use crate::types::TrackPoint;
 pub use block::{BLOCK_HEADER_SIZE, BLOCK_SIZE, BlockHeader};
 pub use exif::{

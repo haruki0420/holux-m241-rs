@@ -28,7 +28,7 @@
 //!
 //! # Wall-clock time
 //!
-//! `DateTimeOriginal` carries no timezone (`exif::read_datetime_original` reads
+//! `DateTimeOriginal` carries no timezone ([`exif::read_datetime_original`] reads
 //! it as if it were UTC, and says so). This module therefore compares it against
 //! the track's UTC directly. A camera left on local time is off by its UTC
 //! offset; correcting that is the caller's job, because only the caller knows
@@ -46,7 +46,7 @@
 //! Every rewrite goes through a sibling temporary file and a rename, so an
 //! interrupted run leaves either the old photo or the new one at the original
 //! name, never a half-written JPEG. The bytes themselves are produced by
-//! [`crate::log::exif::write_gps`], which appends rather than relocates.
+//! [`exif::write_gps`], which appends rather than relocates.
 
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -150,30 +150,24 @@ pub fn plan(photos: &[PathBuf], track: &Track, options: &GeotagOptions) -> Resul
 /// skipped. The photo is re-read here rather than carried in the plan, because a
 /// reviewed plan is a decision, not a copy of the file: if the photo changed
 /// between planning and applying, the change is what gets modified, and every
-/// tag this module does not own is still preserved by
-/// [`crate::log::exif::write_gps`].
+/// tag this module does not own is still preserved by [`exif::write_gps`].
 ///
 /// # Errors
 ///
 /// [`Error::Io`] when a photo cannot be read or replaced, and whatever
-/// [`crate::log::exif::write_gps`] reports when a photo's Exif cannot be
-/// rewritten (most often: the new block no longer fits a JPEG segment).
+/// [`exif::write_gps`] reports when a photo's Exif cannot be rewritten (most
+/// often: the new block no longer fits a JPEG segment).
 pub fn apply(plans: &[GeotagPlan]) -> Result<Vec<PathBuf>> {
     let mut written = Vec::new();
     for plan in plans {
         let Some(point) = plan.point else {
             continue;
         };
-        // `plan` never chooses a point without a position; a hand-built plan
-        // that does gets no coordinate rather than a made-up (0, 0).
-        let (Some(latitude), Some(longitude)) = (point.latitude, point.longitude) else {
+        // `plan` never chooses a point without a position, and it validates the
+        // rewrite before promising one; a hand-built plan that lacks a
+        // coordinate gets no tag rather than a made-up (0, 0).
+        let Some(position) = position_of(&point) else {
             continue;
-        };
-        let position = GpsPosition {
-            latitude,
-            longitude,
-            altitude_m: point.height_m,
-            utc: point.utc,
         };
         let bytes = std::fs::read(&plan.photo)
             .map_err(|source| Error::io(plan.photo.display().to_string(), source))?;
@@ -186,35 +180,46 @@ pub fn apply(plans: &[GeotagPlan]) -> Result<Vec<PathBuf>> {
 
 /// The decision for one photo, from its bytes and the track.
 fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) -> GeotagPlan {
-    let Some(captured) = capture_utc(photo, bytes) else {
-        return GeotagPlan {
-            photo: photo.to_path_buf(),
-            point: None,
-            gap_seconds: None,
-            skipped: Some(capture_problem(photo, bytes)),
-        };
+    let captured = match capture_time(photo, bytes) {
+        Ok(captured) => captured,
+        Err(reason) => return skipped(photo, None, reason),
     };
     let Some((point, gap)) = nearest_positioned_point(track, captured) else {
-        return GeotagPlan {
-            photo: photo.to_path_buf(),
-            point: None,
-            gap_seconds: None,
-            skipped: Some(String::from(
+        return skipped(
+            photo,
+            None,
+            String::from(
                 "the track has no point with both a time and a position to compare with",
-            )),
-        };
+            ),
+        );
     };
     if gap > options.max_gap_seconds {
-        return GeotagPlan {
-            photo: photo.to_path_buf(),
-            point: None,
-            gap_seconds: Some(gap),
-            skipped: Some(format!(
+        return skipped(
+            photo,
+            Some(gap),
+            format!(
                 "the nearest track point is {gap} s from the capture time, past the \
                  {} s limit",
                 options.max_gap_seconds
-            )),
-        };
+            ),
+        );
+    }
+    // Validate the rewrite now, on the bytes we already have. A plan the user
+    // reviews then fails in `apply` is worse than no plan: it would abort a run
+    // halfway through a folder.
+    let Some(position) = position_of(&point) else {
+        return skipped(
+            photo,
+            Some(gap),
+            String::from("the chosen track point has no complete coordinate"),
+        );
+    };
+    if let Err(err) = exif::write_gps(bytes, &position) {
+        return skipped(
+            photo,
+            Some(gap),
+            format!("the photo's Exif block cannot be rewritten: {err}"),
+        );
     }
     GeotagPlan {
         photo: photo.to_path_buf(),
@@ -224,42 +229,77 @@ fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) 
     }
 }
 
-/// The capture time, or `None` when the photo has none.
-///
-/// `DateTimeOriginal` first, then the modification time. Read through
-/// [`capture_problem`]'s counterpart so the reason for a missing time is not
-/// recomputed differently in two places.
-fn capture_utc(photo: &Path, bytes: &[u8]) -> Option<u32> {
-    match exif::read_datetime_original(bytes) {
-        Ok(Some(utc)) => Some(utc),
-        // `Ok(None)`: no Exif segment, no Exif sub-IFD, or no
-        // `DateTimeOriginal` tag. `Err`: the file is not a JPEG, or its
-        // structure is damaged. Both fall back to the modification time, which
-        // is a weaker time but still a time — except for a non-JPEG, which
-        // `write_gps` would refuse; that case is rejected before it gets here by
-        // `is_jpeg` in `capture_problem`.
-        _ => file_mtime_utc(photo),
+/// A plan for a photo that will not be tagged.
+fn skipped(photo: &Path, gap_seconds: Option<u32>, reason: String) -> GeotagPlan {
+    GeotagPlan {
+        photo: photo.to_path_buf(),
+        point: None,
+        gap_seconds,
+        skipped: Some(reason),
     }
 }
 
-/// Why [`capture_utc`] returned `None`, in words the caller can show.
-fn capture_problem(photo: &Path, bytes: &[u8]) -> String {
+/// The position a track point would be written as, when it has both coordinates.
+fn position_of(point: &TrackPoint) -> Option<GpsPosition> {
+    Some(GpsPosition {
+        latitude: point.latitude?,
+        longitude: point.longitude?,
+        altitude_m: point.height_m,
+        utc: point.utc,
+    })
+}
+
+/// When the photo was taken, and which clock that answer came from.
+///
+/// Kept as a named type rather than a bare `u32` so the reason a time is weak
+/// (it came from the filesystem, not the shutter) stays visible at the use site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureTime {
+    /// `DateTimeOriginal`, read as UTC because EXIF has no zone.
+    Exif(u32),
+    /// The file's modification time, for a photo whose Exif holds no capture
+    /// time.
+    FileModified(u32),
+}
+
+impl CaptureTime {
+    /// The capture moment as Unix seconds.
+    fn utc(self) -> u32 {
+        match self {
+            Self::Exif(utc) | Self::FileModified(utc) => utc,
+        }
+    }
+}
+
+/// Read the capture time, or say why there is none.
+///
+/// A damaged Exif block is *not* treated as "no timestamp": appending to a block
+/// this module cannot parse would fail in [`apply`], after the user had already
+/// reviewed a plan that promised a tag.
+fn capture_time(photo: &Path, bytes: &[u8]) -> std::result::Result<CaptureTime, String> {
     // A non-JPEG has no EXIF by definition, and the modification time of a PNG
     // says nothing about when its picture was taken: naming the real problem is
     // more useful than a vague "no capture time".
     if !is_jpeg(bytes) {
-        return format!(
+        return Err(format!(
             "{} is not a JPEG, so it has no Exif block to write a position into",
             photo.display()
-        );
+        ));
     }
     match exif::read_datetime_original(bytes) {
-        Ok(Some(_)) => String::from("no track point could be chosen"),
-        Ok(None) => String::from(
-            "the photo has no DateTimeOriginal, and its modification time is not a \
-             usable capture time",
-        ),
-        Err(err) => format!("the photo's Exif could not be read: {err}"),
+        Ok(Some(utc)) => Ok(CaptureTime::Exif(utc)),
+        // `Ok(None)` is the lean case: no Exif segment, no Exif sub-IFD, or no
+        // `DateTimeOriginal` tag. What is left is when the file was last
+        // written, which is what a stripped or re-exported photo still carries.
+        Ok(None) => file_mtime_utc(photo).map(CaptureTime::FileModified).ok_or_else(|| {
+            String::from(
+                "the photo has no DateTimeOriginal, and its modification time is not a \
+                 usable capture time",
+            )
+        }),
+        Err(err) => Err(format!(
+            "the photo's Exif could not be read, so it cannot be rewritten: {err}"
+        )),
     }
 }
 

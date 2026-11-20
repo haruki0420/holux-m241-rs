@@ -128,14 +128,19 @@ impl ByteOrder {
         }
     }
 
-    fn u16_bytes(self, value: u16) -> [u8; 2] {
+    /// Render a 16-bit value in this order.
+    ///
+    /// `pub(crate)` because the test fixture in [`crate::log::fixture`] writes
+    /// the same byte order and must not reimplement it: two copies would drift.
+    pub(crate) fn u16_bytes(self, value: u16) -> [u8; 2] {
         match self {
             Self::Little => value.to_le_bytes(),
             Self::Big => value.to_be_bytes(),
         }
     }
 
-    fn u32_bytes(self, value: u32) -> [u8; 4] {
+    /// Render a 32-bit value in this order; `pub(crate)` for the fixture.
+    pub(crate) fn u32_bytes(self, value: u32) -> [u8; 4] {
         match self {
             Self::Little => value.to_le_bytes(),
             Self::Big => value.to_be_bytes(),
@@ -1430,4 +1435,410 @@ fn parse_datetime_text(text: &str) -> Option<i64> {
     let days = days_from_civil(i64::from(year), month, day)?;
     days.checked_mul(86_400)?
         .checked_add(i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log::fixture;
+
+    /// The repository's example coordinate. Never a real place anyone stood.
+    const TOKYO_LAT: f64 = 35.681_236;
+    const TOKYO_LON: f64 = 139.767_125;
+    /// 2023-11-14 22:13:20 UTC, the moment the {@link tokyo} fixture was taken.
+    const TOKYO_UTC: u32 = 1_700_000_000;
+    const TOKYO_DATETIME: &str = "2023:11:14 22:13:20";
+
+    fn tokyo() -> GpsPosition {
+        GpsPosition {
+            latitude: TOKYO_LAT,
+            longitude: TOKYO_LON,
+            altitude_m: Some(80.0),
+            utc: Some(TOKYO_UTC),
+        }
+    }
+
+    /// Every GPS tag the fixture writes, in either byte order.
+    fn gps_entries(order: ByteOrder) -> Vec<fixture::Entry> {
+        vec![
+            fixture::Entry::ascii(tag::GPS_LATITUDE_REF, "N"),
+            fixture::Entry::rationals(
+                tag::GPS_LATITUDE,
+                &[(35, 1), (40, 1), (52_449_600, 1_000_000)],
+                order,
+            ),
+            fixture::Entry::ascii(tag::GPS_LONGITUDE_REF, "E"),
+            fixture::Entry::rationals(
+                tag::GPS_LONGITUDE,
+                &[(139, 1), (46, 1), (1_650_000, 1_000_000)],
+                order,
+            ),
+            fixture::Entry::byte(tag::GPS_ALTITUDE_REF, 0),
+            fixture::Entry::rationals(tag::GPS_ALTITUDE, &[(80_000, 1000)], order),
+            fixture::Entry::rationals(
+                tag::GPS_TIME_STAMP,
+                &[(22, 1), (13, 1), (20, 1)],
+                order,
+            ),
+            fixture::Entry::ascii(tag::GPS_DATE_STAMP, "2023:11:14"),
+        ]
+    }
+
+    /// The Exif APP1's TIFF block, or a panic if the file has none.
+    fn exif_tiff(jpeg: &[u8]) -> Vec<u8> {
+        let location = find_exif_app1(jpeg)
+            .expect("a readable segment chain")
+            .expect("an Exif APP1 segment");
+        tiff_block(jpeg, location).expect("the TIFF block").to_vec()
+    }
+
+    /// The raw contents of IFD0 and the GPS IFD, for checking the tags the
+    /// public API does not expose.
+    struct RawExif {
+        order: ByteOrder,
+        ifd0: Vec<(u16, Vec<u8>)>,
+        gps: Vec<(u16, Vec<u8>)>,
+    }
+
+    fn raw_exif(jpeg: &[u8]) -> RawExif {
+        let location = find_exif_app1(jpeg)
+            .expect("a readable segment chain")
+            .expect("an Exif APP1 segment");
+        let tiff = tiff_block(jpeg, location).expect("the TIFF block");
+        let reader = TiffReader::parse(tiff).expect("a TIFF header");
+        let ifd0 = reader
+            .ifd(reader.ifd0_offset().expect("an IFD0 offset"))
+            .expect("IFD0");
+        let collect = |ifd: &Ifd| -> Vec<(u16, Vec<u8>)> {
+            ifd.entries
+                .iter()
+                .map(|entry| (entry.tag, reader.value_bytes(entry).expect("a readable value")))
+                .collect()
+        };
+        let gps = ifd0
+            .find(tag::GPS_IFD_POINTER)
+            .map(|pointer| {
+                let offset = reader.order.u32(pointer.field);
+                reader.ifd(offset).expect("the GPS IFD")
+            })
+            .map(|ifd| collect(&ifd))
+            .unwrap_or_default();
+        RawExif {
+            order: reader.order,
+            ifd0: collect(&ifd0),
+            gps,
+        }
+    }
+
+    impl RawExif {
+        fn gps_tags(&self) -> Vec<u16> {
+            self.gps.iter().map(|(tag, _)| *tag).collect()
+        }
+
+        fn gps_value(&self, want: u16) -> Option<&[u8]> {
+            self.gps
+                .iter()
+                .find(|(tag, _)| *tag == want)
+                .map(|(_, value)| value.as_slice())
+        }
+
+        fn ifd0_value(&self, want: u16) -> Option<&[u8]> {
+            self.ifd0
+                .iter()
+                .find(|(tag, _)| *tag == want)
+                .map(|(_, value)| value.as_slice())
+        }
+
+        /// An ASCII tag's text, without its terminator and padding.
+        fn gps_text(&self, want: u16) -> Option<String> {
+            self.gps_value(want).map(ascii_text_of)
+        }
+
+        fn ifd0_text(&self, want: u16) -> Option<String> {
+            self.ifd0_value(want).map(ascii_text_of)
+        }
+
+        /// A RATIONAL tag's pairs, decoded in the block's byte order.
+        fn gps_rationals(&self, want: u16) -> Vec<(u32, u32)> {
+            let Some(bytes) = self.gps_value(want) else {
+                return Vec::new();
+            };
+            bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|&[a, b, c, d, e, f, g, h]| {
+                    (
+                        self.order.u32([a, b, c, d]),
+                        self.order.u32([e, f, g, h]),
+                    )
+                })
+                .collect()
+        }
+    }
+
+    fn ascii_text_of(bytes: &[u8]) -> String {
+        let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+        String::from_utf8_lossy(bytes.get(..end).unwrap_or_default())
+            .trim_end()
+            .to_owned()
+    }
+
+    fn assert_degrees(actual: Option<f64>, expected: f64) {
+        let actual = actual.expect("a coordinate");
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn a_jpeg_without_exif_gains_a_gps_block_that_reads_back() {
+        let plain = fixture::jpeg_without_exif();
+        assert!(!has_exif(&plain).expect("a plain JPEG has no Exif"));
+        assert_eq!(read_gps(&plain).expect("read"), None);
+        assert_eq!(read_datetime_original(&plain).expect("read"), None);
+
+        let tagged = write_gps(&plain, &tokyo()).expect("write a new block");
+        assert!(has_exif(&tagged).expect("the new block is there"));
+        let tags = read_gps(&tagged).expect("read").expect("an Exif block");
+        assert_degrees(tags.latitude, TOKYO_LAT);
+        assert_degrees(tags.longitude, TOKYO_LON);
+        assert_eq!(tags.altitude_m, Some(80.0));
+        assert_eq!(tags.utc, Some(TOKYO_UTC));
+        // The picture itself is untouched: the segment chain after APP1 and the
+        // end-of-image marker are still where the camera left them.
+        assert!(tagged.ends_with(&[0xFF, 0xD9]), "lost the end-of-image");
+        assert!(tagged.len() > plain.len());
+    }
+
+    #[test]
+    fn rewriting_keeps_the_tags_this_module_does_not_own() {
+        let mut gps = gps_entries(ByteOrder::Little);
+        // A GPS tag outside `MANAGED_GPS` and an IFD0 tag: a rewrite must leave
+        // both exactly as they were.
+        gps.push(fixture::Entry::ascii(0x0012, "WGS-84"));
+        let artist = [fixture::Entry::ascii(0x013B, "Test Camera")];
+        let jpeg = fixture::exif_jpeg(
+            ByteOrder::Little,
+            &artist,
+            Some(&gps),
+            Some(TOKYO_DATETIME),
+        );
+        let before = exif_tiff(&jpeg);
+
+        let moved = GpsPosition {
+            latitude: 34.693_7,
+            longitude: 135.502_3,
+            altitude_m: Some(21.0),
+            utc: Some(1_700_003_600),
+        };
+        let tagged = write_gps(&jpeg, &moved).expect("rewrite");
+
+        let tags = read_gps(&tagged).expect("read").expect("an Exif block");
+        assert_degrees(tags.latitude, moved.latitude);
+        assert_degrees(tags.longitude, moved.longitude);
+        assert_eq!(tags.altitude_m, Some(21.0));
+        assert_eq!(tags.utc, moved.utc);
+
+        let raw = raw_exif(&tagged);
+        assert!(
+            raw.gps_tags().contains(&0x0012),
+            "GPSMapDatum disappeared: {:04X?}",
+            raw.gps_tags()
+        );
+        assert_eq!(raw.gps_text(0x0012).as_deref(), Some("WGS-84"));
+        assert_eq!(raw.ifd0_text(0x013B).as_deref(), Some("Test Camera"));
+        // Appending, not rebuilding: every byte the file already had is still a
+        // prefix of the new block.
+        let after = exif_tiff(&tagged);
+        assert!(
+            after.starts_with(&before),
+            "the rewrite moved bytes the old block referenced"
+        );
+        // The capture time lives in the Exif sub-IFD, which was not touched.
+        assert_eq!(
+            read_datetime_original(&tagged).expect("read"),
+            Some(TOKYO_UTC)
+        );
+    }
+
+    #[test]
+    fn a_big_endian_tiff_is_read_and_rewritten_in_its_own_order() {
+        let gps = gps_entries(ByteOrder::Big);
+        let jpeg = fixture::exif_jpeg(ByteOrder::Big, &[], Some(&gps), Some(TOKYO_DATETIME));
+        let before = read_gps(&jpeg).expect("read").expect("an Exif block");
+        assert_degrees(before.latitude, TOKYO_LAT);
+
+        let tagged = write_gps(&jpeg, &tokyo()).expect("rewrite");
+        let raw = raw_exif(&tagged);
+        assert_eq!(
+            raw.order,
+            ByteOrder::Big,
+            "a rewrite must not switch a MM file to II"
+        );
+        let tags = read_gps(&tagged).expect("read").expect("an Exif block");
+        assert_degrees(tags.latitude, TOKYO_LAT);
+        assert_eq!(tags.utc, Some(TOKYO_UTC));
+    }
+
+    #[test]
+    fn a_truncated_jpeg_is_an_error_not_a_panic() {
+        let jpeg = fixture::exif_jpeg(
+            ByteOrder::Little,
+            &[],
+            Some(&gps_entries(ByteOrder::Little)),
+            Some(TOKYO_DATETIME),
+        );
+        // Cut points: inside the SOI, inside the APP1 length field, inside the
+        // TIFF header, inside the IFD, and inside the last segment.
+        for cut in [1usize, 3, 9, 24, 40, jpeg.len() - 4] {
+            let truncated = jpeg.get(..cut).expect("a cut inside the JPEG");
+            assert!(
+                read_gps(truncated).is_err(),
+                "reading a {cut}-byte prefix should fail"
+            );
+            assert!(
+                write_gps(truncated, &tokyo()).is_err(),
+                "writing a {cut}-byte prefix should fail"
+            );
+        }
+        // A segment whose length runs past the end of the file is the damaged
+        // case a truncated download produces most often.
+        let mut liar = jpeg.clone();
+        let location = find_exif_app1(&jpeg)
+            .expect("segment chain")
+            .expect("exif segment");
+        // The APP1 length field sits just past the 0xFF 0xE1 pair.
+        liar[location.start + 2..location.start + 4]
+            .copy_from_slice(&0xFFFFu16.to_be_bytes());
+        assert!(read_gps(&liar).is_err());
+    }
+
+    #[test]
+    fn a_png_is_refused_with_a_clear_error() {
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        for result in [has_exif(png), read_gps(png).map(|_| false)] {
+            let err = result.expect_err("a PNG is not a JPEG");
+            let text = err.to_string();
+            assert!(
+                text.contains("not a JPEG"),
+                "the error should name the problem, got: {text}"
+            );
+        }
+        let err = write_gps(png, &tokyo()).expect_err("a PNG is not a JPEG");
+        assert!(err.to_string().contains("not a JPEG"), "got {err}");
+    }
+
+    #[test]
+    fn south_and_west_references_survive_a_round_trip() {
+        let sydney = GpsPosition {
+            latitude: -33.868_8,
+            longitude: -151.209_3,
+            altitude_m: Some(2.0),
+            utc: Some(TOKYO_UTC),
+        };
+        let tagged = fixture::exif_jpeg(
+            ByteOrder::Little,
+            &[],
+            Some(&gps_entries(ByteOrder::Little)),
+            None,
+        );
+        let tagged = write_gps(&tagged, &sydney).expect("rewrite");
+
+        let tags = read_gps(&tagged).expect("read").expect("an Exif block");
+        assert_degrees(tags.latitude, sydney.latitude);
+        assert_degrees(tags.longitude, sydney.longitude);
+        // The sign is carried by the reference letter, not the rational, so the
+        // letters are what makes the read come back negative.
+        let raw = raw_exif(&tagged);
+        assert_eq!(
+            raw.gps_text(tag::GPS_LATITUDE_REF).as_deref(),
+            Some("S"),
+            "a southern latitude needs an S reference"
+        );
+        assert_eq!(
+            raw.gps_text(tag::GPS_LONGITUDE_REF).as_deref(),
+            Some("W"),
+            "a western longitude needs a W reference"
+        );
+    }
+
+    #[test]
+    fn a_fractional_arcsecond_round_trips_without_being_rounded_away() {
+        // 12.5 seconds of arc: the value the RATIONAL denominator of 1,000,000
+        // exists to carry. A writer that rounded to whole seconds would lose
+        // about 15 metres here.
+        let latitude = 35.0 + 40.0 / 60.0 + 12.5 / 3600.0;
+        let longitude = -120.0 - 30.0 / 60.0 - 7.25 / 3600.0;
+        let position = GpsPosition {
+            latitude,
+            longitude,
+            altitude_m: Some(12.5),
+            utc: Some(TOKYO_UTC),
+        };
+        let tagged = fixture::exif_jpeg(ByteOrder::Little, &[], None, None);
+        let tagged = write_gps(&tagged, &position).expect("write");
+
+        let raw = raw_exif(&tagged);
+        assert_eq!(
+            raw.gps_rationals(tag::GPS_LATITUDE).last().copied(),
+            Some((12_500_000, 1_000_000)),
+            "12.5 seconds of arc must be stored as 12.5, not 12 or 13"
+        );
+        assert_eq!(
+            raw.gps_rationals(tag::GPS_LONGITUDE).last().copied(),
+            Some((7_250_000, 1_000_000))
+        );
+
+        let tags = read_gps(&tagged).expect("read").expect("an Exif block");
+        assert_degrees(tags.latitude, latitude);
+        assert_degrees(tags.longitude, longitude);
+        // Altitude has the same fractional case, at millimetre precision.
+        assert_eq!(tags.altitude_m, Some(12.5));
+    }
+
+    #[test]
+    fn a_fractional_timestamp_second_reads_as_its_whole_second() {
+        // EXIF's GPSTimeStamp is a RATIONAL, so a camera may write 25/2 for
+        // 12.5 seconds. The crate's timestamp is whole Unix seconds, so the
+        // fraction is dropped rather than rounded up into the next second.
+        let timestamp = vec![fixture::Entry::rationals(
+            tag::GPS_TIME_STAMP,
+            &[(22, 1), (13, 1), (25, 2)],
+            ByteOrder::Little,
+        )];
+        let mut gps = timestamp;
+        gps.push(fixture::Entry::ascii(tag::GPS_DATE_STAMP, "2023:11:14"));
+        let jpeg = fixture::exif_jpeg(ByteOrder::Little, &[], Some(&gps), None);
+
+        let tags = read_gps(&jpeg).expect("read").expect("an Exif block");
+        let expected = parse_datetime_text("2023:11:14 22:13:12").expect("a known date");
+        assert_eq!(tags.utc, Some(u32::try_from(expected).expect("a Unix time")));
+    }
+
+    #[test]
+    fn an_exif_block_at_the_segment_limit_is_refused() {
+        // A block already holding the largest TIFF payload an APP1 segment can
+        // carry: appending a GPS IFD would push the segment past 65,535 bytes.
+        let full = fixture::padded_exif_jpeg(ByteOrder::Little, MAX_TIFF_BYTES);
+        assert_eq!(
+            exif_tiff(&full).len(),
+            MAX_TIFF_BYTES,
+            "the fixture must fill the segment exactly"
+        );
+        let err = write_gps(&full, &tokyo()).expect_err("the segment is full");
+        let text = err.to_string();
+        assert!(
+            text.contains("at most 65535") && text.contains("left untouched"),
+            "the error must say the segment limit was hit and the photo kept: {text}"
+        );
+
+        // Just under the limit, the same rewrite succeeds: the refusal is about
+        // size, not about this being an unusual file.
+        let room = fixture::padded_exif_jpeg(ByteOrder::Little, MAX_TIFF_BYTES - 1024);
+        let tagged = write_gps(&room, &tokyo()).expect("1024 bytes of headroom is enough");
+        let tags = read_gps(&tagged).expect("read").expect("an Exif block");
+        assert_degrees(tags.latitude, TOKYO_LAT);
+    }
 }
