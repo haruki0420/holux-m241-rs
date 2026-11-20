@@ -27,6 +27,13 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install the Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libudev-dev \
+            libxkbcommon-dev libwayland-dev libx11-dev libxi-dev \
+            libgl1-mesa-dev libegl1-mesa-dev pkg-config
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -46,11 +53,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install the Linux GUI build dependencies
+      # `serialport` links libudev on Linux; egui links the X11/Wayland stack.
+      - name: Install the Linux build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
+            libudev-dev \
             libxkbcommon-dev libwayland-dev libx11-dev libxi-dev \
             libgl1-mesa-dev libegl1-mesa-dev pkg-config
       - name: Test
@@ -75,11 +84,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install the Linux GUI build dependencies
+      - name: Install the Linux build dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
+            libudev-dev \
             libxkbcommon-dev libwayland-dev libx11-dev libxi-dev \
             libgl1-mesa-dev libegl1-mesa-dev pkg-config
       - name: Build
