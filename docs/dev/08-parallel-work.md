@@ -16,11 +16,11 @@
 | # | 範囲 | 書き込み先 | 依存 |
 |---|---|---|---|
 | A | DA 逆解析 → `docs/reference/01-da-protocol.md` | `docs/reference/01-da-protocol.md`、解析メモは `_scratch/` | なし |
-| B | ezTour 仕様書 → `docs/dev/07-eztour-spec.ja.md` | そのファイルのみ | なし |
+| B | ezTour 仕様書 → `docs/dev/07-eztour-spec.ja.md`（未作成） | そのファイルのみ | なし | <!-- path-check: ignore -->
 | C | 上流差分表 → `docs/dev/04-prior-art.md` 追記 | そのファイルのみ | なし |
 | D | コア読み取り系（PMTK、`fw dump`、`log download`、`log read`） | `crates/m241-core/src/protocol/pmtk.rs`、`log/`、`firmware/profiles.rs` | なし |
 | E | GUI 3画面（接続・ログ・ファーム） | `crates/m241-gui/src/screens/*` | D（型が要る。スタブで開始可） |
-| F | 写真ジオタグ（EXIF 自前実装） | `crates/m241-core/src/log/exif.rs`、`geotag.rs` | D |
+| F | 写真ジオタグ（EXIF 自前実装） | `crates/m241-core/src/log/` 配下に exif / geotag を追加 | D | <!-- path-check: ignore -->
 
 **A が終わるまで flash の実装は始めない。** `protocol/da.rs` は A の成果物を
 引用できない限り書かない、が現行のルール（`CONTRIBUTING.md`）。

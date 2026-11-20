@@ -41,6 +41,10 @@ USER_SUFFIXES = (".bin", ".gpx", ".kml", ".csv", ".log", ".jpg", ".jpeg", ".png"
 PATH_SUFFIXES = (".md", ".rs", ".toml", ".json", ".yml", ".yaml", ".sh", ".py")
 #: Files whose inline paths are historical records, not live references.
 INLINE_PATH_SKIP_FILES = {"CHANGELOG.md"}
+#: Put this in a line to opt out of the inline-path check. Used by planning
+#: documents that name files which do not exist yet; the marker makes the
+#: forward reference deliberate instead of a silent stale path.
+IGNORE_MARKER = "path-check: ignore"
 
 
 def markdown_files() -> list[Path]:
@@ -74,6 +78,8 @@ def code_paths_in(path: Path) -> list[tuple[int, str]]:
         return []
     found: list[tuple[int, str]] = []
     for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if IGNORE_MARKER in line:
+            continue
         for match in INLINE_CODE_RE.finditer(line):
             token = match.group(1).strip()
             if not token or token.startswith(SKIP_PREFIXES):
