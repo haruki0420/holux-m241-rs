@@ -41,6 +41,8 @@ pub enum Error {
     },
     /// The chip refused a command with its own negative acknowledgement.
     Rejected { what: String },
+    /// A destructive action was refused because a safety condition was not met.
+    Safety { reason: String },
     /// The image cannot be parsed.
     Firmware {
         message: String,
@@ -92,6 +94,7 @@ impl fmt::Display for Error {
                 write!(f, "framing error: {}", with_offset(what, *offset))
             }
             Self::Rejected { what } => write!(f, "the device rejected {what}"),
+            Self::Safety { reason } => write!(f, "refused: {reason}"),
             Self::Firmware { message, offset } => {
                 write!(f, "firmware image: {}", with_offset(message, *offset))
             }
@@ -169,6 +172,7 @@ impl Error {
             Self::Rejected { .. } => {
                 Some("本体を再起動し、書き込みに失敗したなら自分のバックアップを書き戻してください")
             }
+            Self::Safety { .. } => None,
             Self::Firmware { .. } => Some("自分の個体から吸い出したイメージか確認してください"),
             Self::Profile { .. } => Some("`m241 fw patch --dry-run` で検出結果を確認してください"),
             Self::Log { .. } => Some("`m241 log info` でブロックヘッダを確認してください"),
@@ -182,12 +186,17 @@ impl Error {
     ///
     /// A timeout is retryable. A framing error usually is not: the line is
     /// desynchronised and retrying makes it worse. A rejected write is fatal
-    /// because the device state is now undefined.
+    /// because the device state is now undefined. A safety refusal is fatal
+    /// because retrying it unchanged would ask for the same dangerous action
+    /// again.
     #[must_use]
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,
-            Self::Framing { .. } | Self::Rejected { .. } | Self::Firmware { .. }
+            Self::Framing { .. }
+                | Self::Rejected { .. }
+                | Self::Safety { .. }
+                | Self::Firmware { .. }
         )
     }
 }
