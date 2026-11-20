@@ -296,12 +296,13 @@ pub fn write_gps(jpeg: &[u8], position: &GpsPosition) -> Result<Vec<u8>> {
     let tiff = tiff_block(jpeg, location)?;
     let reader = TiffReader::parse(tiff)?;
     let new_tiff = rewrite_tiff(&reader, position)?;
-    let payload_len = EXIF_HEADER.len().checked_add(new_tiff.len()).ok_or_else(|| {
-        malformed(String::from("the Exif block length overflowed usize"), 0)
-    })?;
-    let segment_len = payload_len.checked_add(2).ok_or_else(|| {
-        malformed(String::from("the Exif block length overflowed usize"), 0)
-    })?;
+    let payload_len = EXIF_HEADER
+        .len()
+        .checked_add(new_tiff.len())
+        .ok_or_else(|| malformed(String::from("the Exif block length overflowed usize"), 0))?;
+    let segment_len = payload_len
+        .checked_add(2)
+        .ok_or_else(|| malformed(String::from("the Exif block length overflowed usize"), 0))?;
     if segment_len > MAX_SEGMENT_LENGTH {
         return Err(malformed(
             format!(
@@ -378,10 +379,9 @@ fn slice_at(data: &[u8], pos: usize, len: usize) -> Option<&[u8]> {
     data.get(pos..pos.checked_add(len)?)
 }
 
-fn tiff_block<'a>(jpeg: &'a [u8], location: App1Location) -> Result<&'a [u8]> {
-    slice_at(jpeg, location.tiff_start, location.tiff_len).ok_or_else(|| {
-        truncated("the Exif APP1 segment", location.start, jpeg.len())
-    })
+fn tiff_block(jpeg: &[u8], location: App1Location) -> Result<&[u8]> {
+    slice_at(jpeg, location.tiff_start, location.tiff_len)
+        .ok_or_else(|| truncated("the Exif APP1 segment", location.start, jpeg.len()))
 }
 
 /// Walk the JPEG segment chain to the first APP1 segment that holds Exif data.
@@ -396,7 +396,11 @@ fn find_exif_app1(jpeg: &[u8]) -> Result<Option<App1Location>> {
     let mut pos = 2usize;
     loop {
         let Some(&marker_byte) = jpeg.get(pos) else {
-            return Err(truncated("the marker after the last segment", pos, jpeg.len()));
+            return Err(truncated(
+                "the marker after the last segment",
+                pos,
+                jpeg.len(),
+            ));
         };
         if marker_byte != 0xFF {
             return Err(malformed(
@@ -439,9 +443,9 @@ fn find_exif_app1(jpeg: &[u8]) -> Result<Option<App1Location>> {
                     ));
                 }
                 let payload_start = length_pos + 2;
-                let segment_end = length_pos.checked_add(length).ok_or_else(|| {
-                    truncated("a JPEG segment length", length_pos, jpeg.len())
-                })?;
+                let segment_end = length_pos
+                    .checked_add(length)
+                    .ok_or_else(|| truncated("a JPEG segment length", length_pos, jpeg.len()))?;
                 if segment_end > jpeg.len() {
                     return Err(truncated(
                         "an APP1 segment (its length runs past the end of the file)",
@@ -510,7 +514,10 @@ impl<'a> TiffReader<'a> {
     fn parse(data: &'a [u8]) -> Result<Self> {
         let Some(order_bytes) = data.get(..2) else {
             return Err(malformed(
-                format!("the Exif TIFF block is {} bytes, shorter than its header", data.len()),
+                format!(
+                    "the Exif TIFF block is {} bytes, shorter than its header",
+                    data.len()
+                ),
                 0,
             ));
         };
@@ -570,9 +577,9 @@ impl<'a> TiffReader<'a> {
         })?;
         let count = usize::from(self.u16_at(offset)?);
         let mut entries = Vec::with_capacity(count);
-        let mut pos = offset.checked_add(2).ok_or_else(|| {
-            malformed(String::from("IFD offset overflowed"), offset)
-        })?;
+        let mut pos = offset
+            .checked_add(2)
+            .ok_or_else(|| malformed(String::from("IFD offset overflowed"), offset))?;
         for _ in 0..count {
             let tag = self.u16_at(pos)?;
             let field_type = self.u16_at(pos + 2)?;
@@ -590,9 +597,9 @@ impl<'a> TiffReader<'a> {
                 field,
                 position: pos,
             });
-            pos = pos.checked_add(12).ok_or_else(|| {
-                malformed(String::from("IFD entry offset overflowed"), pos)
-            })?;
+            pos = pos
+                .checked_add(12)
+                .ok_or_else(|| malformed(String::from("IFD entry offset overflowed"), pos))?;
         }
         let next = self.u32_at(pos)?;
         Ok(Ifd { entries, next })
@@ -616,7 +623,11 @@ impl<'a> TiffReader<'a> {
             ));
         };
         if len <= 4 {
-            return Ok(entry.field.get(..len).map(<[u8]>::to_vec).unwrap_or_default());
+            return Ok(entry
+                .field
+                .get(..len)
+                .map(<[u8]>::to_vec)
+                .unwrap_or_default());
         }
         let offset = usize::try_from(self.order.u32(entry.field)).map_err(|_| {
             malformed(
@@ -770,16 +781,17 @@ fn read_gps_time(reader: &TiffReader, ifd: &Ifd) -> Result<Option<u32>> {
     let Some(days) = days_from_civil(i64::from(year), month, day) else {
         return Ok(None);
     };
-    let Some(seconds_of_day) = days
-        .checked_mul(86_400)
-        .and_then(|start| {
-            i64::from(hour)
-                .checked_mul(3_600)
-                .and_then(|h| i64::from(minute).checked_mul(60).and_then(|m| h.checked_add(m)))
-                .and_then(|hm| hm.checked_add(i64::from(second)))
-                .and_then(|offset| start.checked_add(offset))
-        })
-    else {
+    let Some(seconds_of_day) = days.checked_mul(86_400).and_then(|start| {
+        i64::from(hour)
+            .checked_mul(3_600)
+            .and_then(|h| {
+                i64::from(minute)
+                    .checked_mul(60)
+                    .and_then(|m| h.checked_add(m))
+            })
+            .and_then(|hm| hm.checked_add(i64::from(second)))
+            .and_then(|offset| start.checked_add(offset))
+    }) else {
         return Ok(None);
     };
     Ok(u32::try_from(seconds_of_day).ok())
@@ -792,7 +804,10 @@ fn ascii_text(reader: &TiffReader, entry: &RawEntry) -> Result<Option<String>> {
     let bytes = reader.value_bytes(entry)?;
     // The count includes the terminating NUL, and some writers pad with more
     // NULs or spaces; everything from the first NUL on is padding.
-    let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
     let text = bytes.get(..end).unwrap_or_default();
     Ok(Some(String::from_utf8_lossy(text).trim_end().to_owned()))
 }
@@ -802,26 +817,20 @@ fn rationals(reader: &TiffReader, entry: &RawEntry) -> Result<Option<Vec<(u32, u
         return Ok(None);
     }
     let bytes = reader.value_bytes(entry)?;
-    if bytes.len() % 8 != 0 {
+    if !bytes.len().is_multiple_of(8) {
         return Err(malformed(
-            format!("tag 0x{:04X} holds an odd number of rational bytes", entry.tag),
+            format!(
+                "tag 0x{:04X} holds an odd number of rational bytes",
+                entry.tag
+            ),
             entry.position,
         ));
     }
     let mut pairs = Vec::with_capacity(bytes.len() / 8);
-    for chunk in bytes.chunks_exact(8) {
-        let (Some(numerator), Some(denominator)) = (
-            chunk.get(..4).and_then(|raw| <[u8; 4]>::try_from(raw).ok()),
-            chunk.get(4..).and_then(|raw| <[u8; 4]>::try_from(raw).ok()),
-        ) else {
-            return Err(malformed(
-                format!("tag 0x{:04X} holds a truncated rational", entry.tag),
-                entry.position,
-            ));
-        };
+    for &[a, b, c, d, e, f, g, h] in bytes.as_chunks::<8>().0 {
         pairs.push((
-            reader.order.u32(numerator),
-            reader.order.u32(denominator),
+            reader.order.u32([a, b, c, d]),
+            reader.order.u32([e, f, g, h]),
         ));
     }
     Ok(Some(pairs))
@@ -861,7 +870,10 @@ fn validate_position(position: &GpsPosition) -> Result<()> {
             position.longitude
         )));
     }
-    if position.altitude_m.is_some_and(|altitude| !altitude.is_finite()) {
+    if position
+        .altitude_m
+        .is_some_and(|altitude| !altitude.is_finite())
+    {
         return Err(Error::State(String::from(
             "altitude is not a finite number of metres",
         )));
@@ -930,9 +942,8 @@ impl IfdEntry {
     }
 
     fn rational(tag: u16, pairs: &[(u32, u32)], order: ByteOrder) -> Result<Self> {
-        let count = u32::try_from(pairs.len()).map_err(|_| {
-            malformed(String::from("too many rationals for one tag"), 0)
-        })?;
+        let count = u32::try_from(pairs.len())
+            .map_err(|_| malformed(String::from("too many rationals for one tag"), 0))?;
         let mut value = Vec::with_capacity(pairs.len() * 8);
         for (numerator, denominator) in pairs {
             value.extend_from_slice(&order.u32_bytes(*numerator));
@@ -959,11 +970,13 @@ impl IfdEntry {
                 0,
             )
         })?;
-        let count = usize::try_from(self.count).map_err(|_| {
-            malformed(format!("tag 0x{:04X} has an impossible count", self.tag), 0)
-        })?;
+        let count = usize::try_from(self.count)
+            .map_err(|_| malformed(format!("tag 0x{:04X} has an impossible count", self.tag), 0))?;
         unit.checked_mul(count).ok_or_else(|| {
-            malformed(format!("tag 0x{:04X} has an impossible length", self.tag), 0)
+            malformed(
+                format!("tag 0x{:04X} has an impossible length", self.tag),
+                0,
+            )
         })
     }
 }
@@ -1001,8 +1014,16 @@ fn to_dms_rationals(value: f64) -> Result<[(u32, u32); 3]> {
 
 fn gps_entries(position: &GpsPosition, order: ByteOrder) -> Result<Vec<IfdEntry>> {
     let mut entries = Vec::with_capacity(tag::MANAGED_GPS.len());
-    let latitude_ref = if position.latitude < 0.0 { b"S\0" } else { b"N\0" };
-    let longitude_ref = if position.longitude < 0.0 { b"W\0" } else { b"E\0" };
+    let latitude_ref = if position.latitude < 0.0 {
+        b"S\0"
+    } else {
+        b"N\0"
+    };
+    let longitude_ref = if position.longitude < 0.0 {
+        b"W\0"
+    } else {
+        b"E\0"
+    };
     entries.push(IfdEntry::ascii(tag::GPS_LATITUDE_REF, latitude_ref));
     entries.push(IfdEntry::rational(
         tag::GPS_LATITUDE,
@@ -1076,7 +1097,7 @@ fn append_ifd(
     next: u32,
 ) -> Result<u32> {
     // An IFD must start on an even offset.
-    if tiff.len() % 2 != 0 {
+    if !tiff.len().is_multiple_of(2) {
         tiff.push(0);
     }
     let base = tiff.len();
@@ -1138,7 +1159,10 @@ fn append_ifd(
             value_area.extend(std::iter::repeat_n(0u8, padding));
             let offset = u32::try_from(offset).map_err(|_| {
                 malformed(
-                    format!("the Exif block has grown past 4 GiB at tag 0x{:04X}", entry.tag),
+                    format!(
+                        "the Exif block has grown past 4 GiB at tag 0x{:04X}",
+                        entry.tag
+                    ),
                     base,
                 )
             })?;
@@ -1159,8 +1183,7 @@ fn append_ifd(
     }
     tiff.extend_from_slice(&order.u32_bytes(next));
     tiff.extend_from_slice(&value_area);
-    u32::try_from(base)
-        .map_err(|_| malformed(String::from("TIFF block is past 4 GiB"), base))
+    u32::try_from(base).map_err(|_| malformed(String::from("TIFF block is past 4 GiB"), base))
 }
 
 /// Replace the GPS IFD of an existing TIFF block without moving any old bytes.
@@ -1201,8 +1224,7 @@ fn rewrite_tiff(reader: &TiffReader, position: &GpsPosition) -> Result<Vec<u8>> 
     let mut tiff = reader.data.to_vec();
     let gps_offset = append_ifd(&mut tiff, &gps_entries, order, 0)?;
 
-    let mut ifd0_entries: Vec<IfdEntry> =
-        ifd0.entries.iter().map(IfdEntry::from_raw).collect();
+    let mut ifd0_entries: Vec<IfdEntry> = ifd0.entries.iter().map(IfdEntry::from_raw).collect();
     match gps_index {
         Some(index) => {
             let Some(slot) = ifd0_entries.get_mut(index) else {
@@ -1275,12 +1297,13 @@ fn fresh_tiff(position: &GpsPosition) -> Result<Vec<u8>> {
 /// Insert a brand-new Exif APP1 segment right after the JPEG's SOI marker.
 fn insert_fresh_exif(jpeg: &[u8], position: &GpsPosition) -> Result<Vec<u8>> {
     let tiff = fresh_tiff(position)?;
-    let payload_len = EXIF_HEADER.len().checked_add(tiff.len()).ok_or_else(|| {
-        malformed(String::from("the Exif block length overflowed usize"), 0)
-    })?;
-    let segment_len = payload_len.checked_add(2).ok_or_else(|| {
-        malformed(String::from("the Exif block length overflowed usize"), 0)
-    })?;
+    let payload_len = EXIF_HEADER
+        .len()
+        .checked_add(tiff.len())
+        .ok_or_else(|| malformed(String::from("the Exif block length overflowed usize"), 0))?;
+    let segment_len = payload_len
+        .checked_add(2)
+        .ok_or_else(|| malformed(String::from("the Exif block length overflowed usize"), 0))?;
     if segment_len > MAX_SEGMENT_LENGTH {
         return Err(malformed(
             format!("a new Exif block of {segment_len} bytes does not fit a JPEG segment"),

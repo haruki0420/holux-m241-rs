@@ -312,13 +312,11 @@ fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
     temp_name.push(file_name);
     temp_name.push(".m241-tmp");
     let temp = path.with_file_name(temp_name);
-    std::fs::write(&temp, bytes)
-        .map_err(|source| Error::io(temp.display().to_string(), source))?;
+    std::fs::write(&temp, bytes).map_err(|source| Error::io(temp.display().to_string(), source))?;
     if std::fs::rename(&temp, path).is_ok() {
         return Ok(());
     }
-    std::fs::remove_file(path)
-        .map_err(|source| Error::io(path.display().to_string(), source))?;
+    std::fs::remove_file(path).map_err(|source| Error::io(path.display().to_string(), source))?;
     std::fs::rename(&temp, path).map_err(|source| {
         let _ = std::fs::remove_file(&temp);
         Error::io(path.display().to_string(), source)

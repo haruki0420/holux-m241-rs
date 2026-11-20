@@ -35,7 +35,9 @@ pub mod record;
 
 pub use crate::types::TrackPoint;
 pub use block::{BLOCK_HEADER_SIZE, BLOCK_SIZE, BlockHeader};
-pub use exif::{GpsPosition, GpsTags, MAX_SEGMENT_LENGTH, read_datetime_original, read_gps, write_gps};
+pub use exif::{
+    GpsPosition, GpsTags, MAX_SEGMENT_LENGTH, read_datetime_original, read_gps, write_gps,
+};
 pub use export::{export, to_csv, to_gpx, to_json, to_kml, to_nmea};
 pub use geotag::{GeotagOptions, GeotagPlan, apply as apply_geotags, plan as plan_geotags};
 pub use parse::{ParseReport, parse_dump};
