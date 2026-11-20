@@ -30,6 +30,14 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+// `m241-flash` is a dependency of this binary because two of its subcommands
+// write to the device: `fw flash` (the Download Agent) and `log erase`
+// (`$PMTK182,6`). Neither is implemented yet, so nothing from the crate is
+// called; the import keeps the dependency honest instead of declared-and-unused,
+// and marks where those two subcommands will enter the write path.
+#[allow(unused_imports)]
+use m241_flash as _;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "m241",
@@ -150,6 +158,7 @@ fn run(command: Command) -> m241_core::Result<()> {
             DeviceCommand::Doctor => Err(not_implemented("device doctor")),
         },
         Command::Fw { command } => match command {
+            // `dump` is a read: the BootROM client in `m241-core` performs it.
             FwCommand::Dump => Err(not_implemented("fw dump")),
             FwCommand::Patch => Err(not_implemented("fw patch")),
             FwCommand::Flash => Err(not_implemented("fw flash")),
@@ -168,7 +177,7 @@ fn run(command: Command) -> m241_core::Result<()> {
     }
 }
 
-/// The error for a command this build parses but cannot carry out yet.
+/// The error for a command this build parses but cannot carry out yet./// The error for a command this build parses but cannot carry out yet.
 ///
 /// The message names the command the user actually typed and says where to find
 /// one that works. "not implemented yet" on its own leaves them with no next

@@ -43,5 +43,9 @@
     )
 )]
 
+pub mod erase;
+
+pub use erase::{BackupProof, ERASE_SUBCOMMAND, LogEraser};
+
 /// Version of the crate, taken from `Cargo.toml` at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

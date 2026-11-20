@@ -418,10 +418,6 @@ impl FakeDevice {
                 self.logging_enabled = true;
                 self.queue_line(&pmtk_line("PMTK001,182,4,3"));
             }
-            "6" => {
-                self.log.clear();
-                self.queue_line(&pmtk_line("PMTK001,182,6,3"));
-            }
             "7" => self.handle_log_read(fields.next(), fields.next()),
             _ => {}
         }
