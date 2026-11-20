@@ -181,10 +181,16 @@ impl PatchPlan {
 
     /// Apply the plan to a copy of `image`.
     ///
+    /// Each edit is checked against the image before it is written: the byte the
+    /// plan says it replaces must actually be there. That is what makes a
+    /// reviewed plan safe to apply — a plan built for a different image is
+    /// refused instead of overwriting whatever the offset happens to hold.
+    ///
     /// # Errors
     ///
-    /// [`crate::Error::Firmware`] when an edit lands outside the image, which
-    /// means the plan was built against a different file.
+    /// [`crate::Error::Firmware`] when an edit lands outside the image or when
+    /// the byte at its offset is not [`PatchEdit::before`]; either means the
+    /// plan was built against a different file.
     pub fn apply(&self, image: &[u8]) -> crate::Result<Vec<u8>> {
         let mut out = image.to_vec();
         for edit in &self.edits {
@@ -198,6 +204,18 @@ impl PatchPlan {
                     offset: Some(edit.offset),
                 });
             };
+            let found = *byte;
+            if found != edit.before {
+                return Err(crate::Error::Firmware {
+                    message: format!(
+                        "patch expects 0x{expect:02X} at offset 0x{offset:X}, but the image has \
+                         0x{found:02X}; the plan was built for a different image",
+                        expect = edit.before,
+                        offset = edit.offset,
+                    ),
+                    offset: Some(edit.offset),
+                });
+            }
             *byte = edit.after;
         }
         Ok(out)
@@ -359,6 +377,32 @@ mod tests {
         };
         let err = plan.apply(&[0; 4]).expect_err("offset is outside");
         assert!(format!("{err}").contains("0x63"), "got {err}");
+    }
+
+    #[test]
+    fn a_plan_whose_before_byte_is_absent_from_the_image_is_refused() {
+        // The plan was built from a stock image whose byte 1 is 0x00; this image
+        // has 0x2A there, so it is a different file and must not be touched.
+        let plan = PatchPlan {
+            edits: vec![PatchEdit {
+                offset: 1,
+                before: 0x00,
+                after: 0xFF,
+            }],
+            profile: None,
+            no_op_reason: None,
+        };
+        let err = plan
+            .apply(&[0x11, 0x2A, 0x33])
+            .expect_err("before does not match");
+        assert!(matches!(err, crate::Error::Firmware { .. }), "got {err}");
+        let text = format!("{err}");
+        assert!(text.contains("0x2A"), "the found byte is named: {text}");
+        assert!(text.contains("0x00"), "the expected byte is named: {text}");
+        assert!(
+            text.contains("different image"),
+            "the cause is named: {text}"
+        );
     }
 
     #[test]
