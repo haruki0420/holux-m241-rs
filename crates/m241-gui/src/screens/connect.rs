@@ -235,26 +235,19 @@ impl ConnectScreen {
         common::sample_panel(ui, "ログ", sample, |ui| {
             if sample {
                 let summary = sample_summary();
-                egui::Grid::new("m241-log-figures")
-                    .num_columns(2)
-                    .spacing([space::L, space::S])
-                    .show(ui, |ui| {
-                        for (label, value) in [
-                            ("使用量", common::bytes(212_860)),
-                            ("点数", summary.records.to_string()),
-                            ("期間", String::from("11/14 → 11/15")),
-                            ("記録", String::from("有効")),
-                        ] {
-                            ui.label(RichText::new(label).size(size::CAPTION).color(theme::MUTE));
-                            ui.label(
-                                RichText::new(value)
-                                    .size(size::UI)
-                                    .color(theme::INK)
-                                    .monospace(),
-                            );
-                            ui.end_row();
-                        }
-                    });
+                // One figure per row with the value on the panel's right edge. The
+                // review found this panel's numbers bunched into its left third with
+                // ragged right edges, a column of notes rather than a table of
+                // measurements; the device panel beside it already used figure lines,
+                // so the two panels' figures did not even line up with each other.
+                for (label, value) in [
+                    ("使用量", common::bytes(212_860)),
+                    ("点数", summary.records.to_string()),
+                    ("期間", String::from("11/14 → 11/15")),
+                    ("記録", String::from("有効")),
+                ] {
+                    common::figure_line(ui, label, &value);
+                }
             } else {
                 common::status_line(ui, Status::Info, "未取得 — ログはまだ読んでいません");
                 ui.add_space(space::S);
