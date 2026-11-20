@@ -39,7 +39,6 @@ pub fn rail(ui: &mut Ui, current: Screen) -> Option<Screen> {
 
 fn tab(ui: &mut Ui, screen: Screen, active: bool) -> Response {
     let indent = INSET + STEP * screen.index() as f32;
-    ui.add_space(0.0);
     let width = (ui.available_width() - indent).max(0.0);
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, TAB_HEIGHT), Sense::click());
 
