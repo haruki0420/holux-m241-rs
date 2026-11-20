@@ -17,8 +17,8 @@ repository = "https://github.com/haruki0420/holux-m241-rs"
 
 # Only what is used today. Declaring a dependency before its consumer exists
 # produces a permanent "unused workspace dependency" warning and hides the real
-# ones. `serde` / `serde_json` return with the profile database; `walkers` (map
-# tiles) is a separate change because it needs the network at runtime.
+# ones. `walkers` (map tiles) is a separate change because it needs the network
+# at runtime.
 [workspace.dependencies]
 m241-core = { path = "crates/m241-core" }
 # The write path is a separate crate on purpose: a binary that only reads must
@@ -27,6 +27,7 @@ m241-core = { path = "crates/m241-core" }
 m241-flash = { path = "crates/m241-flash" }
 thiserror = "2"
 serialport = "4"
+serde_json = "1"
 egui = "0.37"
 eframe = "0.37"
 clap = { version = "4", features = ["derive"] }

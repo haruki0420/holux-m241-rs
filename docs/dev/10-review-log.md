@@ -308,3 +308,35 @@ main は `e58c5d3` → `5d6ad74` → `19e07c6` と進んだが、いずれも本
 
 - **ゲート・テスト**: `./tools/check.sh` 全ゲート PASS、`crates/m241-gui/` テスト **93 件**（`main` 79 → `0321bef` 87 → `1f97b24` 93、削除・弱体化 0 件）。本番コードの `unwrap`/`expect`/`panic!`/`unsafe`/無検証添字 0 件、個人情報違反なし。
 - **判定**: **合格**（`main` へマージ）。
+
+---
+
+## 2026-11-21 / CLI 8 コマンド配線（`feat/cli-wire2` → `fix/cli-wire2-v2`）
+
+対象: `crates/m241-cli/`（`device ports` / `device info`、`fw dump` / `fw patch`、`log info` / `log download` / `log read`、`nmea repair` の 8 コマンド配線）および `docs/reference/02-cli.md`。
+
+- **Stage 1 並行レビュー（`feat/cli-wire2` `ea58d10`、仕様検収＋可読性レビューを互いの結果を見せずに並行実施）**: **不合格**（統合 Must 8 件・Should 13 件；なお未実装 5 コマンド `device doctor`/`fw flash`/`log erase`/`log geotag`/`nmea proxy` は後続ストリーム対象として分離）
+  - **Must 1**: `fw.rs` の `StreamState::Unknown` 拒否（`AGENTS.md` §2.1）が `Error::State`（exit 1）を返しており、かつテストが `without_nmea()`（`Silent`）を渡していたため変異テスト M7 が生存。
+  - **Must 2**: `fw.rs` のヘッダ記載サイズ不一致で `declared != len - 4` でも「expected」と表示。
+  - **Must 3**: `fw.rs` の `BASE_ADDR_FIRMWARE + offset` が無検査加算。
+  - **Must 4**: `nmea.rs` の `repair_zda` に年月日の範囲検証が無く、不正日付を別日付＋有効チェックサムに書き換える。
+  - **Must 5**: `logcmd.rs` の `log read --utc-offset-days auto` で `track_days` が「最新」でなく「末尾」を参照し、stale 自動シフトのテスト欠落で変異テスト M6 が生存。また明示 `7168` 指定時も自動検出注記を表示。
+  - **Must 6**: `exit.rs` が非フラッシュの `Error::Rejected`（`log download` のデバイス拒否等）を一律 exit 6（フラッシュ書込失敗）に写像（`02-cli.md` は exit 1）。
+  - **Must 7**: `fw dump --json`、`log download --json`、`fw patch --json`（適用時）のテスト欠落。
+  - **Must 8**: `fw patch` の epoch 定数異常拒否の CLI テスト欠落、および `--dry-run` が既パッチ済みイメージを拒否せず exit 0 を返す不統一。
+  - **Should 9〜21**: 内部可視性（`pub(crate)`）と `link::open_pmtk` 統一、`logcmd.rs` モジュール doc・rustdoc リンク、ハードウェア offset 定数名、コメント日付、CH340/CH341 統一、非 TTY `Confirm::pause` の安全拒否、書き出し後パース失敗時の保存先明示、`output.rs` JSON 往復と `progress(_, 0)` テスト、`nmea.rs` 変数名、`dump`/`read_once` 分割、`--length 0`/奇数長の exit 2 化、stdin `"-"` / `--assume-brom` / `Silent` / `--port` / `kml` / `nmea` テスト追加、`02-cli.md` フラグ同期。
+- **Stage 2 修正（別エージェント、`fix/cli-wire2-v2` `9e8bf1c`）**: 12 ファイル変更（+1,367/−292 行、CLI テスト 84 → 108 件、+24 件追加）。
+- **Stage 3 独立検証（三人目、修正者の説明・コミット本文は未読）**:
+
+| # | 指摘 | 解消 | 確認箇所・検出テスト |
+|---|---|---|---|
+| 1 | `StreamState::Unknown` 安全拒否（exit 5）とテスト | 解消 | `crates/m241-cli/src/fw.rs` で `Error::Safety` を返却、`dump_refuses_unknown_line_state_with_safety_error` 追加。変異テスト M7a・M7b とも FAIL |
+| 2〜3 | ヘッダサイズ警告分離・`checked_add` | 解消 | `report_declared_size` と `checked_add` を実装し単体テスト追加。変異テスト M1 で FAIL |
+| 4 | `$GPZDA` 暦妥当性検証 | 解消 | `cal::is_valid_date` による検証と `a_zda_sentence_with_an_out_of_range_date_is_left_alone` 追加。変異テスト M2 で FAIL |
+| 5 | `log read --utc-offset-days auto` 最新日時・テスト | 解消 | `track_days` を `.max()` に修正し 3 テスト追加。変異テスト M6a・M6b とも FAIL |
+| 6 | デバイス拒否（exit 1）とフラッシュ失敗（exit 6）分離 | 解消 | `CliError::{Core, FlashWriteFailed}` により非フラッシュ `Error::Rejected` を exit 1 に分離しつつ exit 6 の producer を維持。変異テスト M3 で 3 テスト FAIL |
+| 7〜8 | `--json` テスト・epoch 異常拒否・`--dry-run` 既パッチ拒否 | 解消 | `--json` 3 テストと epoch 異常拒否テスト追加、`--dry-run` でも既パッチを exit 4 で拒否。変異テスト M4 で FAIL |
+| 9〜21 | Should 13 項目（可視性・doc・非 TTY・exit 2・追加テスト・仕様同期） | 解消 | 全 13 項目の解消を diff・テスト・`docs/reference/02-cli.md` で確認 |
+
+- **ゲート・テスト**: `./tools/check.sh` 全ゲート PASS、`m241-cli` テスト **108 件**（84 → 108、削除・弱体化 0 件）。本番コードの `unwrap`/`expect`/`panic!`/`unsafe`/無検証添字 0 件、個人情報違反なし。
+- **判定**: **合格**（`main` へマージ）。

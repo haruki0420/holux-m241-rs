@@ -21,6 +21,14 @@ m241-core.workspace = true
 # needs it does not link this binary.
 m241-flash.workspace = true
 clap.workspace = true
+# `--json` prints one object per command (`docs/reference/02-cli.md` §Output).
+# The core exports JSON as text because it has no dependency budget; the CLI
+# needs to *build* a document, so it owns this dependency.
+serde_json.workspace = true
+# `m241 device ports` reports which USB-serial bridge each port is. The vendor
+# and product ids only exist on `serialport`'s `SerialPortInfo`, and the core's
+# `Port::list` deliberately returns names alone.
+serialport.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
