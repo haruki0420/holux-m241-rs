@@ -39,6 +39,7 @@ pub mod cli;
 pub mod device;
 pub mod exit;
 pub mod fileio;
+pub mod fw;
 pub mod link;
 pub mod output;
 
@@ -216,7 +217,7 @@ pub fn run_with(session: Session<'_>, command: Command) -> Result<()> {
             DeviceCommand::Doctor => Err(not_implemented("device doctor")),
         },
         Command::Fw { command } => match command {
-            FwCommand::Dump(options) => not_implemented_args("fw dump", &options),
+            FwCommand::Dump(options) => fw::dump(&options, session),
             FwCommand::Patch(options) => not_implemented_args("fw patch", &options),
             FwCommand::Flash => Err(not_implemented("fw flash")),
         },
@@ -293,7 +294,6 @@ mod tests {
     fn unimplemented_commands() -> Vec<(Command, &'static str)> {
         vec![
             (parsed(&["device", "doctor"]), "device doctor"),
-            (parsed(&["fw", "dump", "-o", "stock.bin"]), "fw dump"),
             (
                 parsed(&["fw", "patch", "stock.bin", "--dry-run"]),
                 "fw patch",
@@ -348,7 +348,6 @@ mod tests {
             names,
             vec![
                 "device doctor",
-                "fw dump",
                 "fw patch",
                 "fw flash",
                 "log info",
