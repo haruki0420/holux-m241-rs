@@ -315,13 +315,25 @@ pub fn write_gps(jpeg: &[u8], position: &GpsPosition) -> Result<Vec<u8>> {
     let segment_len = u16::try_from(segment_len)
         .map_err(|_| malformed(String::from("Exif segment length does not fit 16 bits"), 0))?;
 
+    // `location` was measured on this same slice, so both halves exist; the
+    // `get` calls state that instead of trusting it.
+    let Some(before) = jpeg.get(..location.start) else {
+        return Err(truncated("the JPEG before the Exif segment", 0, jpeg.len()));
+    };
+    let Some(after) = jpeg.get(location.end..) else {
+        return Err(truncated(
+            "the JPEG after the Exif segment",
+            location.end,
+            jpeg.len(),
+        ));
+    };
     let mut out = Vec::with_capacity(jpeg.len() + new_tiff.len() + 8);
-    out.extend_from_slice(&jpeg[..location.start]);
+    out.extend_from_slice(before);
     out.extend_from_slice(&[0xFF, 0xE1]);
     out.extend_from_slice(&segment_len.to_be_bytes());
     out.extend_from_slice(EXIF_HEADER);
     out.extend_from_slice(&new_tiff);
-    out.extend_from_slice(&jpeg[location.end..]);
+    out.extend_from_slice(after);
     Ok(out)
 }
 
@@ -416,7 +428,10 @@ fn find_exif_app1(jpeg: &[u8]) -> Result<Option<App1Location>> {
                 let Some(length_bytes) = slice_at(jpeg, length_pos, 2) else {
                     return Err(truncated("a JPEG segment length", length_pos, jpeg.len()));
                 };
-                let length = usize::from(ByteOrder::Big.u16([length_bytes[0], length_bytes[1]]));
+                let Ok(length_field) = <[u8; 2]>::try_from(length_bytes) else {
+                    return Err(truncated("a JPEG segment length", length_pos, jpeg.len()));
+                };
+                let length = usize::from(ByteOrder::Big.u16(length_field));
                 if length < 2 {
                     return Err(malformed(
                         format!("JPEG segment at byte {pos} claims length {length}"),
@@ -1274,13 +1289,19 @@ fn insert_fresh_exif(jpeg: &[u8], position: &GpsPosition) -> Result<Vec<u8>> {
     }
     let segment_len = u16::try_from(segment_len)
         .map_err(|_| malformed(String::from("Exif segment length does not fit 16 bits"), 0))?;
+    let Some(tiff_prefix) = jpeg.get(..2) else {
+        return Err(not_a_jpeg(jpeg.len()));
+    };
+    let Some(tiff_rest) = jpeg.get(2..) else {
+        return Err(not_a_jpeg(jpeg.len()));
+    };
     let mut out = Vec::with_capacity(jpeg.len() + segment_len as usize);
-    out.extend_from_slice(&jpeg[..2]);
+    out.extend_from_slice(tiff_prefix);
     out.extend_from_slice(&[0xFF, 0xE1]);
     out.extend_from_slice(&segment_len.to_be_bytes());
     out.extend_from_slice(EXIF_HEADER);
     out.extend_from_slice(&tiff);
-    out.extend_from_slice(&jpeg[2..]);
+    out.extend_from_slice(tiff_rest);
     Ok(out)
 }
 
