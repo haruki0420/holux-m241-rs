@@ -397,9 +397,15 @@ pub fn checksum_matches(record: &[u8], bitmask: u32) -> bool {
 }
 
 /// Whether `bytes` is the `0xFF` padding that ends a block's used area.
+///
+/// Four bytes are checked, not one. A record may legitimately begin with a single
+/// `0xFF` byte — a UTC low byte of `0xFF` is a 2106 timestamp, and a waypoint's
+/// `RCR` can be `0xFF` — so stopping at the first `0xFF` would truncate a real
+/// record. Four in a row is what the format leaves behind.
 #[must_use]
 pub fn is_padding(bytes: &[u8]) -> bool {
-    bytes.first() == Some(&0xFF)
+    let head = bytes.get(..4).unwrap_or(bytes);
+    !head.is_empty() && head.iter().all(|byte| *byte == 0xFF)
 }
 
 #[cfg(test)]
@@ -532,9 +538,19 @@ mod tests {
     }
 
     #[test]
-    fn padding_is_recognised_by_its_first_byte() {
-        assert!(is_padding(&[0xFF, 0x00, 0x12]));
+    fn padding_needs_four_ff_bytes_not_just_the_first() {
+        assert!(is_padding(&[0xFF, 0xFF, 0xFF, 0xFF, 0x00]));
+        // A single 0xFF can be the first byte of a real record, so it is not
+        // enough to call the area padding.
+        assert!(!is_padding(&[0xFF, 0x00, 0x12, 0x34]));
         assert!(!is_padding(&[0x00]));
         assert!(!is_padding(&[]));
+    }
+
+    #[test]
+    fn a_short_tail_of_ff_bytes_still_counts_as_padding() {
+        // The last block of a dump can end before four padding bytes fit.
+        assert!(is_padding(&[0xFF]));
+        assert!(is_padding(&[0xFF, 0xFF]));
     }
 }
