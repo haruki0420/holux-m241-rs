@@ -1,11 +1,12 @@
 //! Design tokens, in the one place the GUI reads colour and type from.
 //!
 //! Values and their contrast ratios are in `DESIGN.md` §3. Two rules are
-//! enforced by tests rather than by review:
+//! enforced mechanically rather than by review:
 //!
 //! 1. [`DANGER`] is reserved: it may appear only on the destructive action in
-//!    the firmware screen. `tests/design_invariants.rs` greps for it.
-//! 2. Every text colour clears 4.5:1 against both [`GROUND`] and [`PANEL`].
+//!    the firmware screen. `tools/check_design.py` rejects it anywhere else.
+//! 2. Every text colour clears 4.5:1 against both [`GROUND`] and [`PANEL`],
+//!    measured by the assertions at the bottom of this file.
 
 // The token module is a palette: not every colour has a consumer yet, and the
 // unused ones are the specification for screens that do not exist. Removing them
