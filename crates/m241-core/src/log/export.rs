@@ -313,7 +313,7 @@ fn json_optional_float(value: Option<f64>) -> String {
 }
 
 /// Escape the five characters that cannot appear literally in XML text.
-fn escape_xml(text: &str) -> String {
+pub(crate) fn escape_xml(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for character in text.chars() {
         match character {

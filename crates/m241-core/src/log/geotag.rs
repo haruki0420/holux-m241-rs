@@ -62,22 +62,35 @@ use crate::types::{Track, TrackPoint};
 /// outside it. The number is a judgement, which is why it is configurable.
 pub const DEFAULT_MAX_GAP_SECONDS: u32 = 300;
 
-/// How closely a photo and a track point have to agree.
+/// How closely a photo and a track point have to agree, and how matching
+/// behaves.
 ///
 /// [`plan`] never writes to any file; a `--dry-run` caller stops after [`plan`]
 /// and skips [`apply`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GeotagOptions {
     /// Largest accepted difference between the capture time and the track point,
     /// in whole seconds. A photo whose nearest point is further away is skipped
     /// rather than tagged with a coordinate it cannot support.
     pub max_gap_seconds: u32,
+    /// When `true`, [`apply`] writes a sibling `<photo>_original` backup before
+    /// replacing a photo (if that backup does not already exist).
+    pub keep_backup: bool,
+    /// Offset in seconds added to each photo's capture time before matching
+    /// against the track (for camera clock drift or timezone correction).
+    pub photo_shift_seconds: i64,
+    /// Optional haversine distance threshold in metres for grouping matched
+    /// photos into the same [`GeotagPlan::group_id`] when `Some(d)` with `d > 0.0`.
+    pub group_distance_meters: Option<f64>,
 }
 
 impl Default for GeotagOptions {
     fn default() -> Self {
         Self {
             max_gap_seconds: DEFAULT_MAX_GAP_SECONDS,
+            keep_backup: false,
+            photo_shift_seconds: 0,
+            group_distance_meters: None,
         }
     }
 }
@@ -111,9 +124,9 @@ impl CaptureTime {
 pub struct GeotagPlan {
     /// The photo the decision is about.
     pub photo: PathBuf,
-    /// When the photo was taken and which clock that time came from. `None`
-    /// when no usable capture time could be obtained (for example, a non-JPEG
-    /// or corrupt Exif).
+    /// When the photo was taken (after applying `photo_shift_seconds`) and
+    /// which clock that time came from. `None` when no usable capture time
+    /// could be obtained (for example, a non-JPEG or corrupt Exif).
     pub capture_time: Option<CaptureTime>,
     /// The point to write, when one was found inside the gap.
     pub point: Option<TrackPoint>,
@@ -125,6 +138,12 @@ pub struct GeotagPlan {
     /// Why the photo will not be tagged. `Some` exactly when [`Self::point`] is
     /// `None`.
     pub skipped: Option<String>,
+    /// Whether [`apply`] should preserve a `<photo>_original` backup before
+    /// replacing the photo.
+    pub keep_backup: bool,
+    /// Cluster identifier assigned by [`group_matched_plans`] when distance
+    /// grouping is enabled.
+    pub group_id: Option<usize>,
 }
 
 impl GeotagPlan {
@@ -156,7 +175,69 @@ pub fn plan(photos: &[PathBuf], track: &Track, options: &GeotagOptions) -> Resul
             .map_err(|source| Error::io(photo.display().to_string(), source))?;
         plans.push(plan_one(photo, &bytes, track, options));
     }
+    if let Some(max_distance_meters) = options.group_distance_meters
+        && max_distance_meters.is_finite()
+        && max_distance_meters > 0.0
+    {
+        group_matched_plans(&mut plans, max_distance_meters);
+    }
     Ok(plans)
+}
+
+/// Group matched plans whose haversine distance to an existing group anchor is
+/// strictly less than `max_distance_meters` into the same [`GeotagPlan::group_id`].
+///
+/// Unmatched plans (or plans without a finite coordinate) keep `group_id = None`.
+/// If `max_distance_meters` is not finite or not positive, all `group_id` values
+/// are cleared to `None`.
+pub fn group_matched_plans(plans: &mut [GeotagPlan], max_distance_meters: f64) {
+    for plan in plans.iter_mut() {
+        plan.group_id = None;
+    }
+    if !max_distance_meters.is_finite() || max_distance_meters <= 0.0 {
+        return;
+    }
+
+    let mut anchors: Vec<(f64, f64)> = Vec::new();
+    for plan in plans.iter_mut() {
+        let Some(point) = plan.point else {
+            continue;
+        };
+        let (Some(lat), Some(lon)) = (point.latitude, point.longitude) else {
+            continue;
+        };
+        if !lat.is_finite() || !lon.is_finite() {
+            continue;
+        }
+        let existing = anchors.iter().position(|&(anchor_lat, anchor_lon)| {
+            haversine_meters(anchor_lat, anchor_lon, lat, lon) < max_distance_meters
+        });
+        let group_id = match existing {
+            Some(id) => id,
+            None => {
+                let id = anchors.len();
+                anchors.push((lat, lon));
+                id
+            }
+        };
+        plan.group_id = Some(group_id);
+    }
+}
+
+/// Great-circle distance in metres between two WGS84-ish lat/lon points using
+/// the mean Earth radius (`6_371_000` m).
+#[must_use]
+pub(crate) fn haversine_meters(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_RADIUS_M: f64 = 6_371_000.0;
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let lat1_rad = lat1.to_radians();
+    let lat2_rad = lat2.to_radians();
+    let sin_dlat = (dlat / 2.0).sin();
+    let sin_dlon = (dlon / 2.0).sin();
+    let a = sin_dlat * sin_dlat + lat1_rad.cos() * lat2_rad.cos() * sin_dlon * sin_dlon;
+    let c = 2.0 * a.sqrt().min(1.0).asin();
+    EARTH_RADIUS_M * c
 }
 
 /// Apply every plan that carries a point, and return the photos written.
@@ -167,11 +248,16 @@ pub fn plan(photos: &[PathBuf], track: &Track, options: &GeotagOptions) -> Resul
 /// between planning and applying, the change is what gets modified, and every
 /// tag this module does not own is still preserved by [`exif::write_gps`].
 ///
+/// When [`GeotagPlan::keep_backup`] is `true`, a sibling `<photo>_original`
+/// backup of the pre-modification bytes is written if that backup file does not
+/// already exist.
+///
 /// # Errors
 ///
-/// [`Error::Io`] when a photo cannot be read or replaced, and whatever
-/// [`exif::write_gps`] reports when a photo's Exif cannot be rewritten (most
-/// often: the new block no longer fits a JPEG segment).
+/// [`Error::Io`] when a photo cannot be read or replaced (or its backup cannot
+/// be written), and whatever [`exif::write_gps`] reports when a photo's Exif
+/// cannot be rewritten (most often: the new block no longer fits a JPEG
+/// segment).
 pub fn apply(plans: &[GeotagPlan]) -> Result<Vec<PathBuf>> {
     let mut written = Vec::new();
     for plan in plans {
@@ -187,23 +273,66 @@ pub fn apply(plans: &[GeotagPlan]) -> Result<Vec<PathBuf>> {
         let bytes = std::fs::read(&plan.photo)
             .map_err(|source| Error::io(plan.photo.display().to_string(), source))?;
         let tagged = exif::write_gps(&bytes, &position)?;
+        if plan.keep_backup {
+            write_backup_if_missing(&plan.photo, &bytes)?;
+        }
         replace_file(&plan.photo, &tagged)?;
         written.push(plan.photo.clone());
     }
     Ok(written)
 }
 
+/// Write `<photo>_original` if it does not already exist.
+///
+/// Uses `create_new(true)` so an existing `_original` backup is never
+/// overwritten, preserving the true un-tagged original across repeated runs.
+fn write_backup_if_missing(photo: &Path, original_bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+
+    let Some(file_name) = photo.file_name() else {
+        return Err(Error::State(format!(
+            "{} has no file name to back up",
+            photo.display()
+        )));
+    };
+    let mut backup_name = file_name.to_os_string();
+    backup_name.push("_original");
+    let backup = photo.with_file_name(backup_name);
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&backup)
+    {
+        Ok(mut file) => file
+            .write_all(original_bytes)
+            .and_then(|()| file.flush())
+            .map_err(|source| Error::io(backup.display().to_string(), source)),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(Error::io(backup.display().to_string(), err)),
+    }
+}
+
 /// The decision for one photo, from its bytes and the track.
 fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) -> GeotagPlan {
-    let captured = match capture_time(photo, bytes) {
+    let raw_captured = match capture_time(photo, bytes) {
         Ok(captured) => captured,
-        Err(reason) => return skipped(photo, None, None, reason),
+        Err(reason) => return skipped(photo, None, None, options.keep_backup, reason),
+    };
+    let Some(captured) = shift_capture_time(raw_captured, options.photo_shift_seconds) else {
+        return skipped(
+            photo,
+            None,
+            None,
+            options.keep_backup,
+            String::from("the shifted capture time is outside the representable Unix range"),
+        );
     };
     let Some((point, gap)) = nearest_positioned_point(track, captured.utc()) else {
         return skipped(
             photo,
             Some(captured),
             None,
+            options.keep_backup,
             String::from("the track has no point with both a time and a position to compare with"),
         );
     };
@@ -212,6 +341,7 @@ fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) 
             photo,
             Some(captured),
             Some(gap),
+            options.keep_backup,
             format!(
                 "the nearest track point is {gap} s from the capture time, past the \
                  {} s limit",
@@ -227,6 +357,7 @@ fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) 
             photo,
             Some(captured),
             Some(gap),
+            options.keep_backup,
             String::from("the chosen track point has no complete coordinate"),
         );
     };
@@ -235,6 +366,7 @@ fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) 
             photo,
             Some(captured),
             Some(gap),
+            options.keep_backup,
             format!("the photo's Exif block cannot be rewritten: {err}"),
         );
     }
@@ -244,7 +376,18 @@ fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) 
         point: Some(point),
         gap_seconds: Some(gap),
         skipped: None,
+        keep_backup: options.keep_backup,
+        group_id: None,
     }
+}
+
+fn shift_capture_time(captured: CaptureTime, shift_seconds: i64) -> Option<CaptureTime> {
+    let shifted = i64::from(captured.utc()).checked_add(shift_seconds)?;
+    let utc = u32::try_from(shifted).ok()?;
+    Some(match captured {
+        CaptureTime::Exif(_) => CaptureTime::Exif(utc),
+        CaptureTime::FileModified(_) => CaptureTime::FileModified(utc),
+    })
 }
 
 /// A plan for a photo that will not be tagged.
@@ -252,6 +395,7 @@ fn skipped(
     photo: &Path,
     capture_time: Option<CaptureTime>,
     gap_seconds: Option<u32>,
+    keep_backup: bool,
     reason: String,
 ) -> GeotagPlan {
     GeotagPlan {
@@ -260,6 +404,8 @@ fn skipped(
         point: None,
         gap_seconds,
         skipped: Some(reason),
+        keep_backup,
+        group_id: None,
     }
 }
 
@@ -567,6 +713,7 @@ mod tests {
         // is the policy, not a broken match.
         let wider = GeotagOptions {
             max_gap_seconds: 600,
+            ..GeotagOptions::default()
         };
         assert!(
             plan(std::slice::from_ref(&decision.photo), &track, &wider)
@@ -842,5 +989,147 @@ mod tests {
             std::fs::read(&original).expect("read replaced photo"),
             b"new rewritten photo"
         );
+    }
+
+    #[test]
+    fn keep_backup_writes_original_once_and_never_overwrites_existing_backup() {
+        let dir = TempDir::new("backup");
+        let original_bytes = photo_taken_at(SHUTTER);
+        let photo = dir.photo("photo.jpg", &original_bytes);
+        let backup = dir.0.join("photo.jpg_original");
+
+        let track = track_at(&[SHUTTER]);
+        let opts = GeotagOptions {
+            keep_backup: true,
+            ..GeotagOptions::default()
+        };
+        let plans = plan(std::slice::from_ref(&photo), &track, &opts).expect("plan");
+        assert!(!backup.exists(), "plan must not write the backup");
+
+        apply(&plans).expect("first apply");
+        assert!(backup.exists(), "_original backup must be created");
+        assert_eq!(
+            std::fs::read(&backup).expect("read backup"),
+            original_bytes,
+            "_original must match the pre-tag photo"
+        );
+        let first_tagged = std::fs::read(&photo).expect("read tagged photo");
+        assert_ne!(first_tagged, original_bytes);
+
+        // Re-applying against a shifted track must NOT overwrite the existing _original.
+        let moved_track = Track {
+            points: vec![TrackPoint {
+                utc: Some(SHUTTER),
+                latitude: Some(34.693_7),
+                longitude: Some(135.502_3),
+                height_m: Some(20.0),
+                speed_kmh: None,
+                rcr: None,
+            }],
+            damaged_blocks: Vec::new(),
+        };
+        let plans2 = plan(std::slice::from_ref(&photo), &moved_track, &opts).expect("plan2");
+        apply(&plans2).expect("second apply");
+        assert_eq!(
+            std::fs::read(&backup).expect("read preserved backup"),
+            original_bytes,
+            "existing _original backup must never be overwritten"
+        );
+        let tags = exif::read_gps(&std::fs::read(&photo).expect("read re-tagged"))
+            .expect("read")
+            .expect("Exif");
+        assert!((tags.latitude.expect("lat") - 34.693_7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn photo_shift_seconds_adjusts_capture_time_before_matching() {
+        let dir = TempDir::new("shift");
+        // Camera clock was 1 hour slow: photo says SHUTTER - 3600, track is at SHUTTER.
+        let photo = dir.photo("slow-clock.jpg", &photo_taken_at(SHUTTER - 3_600));
+        let track = track_at(&[SHUTTER]);
+
+        let unshifted = plan(
+            std::slice::from_ref(&photo),
+            &track,
+            &GeotagOptions::default(),
+        )
+        .expect("unshifted plan");
+        assert!(!unshifted[0].will_write());
+
+        let shifted_opts = GeotagOptions {
+            photo_shift_seconds: 3_600,
+            ..GeotagOptions::default()
+        };
+        let shifted = plan(std::slice::from_ref(&photo), &track, &shifted_opts).expect("shifted");
+        assert!(shifted[0].will_write());
+        assert_eq!(shifted[0].capture_time, Some(CaptureTime::Exif(SHUTTER)));
+        assert_eq!(shifted[0].gap_seconds, Some(0));
+
+        // Negative shift works too: camera 1 hour fast.
+        let fast_photo = dir.photo("fast-clock.jpg", &photo_taken_at(SHUTTER + 3_600));
+        let neg_opts = GeotagOptions {
+            photo_shift_seconds: -3_600,
+            ..GeotagOptions::default()
+        };
+        let neg = plan(&[fast_photo], &track, &neg_opts).expect("neg shifted");
+        assert!(neg[0].will_write());
+        assert_eq!(neg[0].gap_seconds, Some(0));
+
+        // Shifting below Unix epoch skips cleanly instead of panicking or wrapping.
+        let epoch_photo = dir.photo("early.jpg", &photo_taken_at(100));
+        let underflow_opts = GeotagOptions {
+            photo_shift_seconds: -200,
+            ..GeotagOptions::default()
+        };
+        let underflow = plan(&[epoch_photo], &track, &underflow_opts).expect("underflow plan");
+        assert!(!underflow[0].will_write());
+        assert!(underflow[0].skipped.is_some());
+    }
+
+    #[test]
+    fn distance_grouping_clusters_nearby_matched_photos() {
+        let dir = TempDir::new("group");
+        let p1 = dir.photo("p1.jpg", &photo_taken_at(SHUTTER));
+        let p2 = dir.photo("p2.jpg", &photo_taken_at(SHUTTER + 10));
+        let p3 = dir.photo("p3.jpg", &photo_taken_at(SHUTTER + 20));
+        let p_skip = dir.photo("p_skip.jpg", &photo_taken_at(SHUTTER + 10_000));
+
+        // p1 at Tokyo Station, p2 ~15m away, p3 in Osaka (~400km away).
+        let track = Track {
+            points: vec![
+                TrackPoint {
+                    utc: Some(SHUTTER),
+                    latitude: Some(TOKYO_LAT),
+                    longitude: Some(TOKYO_LON),
+                    height_m: Some(10.0),
+                    ..TrackPoint::default()
+                },
+                TrackPoint {
+                    utc: Some(SHUTTER + 10),
+                    latitude: Some(TOKYO_LAT + 0.000_1),
+                    longitude: Some(TOKYO_LON + 0.000_1),
+                    height_m: Some(10.0),
+                    ..TrackPoint::default()
+                },
+                TrackPoint {
+                    utc: Some(SHUTTER + 20),
+                    latitude: Some(34.693_7),
+                    longitude: Some(135.502_3),
+                    height_m: Some(20.0),
+                    ..TrackPoint::default()
+                },
+            ],
+            damaged_blocks: Vec::new(),
+        };
+
+        let opts = GeotagOptions {
+            group_distance_meters: Some(50.0),
+            ..GeotagOptions::default()
+        };
+        let plans = plan(&[p1, p2, p3, p_skip], &track, &opts).expect("plan");
+        assert_eq!(plans[0].group_id, Some(0));
+        assert_eq!(plans[1].group_id, Some(0));
+        assert_eq!(plans[2].group_id, Some(1));
+        assert_eq!(plans[3].group_id, None);
     }
 }

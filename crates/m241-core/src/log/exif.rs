@@ -31,7 +31,7 @@
 //! # What this module does not do
 //!
 //! * PNG/WebP/TIFF files: only JPEG has an APP1 segment.
-//! * XMP, IPTC, and Exif fields other than the eight GPS tags below and
+//! * XMP, IPTC, and Exif fields other than the nine GPS tags below and
 //!   `DateTimeOriginal` (read only).
 //! * Multi-segment (`Exif\0\0` repeated) or XMP-embedded Exif: the first Exif
 //!   APP1 wins, which is what every reader does.
@@ -63,6 +63,8 @@ pub(crate) const JPEG_MARKER_EOI: u8 = JPEG_MARKER_SOI + 1;
 
 /// Exif tag ids this module reads or writes.
 pub mod tag {
+    /// GPS tag version: BYTE 4, `[2, 2, 0, 0]` for EXIF 2.2/2.32.
+    pub const GPS_VERSION_ID: u16 = 0x0000;
     /// GPS latitude reference: ASCII 2, `"N\0"` or `"S\0"`.
     pub const GPS_LATITUDE_REF: u16 = 0x0001;
     /// GPS latitude: RATIONAL 3, degrees / minutes / seconds.
@@ -89,7 +91,8 @@ pub mod tag {
 
     /// Every GPS tag this module owns: a rewrite replaces these and keeps the
     /// rest of the GPS IFD.
-    pub const MANAGED_GPS: [u16; 8] = [
+    pub const MANAGED_GPS: [u16; 9] = [
+        GPS_VERSION_ID,
         GPS_LATITUDE_REF,
         GPS_LATITUDE,
         GPS_LONGITUDE_REF,
@@ -198,6 +201,8 @@ impl GpsPosition {
 /// Exif at all" by [`read_gps`] returning `Ok(None)`).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct GpsTags {
+    /// EXIF `GPSVersionID` (`0x0000`), e.g. `[2, 2, 0, 0]`.
+    pub version_id: Option<[u8; 4]>,
     /// Signed decimal degrees; the reference letter decides the sign.
     pub latitude: Option<f64>,
     /// Signed decimal degrees.
@@ -708,16 +713,29 @@ fn type_size(field_type: u16) -> Option<usize> {
 // ---------------------------------------------------------------------------
 
 fn read_gps_tags(reader: &TiffReader, ifd: &Ifd) -> Result<GpsTags> {
+    let version_id = read_gps_version(reader, ifd)?;
     let latitude = read_coordinate(reader, ifd, tag::GPS_LATITUDE_REF, tag::GPS_LATITUDE)?;
     let longitude = read_coordinate(reader, ifd, tag::GPS_LONGITUDE_REF, tag::GPS_LONGITUDE)?;
     let altitude = read_altitude(reader, ifd)?;
     let utc = read_gps_time(reader, ifd)?;
     Ok(GpsTags {
+        version_id,
         latitude,
         longitude,
         altitude_m: altitude,
         utc,
     })
+}
+
+fn read_gps_version(reader: &TiffReader, ifd: &Ifd) -> Result<Option<[u8; 4]>> {
+    let Some(entry) = ifd.find(tag::GPS_VERSION_ID) else {
+        return Ok(None);
+    };
+    if entry.field_type != TYPE_BYTE || entry.count != 4 {
+        return Ok(None);
+    }
+    let bytes = reader.value_bytes(entry)?;
+    Ok(<[u8; 4]>::try_from(bytes.as_slice()).ok())
 }
 
 fn read_coordinate(
@@ -995,12 +1013,16 @@ impl IfdEntry {
     }
 
     fn byte(tag: u16, value: u8) -> Self {
+        Self::bytes(tag, &[value])
+    }
+
+    fn bytes(tag: u16, data: &[u8]) -> Self {
         Self {
             tag,
             field_type: TYPE_BYTE,
-            count: 1,
+            count: u32::try_from(data.len()).unwrap_or(u32::MAX),
             fixed_field: None,
-            value: vec![value],
+            value: data.to_vec(),
         }
     }
 
@@ -1077,6 +1099,7 @@ fn to_dms_rationals(value: f64) -> Result<[(u32, u32); 3]> {
 
 fn gps_entries(position: &GpsPosition, order: ByteOrder) -> Result<Vec<IfdEntry>> {
     let mut entries = Vec::with_capacity(tag::MANAGED_GPS.len());
+    entries.push(IfdEntry::bytes(tag::GPS_VERSION_ID, &[2, 2, 0, 0]));
     let latitude_ref = if position.latitude < 0.0 {
         b"S\0"
     } else {
@@ -1418,7 +1441,7 @@ fn days_in_month(year: i64, month: u32) -> u32 {
 ///
 /// Howard Hinnant's `days_from_civil`; written out because the crate has no
 /// date library and this is the only calendar arithmetic it needs.
-fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
     if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
         return None;
     }
@@ -1738,8 +1761,33 @@ mod tests {
             "a rewrite must not switch a MM file to II"
         );
         let tags = read_gps(&tagged).expect("read").expect("an Exif block");
+        assert_eq!(tags.version_id, Some([2, 2, 0, 0]));
         assert_degrees(tags.latitude, TOKYO_LAT);
         assert_eq!(tags.utc, Some(TOKYO_UTC));
+    }
+
+    #[test]
+    fn gps_version_id_is_written_and_read_in_both_byte_orders() {
+        let plain = fixture::jpeg_without_exif();
+        let tagged_le = write_gps(&plain, &tokyo()).expect("write LE");
+        let tags_le = read_gps(&tagged_le).expect("read LE").expect("Exif LE");
+        assert_eq!(tags_le.version_id, Some([2, 2, 0, 0]));
+        let raw_le = raw_exif(&tagged_le);
+        assert_eq!(
+            raw_le.gps_value(tag::GPS_VERSION_ID),
+            Some(&[2u8, 2, 0, 0][..])
+        );
+
+        let be_base = fixture::exif_jpeg(ByteOrder::Big, &[], None, Some(TOKYO_DATETIME));
+        let tagged_be = write_gps(&be_base, &tokyo()).expect("write BE");
+        let tags_be = read_gps(&tagged_be).expect("read BE").expect("Exif BE");
+        assert_eq!(tags_be.version_id, Some([2, 2, 0, 0]));
+        let raw_be = raw_exif(&tagged_be);
+        assert_eq!(raw_be.order, ByteOrder::Big);
+        assert_eq!(
+            raw_be.gps_value(tag::GPS_VERSION_ID),
+            Some(&[2u8, 2, 0, 0][..])
+        );
     }
 
     #[test]
