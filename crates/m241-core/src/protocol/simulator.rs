@@ -15,9 +15,11 @@
 //!
 //! It stops at the Download Agent on purpose. The DA is what erases and programs
 //! flash, it lives in `m241-flash`, and a fake that modelled it would put the
-//! destructive command set back inside the crate that must stay free of it. A
-//! `0xA8` jump is echoed like any other frame and changes no state; the tests
-//! that pin the DA's behaviour drive `m241_flash`'s own simulator instead.
+//! destructive command set back inside the crate that must stay free of it, in
+//! the one place a source gate cannot see it — a test fixture that ships. The
+//! DA's model, including the measured range and write commands, is
+//! `m241_flash::simulator`; this fake answers a jump with what the wire actually
+//! carries and changes no state.
 //!
 //! # What it deliberately does not model
 //!
@@ -30,7 +32,8 @@ use std::collections::VecDeque;
 
 use crate::error::{Error, Result};
 use crate::protocol::brom::{
-    BASE_ADDR_FIRMWARE, BOOT_REPLY, BOOT_SYNC, OPCODE_CHECKSUM, OPCODE_READ16, OPCODE_READ32,
+    BASE_ADDR_FIRMWARE, BOOT_REPLY, BOOT_SYNC, OPCODE_CHECKSUM, OPCODE_JUMP, OPCODE_READ16,
+    OPCODE_READ32,
 };
 use crate::protocol::frame::{checksum_xor16, swap_pairs};
 use crate::protocol::pmtk::{checksum, line as pmtk_line};
@@ -49,9 +52,8 @@ pub enum Mode {
     Running,
     /// BootROM: the four-probe sync, then nine-byte frames.
     ///
-    /// A jump (`0xA8`) is echoed here like any other frame and then ignored:
-    /// the fake does not model the Download Agent, which is the write crate's
-    /// job. See the module documentation.
+    /// A jump (`0xA8`) leaves the chip here: the fake does not model the
+    /// Download Agent, which is the write crate's subject.
     BootRom,
 }
 
@@ -99,6 +101,13 @@ pub struct FakeDevice {
     /// Number of upcoming log reads the device will answer only after the
     /// client's timeout (zero means "answer normally").
     drop_log_replies: u32,
+    /// Whether the frame currently being assembled is echoed back.
+    ///
+    /// Reads, writes and checksums are echoed byte for byte; a jump is not,
+    /// because the chip hands control over part-way through the frame (measured:
+    /// only part of a jump's echo ever arrives). Requiring the echo there would
+    /// desynchronise the next command, so the simulator does not produce one.
+    echo_frame: bool,
 }
 
 impl FakeDevice {
@@ -130,6 +139,7 @@ impl FakeDevice {
             model: model.to_owned(),
             sdk: sdk.to_owned(),
             drop_log_replies: 0,
+            echo_frame: true,
         }
     }
 
@@ -363,6 +373,9 @@ impl FakeDevice {
                 self.logging_enabled = true;
                 self.queue_line(&pmtk_line("PMTK001,182,4,3"));
             }
+            // `$PMTK182,6` erases the log. The fake does not answer it, because
+            // answering it would mean modelling a destructive command in this
+            // crate; the erase client and its fake are `m241_flash`'s.
             "7" => self.handle_log_read(fields.next(), fields.next()),
             _ => {}
         }
@@ -448,12 +461,20 @@ impl FakeDevice {
                     }
                     return;
                 }
+                if self.line.is_empty() {
+                    // The first byte of a frame decides whether this frame is
+                    // echoed at all: a jump is not, everything else is.
+                    self.echo_frame = byte != OPCODE_JUMP;
+                }
                 self.line.push(byte);
-                self.queue_bytes(&[byte]);
+                if self.echo_frame {
+                    self.queue_bytes(&[byte]);
+                }
                 if self.line.len() < 9 {
                     return;
                 }
                 let frame = std::mem::take(&mut self.line);
+                self.echo_frame = true;
                 self.dispatch_bootrom(&frame);
             }
         }
@@ -495,10 +516,10 @@ impl FakeDevice {
             }
             // A jump hands the chip to the Download Agent, which this fake does
             // not model: the DA erases and programs flash, and putting that
-            // state machine back here would defeat the crate split. Every frame
-            // is echoed above, so a jump answers with its echo and nothing else;
-            // a read path never sends one, because reading never leaves the
-            // BootROM.
+            // state machine back here would defeat the crate split. The chip
+            // stops echoing part-way through the frame, so nothing is queued and
+            // no state changes; a read path never sends a jump, because reading
+            // never leaves the BootROM.
             _ => {}
         }
     }
@@ -754,21 +775,17 @@ mod tests {
     }
 
     #[test]
-    fn a_jump_frame_is_echoed_and_changes_nothing() {
+    fn a_jump_frame_is_echoed_part_way_and_changes_no_state() {
         // The fake stops at the BootROM: the Download Agent is the write crate's
         // subject, and modelling it here would put the erase/program state
-        // machine back inside the read-only crate. A jump therefore behaves like
-        // any other frame — echo, no data, mode unchanged — and a read-path test
-        // never sends one.
-        use crate::protocol::brom::OPCODE_JUMP;
-
+        // machine back inside the read-only crate, in a file that ships. A jump
+        // therefore leaves the chip in the BootROM and queues no report — a read
+        // path never sends one, because reading never leaves the BootROM.
         let mut device = FakeDevice::new().with_firmware(&[0u8; 16]).in_bootrom();
         let jump = [OPCODE_JUMP, 0x00, 0x10, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
         device.write_all(&jump).expect("write the jump frame");
-        let mut echo = [0u8; 9];
-        device.read(&mut echo).expect("read the echo");
-        assert_eq!(echo, jump, "the BootROM echoes every frame byte");
-        assert_eq!(device.mode(), Mode::BootRom);
+        assert_eq!(device.mode(), Mode::BootRom, "a jump must not enter the DA");
+        assert_eq!(device.memory().len(), 16, "a jump must not touch the flash");
         let mut nothing = [0u8; 1];
         assert_eq!(
             device.read(&mut nothing).expect("no data follows"),

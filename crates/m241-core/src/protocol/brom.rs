@@ -459,4 +459,52 @@ mod tests {
         let err = brom.sync().expect_err("wrong first reply");
         assert!(matches!(err, Error::Timeout { .. }));
     }
+
+    /// Assert a sync framing failure carries no position in an image.
+    ///
+    /// A probe answered with the wrong byte means the line is desynchronised;
+    /// the device is not "at" any offset. A fabricated `(at 0x0)` would send
+    /// the reader looking at the first byte of a firmware image.
+    fn assert_reports_no_position(err: Error, probe: u8) {
+        let Error::Framing { what, offset } = err else {
+            panic!("expected Error::Framing for probe 0x{probe:02X}, got {err:?}");
+        };
+        assert!(
+            what.contains(&format!("0x{probe:02X}")),
+            "the error must name the probe that disagreed, got {what}"
+        );
+        assert_eq!(
+            offset, None,
+            "probe 0x{probe:02X} disagreed on the wire, which is not a byte at offset 0: {what}"
+        );
+    }
+
+    #[test]
+    fn a_sync_probe_mismatch_does_not_claim_to_be_at_offset_zero() {
+        // 0x0A must draw 0xF5. A chip answering 0x0A is echoing the probe
+        // rather than replying to it, so this is a wire failure with no
+        // position in an image even though the probe is the second byte.
+        let mut brom = MtkBootRom::new(Canned::new(vec![BOOT_REPLY[0], BOOT_SYNC[1]]));
+        let err = brom
+            .sync()
+            .expect_err("0x0A must not accept its own echo as the reply");
+        assert_reports_no_position(err, BOOT_SYNC[1]);
+    }
+
+    #[test]
+    fn every_probe_byte_that_disagrees_reports_no_position() {
+        // Probes 2..4 draw 0xF5, 0xAF and 0xFA. Answer each with its own probe
+        // byte (0x0A, 0x50, 0x05) - a plausible echo, still wrong - and check
+        // that whichever probe fails reports no position.
+        for (index, probe) in BOOT_SYNC.iter().enumerate().skip(1) {
+            let mut reply = vec![BOOT_REPLY[0]];
+            reply.extend_from_slice(&BOOT_REPLY[1..index]);
+            reply.push(*probe);
+            let mut brom = MtkBootRom::new(Canned::new(reply));
+            let err = brom
+                .sync()
+                .expect_err("an echoed probe byte is not the documented reply");
+            assert_reports_no_position(err, *probe);
+        }
+    }
 }
