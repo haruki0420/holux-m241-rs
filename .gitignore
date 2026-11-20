@@ -22,6 +22,9 @@
 # Local analysis scratch
 /_scratch/
 /.inbox/
-/.cargo-home/
-/.rustup-home/
+# No trailing slash: the parallel worktrees get a *symlink* to the shared cargo
+# cache, and a `dir/` pattern does not match a symlink, so it showed up as
+# untracked in every worktree and was one `git add -A` from being committed.
+/.cargo-home
+/.rustup-home
 /.worktrees/
