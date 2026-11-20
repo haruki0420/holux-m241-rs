@@ -191,7 +191,7 @@ impl<T: Transport> MtkBootRom<T> {
                         "sync probe 0x{probe:02X} answered 0x{:02X}, expected 0x{expect:02X}",
                         byte[0]
                     ),
-                    offset: 0,
+                    offset: None,
                 });
             }
         }
@@ -237,7 +237,7 @@ impl<T: Transport> MtkBootRom<T> {
         if echo != bytes {
             return Err(Error::Framing {
                 what: format!("echo was {echo:02X?}, expected {:02X?}", bytes),
-                offset: 0,
+                offset: None,
             });
         }
         Ok(())
@@ -357,6 +357,19 @@ mod tests {
         let err = brom.read16(0x0020_0000, 4).expect_err("echo mismatch");
         assert!(matches!(err, Error::Framing { .. }));
         assert!(err.is_fatal());
+    }
+
+    #[test]
+    fn an_echo_mismatch_does_not_claim_to_be_at_offset_zero() {
+        // The echo is a wire problem with no position in an image. Reporting
+        // `(at 0x0)` would point the reader at the start of a file.
+        let mut reply = vec![0xA2, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02];
+        reply[8] = 0x03;
+        let mut brom = MtkBootRom::new(Canned::new(reply));
+        let err = brom.read16(0x0020_0000, 4).expect_err("echo mismatch");
+        let text = format!("{err}");
+        assert!(!text.contains("0x0"), "got {text}");
+        assert!(!text.contains("at "), "got {text}");
     }
 
     #[test]

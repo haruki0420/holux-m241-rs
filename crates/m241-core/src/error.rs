@@ -27,7 +27,15 @@ pub enum Error {
     /// The chip did not answer a command in time.
     Timeout { what: String, timeout: Duration },
     /// The bytes coming back are not what the protocol says they must be.
-    Framing { what: String, offset: Offset },
+    ///
+    /// `offset` is `None` when the failure has no position in an image: an echo
+    /// that does not match or a sync probe answered with the wrong byte is a
+    /// desynchronised line, not a bad byte at a known place. Printing a made-up
+    /// `0x0` there would send the reader looking at the start of a file.
+    Framing {
+        what: String,
+        offset: Option<Offset>,
+    },
     /// The chip refused a command with its own negative acknowledgement.
     Rejected { what: String },
     /// The image cannot be parsed.
@@ -72,7 +80,7 @@ impl fmt::Display for Error {
                 write!(f, "no reply from the device within {timeout:?}: {what}")
             }
             Self::Framing { what, offset } => {
-                write!(f, "framing error: {what} (at 0x{offset:X})")
+                write!(f, "framing error: {}", with_offset(what, *offset))
             }
             Self::Rejected { what } => write!(f, "the device rejected {what}"),
             Self::Firmware { message, offset } => {
@@ -124,7 +132,10 @@ impl Error {
                 message,
                 offset: Some(offset),
             },
-            Self::Framing { what, .. } => Self::Framing { what, offset },
+            Self::Framing { what, .. } => Self::Framing {
+                what,
+                offset: Some(offset),
+            },
             other => other,
         }
     }
@@ -306,11 +317,34 @@ mod tests {
         assert!(
             Error::Framing {
                 what: String::from("echo"),
-                offset: 3
+                offset: Some(3)
             }
             .hint()
             .is_some()
         );
+    }
+
+    #[test]
+    fn a_framing_error_without_a_position_prints_no_coordinates() {
+        // An echo mismatch has no offset into an image; it must not pretend to
+        // be at 0x0, which would send the reader to the start of a file.
+        let err = Error::Framing {
+            what: String::from("echo was [0xA2], expected [0xA1]"),
+            offset: None,
+        };
+        let text = format!("{err}");
+        assert!(!text.contains("0x0"), "got {text}");
+        assert!(!text.contains("at "), "got {text}");
+        assert!(text.contains("echo was"), "got {text}");
+    }
+
+    #[test]
+    fn a_framing_error_that_names_an_offset_still_prints_it() {
+        let err = Error::Framing {
+            what: String::from("data does not match the block header"),
+            offset: Some(0x1F4),
+        };
+        assert!(format!("{err}").contains("at 0x1F4"), "got {err}");
     }
 
     #[test]
