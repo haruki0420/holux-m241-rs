@@ -17,7 +17,7 @@
 //! may index and unwrap freely: a panic here is a broken fixture, not a broken
 //! photo.
 
-use crate::log::exif::ByteOrder;
+use crate::log::exif::{ByteOrder, JPEG_MARKER_EOI, JPEG_MARKER_SOI};
 
 /// TIFF field type ids. Written out rather than borrowed from `exif` because a
 /// fixture has to be able to build blocks the module's own writers never
@@ -97,7 +97,7 @@ pub(crate) fn jpeg_without_exif() -> Vec<u8> {
 /// A JPEG whose first APP1 payload is `payload` — Exif when it starts with
 /// `Exif\0\0`, something else (XMP, for instance) when it does not.
 fn jpeg_with_payload(payload: Option<&[u8]>) -> Vec<u8> {
-    let mut out = vec![0xFF, 0xD8];
+    let mut out = vec![0xFF, JPEG_MARKER_SOI];
     push_segment(&mut out, 0xE0, b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0");
     if let Some(payload) = payload {
         push_segment(&mut out, 0xE1, payload);
@@ -107,7 +107,7 @@ fn jpeg_with_payload(payload: Option<&[u8]>) -> Vec<u8> {
     let mut dqt = vec![0x00];
     dqt.extend(std::iter::repeat_n(0x10u8, 64));
     push_segment(&mut out, 0xDB, &dqt);
-    out.extend_from_slice(&[0xFF, 0xD9]);
+    out.extend_from_slice(&[0xFF, JPEG_MARKER_EOI]);
     out
 }
 

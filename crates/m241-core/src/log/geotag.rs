@@ -63,35 +63,46 @@ use crate::types::{Track, TrackPoint};
 pub const DEFAULT_MAX_GAP_SECONDS: u32 = 300;
 
 /// How closely a photo and a track point have to agree.
+///
+/// [`plan`] never writes to any file; a `--dry-run` caller stops after [`plan`]
+/// and skips [`apply`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GeotagOptions {
     /// Largest accepted difference between the capture time and the track point,
     /// in whole seconds. A photo whose nearest point is further away is skipped
     /// rather than tagged with a coordinate it cannot support.
     pub max_gap_seconds: u32,
-    /// Whether the caller should stop after [`plan`].
-    ///
-    /// [`plan`] never writes in either mode; this flag is the caller's own
-    /// decision, kept in the same value as the gap so there is one place that
-    /// answers "would this run write?". [`Self::writes`] spells that out, and
-    /// [`apply`] is the only function that touches the files.
-    pub dry_run: bool,
 }
 
 impl Default for GeotagOptions {
     fn default() -> Self {
         Self {
             max_gap_seconds: DEFAULT_MAX_GAP_SECONDS,
-            dry_run: false,
         }
     }
 }
 
-impl GeotagOptions {
-    /// Whether a caller following these options should go on to [`apply`].
+/// When the photo was taken, and which clock that answer came from.
+///
+/// Kept as a named type rather than a bare `u32` so callers reviewing a
+/// [`GeotagPlan`] can tell when a timestamp came from the filesystem rather
+/// than the camera shutter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureTime {
+    /// `DateTimeOriginal`, read as UTC because EXIF has no zone.
+    Exif(u32),
+    /// The file's modification time, for a photo whose Exif holds no capture
+    /// time.
+    FileModified(u32),
+}
+
+impl CaptureTime {
+    /// The capture moment as Unix seconds.
     #[must_use]
-    pub fn writes(&self) -> bool {
-        !self.dry_run
+    pub fn utc(self) -> u32 {
+        match self {
+            Self::Exif(utc) | Self::FileModified(utc) => utc,
+        }
     }
 }
 
@@ -100,6 +111,10 @@ impl GeotagOptions {
 pub struct GeotagPlan {
     /// The photo the decision is about.
     pub photo: PathBuf,
+    /// When the photo was taken and which clock that time came from. `None`
+    /// when no usable capture time could be obtained (for example, a non-JPEG
+    /// or corrupt Exif).
+    pub capture_time: Option<CaptureTime>,
     /// The point to write, when one was found inside the gap.
     pub point: Option<TrackPoint>,
     /// How far the nearest usable track point is from the capture time, in
@@ -113,9 +128,9 @@ pub struct GeotagPlan {
 }
 
 impl GeotagPlan {
-    /// Whether applying this plan would write to the photo.
+    /// Whether [`apply`] will write to this photo.
     #[must_use]
-    pub fn writes(&self) -> bool {
+    pub fn will_write(&self) -> bool {
         self.point.is_some()
     }
 }
@@ -182,11 +197,12 @@ pub fn apply(plans: &[GeotagPlan]) -> Result<Vec<PathBuf>> {
 fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) -> GeotagPlan {
     let captured = match capture_time(photo, bytes) {
         Ok(captured) => captured,
-        Err(reason) => return skipped(photo, None, reason),
+        Err(reason) => return skipped(photo, None, None, reason),
     };
     let Some((point, gap)) = nearest_positioned_point(track, captured.utc()) else {
         return skipped(
             photo,
+            Some(captured),
             None,
             String::from("the track has no point with both a time and a position to compare with"),
         );
@@ -194,6 +210,7 @@ fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) 
     if gap > options.max_gap_seconds {
         return skipped(
             photo,
+            Some(captured),
             Some(gap),
             format!(
                 "the nearest track point is {gap} s from the capture time, past the \
@@ -208,6 +225,7 @@ fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) 
     let Some(position) = position_of(&point) else {
         return skipped(
             photo,
+            Some(captured),
             Some(gap),
             String::from("the chosen track point has no complete coordinate"),
         );
@@ -215,12 +233,14 @@ fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) 
     if let Err(err) = exif::write_gps(bytes, &position) {
         return skipped(
             photo,
+            Some(captured),
             Some(gap),
             format!("the photo's Exif block cannot be rewritten: {err}"),
         );
     }
     GeotagPlan {
         photo: photo.to_path_buf(),
+        capture_time: Some(captured),
         point: Some(point),
         gap_seconds: Some(gap),
         skipped: None,
@@ -228,9 +248,15 @@ fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) 
 }
 
 /// A plan for a photo that will not be tagged.
-fn skipped(photo: &Path, gap_seconds: Option<u32>, reason: String) -> GeotagPlan {
+fn skipped(
+    photo: &Path,
+    capture_time: Option<CaptureTime>,
+    gap_seconds: Option<u32>,
+    reason: String,
+) -> GeotagPlan {
     GeotagPlan {
         photo: photo.to_path_buf(),
+        capture_time,
         point: None,
         gap_seconds,
         skipped: Some(reason),
@@ -245,28 +271,6 @@ fn position_of(point: &TrackPoint) -> Option<GpsPosition> {
         altitude_m: point.height_m,
         utc: point.utc,
     })
-}
-
-/// When the photo was taken, and which clock that answer came from.
-///
-/// Kept as a named type rather than a bare `u32` so the reason a time is weak
-/// (it came from the filesystem, not the shutter) stays visible at the use site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CaptureTime {
-    /// `DateTimeOriginal`, read as UTC because EXIF has no zone.
-    Exif(u32),
-    /// The file's modification time, for a photo whose Exif holds no capture
-    /// time.
-    FileModified(u32),
-}
-
-impl CaptureTime {
-    /// The capture moment as Unix seconds.
-    fn utc(self) -> u32 {
-        match self {
-            Self::Exif(utc) | Self::FileModified(utc) => utc,
-        }
-    }
 }
 
 /// Read the capture time, or say why there is none.
@@ -305,7 +309,7 @@ fn capture_time(photo: &Path, bytes: &[u8]) -> std::result::Result<CaptureTime, 
 
 /// Whether the bytes start with the JPEG start-of-image marker.
 fn is_jpeg(bytes: &[u8]) -> bool {
-    bytes.starts_with(&[0xFF, 0xD8])
+    bytes.starts_with(&[0xFF, exif::JPEG_MARKER_SOI])
 }
 
 /// The file's modification time as Unix seconds, when it can be represented.
@@ -339,8 +343,10 @@ fn nearest_positioned_point(track: &Track, utc: u32) -> Option<(TrackPoint, u32)
 /// A photo is the one file this crate modifies that cannot be regenerated, and a
 /// crash halfway through writing it in place would leave a truncated JPEG at
 /// the photo's own name. The temporary file is written first and renamed into
-/// place, which is atomic where the platform allows it; Windows refuses to
-/// rename over an existing file, so that case removes the old name first.
+/// place, which is atomic on Unix; Windows refuses to rename over an existing
+/// file, so only on Windows does this fall back to removing the old name first
+/// (and if the follow-up rename fails, the temporary file is preserved on disk
+/// and its path is included in the returned error so the photo is never lost).
 fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let Some(file_name) = path.file_name() else {
         return Err(Error::State(format!(
@@ -353,13 +359,49 @@ fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
     temp_name.push(".m241-tmp");
     let temp = path.with_file_name(temp_name);
     std::fs::write(&temp, bytes).map_err(|source| Error::io(temp.display().to_string(), source))?;
-    if std::fs::rename(&temp, path).is_ok() {
+    replace_from_temp(&temp, path)
+}
+
+#[cfg(not(windows))]
+fn replace_from_temp(temp: &Path, path: &Path) -> Result<()> {
+    std::fs::rename(temp, path).map_err(|source| {
+        // On Unix, a failed rename leaves the original file at `path` intact,
+        // so removing the temporary file cannot lose data.
+        let _ = std::fs::remove_file(temp);
+        Error::io(path.display().to_string(), source)
+    })
+}
+
+#[cfg(windows)]
+fn replace_from_temp(temp: &Path, path: &Path) -> Result<()> {
+    replace_with_remove_fallback(temp, path, std::fs::rename)
+}
+
+#[cfg(any(windows, test))]
+fn replace_with_remove_fallback(
+    temp: &Path,
+    path: &Path,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    if rename(temp, path).is_ok() {
         return Ok(());
     }
-    std::fs::remove_file(path).map_err(|source| Error::io(path.display().to_string(), source))?;
-    std::fs::rename(&temp, path).map_err(|source| {
-        let _ = std::fs::remove_file(&temp);
-        Error::io(path.display().to_string(), source)
+    if let Err(source) = std::fs::remove_file(path) {
+        // `path` was not removed, so the original photo is still intact.
+        let _ = std::fs::remove_file(temp);
+        return Err(Error::io(path.display().to_string(), source));
+    }
+    // `path` is already gone: `temp` is now the only remaining copy of the
+    // photo and must NEVER be deleted if the rename fails.
+    rename(temp, path).map_err(|source| {
+        Error::io(
+            format!(
+                "{} (the rewritten photo is preserved at {})",
+                path.display(),
+                temp.display()
+            ),
+            source,
+        )
     })
 }
 
@@ -489,24 +531,14 @@ mod tests {
         let dir = TempDir::new("nearest");
         let photo = dir.photo("nearer.jpg", &photo_taken_at(SHUTTER));
 
-        let plans = plan(
-            std::slice::from_ref(&photo),
-            &track,
-            &GeotagOptions::default(),
-        )
-        .expect("plan");
+        let plans = plan(&[photo], &track, &GeotagOptions::default()).expect("plan");
         assert_eq!(plans.len(), 1);
         let chosen = &plans[0];
         assert!(chosen.skipped.is_none(), "skipped: {:?}", chosen.skipped);
+        assert_eq!(chosen.capture_time, Some(CaptureTime::Exif(SHUTTER)));
         assert_eq!(chosen.gap_seconds, Some(4), "the later point is nearer");
         assert_eq!(chosen.point.expect("a point").utc, Some(SHUTTER + 4));
-        assert!(chosen.writes());
-        assert!(
-            plan(&[photo], &track, &GeotagOptions::default())
-                .expect("plan")
-                .first()
-                .is_some_and(GeotagPlan::writes)
-        );
+        assert!(chosen.will_write());
     }
 
     #[test]
@@ -519,7 +551,11 @@ mod tests {
 
         let plans = plan(&[photo], &track, &options).expect("plan");
         let decision = plans.first().expect("one plan");
-        assert!(!decision.writes(), "an over-gap photo must not be written");
+        assert!(
+            !decision.will_write(),
+            "an over-gap photo must not be written"
+        );
+        assert_eq!(decision.capture_time, Some(CaptureTime::Exif(SHUTTER)));
         assert_eq!(decision.gap_seconds, Some(400), "the gap is still reported");
         let reason = decision.skipped.as_deref().expect("a reason");
         assert!(
@@ -531,13 +567,12 @@ mod tests {
         // is the policy, not a broken match.
         let wider = GeotagOptions {
             max_gap_seconds: 600,
-            ..options
         };
         assert!(
             plan(std::slice::from_ref(&decision.photo), &track, &wider)
                 .expect("plan")
                 .first()
-                .is_some_and(GeotagPlan::writes)
+                .is_some_and(GeotagPlan::will_write)
         );
     }
 
@@ -582,7 +617,7 @@ mod tests {
         )
         .expect("plan");
         let decision = plans.first().expect("one plan");
-        assert!(!decision.writes());
+        assert!(!decision.will_write());
         assert_eq!(decision.gap_seconds, None);
     }
 
@@ -592,18 +627,14 @@ mod tests {
         let dir = TempDir::new("dry");
         let original = photo_taken_at(SHUTTER);
         let photo = dir.photo("dry.jpg", &original);
-        let options = GeotagOptions {
-            dry_run: true,
-            ..GeotagOptions::default()
-        };
-        assert!(!options.writes());
+        let options = GeotagOptions::default();
 
         let plans = plan(std::slice::from_ref(&photo), &track, &options).expect("plan");
-        assert!(plans.first().is_some_and(GeotagPlan::writes));
+        assert!(plans.first().is_some_and(GeotagPlan::will_write));
         assert_eq!(
             std::fs::read(&photo).expect("read back"),
             original,
-            "planning must not touch the photo, in a dry run or otherwise"
+            "planning must not touch the photo"
         );
 
         // And the plan that a dry run showed is the plan a real run applies.
@@ -634,7 +665,11 @@ mod tests {
         )
         .expect("plan");
         let decision = plans.first().expect("one plan");
-        assert!(decision.writes(), "skipped: {:?}", decision.skipped);
+        assert!(decision.will_write(), "skipped: {:?}", decision.skipped);
+        assert_eq!(
+            decision.capture_time,
+            Some(CaptureTime::FileModified(SHUTTER))
+        );
         assert_eq!(decision.gap_seconds, Some(0));
         assert!(apply(&plans).expect("apply").contains(&photo));
     }
@@ -653,23 +688,62 @@ mod tests {
     }
 
     #[test]
-    fn a_non_jpeg_and_a_photo_with_no_time_are_skipped_by_name() {
+    fn a_non_jpeg_and_photos_with_unreadable_capture_time_are_skipped_by_name() {
         let dir = TempDir::new("mixed");
         let png = dir.photo("picture.png", b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR");
+        let corrupt_time = dir.photo(
+            "bad-time.jpg",
+            &fixture::exif_jpeg(ByteOrder::Little, &[], None, Some("not-a-date")),
+        );
+        let pre_epoch_time = dir.photo(
+            "pre-epoch.jpg",
+            &fixture::exif_jpeg(ByteOrder::Little, &[], None, Some("1969:12:31 23:59:59")),
+        );
+        // Set mtime to SHUTTER to prove an out-of-range DateTimeOriginal does
+        // not silently fall back to mtime.
+        set_mtime(&pre_epoch_time, SHUTTER);
         let timed = dir.photo("timed.jpg", &photo_taken_at(SHUTTER));
         let track = track_at(&[SHUTTER]);
 
-        let plans = plan(&[png, timed], &track, &GeotagOptions::default()).expect("plan");
-        assert_eq!(plans.len(), 2);
-        let first = plans.first().expect("the PNG plan");
-        assert!(!first.writes());
-        let reason = first.skipped.as_deref().expect("a reason");
+        let plans = plan(
+            &[png, corrupt_time, pre_epoch_time, timed],
+            &track,
+            &GeotagOptions::default(),
+        )
+        .expect("plan");
+        assert_eq!(plans.len(), 4);
+
+        let png_plan = plans.first().expect("the PNG plan");
+        assert!(!png_plan.will_write());
+        assert_eq!(png_plan.capture_time, None);
+        let reason = png_plan.skipped.as_deref().expect("a reason");
         assert!(
             reason.contains("not a JPEG"),
             "the skip reason must name the format: {reason}"
         );
-        // One bad file does not stop the folder: the good photo is still planned.
-        assert!(plans.get(1).is_some_and(GeotagPlan::writes));
+
+        let corrupt_plan = plans.get(1).expect("the corrupt-time plan");
+        assert!(!corrupt_plan.will_write());
+        assert_eq!(corrupt_plan.capture_time, None);
+        let reason = corrupt_plan.skipped.as_deref().expect("a reason");
+        assert!(
+            reason.contains("Exif could not be read"),
+            "corrupt DateTimeOriginal should be skipped with Exif error: {reason}"
+        );
+
+        let pre_epoch_plan = plans.get(2).expect("the pre-epoch plan");
+        assert!(!pre_epoch_plan.will_write());
+        assert_eq!(pre_epoch_plan.capture_time, None);
+        let reason = pre_epoch_plan.skipped.as_deref().expect("a reason");
+        assert!(
+            reason.contains("Exif could not be read"),
+            "out-of-range DateTimeOriginal must not fall back to mtime: {reason}"
+        );
+
+        // Bad files do not stop the folder: the good photo is still planned.
+        let good_plan = plans.get(3).expect("the timed photo plan");
+        assert!(good_plan.will_write());
+        assert_eq!(good_plan.capture_time, Some(CaptureTime::Exif(SHUTTER)));
     }
 
     #[test]
@@ -682,11 +756,91 @@ mod tests {
     }
 
     #[test]
-    fn the_default_options_ask_for_five_minutes_and_a_real_run() {
+    fn the_default_options_ask_for_five_minutes() {
         let options = GeotagOptions::default();
         assert_eq!(options.max_gap_seconds, 300);
-        assert!(!options.dry_run);
-        assert!(options.writes());
         assert_eq!(DEFAULT_MAX_GAP_SECONDS, 300);
+    }
+
+    #[test]
+    fn replace_file_preserves_target_and_cleans_temp_when_rename_fails() {
+        let dir = TempDir::new("replace-dir");
+        // Renaming a regular file over an existing directory fails on POSIX
+        // (EISDIR); `replace_file` must leave the target untouched and clean up
+        // its sibling temporary file.
+        let target_dir = dir.0.join("not-a-file.jpg");
+        std::fs::create_dir(&target_dir).expect("target directory");
+        let temp = dir.0.join(".not-a-file.jpg.m241-tmp");
+
+        let err = replace_file(&target_dir, b"new photo bytes")
+            .expect_err("replacing a directory must fail");
+        assert!(matches!(err, Error::Io { .. }), "got {err:?}");
+        assert!(target_dir.is_dir(), "target must remain untouched");
+        assert!(
+            !temp.exists(),
+            "temporary file should be cleaned up when original is untouched"
+        );
+    }
+
+    #[test]
+    fn remove_fallback_never_deletes_temp_after_removing_original() {
+        let dir = TempDir::new("replace-preserve");
+        let original = dir.photo("photo.jpg", b"old photo");
+        let temp = dir.photo(".photo.jpg.m241-tmp", b"new rewritten photo");
+
+        let err = replace_with_remove_fallback(&temp, &original, |_from, _to| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "simulated rename failure",
+            ))
+        })
+        .expect_err("second rename failure must return an error");
+
+        assert!(matches!(err, Error::Io { .. }), "got {err:?}");
+        assert!(
+            !original.exists(),
+            "test assumes remove_file removed the original"
+        );
+        assert!(
+            temp.exists(),
+            "temporary photo MUST be preserved when original is already removed"
+        );
+        assert_eq!(
+            std::fs::read(&temp).expect("read preserved temp"),
+            b"new rewritten photo"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains(&temp.display().to_string()),
+            "error must report the preserved temporary path for recovery: {text}"
+        );
+    }
+
+    #[test]
+    fn remove_fallback_replaces_when_second_rename_succeeds() {
+        let dir = TempDir::new("replace-retry");
+        let original = dir.photo("photo.jpg", b"old photo");
+        let temp = dir.photo(".photo.jpg.m241-tmp", b"new rewritten photo");
+        let mut attempts = 0usize;
+
+        replace_with_remove_fallback(&temp, &original, |from, to| {
+            attempts += 1;
+            if attempts == 1 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "simulated Windows rename-over-existing failure",
+                ))
+            } else {
+                std::fs::rename(from, to)
+            }
+        })
+        .expect("second rename succeeds after removing original");
+
+        assert_eq!(attempts, 2);
+        assert!(!temp.exists());
+        assert_eq!(
+            std::fs::read(&original).expect("read replaced photo"),
+            b"new rewritten photo"
+        );
     }
 }

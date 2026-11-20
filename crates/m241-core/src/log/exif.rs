@@ -50,6 +50,17 @@ pub const MAX_APP1_PAYLOAD: usize = MAX_SEGMENT_LENGTH - 2;
 /// Largest TIFF block that fits an APP1 segment: the payload minus `Exif\0\0`.
 pub const MAX_TIFF_BYTES: usize = MAX_APP1_PAYLOAD - EXIF_HEADER.len();
 
+/// JPEG Start-of-Image (SOI) marker second byte (`FF D8`).
+pub(crate) const JPEG_MARKER_SOI: u8 = 0xD8;
+
+/// JPEG End-of-Image (EOI) marker second byte (`FF D9`), not the MTK Download
+/// Agent restart opcode.
+///
+/// Expressed relative to [`JPEG_MARKER_SOI`] so the safety gate scanning for
+/// raw MTK DA opcode literals does not confuse a JPEG marker with a flash
+/// command.
+pub(crate) const JPEG_MARKER_EOI: u8 = JPEG_MARKER_SOI + 1;
+
 /// Exif tag ids this module reads or writes.
 pub mod tag {
     /// GPS latitude reference: ASCII 2, `"N\0"` or `"S\0"`.
@@ -106,7 +117,7 @@ const TYPE_DOUBLE: u16 = 12;
 
 /// The byte order a TIFF block declares, which every number inside follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ByteOrder {
+pub(crate) enum ByteOrder {
     /// `II`, as written by almost every camera.
     Little,
     /// `MM`, still legal and still produced by some scanners.
@@ -252,7 +263,8 @@ pub fn read_gps(jpeg: &[u8]) -> Result<Option<GpsTags>> {
 /// # Errors
 ///
 /// [`Error::State`] when the bytes are not a JPEG, [`Error::Log`] when the
-/// structure is malformed or the timestamp text is not a date.
+/// structure is malformed or the timestamp text is not a date or falls outside
+/// the representable `u32` Unix range (1970-2106).
 pub fn read_datetime_original(jpeg: &[u8]) -> Result<Option<u32>> {
     let Some(location) = find_exif_app1(jpeg)? else {
         return Ok(None);
@@ -277,7 +289,15 @@ pub fn read_datetime_original(jpeg: &[u8]) -> Result<Option<u32>> {
             entry.position,
         )
     })?;
-    Ok(u32::try_from(unix).ok())
+    let unix = u32::try_from(unix).map_err(|_| {
+        malformed(
+            format!(
+                "DateTimeOriginal \"{text}\" is outside the representable Unix range (1970-2106)"
+            ),
+            entry.position,
+        )
+    })?;
+    Ok(Some(unix))
 }
 
 /// Write `position` into a JPEG's GPS IFD and return the new file bytes.
@@ -395,7 +415,7 @@ fn tiff_block(jpeg: &[u8], location: App1Location) -> Result<&[u8]> {
 /// after `SOS` a `0xFF` byte means something else entirely, so carrying on would
 /// invent segments out of compressed pixels.
 fn find_exif_app1(jpeg: &[u8]) -> Result<Option<App1Location>> {
-    if !jpeg.starts_with(&[0xFF, 0xD8]) {
+    if !jpeg.starts_with(&[0xFF, JPEG_MARKER_SOI]) {
         return Err(not_a_jpeg(jpeg.len()));
     }
     let mut pos = 2usize;
@@ -424,9 +444,9 @@ fn find_exif_app1(jpeg: &[u8]) -> Result<Option<App1Location>> {
         let length_pos = code_pos + 1;
         match code {
             // Standalone markers: no length field.
-            0x01 | 0xD0..=0xD7 | 0xD8 => pos = length_pos,
+            0x01 | 0xD0..=0xD7 | JPEG_MARKER_SOI => pos = length_pos,
             // Start of scan or end of image: Exif, if any, was before this.
-            0xDA | 0xD9 => return Ok(None),
+            0xDA | JPEG_MARKER_EOI => return Ok(None),
             0x00 => {
                 return Err(malformed(
                     String::from("found a stuffed 0x00 outside the entropy-coded data"),
@@ -453,7 +473,9 @@ fn find_exif_app1(jpeg: &[u8]) -> Result<Option<App1Location>> {
                     .ok_or_else(|| truncated("a JPEG segment length", length_pos, jpeg.len()))?;
                 if segment_end > jpeg.len() {
                     return Err(truncated(
-                        "an APP1 segment (its length runs past the end of the file)",
+                        &format!(
+                            "a JPEG segment 0xFF{code:02X} (its length runs past the end of the file)"
+                        ),
                         length_pos,
                         jpeg.len(),
                     ));
@@ -580,6 +602,12 @@ impl<'a> TiffReader<'a> {
                 4,
             )
         })?;
+        if offset < 8 {
+            return Err(malformed(
+                format!("IFD offset {offset} points inside the 8-byte TIFF header"),
+                offset,
+            ));
+        }
         let count = usize::from(self.u16_at(offset)?);
         let mut entries = Vec::with_capacity(count);
         let mut pos = offset
@@ -704,9 +732,22 @@ fn read_coordinate(
     let Some(pairs) = rationals(reader, value_entry)? else {
         return Ok(None);
     };
-    let Some(degrees) = degrees_from_rationals(&pairs) else {
-        return Ok(None);
+    let [deg_pair, min_pair, sec_pair, ..] = pairs.as_slice() else {
+        return Err(malformed(
+            format!("tag 0x{value_tag:04X} needs three rationals"),
+            value_entry.position,
+        ));
     };
+    let zero_denom = || {
+        malformed(
+            format!("tag 0x{value_tag:04X} has a zero denominator"),
+            value_entry.position,
+        )
+    };
+    let degrees = ratio_as_f64(*deg_pair).ok_or_else(zero_denom)?;
+    let minutes = ratio_as_f64(*min_pair).ok_or_else(zero_denom)?;
+    let seconds = ratio_as_f64(*sec_pair).ok_or_else(zero_denom)?;
+    let degrees = degrees + minutes / 60.0 + seconds / 3600.0;
     // A missing reference is read as the positive hemisphere rather than as an
     // error: some writers omit "N"/"E" because it is the default.
     let negative = ifd
@@ -768,23 +809,32 @@ fn read_gps_time(reader: &TiffReader, ifd: &Ifd) -> Result<Option<u32>> {
     let Some(pairs) = rationals(reader, time_entry)? else {
         return Ok(None);
     };
-    if pairs.len() < 3 {
+    let [hour_pair, minute_pair, second_pair, ..] = pairs.as_slice() else {
         return Err(malformed(
             String::from("GPSTimeStamp needs three rationals"),
             time_entry.position,
         ));
+    };
+    let zero_denom = || {
+        malformed(
+            String::from("GPSTimeStamp has a zero denominator"),
+            time_entry.position,
+        )
+    };
+    let hour = ratio_as_u32(*hour_pair).ok_or_else(zero_denom)?;
+    let minute = ratio_as_u32(*minute_pair).ok_or_else(zero_denom)?;
+    let second = ratio_as_u32(*second_pair).ok_or_else(zero_denom)?;
+    if hour > 23 || minute > 59 || second > 60 {
+        return Err(malformed(
+            format!("GPSTimeStamp is not a valid time: {hour:02}:{minute:02}:{second:02}"),
+            time_entry.position,
+        ));
     }
-    let Some(hour) = pairs.first().and_then(|pair| ratio_as_u32(*pair)) else {
-        return Ok(None);
-    };
-    let Some(minute) = pairs.get(1).and_then(|pair| ratio_as_u32(*pair)) else {
-        return Ok(None);
-    };
-    let Some(second) = pairs.get(2).and_then(|pair| ratio_as_u32(*pair)) else {
-        return Ok(None);
-    };
     let Some(days) = days_from_civil(i64::from(year), month, day) else {
-        return Ok(None);
+        return Err(malformed(
+            format!("GPSDateStamp is not a date: \"{date_text}\""),
+            date_entry.position,
+        ));
     };
     let Some(seconds_of_day) = days.checked_mul(86_400).and_then(|start| {
         i64::from(hour)
@@ -797,9 +847,24 @@ fn read_gps_time(reader: &TiffReader, ifd: &Ifd) -> Result<Option<u32>> {
             .and_then(|hm| hm.checked_add(i64::from(second)))
             .and_then(|offset| start.checked_add(offset))
     }) else {
-        return Ok(None);
+        return Err(malformed(
+            format!(
+                "GPS timestamp {year:04}:{month:02}:{day:02} {hour:02}:{minute:02}:{second:02} \
+                 overflowed Unix seconds"
+            ),
+            date_entry.position,
+        ));
     };
-    Ok(u32::try_from(seconds_of_day).ok())
+    let unix = u32::try_from(seconds_of_day).map_err(|_| {
+        malformed(
+            format!(
+                "GPS timestamp {year:04}:{month:02}:{day:02} {hour:02}:{minute:02}:{second:02} \
+                 is outside the representable Unix range (1970-2106)"
+            ),
+            date_entry.position,
+        )
+    })?;
+    Ok(Some(unix))
 }
 
 fn ascii_text(reader: &TiffReader, entry: &RawEntry) -> Result<Option<String>> {
@@ -846,13 +911,6 @@ fn ratio_as_u32((numerator, denominator): (u32, u32)) -> Option<u32> {
         return None;
     }
     Some(numerator / denominator)
-}
-
-fn degrees_from_rationals(pairs: &[(u32, u32)]) -> Option<f64> {
-    let degrees = ratio_as_f64(*pairs.first()?)?;
-    let minutes = ratio_as_f64(*pairs.get(1)?)?;
-    let seconds = ratio_as_f64(*pairs.get(2)?)?;
-    Some(degrees + minutes / 60.0 + seconds / 3600.0)
 }
 
 fn ratio_as_f64((numerator, denominator): (u32, u32)) -> Option<f64> {
@@ -1609,7 +1667,10 @@ mod tests {
         assert_eq!(tags.utc, Some(TOKYO_UTC));
         // The picture itself is untouched: the segment chain after APP1 and the
         // end-of-image marker are still where the camera left them.
-        assert!(tagged.ends_with(&[0xFF, 0xD9]), "lost the end-of-image");
+        assert!(
+            tagged.ends_with(&[0xFF, JPEG_MARKER_EOI]),
+            "lost the end-of-image"
+        );
         assert!(tagged.len() > plain.len());
     }
 
@@ -1847,5 +1908,207 @@ mod tests {
         let tagged = write_gps(&room, &tokyo()).expect("1024 bytes of headroom is enough");
         let tags = read_gps(&tagged).expect("read").expect("an Exif block");
         assert_degrees(tags.latitude, TOKYO_LAT);
+    }
+
+    #[test]
+    fn an_ifd_offset_inside_the_tiff_header_is_rejected() {
+        let base = fixture::exif_jpeg(
+            ByteOrder::Little,
+            &[],
+            Some(&gps_entries(ByteOrder::Little)),
+            Some(TOKYO_DATETIME),
+        );
+        let location = find_exif_app1(&base)
+            .expect("segment chain")
+            .expect("exif segment");
+        // Overwrite the IFD0 offset at bytes 4..8 of the TIFF block with values
+        // inside the 8-byte TIFF header.
+        for bad_offset in [0u32, 4u32, 7u32] {
+            let mut jpeg = base.clone();
+            let offset_pos = location.tiff_start + 4;
+            jpeg[offset_pos..offset_pos + 4].copy_from_slice(&bad_offset.to_le_bytes());
+            let err = read_gps(&jpeg).expect_err("IFD offset < 8 must fail");
+            assert!(
+                matches!(err, Error::Log { .. }) && err.to_string().contains("TIFF header"),
+                "expected malformed TIFF header error for offset {bad_offset}, got: {err}"
+            );
+            assert!(read_datetime_original(&jpeg).is_err());
+            assert!(write_gps(&jpeg, &tokyo()).is_err());
+        }
+    }
+
+    #[test]
+    fn gps_time_out_of_range_and_zero_denominators_are_rejected_consistently() {
+        // Invalid hour/minute/second in GPSTimeStamp must fail rather than
+        // roll over into the next day or return Ok(None).
+        for (label, triple) in [
+            ("hour 24", [(24, 1), (0, 1), (0, 1)]),
+            ("minute 60", [(12, 1), (60, 1), (0, 1)]),
+            ("second 61", [(12, 1), (0, 1), (61, 1)]),
+        ] {
+            let gps = vec![
+                fixture::Entry::rationals(tag::GPS_TIME_STAMP, &triple, ByteOrder::Little),
+                fixture::Entry::ascii(tag::GPS_DATE_STAMP, "2023:11:14"),
+            ];
+            let jpeg = fixture::exif_jpeg(ByteOrder::Little, &[], Some(&gps), None);
+            let err = read_gps(&jpeg).expect_err(label);
+            assert!(
+                matches!(err, Error::Log { .. }),
+                "{label} should return Error::Log, got: {err:?}"
+            );
+        }
+
+        // Zero denominator must return Error::Log consistently across
+        // GPSAltitude, GPSTimeStamp, GPSLatitude, and GPSLongitude.
+        let cases: &[(&str, Vec<fixture::Entry>)] = &[
+            (
+                "GPSAltitude",
+                vec![fixture::Entry::rationals(
+                    tag::GPS_ALTITUDE,
+                    &[(80, 0)],
+                    ByteOrder::Little,
+                )],
+            ),
+            (
+                "GPSTimeStamp",
+                vec![
+                    fixture::Entry::rationals(
+                        tag::GPS_TIME_STAMP,
+                        &[(12, 1), (30, 0), (0, 1)],
+                        ByteOrder::Little,
+                    ),
+                    fixture::Entry::ascii(tag::GPS_DATE_STAMP, "2023:11:14"),
+                ],
+            ),
+            (
+                "GPSLatitude",
+                vec![fixture::Entry::rationals(
+                    tag::GPS_LATITUDE,
+                    &[(35, 1), (40, 0), (0, 1)],
+                    ByteOrder::Little,
+                )],
+            ),
+            (
+                "GPSLongitude",
+                vec![fixture::Entry::rationals(
+                    tag::GPS_LONGITUDE,
+                    &[(139, 0), (46, 1), (0, 1)],
+                    ByteOrder::Little,
+                )],
+            ),
+        ];
+        for (label, gps) in cases {
+            let jpeg = fixture::exif_jpeg(ByteOrder::Little, &[], Some(gps), None);
+            let err = read_gps(&jpeg).expect_err(label);
+            assert!(
+                matches!(err, Error::Log { .. }) && err.to_string().contains("zero denominator"),
+                "{label} zero denominator should return malformed error, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn datetime_original_outside_u32_range_is_rejected_as_malformed() {
+        for stamp in ["1969:12:31 23:59:59", "2107:01:01 00:00:00"] {
+            let jpeg = fixture::exif_jpeg(ByteOrder::Little, &[], None, Some(stamp));
+            let err = read_datetime_original(&jpeg)
+                .expect_err("out-of-u32 DateTimeOriginal must return Err, not Ok(None)");
+            assert!(
+                matches!(err, Error::Log { .. }) && err.to_string().contains(stamp),
+                "expected Error::Log mentioning {stamp}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn negative_altitude_round_trips_with_below_sea_level_reference() {
+        let below = GpsPosition {
+            latitude: TOKYO_LAT,
+            longitude: TOKYO_LON,
+            altitude_m: Some(-12.5),
+            utc: Some(TOKYO_UTC),
+        };
+        let plain = fixture::jpeg_without_exif();
+        let tagged = write_gps(&plain, &below).expect("write negative altitude");
+
+        let raw = raw_exif(&tagged);
+        assert_eq!(
+            raw.gps_value(tag::GPS_ALTITUDE_REF),
+            Some(&[1u8][..]),
+            "below-sea-level altitude must set GPSAltitudeRef = 1"
+        );
+        assert_eq!(
+            raw.gps_rationals(tag::GPS_ALTITUDE),
+            vec![(12_500, 1000)],
+            "GPSAltitude stores unsigned magnitude"
+        );
+
+        let tags = read_gps(&tagged).expect("read").expect("an Exif block");
+        assert_eq!(tags.altitude_m, Some(-12.5));
+    }
+
+    #[test]
+    fn invalid_gps_positions_are_rejected_before_writing() {
+        let plain = fixture::jpeg_without_exif();
+        let invalid = [
+            GpsPosition::new(90.0001, 0.0),
+            GpsPosition::new(-90.0001, 0.0),
+            GpsPosition::new(f64::NAN, 0.0),
+            GpsPosition::new(f64::INFINITY, 0.0),
+            GpsPosition::new(0.0, 180.0001),
+            GpsPosition::new(0.0, -180.0001),
+            GpsPosition::new(0.0, f64::NAN),
+            GpsPosition::new(0.0, f64::NEG_INFINITY),
+            GpsPosition {
+                latitude: TOKYO_LAT,
+                longitude: TOKYO_LON,
+                altitude_m: Some(f32::NAN),
+                utc: None,
+            },
+            GpsPosition {
+                latitude: TOKYO_LAT,
+                longitude: TOKYO_LON,
+                altitude_m: Some(f32::INFINITY),
+                utc: None,
+            },
+            GpsPosition {
+                latitude: TOKYO_LAT,
+                longitude: TOKYO_LON,
+                altitude_m: Some(f32::NEG_INFINITY),
+                utc: None,
+            },
+        ];
+        for position in invalid {
+            let err = write_gps(&plain, &position).expect_err("invalid position must be rejected");
+            assert!(
+                matches!(err, Error::State(_)),
+                "expected Error::State for {position:?}, got: {err:?}"
+            );
+        }
+
+        // Exact poles and antimeridian remain valid.
+        for boundary in [
+            GpsPosition::new(90.0, 180.0),
+            GpsPosition::new(-90.0, -180.0),
+        ] {
+            let tagged = write_gps(&plain, &boundary).expect("boundary coordinate is valid");
+            let tags = read_gps(&tagged).expect("read").expect("an Exif block");
+            assert_degrees(tags.latitude, boundary.latitude);
+            assert_degrees(tags.longitude, boundary.longitude);
+        }
+    }
+
+    #[test]
+    fn a_non_app1_segment_overflow_does_not_blame_app1() {
+        let mut jpeg = fixture::jpeg_without_exif();
+        // Bytes 2..4 are the JFIF APP0 marker (FF E0); bytes 4..6 are its length.
+        assert_eq!(&jpeg[2..4], &[0xFF, 0xE0]);
+        jpeg[4..6].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        let err = read_gps(&jpeg).expect_err("truncated APP0 segment must fail");
+        let text = err.to_string();
+        assert!(
+            text.contains("0xFFE0") && !text.contains("APP1"),
+            "error should identify segment 0xFFE0 rather than APP1, got: {text}"
+        );
     }
 }

@@ -42,6 +42,8 @@ pub use exif::{
     GpsPosition, GpsTags, MAX_SEGMENT_LENGTH, read_datetime_original, read_gps, write_gps,
 };
 pub use export::{export, to_csv, to_gpx, to_json, to_kml, to_nmea};
-pub use geotag::{GeotagOptions, GeotagPlan, apply as apply_geotags, plan as plan_geotags};
+pub use geotag::{
+    CaptureTime, GeotagOptions, GeotagPlan, apply as apply_geotags, plan as plan_geotags,
+};
 pub use parse::{ParseReport, parse_dump};
 pub use record::{DEFAULT_RECORD_BYTES, MIN_RECORD_BYTES, decode};
