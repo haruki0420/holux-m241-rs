@@ -3,24 +3,26 @@
 //! `eframe` 0.37 hands the app a `Ui` rather than a bare `Context`, so panels are
 //! added to that `Ui` with [`egui::Panel`]. The nesting order matters: panels are
 //! added outermost first and the central panel last.
+//!
+//! The shell owns the three screens' state, and each screen owns its own fields.
+//! That split is what lets a screen be tested with `Screen::ui` directly instead of
+//! through the whole application, and it is why the dispatch below takes `&mut` per
+//! screen rather than one big state struct passed by name.
 
+use crate::screens::connect::ConnectScreen;
+use crate::screens::firmware::FirmwareScreen;
+use crate::screens::log::LogScreen;
 use crate::screens::{self, Screen};
-use crate::theme::{self, space};
+use crate::theme::{self, size, space};
 use crate::widgets::rail;
 
-/// Application state. Deliberately small: the shell owns navigation only, and
-/// each screen owns its own state so a screen can be reviewed in isolation.
-#[derive(Debug)]
+/// Application state: the selected screen and the three screens' own state.
+#[derive(Debug, Default)]
 pub struct App {
     current: Screen,
-}
-
-impl Default for App {
-    fn default() -> Self {
-        Self {
-            current: Screen::Connect,
-        }
-    }
+    connect: ConnectScreen,
+    log: LogScreen,
+    firmware: FirmwareScreen,
 }
 
 impl App {
@@ -34,6 +36,24 @@ impl App {
     /// [`crate::widgets::rail::rail`].
     pub fn select(&mut self, screen: Screen) {
         self.current = screen;
+    }
+
+    /// The Connect screen's state, for a caller that has just read a device.
+    #[must_use]
+    pub fn connect_mut(&mut self) -> &mut ConnectScreen {
+        &mut self.connect
+    }
+
+    /// The Log screen's state, for a caller that has just downloaded a log.
+    #[must_use]
+    pub fn log_mut(&mut self) -> &mut LogScreen {
+        &mut self.log
+    }
+
+    /// The Firmware screen's state, for a caller that has just dumped an image.
+    #[must_use]
+    pub fn firmware_mut(&mut self) -> &mut FirmwareScreen {
+        &mut self.firmware
     }
 
     /// Draw the whole shell into `ui`.
@@ -53,14 +73,14 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("Holux M-241")
-                            .size(20.0)
+                            .size(size::TITLE)
                             .color(theme::INK)
                             .strong(),
                     );
                     ui.add_space(space::M);
                     ui.label(
                         egui::RichText::new("ファームの日付が 19.6 年ずれています")
-                            .size(13.0)
+                            .size(size::UI)
                             .color(theme::MUTE),
                     );
                 });
@@ -78,14 +98,21 @@ impl App {
                 }
             });
 
+        // Copied out of `self` before the closure: a `&mut` to one screen field and
+        // a borrow of `self.current` cannot coexist inside it.
+        let current = self.current;
+        let connect = &mut self.connect;
+        let log = &mut self.log;
+        let firmware = &mut self.firmware;
+
         egui::CentralPanel::no_frame().show(ui, |ui| {
             egui::Frame::new()
                 .fill(theme::GROUND)
                 .inner_margin(space::XL)
-                .show(ui, |ui| match self.current {
-                    Screen::Connect => screens::connect::ui(ui),
-                    Screen::Log => screens::log::ui(ui),
-                    Screen::Firmware => screens::firmware::ui(ui),
+                .show(ui, |ui| match current {
+                    Screen::Connect => connect.ui(ui),
+                    Screen::Log => log.ui(ui),
+                    Screen::Firmware => firmware.ui(ui),
                     Screen::Settings => screens::settings::ui(ui),
                 });
         });
@@ -95,5 +122,28 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.draw(ui);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_shell_starts_on_connect() {
+        // Every session starts by asking "is the device there"; landing anywhere
+        // else would put a destructive screen one click from a cold start.
+        assert_eq!(App::default().current(), Screen::Connect);
+    }
+
+    #[test]
+    fn each_screen_can_reach_its_own_state() {
+        let mut app = App::default();
+        // The accessors exist so a future session layer can fill one screen
+        // without knowing the shell's fields; touching all three proves they are
+        // wired to distinct state rather than to one shared placeholder.
+        let _connect = app.connect_mut();
+        let _log = app.log_mut();
+        let _firmware = app.firmware_mut();
     }
 }
