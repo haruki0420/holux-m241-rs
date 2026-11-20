@@ -22,8 +22,10 @@ pub mod da;
 pub mod frame;
 pub mod pmtk;
 pub mod port;
+pub mod simulator;
 
 pub use brom::{BASE_ADDR_DA, BASE_ADDR_FIRMWARE, MtkBootRom};
 pub use da::DownloadAgent;
 pub use frame::{checksum_xor16, reverse_words32, swap_pairs};
+pub use pmtk::{PmtkClient, StreamState};
 pub use port::Port;
