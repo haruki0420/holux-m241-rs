@@ -1,0 +1,19 @@
+[package]
+name = "m241-core"
+description = "Protocol, firmware and log handling for the Holux M-241 GPS logger"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serialport.workspace = true
+
+# serde / serde_json / tracing return when the profile database and the
+# structured output land. Leaving them declared now only produces warnings.
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "m241-gui"
+description = "Desktop UI for the Holux M-241"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "m241-gui"
+path = "src/main.rs"
+
+[dependencies]
+egui.workspace = true
+eframe.workspace = true
+
+# m241-core joins when the Connect screen reads the device, and walkers when the
+# Log screen draws the map.
+
+[lints]
+workspace = true

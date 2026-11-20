@@ -1,0 +1,26 @@
+/target/
+**/*.rs.bk
+*.pdb
+.DS_Store
+
+# Vendor drops and device data are never committed. See docs/dev/02-provenance.md.
+/holux/
+/vendor/
+/backup/
+/backups/
+/*.bin
+/*.dll
+/*.exe
+/*.zip
+/DA_v3.8.*
+
+# Device captures can contain the user's real coordinates.
+/captures/
+*.nmea
+*.dump
+
+# Local analysis scratch
+/_scratch/
+/.inbox/
+/.cargo-home/
+/.rustup-home/

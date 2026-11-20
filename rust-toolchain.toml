@@ -1,0 +1,4 @@
+# egui 0.37 needs 1.95, and the format layer is stable well past 1.85.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
