@@ -234,9 +234,13 @@ fn tiff(
     out.extend_from_slice(&order.u32_bytes(u32::try_from(ifd0_offset).expect("fits")));
     emit_ifd(&mut out, order, &ifd0);
     debug_assert_eq!(out.len(), gps_offset, "the GPS IFD offset was miscounted");
-    emit_ifd(&mut out, order, &gps_placed);
-    debug_assert_eq!(out.len(), exif_offset, "the Exif IFD offset was miscounted");
-    emit_ifd(&mut out, order, &exif_placed);
+    if has_gps {
+        emit_ifd(&mut out, order, &gps_placed);
+    }
+    if datetime.is_some() {
+        debug_assert_eq!(out.len(), exif_offset, "the Exif IFD offset was miscounted");
+        emit_ifd(&mut out, order, &exif_placed);
+    }
     for (offset, payload) in values {
         while out.len() < offset {
             out.push(0);

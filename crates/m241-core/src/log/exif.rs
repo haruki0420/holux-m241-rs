@@ -1475,11 +1475,7 @@ mod tests {
             ),
             fixture::Entry::byte(tag::GPS_ALTITUDE_REF, 0),
             fixture::Entry::rationals(tag::GPS_ALTITUDE, &[(80_000, 1000)], order),
-            fixture::Entry::rationals(
-                tag::GPS_TIME_STAMP,
-                &[(22, 1), (13, 1), (20, 1)],
-                order,
-            ),
+            fixture::Entry::rationals(tag::GPS_TIME_STAMP, &[(22, 1), (13, 1), (20, 1)], order),
             fixture::Entry::ascii(tag::GPS_DATE_STAMP, "2023:11:14"),
         ]
     }
@@ -1512,7 +1508,12 @@ mod tests {
         let collect = |ifd: &Ifd| -> Vec<(u16, Vec<u8>)> {
             ifd.entries
                 .iter()
-                .map(|entry| (entry.tag, reader.value_bytes(entry).expect("a readable value")))
+                .map(|entry| {
+                    (
+                        entry.tag,
+                        reader.value_bytes(entry).expect("a readable value"),
+                    )
+                })
                 .collect()
         };
         let gps = ifd0
@@ -1568,17 +1569,17 @@ mod tests {
                 .0
                 .iter()
                 .map(|&[a, b, c, d, e, f, g, h]| {
-                    (
-                        self.order.u32([a, b, c, d]),
-                        self.order.u32([e, f, g, h]),
-                    )
+                    (self.order.u32([a, b, c, d]), self.order.u32([e, f, g, h]))
                 })
                 .collect()
         }
     }
 
     fn ascii_text_of(bytes: &[u8]) -> String {
-        let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
         String::from_utf8_lossy(bytes.get(..end).unwrap_or_default())
             .trim_end()
             .to_owned()
@@ -1619,12 +1620,7 @@ mod tests {
         // both exactly as they were.
         gps.push(fixture::Entry::ascii(0x0012, "WGS-84"));
         let artist = [fixture::Entry::ascii(0x013B, "Test Camera")];
-        let jpeg = fixture::exif_jpeg(
-            ByteOrder::Little,
-            &artist,
-            Some(&gps),
-            Some(TOKYO_DATETIME),
-        );
+        let jpeg = fixture::exif_jpeg(ByteOrder::Little, &artist, Some(&gps), Some(TOKYO_DATETIME));
         let before = exif_tiff(&jpeg);
 
         let moved = GpsPosition {
@@ -1649,13 +1645,16 @@ mod tests {
         );
         assert_eq!(raw.gps_text(0x0012).as_deref(), Some("WGS-84"));
         assert_eq!(raw.ifd0_text(0x013B).as_deref(), Some("Test Camera"));
-        // Appending, not rebuilding: every byte the file already had is still a
-        // prefix of the new block.
+        // Appending, not rebuilding: every byte of the old block is still
+        // there, apart from the header's IFD0 pointer, which is the one thing a
+        // rewrite exists to change.
         let after = exif_tiff(&tagged);
-        assert!(
-            after.starts_with(&before),
+        assert_eq!(
+            after.get(8..before.len()),
+            before.get(8..),
             "the rewrite moved bytes the old block referenced"
         );
+        assert!(after.len() > before.len(), "nothing was appended");
         // The capture time lives in the Exif sub-IFD, which was not touched.
         assert_eq!(
             read_datetime_original(&tagged).expect("read"),
@@ -1690,9 +1689,15 @@ mod tests {
             Some(&gps_entries(ByteOrder::Little)),
             Some(TOKYO_DATETIME),
         );
-        // Cut points: inside the SOI, inside the APP1 length field, inside the
-        // TIFF header, inside the IFD, and inside the last segment.
-        for cut in [1usize, 3, 9, 24, 40, jpeg.len() - 4] {
+        let location = find_exif_app1(&jpeg)
+            .expect("segment chain")
+            .expect("exif segment");
+        // Cut points inside everything this module has to read: the SOI, the
+        // APP1 length field, the TIFF header, the IFDs, and the last byte of the
+        // Exif segment. A cut after it leaves the Exif block intact, which is a
+        // damaged *picture* rather than a damaged block, and is not this
+        // module's to refuse.
+        for cut in [1usize, 3, 9, 24, 40, location.start + 2, location.end - 1] {
             let truncated = jpeg.get(..cut).expect("a cut inside the JPEG");
             assert!(
                 read_gps(truncated).is_err(),
@@ -1710,8 +1715,7 @@ mod tests {
             .expect("segment chain")
             .expect("exif segment");
         // The APP1 length field sits just past the 0xFF 0xE1 pair.
-        liar[location.start + 2..location.start + 4]
-            .copy_from_slice(&0xFFFFu16.to_be_bytes());
+        liar[location.start + 2..location.start + 4].copy_from_slice(&0xFFFFu16.to_be_bytes());
         assert!(read_gps(&liar).is_err());
     }
 
@@ -1814,7 +1818,10 @@ mod tests {
 
         let tags = read_gps(&jpeg).expect("read").expect("an Exif block");
         let expected = parse_datetime_text("2023:11:14 22:13:12").expect("a known date");
-        assert_eq!(tags.utc, Some(u32::try_from(expected).expect("a Unix time")));
+        assert_eq!(
+            tags.utc,
+            Some(u32::try_from(expected).expect("a Unix time"))
+        );
     }
 
     #[test]
