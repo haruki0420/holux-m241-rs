@@ -211,8 +211,8 @@ impl FakeDevice {
     /// what makes `sync()` work here as well.
     ///
     /// Tests that are about the frames themselves use this instead of replaying
-    /// the entry sequence; [`tests::the_bootrom_sync_gets_the_measured_replies_through_the_real_client`]
-    /// covers that sequence through the real client.
+    /// the entry sequence; the entry sequence itself is covered by a test that
+    /// runs the real client against this simulator.
     #[must_use]
     pub fn in_bootrom(mut self) -> Self {
         self.streaming = false;
