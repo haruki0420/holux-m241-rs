@@ -1933,6 +1933,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "m241-core",
+ "m241-flash",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1943,6 +1944,13 @@ version = "0.1.0"
 dependencies = [
  "serialport",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "m241-flash"
+version = "0.1.0"
+dependencies = [
+ "m241-core",
 ]
 
 [[package]]

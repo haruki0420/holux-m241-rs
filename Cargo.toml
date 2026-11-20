@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/m241-core", "crates/m241-cli", "crates/m241-gui"]
+members = [
+    "crates/m241-core",
+    "crates/m241-flash",
+    "crates/m241-cli",
+    "crates/m241-gui",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,6 +21,10 @@ repository = "https://github.com/haruki0420/holux-m241-rs"
 # tiles) is a separate change because it needs the network at runtime.
 [workspace.dependencies]
 m241-core = { path = "crates/m241-core" }
+# The write path is a separate crate on purpose: a binary that only reads must
+# not be able to link it. See `crates/m241-flash/src/lib.rs` and
+# `tools/check_safety.py`.
+m241-flash = { path = "crates/m241-flash" }
 thiserror = "2"
 serialport = "4"
 egui = "0.37"

@@ -14,6 +14,12 @@ path = "src/main.rs"
 
 [dependencies]
 m241-core.workspace = true
+# `fw flash` and `log erase` are the commands that write to the device, and they
+# are the reason the CLI depends on the write crate as well as on `m241-core`.
+# Both dependencies are unconditional because this binary ships those
+# subcommands: the read-only surface is `m241-core` itself, and a tool that only
+# needs it does not link this binary.
+m241-flash.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
