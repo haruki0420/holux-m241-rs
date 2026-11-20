@@ -42,6 +42,8 @@ jobs:
         run: python3 tools/check_docs.py
       - name: Design invariants
         run: python3 tools/check_design.py
+      - name: Safety invariants
+        run: python3 tools/check_safety.py
 
   test:
     name: test (${{ matrix.os }})

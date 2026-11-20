@@ -259,7 +259,7 @@ Why bother: the agent that made the mistake reads its own fix with the same
 assumption it read the original. A different agent reading the same diff with
 the same instructions does not.
 
-Every stage ends with `./tools/check.sh` at 5/5.
+Every stage ends with `./tools/check.sh` at 6/6.
 
 ## 9. What went wrong here
 
@@ -272,11 +272,11 @@ is evidence for §8, not general advice.
 **Symptom.** `fix/fix-core`, `fix/fix-gui`, `fix/fix-cli` and `fix/fix-docs`
 went into `main` (`52f023e`) while the verification column of
 `docs/dev/10-review-log.md` still read 未検証 for all four. The merge commit
-itself says "Gates 5/5 after the merge".
+itself says "Gates 6/6 after the merge".
 
 **Cause.** A green `./tools/check.sh` was read as "the fixes are good".
 
-**Check.** 5/5 proves the tree is not broken; it does not prove the findings are
+**Check.** 6/6 proves the tree is not broken; it does not prove the findings are
 resolved. A gate cannot see a finding that was never fixed — the test for it
 does not exist, so nothing fails. No merge until the verification column is
 filled: 未検証 is a stop sign, not a default.
@@ -347,10 +347,10 @@ deleted. Dev builds here answer "does it compile and pass", nothing else.
 **Symptom.** On `feat/exif2`, 3 clippy warnings and zero tests remained while
 the owner twice reported the work complete.
 
-**Cause.** Completion was self-assessed. The stated conditions — 5/5 and at
+**Cause.** Completion was self-assessed. The stated conditions — 6/6 and at
 least one test — were never checked against the artifact.
 
 **Check.** Count what the report claims. "Tests added" means
-`grep -c '#\[test\]'` finds them in the diff. "5/5" means `./tools/check.sh`
+`grep -c '#\[test\]'` finds them in the diff. "6/6" means `./tools/check.sh`
 was run by the reader, not quoted from the report. A report is a claim; the
 artifact is the evidence.

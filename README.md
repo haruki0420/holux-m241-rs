@@ -34,7 +34,7 @@ GUI（`m241-gui`）は同じ仕事を 4 画面（接続 / ログ / ファーム 
 ```bash
 cargo build --release
 cargo test --workspace
-./tools/check.sh          # fmt / clippy / test / docs リンク / design の 5 ゲート
+./tools/check.sh          # fmt / clippy / test / docs リンク / design / safety の 6 ゲート
 ```
 
 Rust 1.95 以降が必要（`Cargo.toml` の `rust-version`）。端末に触れるのは `serialport`

@@ -9,7 +9,7 @@
 - `m241-core`: `frame` / `port` / `brom` / `error` / `firmware::image` / `log::record`
 - `m241-cli`: サブコマンド体系（`device|fw|log|nmea`）と終了コード対応
 - `m241-gui`: レール（階段状タブ）、トークン、ヘッドレス描画テスト
-- CI 3 OS、`./tools/check.sh` 5 ゲート
+- CI 3 OS、`./tools/check.sh` 6 ゲート
 
 ## 並列に走らせる 6 本
 
@@ -30,7 +30,7 @@
 
 ## 共通の決まり
 
-- `./tools/check.sh` が 5/5 でない状態でコミットしない
+- `./tools/check.sh` が 6/6 でない状態でコミットしない
 - `clippy::unwrap_used` / `expect_used` / `panic` / `unsafe` はテスト以外で禁止
 - コメントは「何を」ではなく「なぜ」。特に安全ゲートの理由は消さない
 - 実機で見ていないものは 未検証 と書く。`docs/dev/05-verification.md` が唯一の昇格先
