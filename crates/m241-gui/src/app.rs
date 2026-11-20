@@ -87,9 +87,11 @@ impl App {
             });
 
         // The rail is a fixed-width left panel whose contents are custom painted,
-        // because the staircase is not a widget egui has.
+        // because the staircase is not a widget egui has. The width is pinned
+        // rather than content-sized: otherwise the current screen's deepest tab
+        // decides the rail width, and the heading shifts sideways when you navigate.
         egui::Panel::left("rail")
-            .resizable(false)
+            .exact_size(rail::WIDTH)
             .show_separator_line(false)
             .frame(egui::Frame::new().fill(theme::RAIL))
             .show(ui, |ui| {
