@@ -15,6 +15,8 @@ use std::fmt;
 use m241_core::protocol::port::Transport;
 use m241_core::protocol::{PmtkClient, Port};
 
+use crate::Timings;
+
 /// The USB-serial bridges an M-241 cable can appear as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cable {
@@ -79,7 +81,8 @@ pub fn identify(
         (Some(0x10C4), _) => Some(Cable::Cp210x),
         (Some(0x067B), Some(0x2303)) => Some(Cable::Pl2303),
         (Some(0x0403), _) => Some(Cable::Ftdi),
-        (Some(0x1A86), Some(0x7523)) => Some(Cable::Ch340),
+        // WCH CH340 (`0x7523`) and CH341 in serial mode (`0x5523`).
+        (Some(0x1A86), Some(0x7523 | 0x5523)) => Some(Cable::Ch340),
         _ => None,
     };
     if let Some(cable) = cable {
@@ -259,14 +262,20 @@ pub fn resolve(links: &dyn Links, spec: &str) -> m241_core::Result<String> {
     }
 }
 
-/// Open the identity channel to a unit: NMEA baud, PMTK client.
+/// Open the PMTK channel to a unit at NMEA baud with the session's timeouts.
 ///
 /// # Errors
 ///
 /// [`m241_core::Error::Port`] when the port cannot be opened.
-pub fn open_pmtk(links: &dyn Links, name: &str) -> m241_core::Result<PmtkClient<Opened>> {
+pub(crate) fn open_pmtk(
+    links: &dyn Links,
+    name: &str,
+    timings: Timings,
+) -> m241_core::Result<PmtkClient<Opened>> {
     let transport = links.open(name, m241_core::protocol::pmtk::NMEA_BAUD)?;
-    Ok(PmtkClient::new(transport))
+    Ok(PmtkClient::new(transport)
+        .with_reply_timeout(timings.reply)
+        .with_stream_window(timings.stream))
 }
 
 #[cfg(test)]
@@ -300,18 +309,23 @@ mod tests {
             identify(Some(0x1A86), Some(0x7523), None, None).0,
             Some(Cable::Ch340)
         );
+        assert_eq!(
+            identify(Some(0x1A86), Some(0x5523), None, None).0,
+            Some(Cable::Ch340)
+        );
     }
 
     #[test]
     fn a_bridge_with_another_pid_is_not_mistaken_for_a_cable() {
         // 0x067B is Prolific, but 0x2303 is the PL2303 converter; another pid
-        // on the same vendor is a different product.
+        // on the same vendor is a different product. Same for WCH outside
+        // CH340/CH341 serial pids.
         assert_eq!(
             identify(Some(0x067B), Some(0x0001), None, None),
             (None, false)
         );
         assert_eq!(
-            identify(Some(0x1A86), Some(0x5523), None, None),
+            identify(Some(0x1A86), Some(0x0001), None, None),
             (None, false)
         );
     }
@@ -351,5 +365,37 @@ mod tests {
             .map(|cable| cable.label())
             .collect();
         assert_eq!(labels, vec!["CP210x", "PL2303", "FTDI", "CH340"]);
+    }
+
+    #[test]
+    fn an_explicit_port_name_bypasses_auto_discovery() {
+        let empty = crate::testing::FakePorts::empty();
+        assert_eq!(
+            resolve(&empty, "/dev/ttyUSB0").expect("explicit"),
+            "/dev/ttyUSB0"
+        );
+        assert_eq!(resolve(&empty, " COM3 ").expect("trimmed"), "COM3");
+
+        let ambiguous = crate::testing::FakePorts::with_ports(vec![
+            PortEntry {
+                name: String::from("/dev/ttyUSB0"),
+                cable: Some(Cable::Cp210x),
+                likely: true,
+                description: None,
+            },
+            PortEntry {
+                name: String::from("/dev/ttyUSB1"),
+                cable: Some(Cable::Cp210x),
+                likely: true,
+                description: None,
+            },
+        ]);
+        assert_eq!(
+            resolve(&ambiguous, "/dev/ttyUSB1").expect("explicit beats ambiguity"),
+            "/dev/ttyUSB1"
+        );
+        assert!(resolve(&ambiguous, "auto").is_err());
+        assert!(resolve(&ambiguous, "AUTO").is_err());
+        assert!(resolve(&ambiguous, "").is_err());
     }
 }

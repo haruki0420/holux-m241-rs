@@ -2,8 +2,8 @@
 //!
 //! The binary in `main.rs` only parses the arguments, runs one command and turns
 //! the result into an exit code. Everything else lives here, in modules that can
-//! be tested without a terminal and — through the [`link::Links`] seam — without
-//! a serial port.
+//! be tested without a terminal and — through the internal `link::Links` seam —
+//! without a serial port.
 //!
 //! ```text
 //!   cli      the argument grammar
@@ -19,7 +19,7 @@
 //!
 //! Machine output goes to stdout; progress and warnings go to stderr. Exit codes
 //! are documented in `docs/reference/02-cli.md` and map one-to-one onto
-//! [`exit::exit_code_for`].
+//! [`exit::exit_code_of`].
 
 // A CLI's whole job is to print. The lint that forbids `println!` exists to stop
 // library code from doing it; here it is the interface.
@@ -34,16 +34,16 @@
     )
 )]
 
-pub mod cal;
-pub mod cli;
-pub mod device;
+mod cal;
+mod cli;
+mod device;
 pub mod exit;
-pub mod fileio;
-pub mod fw;
-pub mod link;
-pub mod logcmd;
-pub mod nmea;
-pub mod output;
+mod fileio;
+mod fw;
+mod link;
+mod logcmd;
+mod nmea;
+mod output;
 
 #[cfg(test)]
 // A fixture library: each command's tests take the doubles they need, so a
@@ -56,9 +56,10 @@ use std::time::Duration;
 use m241_core::Result;
 use m241_core::protocol::pmtk::{DEFAULT_REPLY_TIMEOUT, DEFAULT_STREAM_WINDOW};
 
-pub use cli::{Cli, Command, DeviceCommand, FwCommand, LogCommand, NmeaCommand};
-pub use link::{Cable, Links, PortEntry};
-pub use output::Console;
+pub use cli::{Cli, Command};
+pub use exit::CliError;
+pub(crate) use link::Links;
+pub(crate) use output::Console;
 
 /// How long the wire commands wait.
 ///
@@ -67,7 +68,7 @@ pub use output::Console;
 /// Both are exposed so a test can run the same code paths without spending five
 /// seconds proving a timeout.
 #[derive(Debug, Clone, Copy)]
-pub struct Timings {
+pub(crate) struct Timings {
     /// How long one command's direct reply may take.
     pub reply: Duration,
     /// How long the "is NMEA streaming?" probe watches the wire.
@@ -85,6 +86,7 @@ impl Timings {
     }
 
     /// Short enough for a test that is proving a timeout.
+    #[cfg(test)]
     #[must_use]
     pub fn fast() -> Self {
         Self {
@@ -100,18 +102,18 @@ impl Default for Timings {
     }
 }
 
-/// The two prompts a command may need to ask.
+/// Interactive confirmation seam for commands that need user acknowledgement.
 ///
-/// `fw dump` is the only caller today: it stops between the two reads and asks
-/// the user to power-cycle the logger. Making that a seam is what lets the
-/// command be tested without a terminal, and keeps "wait for a human" out of the
-/// command body.
-pub trait Confirm: std::fmt::Debug {
+/// Making confirmation a trait lets commands be tested without a terminal and
+/// keeps "wait for a human" out of the command body.
+pub(crate) trait Confirm: std::fmt::Debug {
     /// Show `message` on stderr and wait for the user to acknowledge it.
     ///
     /// # Errors
     ///
-    /// [`m241_core::Error::Io`] when the terminal cannot be read.
+    /// [`m241_core::Error::Safety`] when standard input is not an interactive
+    /// terminal or reaches EOF before acknowledgement; [`m241_core::Error::Io`]
+    /// when the terminal cannot be read.
     fn pause(&self, message: &str) -> Result<()>;
 }
 
@@ -123,12 +125,12 @@ pub trait Confirm: std::fmt::Debug {
 /// `Debug` bound on every implementation, and a test double has nothing useful
 /// to print.
 #[derive(Clone, Copy)]
-pub struct Session<'a> {
+pub(crate) struct Session<'a> {
     /// The machine's serial ports, or a simulator in a test.
     pub links: &'a dyn Links,
     /// Where results and progress go.
     pub console: &'a dyn Console,
-    /// How the user is asked to power-cycle the logger.
+    /// Interactive confirmation prompt.
     pub confirm: &'a dyn Confirm,
     /// How long the wire commands wait.
     pub timings: Timings,
@@ -147,6 +149,7 @@ impl<'a> Session<'a> {
     }
 
     /// Use different timings.
+    #[cfg(test)]
     #[must_use]
     pub fn with_timings(mut self, timings: Timings) -> Self {
         self.timings = timings;
@@ -162,44 +165,56 @@ impl std::fmt::Debug for Session<'_> {
     }
 }
 
-/// A prompt that reads the terminal, and explains itself when there is not one.
+/// A prompt that reads from an interactive terminal, refusing non-TTY input.
 #[derive(Debug, Default, Clone, Copy)]
-pub struct SystemConfirm;
+pub(crate) struct SystemConfirm;
 
 impl Confirm for SystemConfirm {
     fn pause(&self, message: &str) -> Result<()> {
-        use std::io::{BufRead as _, IsTerminal as _};
+        use std::io::IsTerminal as _;
 
-        eprintln!("{message}");
-        if !std::io::stdin().is_terminal() {
-            // Piped stdin cannot answer, and blocking on a closed pipe would
-            // look like a hang. Say so, then carry on: the read is read-only
-            // either way, and its two passes are still compared.
-            eprintln!(
-                "m241: note: standard input is not a terminal, so the power-cycle prompt was \
-                 not awaited; the second read starts now"
-            );
-            return Ok(());
-        }
-        let mut line = String::new();
-        std::io::stdin()
-            .lock()
-            .read_line(&mut line)
-            .map_err(|source| m241_core::Error::io("<stdin>", source))?;
-        Ok(())
+        let stdin = std::io::stdin();
+        let is_terminal = stdin.is_terminal();
+        pause_reader(message, is_terminal, &mut stdin.lock())
     }
+}
+
+/// Print `message` and await one line from an interactive terminal.
+///
+/// Refuses non-TTY input instead of silently continuing: a command that asks to
+/// pause relies on a human acting before it continues.
+fn pause_reader(message: &str, is_terminal: bool, reader: &mut dyn std::io::BufRead) -> Result<()> {
+    eprintln!("{message}");
+    if !is_terminal {
+        return Err(m241_core::Error::Safety {
+            reason: String::from(
+                "interactive confirmation requires a terminal on standard input; \
+                 re-run this command from an interactive terminal",
+            ),
+        });
+    }
+    let mut line = String::new();
+    let bytes = reader
+        .read_line(&mut line)
+        .map_err(|source| m241_core::Error::io("<stdin>", source))?;
+    if bytes == 0 {
+        return Err(m241_core::Error::Safety {
+            reason: String::from("interactive confirmation cancelled (end of input)"),
+        });
+    }
+    Ok(())
 }
 
 /// Carry out one command against the real machine.
 ///
-/// This is the entry point the binary uses. Tests call [`run_with`] with their
-/// own seams instead.
+/// This is the entry point the binary uses. Unit tests call the crate-private
+/// `run_with` helper with their own seams instead.
 ///
 /// # Errors
 ///
-/// Whatever the command failed with; [`exit::exit_code_for`] turns it into the
+/// Whatever the command failed with; [`exit::exit_code_of`] turns it into the
 /// documented exit code.
-pub fn run(command: Command) -> Result<()> {
+pub fn run(command: Command) -> std::result::Result<(), CliError> {
     run_with(
         Session::new(&link::SystemLinks, &output::SystemConsole, &SystemConfirm),
         command,
@@ -211,30 +226,35 @@ pub fn run(command: Command) -> Result<()> {
 /// # Errors
 ///
 /// As [`run`].
-pub fn run_with(session: Session<'_>, command: Command) -> Result<()> {
+pub(crate) fn run_with(
+    session: Session<'_>,
+    command: Command,
+) -> std::result::Result<(), CliError> {
+    use cli::{DeviceCommand, FwCommand, LogCommand, NmeaCommand};
     match command {
         Command::Device { command } => match command {
-            DeviceCommand::Ports(options) => device::ports(&options, session),
-            DeviceCommand::Info(options) => device::info(&options, session),
-            DeviceCommand::Doctor => Err(not_implemented("device doctor")),
+            DeviceCommand::Ports(options) => device::ports(&options, session)?,
+            DeviceCommand::Info(options) => device::info(&options, session)?,
+            DeviceCommand::Doctor => return Err(not_implemented("device doctor").into()),
         },
         Command::Fw { command } => match command {
-            FwCommand::Dump(options) => fw::dump(&options, session),
-            FwCommand::Patch(options) => fw::patch(&options, session),
-            FwCommand::Flash => Err(not_implemented("fw flash")),
+            FwCommand::Dump(options) => fw::dump(&options, session)?,
+            FwCommand::Patch(options) => fw::patch(&options, session)?,
+            FwCommand::Flash => return Err(not_implemented("fw flash").into()),
         },
         Command::Log { command } => match command {
-            LogCommand::Info(options) => logcmd::info(&options, session),
-            LogCommand::Download(options) => logcmd::download(&options, session),
-            LogCommand::Read(options) => logcmd::read(&options, session),
-            LogCommand::Erase => Err(not_implemented("log erase")),
-            LogCommand::Geotag => Err(not_implemented("log geotag")),
+            LogCommand::Info(options) => logcmd::info(&options, session)?,
+            LogCommand::Download(options) => logcmd::download(&options, session)?,
+            LogCommand::Read(options) => logcmd::read(&options, session)?,
+            LogCommand::Erase => return Err(not_implemented("log erase").into()),
+            LogCommand::Geotag => return Err(not_implemented("log geotag").into()),
         },
         Command::Nmea { command } => match command {
-            NmeaCommand::Repair(options) => nmea::repair(&options, session),
-            NmeaCommand::Proxy => Err(not_implemented("nmea proxy")),
+            NmeaCommand::Repair(options) => nmea::repair(&options, session)?,
+            NmeaCommand::Proxy => return Err(not_implemented("nmea proxy").into()),
         },
     }
+    Ok(())
 }
 
 /// The error for a command this build parses but cannot carry out yet.
@@ -345,5 +365,30 @@ mod tests {
         assert_eq!(timings.reply, DEFAULT_REPLY_TIMEOUT);
         assert_eq!(timings.stream, DEFAULT_STREAM_WINDOW);
         assert_eq!(Timings::default().reply, timings.reply);
+    }
+
+    #[test]
+    fn pause_refuses_non_terminal_stdin_instead_of_silently_continuing() {
+        let mut input = std::io::Cursor::new(b"\n".as_slice());
+        let err = pause_reader("Press Enter to continue.", false, &mut input)
+            .expect_err("non-TTY must be refused");
+        assert!(matches!(err, m241_core::Error::Safety { .. }), "got {err}");
+        assert_eq!(exit::exit_code_for(&err), 5);
+        assert!(
+            format!("{err}").contains("interactive terminal"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn pause_refuses_eof_and_accepts_a_line_on_a_terminal() {
+        let mut empty = std::io::Cursor::new(b"".as_slice());
+        let err = pause_reader("Press Enter to continue.", true, &mut empty)
+            .expect_err("EOF cancels confirmation");
+        assert!(matches!(err, m241_core::Error::Safety { .. }), "got {err}");
+
+        let mut entered = std::io::Cursor::new(b"\n".as_slice());
+        pause_reader("Press Enter to continue.", true, &mut entered)
+            .expect("newline acknowledges the prompt");
     }
 }

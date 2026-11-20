@@ -1,15 +1,15 @@
-//! `m241 log info`.
+//! `m241 log download`, `m241 log info`, and `m241 log read`.
 //!
-//! What a dump contains, without converting it. The point is to answer "did the
-//! download work" and "how much of this log is damaged" before spending time on
-//! an export, so the summary counts what the parser had to skip as well as what
-//! it kept.
+//! Downloading talks PMTK182 to the logger and saves the raw flash blocks;
+//! `info` summarises a dump without converting it so the user can check damage
+//! before exporting; `read` converts a dump to GPX, KML, CSV, NMEA or JSON,
+//! optionally shifting WNRO-stale timestamps.
 
 use m241_core::log::{ParseReport, export, parse_dump};
-use m241_core::protocol::pmtk::{NMEA_BAUD, PmtkClient};
 use m241_core::{LogSummary, Result, Track};
 
 use crate::Session;
+use crate::cal::OffsetSpec;
 use crate::cli::{DownloadOptions, LogInfoOptions, LogReadOptions};
 use crate::fileio;
 use crate::link;
@@ -18,20 +18,21 @@ use crate::output::Console;
 /// Read the track log off the device and save the raw dump.
 ///
 /// Logging is paused for the transfer and resumed by
-/// [`PmtkClient::download_log`] however the transfer ends: a unit left with
-/// recording off loses the next trip, which is worse than the failed download.
+/// [`m241_core::protocol::PmtkClient::download_log`] however the transfer ends:
+/// a unit left with recording off loses the next trip, which is worse than the
+/// failed download.
 ///
 /// # Errors
 ///
-/// * [`Error::Safety`] when the output exists and `--force` was not given;
-/// * [`Error::Port`] when no plausible port can be opened;
-/// * [`Error::Timeout`] / [`Error::Nmea`] when the transfer fails;
-/// * [`Error::Log`] when the bytes that came back are not a dump.
+/// * [`m241_core::Error::Safety`] when the output exists and `--force` was not given;
+/// * [`m241_core::Error::Port`] when no plausible port can be opened;
+/// * [`m241_core::Error::Timeout`] / [`m241_core::Error::Nmea`] /
+///   [`m241_core::Error::Rejected`] when the transfer fails;
+/// * [`m241_core::Error::Log`] when the bytes that came back are not a dump.
 pub fn download(options: &DownloadOptions, session: Session<'_>) -> Result<()> {
     fileio::ensure_free(&options.output, options.force)?;
     let port = link::resolve(session.links, &options.port)?;
-    let transport = session.links.open(&port, NMEA_BAUD)?;
-    let mut client = PmtkClient::new(transport).with_reply_timeout(session.timings.reply);
+    let mut client = link::open_pmtk(session.links, &port, session.timings)?;
 
     session
         .console
@@ -49,10 +50,21 @@ pub fn download(options: &DownloadOptions, session: Session<'_>) -> Result<()> {
     session.console.progress_done();
 
     // Written only after the transfer returned: a failed download must not leave
-    // a partial dump where a complete one is expected.
+    // a partial dump where a complete one is expected. If parsing then fails,
+    // keep the raw capture on disk and tell the user where it was written.
     fileio::write(&options.output, &bytes)?;
 
-    let (track, report) = parse_dump(&bytes)?;
+    let (track, report) = match parse_dump(&bytes) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            session.console.warn(&format!(
+                "saved {} raw bytes to {}, but parsing the log failed",
+                bytes.len(),
+                options.output.display()
+            ));
+            return Err(err);
+        }
+    };
     let summary = report.summary(&track);
     warn_about_damage(session.console, &summary, &report);
 
@@ -92,28 +104,24 @@ pub fn download(options: &DownloadOptions, session: Session<'_>) -> Result<()> {
 ///
 /// # Errors
 ///
-/// [`Error::Io`] when the file cannot be read or the output written,
-/// [`Error::Log`] when it is not a dump at all.
+/// [`m241_core::Error::Io`] when the file cannot be read or the output written,
+/// [`m241_core::Error::Log`] when it is not a dump at all.
 pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
     let bytes = fileio::read(&options.file)?;
     let (mut track, report) = parse_dump(&bytes)?;
     let summary = report.summary(&track);
     warn_about_damage(session.console, &summary, &report);
 
-    let shift = options
-        .utc_offset_days
-        .shift_for(track_days(&track).unwrap_or_default());
+    let shift = track_days(&track).map_or(0, |days| options.utc_offset_days.shift_for(days));
     if shift != 0 {
         shift_track(&mut track, shift);
+        let reason = if matches!(options.utc_offset_days, OffsetSpec::Auto) {
+            "the log was written by a unit whose clock is still on the old GPS epoch"
+        } else {
+            "--utc-offset-days"
+        };
         session.console.note(&format!(
-            "shifted every timestamp by {shift:+} days: {}",
-            if shift == crate::cal::WNRO_DAYS {
-                String::from(
-                    "the log was written by a unit whose clock is still on the old GPS epoch",
-                )
-            } else {
-                String::from("--utc-offset-days")
-            }
+            "shifted every timestamp by {shift:+} days: {reason}"
         ));
     }
 
@@ -138,14 +146,15 @@ pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
 
 /// Which day, in days since the Unix epoch, the log's newest record falls on.
 ///
-/// The stale-window test only needs a day, so this drops the time of day rather
-/// than carrying it around.
+/// Uses the maximum timestamp across all records rather than the final record
+/// in file order, because a wrapped ring buffer places older blocks after newer
+/// ones.
 fn track_days(track: &Track) -> Option<i64> {
     track
         .points
         .iter()
-        .rev()
-        .find_map(|point| point.utc)
+        .filter_map(|point| point.utc)
+        .max()
         .map(|utc| i64::from(utc / 86_400))
 }
 
@@ -666,6 +675,330 @@ mod tests {
             !console.stdout().contains("warning"),
             "stdout must stay machine-readable: {}",
             console.stdout()
+        );
+    }
+
+    /// Build a one-block dump whose records carry the given UTC timestamps.
+    fn dump_with_timestamps(timestamps: &[u32]) -> Vec<u8> {
+        use m241_core::log::block::{
+            BLOCK_HEADER_SIZE, BLOCK_SIZE, POLICY_LOG_ENABLED, xor_checksum,
+        };
+
+        const MASK: u32 = 0x8000_001D;
+        const LAT: f32 = 35.681_236;
+        const LON: f32 = 139.767_13;
+
+        let mut block = vec![0xFFu8; BLOCK_SIZE];
+        block[0..2].copy_from_slice(&(timestamps.len() as u16).to_le_bytes());
+        block[2..6].copy_from_slice(&MASK.to_le_bytes());
+        block[6..8].copy_from_slice(&POLICY_LOG_ENABLED.to_le_bytes());
+        block[8..12].copy_from_slice(&10u32.to_le_bytes());
+
+        let mut cursor = BLOCK_HEADER_SIZE;
+        for &utc in timestamps {
+            let mut record = Vec::new();
+            record.extend_from_slice(&utc.to_le_bytes());
+            record.extend_from_slice(&LAT.to_le_bytes());
+            record.extend_from_slice(&LON.to_le_bytes());
+            record.extend_from_slice(&[0x00, 0xA0, 0x42]);
+            let checksum = xor_checksum(&record);
+            record.push(checksum);
+            block[cursor..cursor + record.len()].copy_from_slice(&record);
+            cursor += record.len();
+        }
+        block
+    }
+
+    #[test]
+    fn auto_shift_advances_a_stale_log_by_one_rollover_cycle() {
+        let scratch = Scratch::new("read-auto-stale");
+        let stale_utc = (crate::cal::days_from_civil(2006, 9, 17) * 86_400) as u32;
+        let path = scratch.join("stale.bin");
+        fileio::write(&path, &dump_with_timestamps(&[stale_utc, stale_utc + 60])).expect("write");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        read(
+            &LogReadOptions {
+                file: path,
+                format: m241_core::ExportFormat::Json,
+                output: None,
+                utc_offset_days: OffsetSpec::Auto,
+            },
+            fast(&links, &console, &confirm),
+        )
+        .expect("read");
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        let expected = crate::cal::shift_seconds(stale_utc, crate::cal::WNRO_DAYS);
+        assert_eq!(document["points"][0]["utc"], expected);
+        assert!(
+            console.stderr().contains("old GPS epoch"),
+            "auto-detected shift should explain itself: {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
+    fn auto_shift_checks_the_newest_record_not_the_last_one() {
+        // Wrapped ring buffer: a modern record appears before an older stale record.
+        // Auto-detection must inspect the newest record (`max`), not the last one.
+        let scratch = Scratch::new("read-wrapped");
+        let modern_utc = 1_700_000_000u32;
+        let stale_utc = (crate::cal::days_from_civil(2006, 9, 17) * 86_400) as u32;
+        let path = scratch.join("wrapped.bin");
+        fileio::write(&path, &dump_with_timestamps(&[modern_utc, stale_utc])).expect("write");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        read(
+            &LogReadOptions {
+                file: path,
+                format: m241_core::ExportFormat::Json,
+                output: None,
+                utc_offset_days: OffsetSpec::Auto,
+            },
+            fast(&links, &console, &confirm),
+        )
+        .expect("read");
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(document["points"][0]["utc"], modern_utc);
+        assert_eq!(document["points"][1]["utc"], stale_utc);
+        assert!(
+            !console.stderr().contains("shifted"),
+            "newest record is modern, so auto must not shift: {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
+    fn explicit_7168_offset_is_not_labelled_as_auto_detected() {
+        let scratch = Scratch::new("read-explicit-7168");
+        let stale_utc = (crate::cal::days_from_civil(2006, 9, 17) * 86_400) as u32;
+        let path = scratch.join("stale.bin");
+        fileio::write(&path, &dump_with_timestamps(&[stale_utc])).expect("write");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        read(
+            &LogReadOptions {
+                file: path,
+                format: m241_core::ExportFormat::Json,
+                output: None,
+                utc_offset_days: OffsetSpec::Days(crate::cal::WNRO_DAYS),
+            },
+            fast(&links, &console, &confirm),
+        )
+        .expect("read");
+        let stderr = console.stderr();
+        assert!(stderr.contains("--utc-offset-days"), "got {stderr}");
+        assert!(
+            !stderr.contains("old GPS epoch"),
+            "explicit offset must not claim auto-detection: {stderr}"
+        );
+    }
+
+    #[test]
+    fn download_json_is_one_object_with_clean_stdout() {
+        let scratch = Scratch::new("download-json");
+        let output = scratch.join("track.bin");
+        let handle = DeviceHandle::new(|| FakeDevice::new().with_log(&synthetic_dump(2)));
+        let links = FakePorts::shared(handle);
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        download(
+            &DownloadOptions {
+                port: String::from("auto"),
+                output: output.clone(),
+                force: false,
+                json: true,
+            },
+            fast(&links, &console, &confirm),
+        )
+        .expect("download --json");
+        let stdout = console.stdout();
+        let document: serde_json::Value =
+            serde_json::from_str(&stdout).expect("stdout must be a single valid JSON object");
+        assert_eq!(document["bytes"], synthetic_dump(2).len());
+        assert_eq!(document["summary"]["records"], 2);
+        assert_eq!(document["output"], output.display().to_string());
+        assert!(
+            !console.stderr().is_empty(),
+            "progress/notes belong on stderr"
+        );
+    }
+
+    #[test]
+    fn download_exits_code_one_when_the_device_rejects_pmtk182() {
+        use std::collections::VecDeque;
+
+        use m241_core::protocol::pmtk::line as pmtk_line;
+        use m241_core::protocol::port::Transport;
+
+        #[derive(Debug)]
+        struct RejectingStopTransport {
+            pending: Vec<u8>,
+            output: VecDeque<u8>,
+        }
+
+        impl Transport for RejectingStopTransport {
+            fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+                let mut count = 0;
+                while count < buf.len() {
+                    let Some(byte) = self.output.pop_front() else {
+                        break;
+                    };
+                    buf[count] = byte;
+                    count += 1;
+                }
+                Ok(count)
+            }
+
+            fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+                self.pending.extend_from_slice(buf);
+                while let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
+                    let raw: Vec<u8> = self.pending.drain(..=pos).collect();
+                    let text = String::from_utf8_lossy(&raw);
+                    if text.contains("PMTK182,2,8") {
+                        self.output.extend(pmtk_line("PMTK182,3,8,100").as_bytes());
+                    } else if text.contains("PMTK182,5") {
+                        // Status 2 = action failed / rejected by the device.
+                        self.output.extend(pmtk_line("PMTK001,182,5,2").as_bytes());
+                    }
+                }
+                Ok(())
+            }
+
+            fn flush(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            fn clear_input(&mut self) -> Result<()> {
+                self.output.clear();
+                Ok(())
+            }
+
+            fn set_baud(&mut self, _baud: u32) -> Result<()> {
+                Ok(())
+            }
+
+            fn set_control_lines(&mut self, _asserted: bool) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        struct RejectingLinks;
+
+        impl crate::Links for RejectingLinks {
+            fn ports(&self) -> Result<Vec<PortEntry>> {
+                Ok(vec![PortEntry {
+                    name: String::from("SIM0"),
+                    cable: Some(crate::link::Cable::Cp210x),
+                    likely: true,
+                    description: None,
+                }])
+            }
+
+            fn open(&self, _name: &str, _baud: u32) -> Result<crate::link::Opened> {
+                Ok(crate::link::Opened::new(Box::new(RejectingStopTransport {
+                    pending: Vec::new(),
+                    output: VecDeque::new(),
+                })))
+            }
+        }
+
+        let scratch = Scratch::new("download-rejected");
+        let output = scratch.join("track.bin");
+        let links = RejectingLinks;
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        let err = download(
+            &DownloadOptions {
+                port: String::from("auto"),
+                output: output.clone(),
+                force: false,
+                json: false,
+            },
+            Session::new(&links, &console, &confirm).with_timings(Timings::fast()),
+        )
+        .expect_err("device rejected $PMTK182,5");
+        assert!(matches!(err, Error::Rejected { .. }), "got {err}");
+        assert_eq!(crate::exit::exit_code_for(&err), 1, "got {err}");
+        assert_eq!(
+            crate::exit::exit_code_of(&Err(crate::exit::CliError::from(err))),
+            1
+        );
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn download_reports_the_saved_path_when_parsing_fails() {
+        let scratch = Scratch::new("download-unparseable");
+        let output = scratch.join("raw.bin");
+        let garbage = vec![0xABu8; 4096];
+        let handle = DeviceHandle::new(move || FakeDevice::new().with_log(&garbage));
+        let links = FakePorts::shared(handle);
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        let err = download(
+            &DownloadOptions {
+                port: String::from("auto"),
+                output: output.clone(),
+                force: false,
+                json: false,
+            },
+            fast(&links, &console, &confirm),
+        )
+        .expect_err("garbage bytes are not a valid log dump");
+        assert!(matches!(err, Error::Log { .. }), "got {err}");
+        assert!(output.exists(), "raw capture is preserved on disk");
+        assert!(
+            console.stderr().contains(&output.display().to_string()),
+            "stderr must tell the user where the raw dump was saved: {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
+    fn read_exports_kml_and_nmea_from_a_dump() {
+        let scratch = Scratch::new("read-kml-nmea");
+        let path = write_dump(&scratch, "track.bin", 2);
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+
+        let kml_console = RecordingConsole::default();
+        read(
+            &LogReadOptions {
+                file: path.clone(),
+                format: m241_core::ExportFormat::Kml,
+                output: None,
+                utc_offset_days: OffsetSpec::Days(0),
+            },
+            fast(&links, &kml_console, &confirm),
+        )
+        .expect("kml export");
+        assert!(
+            kml_console.stdout().contains("<kml") && kml_console.stdout().contains("139.767"),
+            "got {}",
+            kml_console.stdout()
+        );
+
+        let nmea_console = RecordingConsole::default();
+        read(
+            &LogReadOptions {
+                file: path,
+                format: m241_core::ExportFormat::Nmea,
+                output: None,
+                utc_offset_days: OffsetSpec::Days(0),
+            },
+            fast(&links, &nmea_console, &confirm),
+        )
+        .expect("nmea export");
+        assert!(
+            nmea_console.stdout().contains("$GPRMC"),
+            "got {}",
+            nmea_console.stdout()
         );
     }
 }

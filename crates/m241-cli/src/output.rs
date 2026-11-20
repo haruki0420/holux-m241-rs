@@ -38,6 +38,23 @@ pub trait Console: std::fmt::Debug {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemConsole;
 
+/// Render one JSON document cleanly for stdout.
+fn format_json(value: &Value) -> Result<String> {
+    serde_json::to_string_pretty(value)
+        .map_err(|err| Error::State(format!("could not serialise the JSON document: {err}")))
+}
+
+/// Format a progress line for stderr, treating a zero-byte total as 100%.
+fn format_progress(done: usize, total: usize) -> String {
+    // `checked_div` rather than an `if`: a zero-byte transfer is 100% done,
+    // and writing that as a branch invites someone to "simplify" it into a
+    // division that panics on the empty log the device reports.
+    let percent = done.saturating_mul(100).checked_div(total).unwrap_or(100);
+    // `\r` and no newline: the line redraws in place, and stderr is where a
+    // human reads it. stdout stays clean for the pipe.
+    format!("\r{done} / {total} bytes ({percent}%)")
+}
+
 impl Console for SystemConsole {
     fn result(&self, line: &str) {
         println!("{line}");
@@ -48,20 +65,13 @@ impl Console for SystemConsole {
     }
 
     fn json(&self, value: &Value) -> Result<()> {
-        let text = serde_json::to_string_pretty(value)
-            .map_err(|err| Error::State(format!("could not serialise the JSON document: {err}")))?;
+        let text = format_json(value)?;
         println!("{text}");
         Ok(())
     }
 
     fn progress(&self, done: usize, total: usize) {
-        // `checked_div` rather than an `if`: a zero-byte transfer is 100% done,
-        // and writing that as a branch invites someone to "simplify" it into a
-        // division that panics on the empty log the device reports.
-        let percent = done.saturating_mul(100).checked_div(total).unwrap_or(100);
-        // `\r` and no newline: the line redraws in place, and stderr is where a
-        // human reads it. stdout stays clean for the pipe.
-        eprint!("\r{done} / {total} bytes ({percent}%)");
+        eprint!("{}", format_progress(done, total));
     }
 
     fn progress_done(&self) {
@@ -80,17 +90,32 @@ impl Console for SystemConsole {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::RecordingConsole;
     use serde_json::json as value;
 
     #[test]
     fn a_json_document_round_trips_through_the_printer() {
-        // The real console prints, so what is asserted here is that it accepts
-        // the shapes the handlers build rather than the bytes on stdout.
-        assert!(
-            SystemConsole
-                .json(&value!({"release": "B-core_1.20"}))
-                .is_ok()
-        );
-        assert!(SystemConsole.json(&value!({"ports": []})).is_ok());
+        for expected in [
+            value!({"release": "B-core_1.20", "known_release": true}),
+            value!({"ports": [], "candidates": []}),
+        ] {
+            let formatted = format_json(&expected).expect("format json");
+            let parsed: Value = serde_json::from_str(&formatted).expect("valid json");
+            assert_eq!(parsed, expected);
+
+            let console = RecordingConsole::default();
+            console.json(&expected).expect("recording console json");
+            let printed: Value =
+                serde_json::from_str(&console.stdout()).expect("printed output is valid json");
+            assert_eq!(printed, expected);
+        }
+    }
+
+    #[test]
+    fn progress_with_zero_total_reports_100_percent_without_panicking() {
+        assert_eq!(format_progress(0, 0), "\r0 / 0 bytes (100%)");
+        assert_eq!(format_progress(12, 0), "\r12 / 0 bytes (100%)");
+        assert_eq!(format_progress(50, 200), "\r50 / 200 bytes (25%)");
+        SystemConsole.progress(0, 0);
     }
 }

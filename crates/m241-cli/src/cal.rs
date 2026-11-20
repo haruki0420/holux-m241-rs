@@ -72,6 +72,16 @@ pub fn parse_offset(text: &str) -> Result<OffsetSpec, String> {
     Ok(OffsetSpec::Days(days))
 }
 
+/// Whether `(year, month, day)` is a valid proleptic Gregorian calendar date
+/// with a four-digit year (`1..=9999`).
+#[must_use]
+pub fn is_valid_date(year: i32, month: u32, day: u32) -> bool {
+    if !(1..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return false;
+    }
+    civil_from_days(days_from_civil(year, month, day)) == (year, month, day)
+}
+
 /// Days since 1970-01-01 for a civil date in the proleptic Gregorian calendar.
 #[must_use]
 pub fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
@@ -146,7 +156,7 @@ mod tests {
     #[test]
     fn the_rollover_shift_is_7168_days() {
         // The measured defect: 2006-09-17 is what a broken unit says for
-        // 2026-05-04, and 7168 days is the gap.
+        // 2026-05-03 (UTC), and 7168 days is the gap.
         let broken = days_from_civil(2006, 9, 17);
         let fixed = civil_from_days(broken + i64::from(WNRO_DAYS));
         assert_eq!(fixed, (2026, 5, 3));

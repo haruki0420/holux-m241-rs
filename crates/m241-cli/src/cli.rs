@@ -26,6 +26,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use m241_core::ExportFormat;
+use m241_core::protocol::brom::BASE_ADDR_FIRMWARE;
 
 use crate::cal::{self, OffsetSpec};
 
@@ -143,7 +144,7 @@ pub struct DumpOptions {
     /// How many bytes to read from the firmware base.
     ///
     /// The measured V1.13 image is 406,620 bytes; the V1.12 image is 406,312.
-    #[arg(long, default_value_t = DEFAULT_DUMP_LENGTH)]
+    #[arg(long, default_value_t = DEFAULT_DUMP_LENGTH, value_parser = parse_dump_length)]
     pub length: usize,
 
     /// The chip is already in the BootROM; send the sync without `$PMTK180`.
@@ -281,6 +282,34 @@ fn parse_format(text: &str) -> Result<ExportFormat, String> {
         .ok_or_else(|| format!("{text:?} is not a format; choose gpx, kml, csv, nmea or json"))
 }
 
+/// `--length` for `fw dump`: positive, even (16-bit BootROM reads), and within
+/// the 32-bit BootROM address space from [`BASE_ADDR_FIRMWARE`].
+fn parse_dump_length(text: &str) -> Result<usize, String> {
+    let length = text
+        .parse::<usize>()
+        .map_err(|_| format!("{text:?} is not a valid byte length"))?;
+    if length == 0 {
+        return Err(String::from(
+            "--length must be positive; a firmware image is about 400 KiB",
+        ));
+    }
+    if !length.is_multiple_of(2) {
+        return Err(format!(
+            "--length {length} is odd; the BootROM reads 16-bit units"
+        ));
+    }
+    if u32::try_from(length)
+        .ok()
+        .and_then(|bytes| BASE_ADDR_FIRMWARE.checked_add(bytes))
+        .is_none()
+    {
+        return Err(format!(
+            "--length {length} overflows the 32-bit BootROM address space from 0x{BASE_ADDR_FIRMWARE:08X}"
+        ));
+    }
+    Ok(length)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,5 +425,38 @@ mod tests {
         ])
         .expect_err("not a number and not auto");
         assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
+    }
+
+    #[test]
+    fn invalid_dump_lengths_are_usage_errors() {
+        for bad in ["0", "4001", "4294967294"] {
+            let err =
+                Cli::try_parse_from(["m241", "fw", "dump", "-o", "stock.bin", "--length", bad])
+                    .expect_err("invalid --length must fail during argument parsing");
+            assert!(err.use_stderr(), "length {bad}: {err}");
+            assert_eq!(
+                crate::exit::exit_code_for_parse_error(&err),
+                2,
+                "length {bad}: {err}"
+            );
+        }
+
+        let cli = Cli::try_parse_from([
+            "m241",
+            "fw",
+            "dump",
+            "-o",
+            "stock.bin",
+            "--length",
+            "406312",
+        ])
+        .expect("V1.12 length parses");
+        let Command::Fw {
+            command: FwCommand::Dump(options),
+        } = cli.command
+        else {
+            panic!("expected fw dump");
+        };
+        assert_eq!(options.length, 406_312);
     }
 }

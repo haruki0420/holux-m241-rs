@@ -23,9 +23,6 @@ use crate::cal::{self, OffsetSpec};
 use crate::cli::RepairOptions;
 use crate::fileio;
 
-/// Days in one week-number-rollover cycle.
-pub use crate::cal::WNRO_DAYS;
-
 /// Where the `ddmmyy` date sits in a `$GPRMC` field list that includes the
 /// address at index 0.
 ///
@@ -48,8 +45,17 @@ const ZDA_YEAR: usize = 4;
 /// [`m241_core::Error::Io`] when the input cannot be read or the output written,
 /// [`m241_core::Error::State`] when the input is not UTF-8 text.
 pub fn repair(options: &RepairOptions, session: Session<'_>) -> Result<()> {
+    repair_with_stdin(options, session, fileio::read_stdin_text)
+}
+
+/// Inner entry point with an injectable stdin reader so `-` can be unit-tested.
+fn repair_with_stdin(
+    options: &RepairOptions,
+    session: Session<'_>,
+    read_stdin: impl FnOnce() -> Result<String>,
+) -> Result<()> {
     let source = if options.input == "-" {
-        fileio::read_stdin_text()?
+        read_stdin()?
     } else {
         fileio::read_text(Path::new(&options.input))?
     };
@@ -161,6 +167,9 @@ fn repair_zda(fields: &mut [String], offset: OffsetSpec) -> bool {
     ) else {
         return false;
     };
+    if !cal::is_valid_date(year, month, day) {
+        return false;
+    }
     let days = cal::days_from_civil(year, month, day);
     let shift = offset.shift_for(days);
     if shift == 0 {
@@ -203,9 +212,9 @@ fn parse_ddmmyy(text: &str) -> Option<(u32, u32, i32)> {
 
 /// Split the line terminator from the sentence body.
 fn split_ending(line: &str) -> (&str, &str) {
-    let end = line.trim_end_matches(['\r', '\n']);
-    let ending = line.get(end.len()..).unwrap_or("");
-    (end, ending)
+    let body = line.trim_end_matches(['\r', '\n']);
+    let ending = line.get(body.len()..).unwrap_or("");
+    (body, ending)
 }
 
 /// XOR of every byte between `$` and `*`.
@@ -326,6 +335,22 @@ mod tests {
         ] {
             let (repaired, changed) = repair_line(line, OffsetSpec::Auto);
             assert!(!changed, "{line:?} must not change");
+            assert_eq!(repaired, line);
+        }
+    }
+
+    #[test]
+    fn a_zda_sentence_with_an_out_of_range_date_is_left_alone() {
+        for line in [
+            "$GPZDA,022127.54,00,00,2006,00,00*00",
+            "$GPZDA,022127.54,99,99,2006,00,00*00",
+            "$GPZDA,022127.54,32,01,2006,00,00*00",
+            "$GPZDA,022127.54,17,13,2006,00,00*00",
+            "$GPZDA,022127.54,31,02,2006,00,00*00",
+            "$GPZDA,022127.54,17,09,-2006,00,00*00",
+        ] {
+            let (repaired, changed) = repair_line(line, OffsetSpec::Auto);
+            assert!(!changed, "{line:?} must not be rewritten");
             assert_eq!(repaired, line);
         }
     }
@@ -455,6 +480,29 @@ mod tests {
             !console.stdout().ends_with('\n'),
             "got {:?}",
             console.stdout()
+        );
+    }
+
+    #[test]
+    fn repair_reads_standard_input_when_input_is_dash() {
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        repair_with_stdin(
+            &RepairOptions {
+                input: String::from("-"),
+                output: None,
+                offset_days: OffsetSpec::Auto,
+            },
+            Session::new(&links, &console, &confirm),
+            || Ok(format!("{BROKEN_RMC}\r\n")),
+        )
+        .expect("stdin repair");
+        assert_eq!(console.stdout(), format!("{FIXED_RMC}\r\n"));
+        assert!(
+            console.stderr().contains("1 of 1 lines"),
+            "got {}",
+            console.stderr()
         );
     }
 }

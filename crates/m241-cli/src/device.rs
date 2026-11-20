@@ -11,8 +11,6 @@
 //! the patch path does not trust that string — it decides on the image's bytes —
 //! so an unknown release is a warning here, never a refusal.
 
-use m241_core::protocol::pmtk::{NMEA_BAUD, PmtkClient};
-
 use crate::Result;
 use crate::Session;
 use crate::cli::{InfoOptions, PortsOptions};
@@ -104,8 +102,7 @@ pub fn document(entries: &[PortEntry]) -> serde_json::Value {
 /// [`m241_core::Error::Nmea`] when the reply is malformed.
 pub fn info(options: &InfoOptions, session: Session<'_>) -> Result<()> {
     let port = link::resolve(session.links, &options.port)?;
-    let transport = session.links.open(&port, NMEA_BAUD)?;
-    let mut client = PmtkClient::new(transport).with_reply_timeout(session.timings.reply);
+    let mut client = link::open_pmtk(session.links, &port, session.timings)?;
     let identity = client.request_identity()?;
 
     if !is_known_release(&identity.release) {
@@ -331,6 +328,24 @@ mod tests {
         assert!(is_known_release("B-core_1.20"));
         assert!(!is_known_release("X-core_9.99"));
         assert!(!is_known_release(""));
+    }
+
+    #[test]
+    fn info_accepts_an_explicit_port_name() {
+        let links = FakePorts::single(FakeDevice::new);
+        let console = RecordingConsole::default();
+        run_info(
+            &InfoOptions {
+                port: String::from(FAKE_PORT),
+                json: false,
+            },
+            &links,
+            &console,
+        )
+        .expect("explicit port");
+        let text = console.stdout();
+        assert!(text.contains(FAKE_PORT), "got {text}");
+        assert!(text.contains("B-core_1.20"), "got {text}");
     }
 
     #[test]
