@@ -20,12 +20,6 @@
 | CI | 3 OS 緑 |
 | **実機検証** | **ゼロ** |
 
-**ビルド環境:**
-通常のシェルでは既定の `~/.cargo` をそのまま使う。ホームの `~/.cargo` に書き込めないサンドボックス環境で実行する場合のみ、リポジトリルートで以下を設定する:
-```bash
-export CARGO_HOME="$PWD/.cargo-home"
-```
-
 ---
 
 ## 1. 何を作っているか
@@ -69,8 +63,6 @@ git checkout feat/cli-wire2   # など
 ### 3.1 まず環境を作る
 
 ```bash
-# リポジトリルート（rust/）で実行
-# ホームの ~/.cargo に書き込めないサンドボックス環境のみ: export CARGO_HOME="$PWD/.cargo-home"
 git fetch origin
 ./tools/check.sh          # 5/5 を確認
 ```

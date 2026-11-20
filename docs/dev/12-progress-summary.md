@@ -240,20 +240,13 @@ main を直接触らない。
 
 ### ビルド環境
 
-通常は既定の `~/.cargo` をそのまま使う。ホームの `~/.cargo` が読み取り専用のサンドボックス環境で実行する場合のみ、リポジトリルートで以下を設定する:
-
-```bash
-export CARGO_HOME="$PWD/.cargo-home"
-```
+既定の `~/.cargo` をそのまま使う（特別な環境変数は不要）。
 
 ---
 
 ## 7. コマンド早見表
 
 ```bash
-# ホームの ~/.cargo に書き込めないサンドボックス環境のみ:
-# export CARGO_HOME="$PWD/.cargo-home"
-
 ./tools/check.sh              # 5 ゲート（fmt / clippy / test / docs / design）
 cargo test --workspace        # 256 件
 cargo build --release
@@ -289,7 +282,7 @@ cargo run -q -p m241-gui -- --screenshot   # 実画面 8 枚を .design/ に生�
 
 | 症状 | 対処 |
 |---|---|
-| `cargo` が読み取り専用エラー | `CARGO_HOME` を設定したか確認 |
+| `cargo` が読み取り専用エラー | サンドボックス等で `~/.cargo` への書き込み権限があるか確認 |
 | ディスクが減らない | 各ワークツリーの `target/` を消す（1 本 2 GB 前後） |
 | エージェントが応答しない | `send_message` で催促。それでも駄目なら打ち切って新規に立てる |
 | エージェントが失敗した | **成果物を捨てる前に** `git status` と `git log` を見る |
