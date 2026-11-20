@@ -1,13 +1,17 @@
 //! The four screens and the shell that holds them.
 
+pub mod common;
 pub mod connect;
 pub mod firmware;
 pub mod log;
 pub mod settings;
 
 /// Which screen the rail has selected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Screen {
+    /// The screen a cold start lands on: "is the device there" is the first
+    /// question, and it is the only one that cannot destroy anything.
+    #[default]
     Connect,
     Log,
     Firmware,
