@@ -13,11 +13,13 @@ name = "m241-gui"
 path = "src/main.rs"
 
 [dependencies]
+m241-core.workspace = true
 egui.workspace = true
 eframe.workspace = true
 
-# m241-core joins when the Connect screen reads the device, and walkers when the
-# Log screen draws the map.
+# walkers (map tiles) is deliberately not a dependency yet: it fetches tiles over
+# the network at runtime and cannot be exercised headlessly. The Log screen draws
+# the track itself on a scaled canvas; a slippy map is a later, separate change.
 
 [lints]
 workspace = true

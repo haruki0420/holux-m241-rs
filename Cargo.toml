@@ -10,9 +10,10 @@ license = "MIT"
 authors = ["holux-m241-rs contributors"]
 repository = "https://github.com/haruki0420/holux-m241-rs"
 
-# Only what is used today. `serde`, `serde_json`, `walkers` and `tracing` return
-# with the features that need them; declaring them early produces permanent
-# "unused workspace dependency" warnings and hides the real ones.
+# Only what is used today. Declaring a dependency before its consumer exists
+# produces a permanent "unused workspace dependency" warning and hides the real
+# ones. `serde` / `serde_json` return with the profile database; `walkers` (map
+# tiles) is a separate change because it needs the network at runtime.
 [workspace.dependencies]
 m241-core = { path = "crates/m241-core" }
 thiserror = "2"
