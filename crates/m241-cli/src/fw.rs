@@ -1,8 +1,10 @@
-//! `m241 fw dump`.
+//! `m241 fw dump` and `m241 fw patch`.
 //!
-//! The read-only half of the repair. It touches the device, and it is safe: the
-//! only things it sends are `$PMTK180` (hand over to the BootROM) and the
-//! BootROM's own read command.
+//! The two halves of the repair, deliberately asymmetric. [`dump`] touches the
+//! device and is read-only: it reads the image twice, comparing hashes, so a
+//! read that silently truncated cannot be mistaken for success. [`patch`] never
+//! opens a port at all — it rewrites a file on this machine, and writing to the
+//! device is a different command.
 //!
 //! # Why the second pass exists
 //!
@@ -12,17 +14,21 @@
 //! agreeing byte for byte is the cheapest evidence available without a reference
 //! hash — a user's own unit hashes differently from every other unit.
 
-use m241_core::firmware::image::{FW_SIZE_OFFSET, FirmwareImage};
-use m241_core::firmware::sha256_hex;
+use m241_core::firmware::image::{
+    EFFECTIVE_EPOCH_OFFSET, FW_SIZE_OFFSET, FirmwareImage, GPS_EPOCH_UNIX, GPS_EPOCH_UNIX_WNRO,
+};
+use m241_core::firmware::profiles::Evidence;
+use m241_core::firmware::{self, sha256_hex};
 use m241_core::protocol::brom::{BASE_ADDR_FIRMWARE, DEFAULT_BOOTROM_BAUD, DUMP_CHUNK, MtkBootRom};
 use m241_core::protocol::pmtk::{NMEA_BAUD, PmtkClient, StreamState};
 use m241_core::protocol::port::Transport;
-use m241_core::{Error, Result};
+use m241_core::{Error, PatchPlan, Result};
 
 use crate::Session;
-use crate::cli::DumpOptions;
+use crate::cli::{DumpOptions, PatchOptions};
 use crate::fileio;
 use crate::link;
+use crate::output::Console;
 
 /// Read the firmware off the device, twice, and save it once both reads agree.
 ///
@@ -206,6 +212,191 @@ fn read_once(options: &DumpOptions, session: Session<'_>, port: &str) -> Result<
     Ok(image)
 }
 
+/// What `fw patch` concluded about one file.
+struct PatchReport {
+    /// The profile the image was identified as.
+    profile: &'static m241_core::FirmwareProfile,
+    /// What made the match.
+    evidence: Evidence,
+    /// Every byte the patch would change.
+    plan: PatchPlan,
+}
+
+/// Rewrite the epoch constant and version marker in a **file**.
+///
+/// The device is never opened. `--dry-run` prints the plan and writes nothing.
+///
+/// # Errors
+///
+/// * [`Error::Profile`] when the image matches no known release;
+/// * [`Error::Firmware`] when its epoch constant is not the stock value, was
+///   edited by something else, or is already half patched;
+/// * [`Error::Safety`] when the output would overwrite the source image;
+/// * [`Error::Io`] when a file cannot be read or written.
+pub fn patch(options: &PatchOptions, session: Session<'_>) -> Result<()> {
+    let bytes = fileio::read(&options.source)?;
+    let report = plan_patch(&bytes)?;
+
+    if options.dry_run {
+        if options.json {
+            return session.console.json(&plan_document(&report, None));
+        }
+        print_plan(session.console, &report);
+        session
+            .console
+            .note("dry run: nothing was written. Drop --dry-run to apply the plan.");
+        return Ok(());
+    }
+
+    let Some(output) = &options.output else {
+        // clap makes this unreachable (`required_unless_present = "dry_run"`),
+        // but the handler does not lean on that: a missing destination must not
+        // fall through to "write nowhere".
+        return Err(Error::State(String::from(
+            "no output path: pass -o FILE (or --dry-run to print the plan)",
+        )));
+    };
+    fileio::ensure_distinct(&options.source, output)?;
+
+    if !report.plan.changes_anything() {
+        // Already patched. Nothing is written: rewriting the file would only
+        // produce a copy of the input, and the point of the plan is to say what
+        // changes.
+        if options.json {
+            return session.console.json(&plan_document(&report, None));
+        }
+        print_plan(session.console, &report);
+        session.console.note(
+            "nothing to do; the image was left as it is. The device is never touched by this \
+             command.",
+        );
+        return Ok(());
+    }
+
+    let patched = report.plan.apply(&bytes)?;
+    fileio::write(output, &patched)?;
+
+    // Read the result back through the same parser the rest of the tool uses,
+    // so "the patch applied" means the file on disk, not the buffer in memory.
+    let written = fileio::read(output)?;
+    let image = FirmwareImage::new(&written)?;
+    if !image.is_patched() {
+        return Err(Error::Firmware {
+            message: format!(
+                "the file was written but its effective epoch constant is 0x{:08X}, not the \
+                 patched 0x{GPS_EPOCH_UNIX_WNRO:08X}",
+                image.effective_epoch().unwrap_or(0)
+            ),
+            offset: Some(EFFECTIVE_EPOCH_OFFSET),
+        });
+    }
+
+    if options.json {
+        return session.console.json(&plan_document(&report, Some(output)));
+    }
+    print_plan(session.console, &report);
+    session
+        .console
+        .result(&format!("{:<12}: {}", "written", output.display()));
+    session
+        .console
+        .result(&format!("{:<12}: {}", "sha256", sha256_hex(&written)));
+    session.console.note(
+        "the device was not touched. Write this file back with `m241 fw flash` when you are \
+         ready, keeping the stock image as the backup.",
+    );
+    Ok(())
+}
+
+/// Read an image, identify it, and plan the patch.
+fn plan_patch(bytes: &[u8]) -> Result<PatchReport> {
+    let image = FirmwareImage::new(bytes)?;
+    let identification = m241_core::firmware::identify(&image)?;
+    let plan = firmware::plan(&image)?;
+    Ok(PatchReport {
+        profile: identification.profile,
+        evidence: identification.evidence,
+        plan,
+    })
+}
+
+/// The labelled plan a `--dry-run` shows.
+fn print_plan(console: &dyn Console, report: &PatchReport) {
+    let profile = report.profile;
+    console.result(&format!(
+        "{:<12}: {} ({}, {} bytes)",
+        "profile", profile.name, profile.device_type, profile.size
+    ));
+    console.result(&format!(
+        "{:<12}: {}",
+        "identified",
+        match report.evidence {
+            Evidence::Sha256 => "exact SHA-256 match (official image)",
+            Evidence::Structure => "size, device string and version marker",
+        }
+    ));
+    console.result(&format!(
+        "{:<12}: 0x{GPS_EPOCH_UNIX:08X} -> 0x{GPS_EPOCH_UNIX_WNRO:08X}",
+        "epoch"
+    ));
+    if let Some(reason) = &report.plan.no_op_reason {
+        console.result(&format!("{:<12}: {reason}", "no change"));
+        return;
+    }
+    console.result(&format!("{:<12}: {}", "changes", report.plan.edits.len()));
+    for edit in &report.plan.edits {
+        console.result(&format!(
+            "  0x{:05X}  0x{:02X} -> 0x{:02X}  ({})",
+            edit.offset,
+            edit.before,
+            edit.after,
+            describe_offset(edit.offset)
+        ));
+    }
+}
+
+/// What a changed byte means, when it is one of the measured three.
+fn describe_offset(offset: usize) -> &'static str {
+    match offset {
+        0x402F6 | 0x402F7 => "effective epoch constant",
+        0x59C2C => "version marker (V1.13)",
+        0x59B18 => "version marker (V1.12)",
+        _ => "unexpected offset — stop and check this image",
+    }
+}
+
+/// The JSON document both `--dry-run` and a real run print.
+fn plan_document(report: &PatchReport, written: Option<&std::path::Path>) -> serde_json::Value {
+    let edits: Vec<serde_json::Value> = report
+        .plan
+        .edits
+        .iter()
+        .map(|edit| {
+            serde_json::json!({
+                "offset": format!("0x{:05X}", edit.offset),
+                "before": edit.before,
+                "after": edit.after,
+                "meaning": describe_offset(edit.offset),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "profile": report.profile.name,
+        "device_type": report.profile.device_type,
+        "size": report.profile.size,
+        "evidence": match report.evidence {
+            Evidence::Sha256 => "sha256",
+            Evidence::Structure => "structure",
+        },
+        "epoch_before": GPS_EPOCH_UNIX,
+        "epoch_after": GPS_EPOCH_UNIX_WNRO,
+        "changes": report.plan.edits.len(),
+        "edits": edits,
+        "no_op_reason": report.plan.no_op_reason,
+        "written": written.map(|path| path.display().to_string()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +443,219 @@ mod tests {
     /// A factory for a fake unit that is streaming NMEA with `image` loaded.
     fn streaming_unit(image: Vec<u8>) -> impl Fn() -> FakeDevice + 'static {
         move || FakeDevice::new().with_firmware(&image).with_nmea(4)
+    }
+
+    #[test]
+    fn patch_dry_run_plans_three_bytes_and_writes_nothing() {
+        let scratch = Scratch::new("patch-dry");
+        let source = scratch.join("stock.bin");
+        let output = scratch.join("fixed.bin");
+        fileio::write(&source, &synthetic_image()).expect("write source");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm);
+
+        patch(
+            &PatchOptions {
+                source: source.clone(),
+                output: Some(output.clone()),
+                dry_run: true,
+                json: false,
+            },
+            session,
+        )
+        .expect("dry run");
+        assert!(!output.exists(), "a dry run writes nothing");
+        let text = console.stdout();
+        assert!(text.contains("0x402F6"), "got {text}");
+        assert!(text.contains("0x402F7"), "got {text}");
+        assert!(text.contains("0x59C2C"), "got {text}");
+        assert!(text.contains("changes     : 3"), "got {text}");
+        assert!(
+            console.stderr().contains("nothing was written"),
+            "got {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
+    fn patch_writes_a_verified_image_and_leaves_the_source_alone() {
+        let scratch = Scratch::new("patch-apply");
+        let source = scratch.join("stock.bin");
+        let output = scratch.join("fixed.bin");
+        let stock = synthetic_image();
+        fileio::write(&source, &stock).expect("write source");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm);
+
+        patch(
+            &PatchOptions {
+                source: source.clone(),
+                output: Some(output.clone()),
+                dry_run: false,
+                json: false,
+            },
+            session,
+        )
+        .expect("patch");
+
+        assert_eq!(
+            fileio::read(&source).expect("source"),
+            stock,
+            "the source image must be untouched"
+        );
+        let patched = fileio::read(&output).expect("patched");
+        assert_eq!(patched.len(), stock.len());
+        let image = FirmwareImage::new(&patched).expect("header");
+        assert!(image.is_patched());
+        assert_eq!(image.effective_epoch(), Some(GPS_EPOCH_UNIX_WNRO));
+        // Exactly three bytes differ: the two high epoch bytes and one digit.
+        let changed: Vec<usize> = stock
+            .iter()
+            .zip(patched.iter())
+            .enumerate()
+            .filter(|(_, (before, after))| before != after)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(changed, vec![0x402F6, 0x402F7, 0x59C2C]);
+    }
+
+    #[test]
+    fn patch_json_is_one_object_naming_every_edit() {
+        let scratch = Scratch::new("patch-json");
+        let source = scratch.join("stock.bin");
+        fileio::write(&source, &synthetic_image()).expect("write source");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        patch(
+            &PatchOptions {
+                source,
+                output: None,
+                dry_run: true,
+                json: true,
+            },
+            session,
+        )
+        .expect("dry run");
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(document["profile"], "V1.13");
+        assert_eq!(document["changes"], 3);
+        assert_eq!(document["edits"][0]["offset"], "0x402F6");
+        assert_eq!(document["written"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn patch_refuses_to_rewrite_its_own_input() {
+        let scratch = Scratch::new("patch-inplace");
+        let source = scratch.join("stock.bin");
+        fileio::write(&source, &synthetic_image()).expect("write source");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        let err = patch(
+            &PatchOptions {
+                source: source.clone(),
+                output: Some(source),
+                dry_run: false,
+                json: false,
+            },
+            session,
+        )
+        .expect_err("same file");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+    }
+
+    #[test]
+    fn patch_of_an_already_patched_image_changes_nothing_and_says_why() {
+        let scratch = Scratch::new("patch-repeat");
+        let source = scratch.join("stock.bin");
+        let patched_path = scratch.join("fixed.bin");
+        let again = scratch.join("fixed-again.bin");
+        fileio::write(&source, &synthetic_image()).expect("write source");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        patch(
+            &PatchOptions {
+                source: source.clone(),
+                output: Some(patched_path.clone()),
+                dry_run: false,
+                json: false,
+            },
+            session,
+        )
+        .expect("first patch");
+
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        patch(
+            &PatchOptions {
+                source: patched_path,
+                output: Some(again.clone()),
+                dry_run: false,
+                json: false,
+            },
+            session,
+        )
+        .expect("second run is a no-op, not a failure");
+        assert!(!again.exists(), "a no-op writes nothing");
+        assert!(
+            console.stdout().contains("already patched"),
+            "got {}",
+            console.stdout()
+        );
+        assert!(
+            console.stderr().contains("nothing to do"),
+            "got {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
+    fn patch_of_a_non_firmware_file_is_a_profile_error() {
+        let scratch = Scratch::new("patch-garbage");
+        let source = scratch.join("garbage.bin");
+        fileio::write(&source, &vec![0u8; 1_000]).expect("write");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        let err = patch(
+            &PatchOptions {
+                source,
+                output: None,
+                dry_run: true,
+                json: false,
+            },
+            session,
+        )
+        .expect_err("not an image");
+        assert_eq!(crate::exit::exit_code_for(&err), 4, "got {err}");
+    }
+
+    #[test]
+    fn an_image_one_byte_short_of_its_profile_is_refused_not_patched() {
+        let scratch = Scratch::new("patch-short");
+        let source = scratch.join("short.bin");
+        let mut image = synthetic_image();
+        image.truncate(image.len() - 1);
+        fileio::write(&source, &image).expect("write");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        let err = patch(
+            &PatchOptions {
+                source,
+                output: None,
+                dry_run: true,
+                json: false,
+            },
+            session,
+        )
+        .expect_err("a short dump is not a profile");
+        assert_eq!(crate::exit::exit_code_for(&err), 4, "got {err}");
     }
 
     /// The confirmation that performs the real power cycle, on the fake chip.

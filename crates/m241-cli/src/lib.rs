@@ -218,7 +218,7 @@ pub fn run_with(session: Session<'_>, command: Command) -> Result<()> {
         },
         Command::Fw { command } => match command {
             FwCommand::Dump(options) => fw::dump(&options, session),
-            FwCommand::Patch(options) => not_implemented_args("fw patch", &options),
+            FwCommand::Patch(options) => fw::patch(&options, session),
             FwCommand::Flash => Err(not_implemented("fw flash")),
         },
         Command::Log { command } => match command {
@@ -294,10 +294,6 @@ mod tests {
     fn unimplemented_commands() -> Vec<(Command, &'static str)> {
         vec![
             (parsed(&["device", "doctor"]), "device doctor"),
-            (
-                parsed(&["fw", "patch", "stock.bin", "--dry-run"]),
-                "fw patch",
-            ),
             (parsed(&["fw", "flash"]), "fw flash"),
             (parsed(&["log", "info", "track.dump"]), "log info"),
             (
@@ -348,7 +344,6 @@ mod tests {
             names,
             vec![
                 "device doctor",
-                "fw patch",
                 "fw flash",
                 "log info",
                 "log download",
