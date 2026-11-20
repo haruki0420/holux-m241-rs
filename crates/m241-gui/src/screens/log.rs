@@ -322,19 +322,32 @@ impl LogScreen {
 
     /// 速度: one series, baseline at zero, no smoothing.
     fn speed_panel(&mut self, ui: &mut Ui) {
-        common::panel(ui, "速度", |ui| {
+        let speeds: Vec<f32> = self
+            .track
+            .points
+            .iter()
+            .filter_map(|point| point.speed_kmh)
+            .collect();
+        let maximum = speeds.iter().copied().reduce(f32::max);
+        // The maximum is a figure *about* the panel, so it belongs on the panel's
+        // caption row. Drawn inside the plot it sat on the first peak of the series —
+        // the review read the line as running through its own label.
+        let note = maximum.map(|maximum| format!("最大 {maximum:.0} km/h"));
+        // The sample word travels in the caption even when the caption carries a
+        // figure too: `sample_panel` cannot be used here because this panel already
+        // spends its note slot on the maximum.
+        let title = if self.sample {
+            format!("速度／{}", common::SAMPLE_WORD)
+        } else {
+            String::from("速度")
+        };
+        common::panel_captioned(ui, &title, note.as_deref(), |ui| {
             let (rect, _ignored) = ui.allocate_exact_size(
                 Vec2::new(ui.available_width(), metric::CHART),
                 Sense::hover(),
             );
             let painter = ui.painter_at(rect);
-            let speeds: Vec<f32> = self
-                .track
-                .points
-                .iter()
-                .filter_map(|point| point.speed_kmh)
-                .collect();
-            let Some(maximum) = speeds.iter().copied().reduce(f32::max) else {
+            let Some(maximum) = maximum else {
                 painter.text(
                     rect.center(),
                     Align2::CENTER_CENTER,
@@ -372,13 +385,6 @@ impl LogScreen {
                     egui::epaint::PathStroke::new(metric::TRACK_LINE, theme::DATA),
                 ));
             }
-            painter.text(
-                rect.left_top() + Vec2::new(space::XS, space::XS),
-                Align2::LEFT_TOP,
-                format!("{maximum:.0} km/h"),
-                FontId::monospace(size::CAPTION),
-                theme::MUTE,
-            );
             painter.text(
                 rect.right_bottom() + Vec2::new(-space::XS, -space::XS),
                 Align2::RIGHT_BOTTOM,
