@@ -292,18 +292,17 @@ Plain rows, no rail block: map cache size and location, units, theme
 
 ## 8. Review protocol (post-build)
 
-`design-review` requires screenshots of the running app; there is no build yet,
-and image generation is unavailable in this session (no provider logged in), so
-the comp round is deferred rather than skipped.
-
-When the shell exists:
+`m241-gui --screenshot` is now built and renders the four screens offscreen at
+1280×800 and 1024×640; the initial design review and its Stage 3 verified fixes
+are recorded in `docs/dev/10-review-log.md`. Repeat this protocol whenever the
+UI changes:
 
 1. `m241-gui --screenshot` renders each screen to PNG at 1280×800 and 1024×640
    using `egui`'s offscreen path, saved under
    `.design/firmware-wizard/screenshots/`.
 2. Review against this document, not against taste: contrast measured, rail
    staircase verified, amber inventory verified to be exactly one control.
-3. Findings recorded in a review document beside this one with Must / Should / Could.
+3. Findings recorded in `docs/dev/10-review-log.md` with Must / Should / Could.
 
 Three checks are mechanical and belong in CI, not in a human pass:
 

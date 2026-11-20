@@ -33,15 +33,21 @@ A fourth offset means the image is not the version this tool expects. Stop.
 
 ## Step 4 is the only dangerous step
 
-The tool refuses unless all three of these hold:
+> **Status: 未検証 / 未実装.** `m241 fw flash` is not implemented in this build
+> yet; `crates/m241-flash/src/da.rs` still refuses to operate while the write
+> path is reviewed against `docs/reference/01-da-protocol.md` and
+> `docs/dev/11-safety-review.md`.
+
+When implemented, the tool refuses unless all three of these hold:
 
 1. the image matches a known firmware profile, or every byte that differs from
    `--backup` falls inside the patch offsets;
 2. the image fits the flash size the device reports;
 3. you typed `WRITE`.
 
-It does not read the device back afterwards. Success means the download agent
-accepted every packet and restarted; confirm the result in step 4 below.
+Per `docs/dev/11-safety-review.md` and `docs/dev/04-prior-art.md`, the v2 flash
+design also re-enters the BootROM to read back and verify the written bytes, and
+you should confirm the live NMEA date in Step 5 below.
 
 ## Step 5: check the date
 

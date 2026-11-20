@@ -13,10 +13,7 @@ chrome and font rendering.)
 
 ## Stack
 
-Rust. Three-crate workspace: `m241-core` (protocol, firmware, log), `m241-cli`
-(`m241 device|fw|log|nmea <verb>`), `m241-gui` (`eframe`/`egui` + `walkers` for
-OpenStreetMap tiles). The CLI and the GUI are one binary: the GUI calls the same
-`m241-core` functions the CLI calls, never a subprocess.
+Rust. Four-crate workspace: `m241-core` (read-only protocol, firmware, log, EXIF/geotag), `m241-flash` (destructive write/erase path: `LogEraser` and Download Agent), `m241-cli` (`m241 device|fw|log|nmea <verb>`), `m241-gui` (`eframe`/`egui` + `walkers` for OpenStreetMap tiles). The GUI calls the same `m241-core` functions the CLI calls, never a subprocess, and does not link `m241-flash`.
 
 ## Users
 
@@ -36,10 +33,7 @@ Two pressures shape every screen:
 
 ## Product Purpose
 
-Repair the GPS week-number-rollover damage on an M-241, and get the track log off
-the device and onto a map. Success is: the logger reports today's date, the track
-is visible on a map with photos attached, and the user never had to read a
-protocol document to get there.
+Repair the GPS week-number-rollover damage on an M-241, and replace the broken vendor software (HOLUX ezTour for Logger v3.0, whose Google Maps API and activation servers are dead; behaviour specified in `docs/dev/07-eztour-spec.ja.md`) so the user can get the track log off the device, view and edit it on a map, export GPX/KML/KMZ/CSV, and geotag photos — all without authentication, external tools, or reading a protocol document.
 
 ## Positioning
 

@@ -76,8 +76,9 @@
 
 ## 5. design-review の実施計画
 
-`design-review` はスクリーンショット必須。ビルドが無い今は実行できないので、
-実行可能になった時点の手順を DESIGN.md の §8 に固定した。
+`m241-gui --screenshot` が実装済みとなり、初回レビューと Stage 3 検証済み修正は
+`docs/dev/10-review-log.md` に記録済み。UI を変更するたびに `DESIGN.md` §8 の
+手順で再点検する。
 
 1. `m241-gui --screenshot` で各画面を 1280×800 と 1024×640 で PNG 出力
 2. `.design/firmware-wizard/screenshots/` に保存

@@ -40,3 +40,14 @@ flowing. That refusal is correct but means a unit that answers neither NMEA nor
 
 Open because: knowing whether the firmware is running without a serial read would
 need another signal — a current measurement, or a GPIO on the cable.
+
+## 5. Raw device speed vs. point-to-point recomputed speed (ezTour parity)
+
+`docs/dev/07-eztour-spec.ja.md` §4.2 establishes that HOLUX ezTour v3.0 did not
+display the raw speed byte from the device log; `HLX_GetTrkInfo.dll` recomputed
+speed and distance from the track point sequence (which also handles 16-byte log
+records that carry no speed field).
+
+Open because: this project has not yet decided whether track summaries and charts
+should prefer the device's raw speed field when present and fall back to
+recomputed speed, or recompute uniformly from point pairs.

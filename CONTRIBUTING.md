@@ -20,7 +20,7 @@ recovery instructions have to survive it.
 
 **The flash path is rebuilt from the vendor binary's disassembly, not ported.**
 
-`DA_v3.8.4.bin` is being disassembled, and its command semantics are recorded in
+`DA_v3.8.4.bin` has been disassembled, and its command semantics are recorded in
 `docs/reference/01-da-protocol.md` before any code implements them. Two things
 follow:
 
