@@ -760,19 +760,7 @@ impl FirmwareScreen {
         ui.add_space(space::M);
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // The only amber-filled control in the product. It is disabled until
-                // every gate holds, which is why the fill is applied unconditionally:
-                // a button that changes colour on hover would be amber doing a second
-                // job.
-                let armed = self.write_armed();
-                let label = Destructive::ConfirmButton.voice().1;
-                let response = ui.add_enabled(
-                    armed,
-                    egui::Button::new(RichText::new(label).size(size::UI))
-                        .fill(Destructive::ConfirmButton.voice().0)
-                        .corner_radius(theme::RADIUS)
-                        .min_size(Vec2::new(metric::ACTION_WIDTH, 0.0)),
-                );
+                let response = self.write_button(ui);
                 if response.clicked() {
                     let refusal = self.attempt_flash();
                     self.message = Some((Status::Err, refusal));
@@ -784,6 +772,36 @@ impl FirmwareScreen {
                 );
             });
         });
+    }
+
+    /// The write button, the only amber-filled control in the product.
+    ///
+    /// Both states are readable, and amber stays on the surface and the frame.
+    /// The review measured the old button at 2.2–2.4:1: `ink` on the amber fill
+    /// is 1.8:1 by itself, and `add_enabled(false, …)` then multiplies both fill
+    /// and label by `disabled_alpha`, which turned a bad pair into an unreadable
+    /// one. So the label colour is chosen from the surface it sits on — `ground`
+    /// on the amber face (7.9:1), `ink` on the dark face (14.3:1) — and the
+    /// disabled dimming is overridden for this one control so the pair survives
+    /// with the ratio it was designed for. The button is still non-interactive
+    /// and still reported as disabled to assistive technology.
+    fn write_button(&mut self, ui: &mut Ui) -> egui::Response {
+        let armed = self.write_armed();
+        let (amber, label) = Destructive::ConfirmButton.voice();
+        let (fill, ink) = confirm_button_colours(amber, armed);
+        let button = egui::Button::new(RichText::new(label).size(size::UI).color(ink))
+            .fill(fill)
+            .stroke(Stroke::new(metric::HAIRLINE, amber))
+            .corner_radius(theme::RADIUS)
+            .min_size(Vec2::new(metric::ACTION_WIDTH, 0.0));
+        ui.scope(|ui| {
+            // The pair above already states "locked" (dark face, ink text); egui's
+            // 0.5 opacity on top would dim the label toward the dark face and take
+            // it back under 4.5:1, which is the defect being fixed.
+            ui.style_mut().visuals.disabled_alpha = 1.0;
+            ui.add_enabled(armed, button)
+        })
+        .inner
     }
 
     /// The prerequisites of the write, each with its state in words.
@@ -1013,6 +1031,21 @@ fn recovery_command(source: &str, patched: &str) -> String {
     format!("m241 fw flash PORT --da DA_v3.8.4.bin --fw {image} --backup {backup} --yes")
 }
 
+/// The write button's (surface, label) pair for its two states.
+///
+/// Amber is the surface and the frame; the label is `ground` on the amber face
+/// (7.9:1) and `ink` on the dark face (14.3:1). One function for both states so
+/// the pair cannot be half-changed: the review found the two ratios 1.8:1 and
+/// 2.2:1, which is what happens when a fill and a label are chosen apart.
+#[must_use]
+fn confirm_button_colours(amber: Color32, armed: bool) -> (Color32, Color32) {
+    if armed {
+        (amber, theme::GROUND)
+    } else {
+        (theme::GROUND, theme::INK)
+    }
+}
+
 /// A label/value row that takes a whole line, for a long figure.
 fn table_row(ui: &mut Ui, label: &str, value: &str, note: &str) {
     ui.horizontal(|ui| {
@@ -1044,11 +1077,58 @@ mod tests {
         FirmwareScreen::default()
     }
 
+    /// WCAG relative luminance, so the button's contrast is measured rather than
+    /// claimed. Duplicated from `theme`'s test module on purpose: the token tests
+    /// assert the palette, this one asserts a pair the palette does not fix.
+    fn luminance(colour: Color32) -> f64 {
+        let channel = |value: u8| {
+            let v = f64::from(value) / 255.0;
+            if v <= 0.039_28 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(colour.r()) + 0.7152 * channel(colour.g()) + 0.0722 * channel(colour.b())
+    }
+
+    fn contrast(a: Color32, b: Color32) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
     #[test]
     fn the_wizard_starts_at_the_read_only_step() {
         let screen = screen();
         assert_eq!(screen.step(), Step::Dump);
         assert_eq!(screen.dump_state(), &DumpState::Idle);
+    }
+
+    #[test]
+    fn the_write_button_label_clears_wcag_aa_in_both_states() {
+        // The defect the review found: ink on amber is 1.8:1, and the disabled
+        // treatment dimmed both until the label was a lighter patch on a lighter
+        // patch. Measured here rather than asserted in a comment, because the two
+        // colours are chosen in different branches and only the pair has a ratio.
+        let (amber, _label) = Destructive::ConfirmButton.voice();
+        for armed in [false, true] {
+            let (fill, ink) = confirm_button_colours(amber, armed);
+            let ratio = contrast(ink, fill);
+            assert!(
+                ratio >= 4.5,
+                "the {} write button is {ratio:.2}:1, below 4.5:1 (ink {ink:?}, fill {fill:?})",
+                if armed { "armed" } else { "locked" }
+            );
+        }
+    }
+
+    #[test]
+    fn the_armed_write_button_puts_ground_text_on_amber() {
+        // DESIGN.md's answer to "how is amber spent on text": it is not. The face
+        // is amber and the word on it is `ground`, which is 7.9:1.
+        let (amber, _label) = Destructive::ConfirmButton.voice();
+        assert_eq!(confirm_button_colours(amber, true), (amber, theme::GROUND));
     }
 
     #[test]
