@@ -255,11 +255,11 @@ pub fn to_json(track: &Track) -> String {
     let summary = crate::types::LogSummary::of(track);
     let _ = writeln!(
         out,
-        "  \"summary\": {{\"records\": {}, \"fixes\": {}, \"damaged_blocks\": {}, \
+        "  \"summary\": {{\"records\": {}, \"fixes\": {}, \"damaged_block_count\": {}, \
          \"started_at\": {}, \"ended_at\": {}}},",
         summary.records,
         summary.fixes,
-        summary.damaged_blocks,
+        summary.damaged_block_count,
         json_optional(summary.started_at.map(i64::from)),
         json_optional(summary.ended_at.map(i64::from)),
     );

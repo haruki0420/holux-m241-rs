@@ -1,9 +1,15 @@
 //! Firmware images: header parsing, the profile table, and the WNRO patch.
 //!
-//! The modules below never read or write a device — they operate on a byte slice
-//! the caller already has. That is deliberate: the patch path is the one that can
-//! leave a unit unbootable, so it is kept pure and testable, and the code that
-//! talks to a device lives in [`crate::protocol`].
+//! [`image`] only decodes an image: it parses the header and reads the epoch
+//! constant, and never writes a byte. [`profiles`] says which release an image
+//! is, and [`patch`] turns that into a [`crate::types::PatchPlan`]. The plan and
+//! its edits are [`crate::types::PatchPlan`] / [`crate::types::PatchEdit`],
+//! because the CLI and the GUI both handle a plan before any image is opened.
+//!
+//! Nothing here reads or writes a device: it operates on a byte slice the caller
+//! already has. That is deliberate — the patch path is the one that can leave a
+//! unit unbootable, so it is pure and testable, and the code that talks to a
+//! device lives in [`crate::protocol`].
 //!
 //! ```text
 //!   image::FirmwareImage   the 0x200-byte header, decoded on demand

@@ -124,8 +124,11 @@ pub struct LogSummary {
     pub records: usize,
     /// Records that carry a position.
     pub fixes: usize,
-    /// Blocks whose header checksum did not match.
-    pub damaged_blocks: usize,
+    /// How many blocks had a header checksum that did not match.
+    ///
+    /// A count, not the list: [`Track::damaged_blocks`] is the list, and the two
+    /// sharing a name made `summary.damaged_blocks` read as if it were one.
+    pub damaged_block_count: usize,
     /// First timestamp, as Unix seconds.
     pub started_at: Option<u32>,
     /// Last timestamp, as Unix seconds.
@@ -140,7 +143,7 @@ impl LogSummary {
         Self {
             records: track.points.len(),
             fixes: track.fix_count(),
-            damaged_blocks: track.damaged_blocks.len(),
+            damaged_block_count: track.damaged_blocks.len(),
             started_at: span.map(|(start, _)| start),
             ended_at: span.map(|(_, end)| end),
         }
@@ -181,10 +184,16 @@ impl PatchPlan {
 
     /// Apply the plan to a copy of `image`.
     ///
+    /// Each edit is checked against the image before it is written: the byte the
+    /// plan says it replaces must actually be there. That is what makes a
+    /// reviewed plan safe to apply — a plan built for a different image is
+    /// refused instead of overwriting whatever the offset happens to hold.
+    ///
     /// # Errors
     ///
-    /// [`crate::Error::Firmware`] when an edit lands outside the image, which
-    /// means the plan was built against a different file.
+    /// [`crate::Error::Firmware`] when an edit lands outside the image or when
+    /// the byte at its offset is not [`PatchEdit::before`]; either means the
+    /// plan was built against a different file.
     pub fn apply(&self, image: &[u8]) -> crate::Result<Vec<u8>> {
         let mut out = image.to_vec();
         for edit in &self.edits {
@@ -198,6 +207,18 @@ impl PatchPlan {
                     offset: Some(edit.offset),
                 });
             };
+            let found = *byte;
+            if found != edit.before {
+                return Err(crate::Error::Firmware {
+                    message: format!(
+                        "patch expects 0x{expect:02X} at offset 0x{offset:X}, but the image has \
+                         0x{found:02X}; the plan was built for a different image",
+                        expect = edit.before,
+                        offset = edit.offset,
+                    ),
+                    offset: Some(edit.offset),
+                });
+            }
             *byte = edit.after;
         }
         Ok(out)
@@ -332,6 +353,20 @@ mod tests {
     }
 
     #[test]
+    fn the_summary_counts_the_damaged_blocks_the_track_listed() {
+        // The summary carries the count and the track carries the list: the two
+        // must not be confused for one another, which is why the summary field
+        // is `damaged_block_count` and not `damaged_blocks`.
+        let track = Track {
+            points: Vec::new(),
+            damaged_blocks: vec![3, 17, 42],
+        };
+        let summary = LogSummary::of(&track);
+        assert_eq!(summary.damaged_block_count, 3);
+        assert_eq!(summary.damaged_block_count, track.damaged_blocks.len());
+    }
+
+    #[test]
     fn a_plan_applies_only_the_bytes_it_names() {
         let plan = PatchPlan {
             edits: vec![PatchEdit {
@@ -359,6 +394,32 @@ mod tests {
         };
         let err = plan.apply(&[0; 4]).expect_err("offset is outside");
         assert!(format!("{err}").contains("0x63"), "got {err}");
+    }
+
+    #[test]
+    fn a_plan_whose_before_byte_is_absent_from_the_image_is_refused() {
+        // The plan was built from a stock image whose byte 1 is 0x00; this image
+        // has 0x2A there, so it is a different file and must not be touched.
+        let plan = PatchPlan {
+            edits: vec![PatchEdit {
+                offset: 1,
+                before: 0x00,
+                after: 0xFF,
+            }],
+            profile: None,
+            no_op_reason: None,
+        };
+        let err = plan
+            .apply(&[0x11, 0x2A, 0x33])
+            .expect_err("before does not match");
+        assert!(matches!(err, crate::Error::Firmware { .. }), "got {err}");
+        let text = format!("{err}");
+        assert!(text.contains("0x2A"), "the found byte is named: {text}");
+        assert!(text.contains("0x00"), "the expected byte is named: {text}");
+        assert!(
+            text.contains("different image"),
+            "the cause is named: {text}"
+        );
     }
 
     #[test]

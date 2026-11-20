@@ -39,7 +39,6 @@ pub fn rail(ui: &mut Ui, current: Screen) -> Option<Screen> {
 
 fn tab(ui: &mut Ui, screen: Screen, active: bool) -> Response {
     let indent = INSET + STEP * screen.index() as f32;
-    ui.add_space(0.0);
     let width = (ui.available_width() - indent).max(0.0);
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, TAB_HEIGHT), Sense::click());
 
@@ -113,9 +112,28 @@ mod tests {
 
     #[test]
     fn screens_are_in_rail_order() {
-        for (index, screen) in Screen::ALL.iter().enumerate() {
-            assert_eq!(screen.index(), index);
-        }
+        // Written as the expected order rather than derived from `index()`: the
+        // previous form re-ran the implementation and could not fail when `ALL`
+        // was reordered. This is the requirement, spelled out.
+        assert_eq!(
+            Screen::ALL,
+            [
+                Screen::Connect,
+                Screen::Log,
+                Screen::Firmware,
+                Screen::Settings
+            ]
+        );
+    }
+
+    #[test]
+    fn each_screen_knows_its_rail_position() {
+        // The staircase is drawn from `index()`; a variant that lands on the
+        // wrong step draws on top of its neighbour. Literals, not a search.
+        assert_eq!(Screen::Connect.index(), 0);
+        assert_eq!(Screen::Log.index(), 1);
+        assert_eq!(Screen::Firmware.index(), 2);
+        assert_eq!(Screen::Settings.index(), 3);
     }
 
     #[test]

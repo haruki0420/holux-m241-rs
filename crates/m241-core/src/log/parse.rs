@@ -13,10 +13,10 @@
 
 use crate::error::{Error, Result};
 use crate::log::block::{
-    BLOCK_HEADER_SIZE, BLOCK_SIZE, BlockHeader, POLICY_LOG_DISABLED, POLICY_LOG_ENABLED,
+    self, BLOCK_HEADER_SIZE, BLOCK_SIZE, BlockHeader, POLICY_LOG_DISABLED, POLICY_LOG_ENABLED,
     is_padding, record_length,
 };
-use crate::log::record::LogRecord;
+use crate::log::record;
 use crate::types::{LogSummary, Track};
 
 /// What the parser had to skip, in the same units as [`LogSummary`].
@@ -43,7 +43,7 @@ impl ParseReport {
     #[must_use]
     pub fn summary(&self, track: &Track) -> LogSummary {
         let mut summary = LogSummary::of(track);
-        summary.damaged_blocks = self.damaged_blocks;
+        summary.damaged_block_count = self.damaged_blocks;
         summary
     }
 }
@@ -129,18 +129,20 @@ pub fn parse_dump(data: &[u8]) -> Result<(Track, ParseReport)> {
                 report.truncated_records += 1;
                 break;
             };
-            match LogRecord::decode(bytes, header.effective_bitmask()) {
-                Ok(record) => {
-                    if !record.checksum_ok {
-                        report.bad_checksums += 1;
-                        block_damaged = true;
-                    }
-                    // MTK writes the whole record block including a waypoint
-                    // record with no position; a point with neither a time nor a
-                    // position carries no information, so it is dropped rather
-                    // than exported as an empty row.
-                    if record.utc.is_some() || record.latitude.is_some() {
-                        track.points.push(record.to_track_point());
+            // The trailer is checked here rather than in `record::decode`: a bad
+            // checksum marks a block, it does not discard a point whose fields
+            // are almost certainly intact.
+            if !block::checksum_matches(bytes, header.effective_bitmask()) {
+                report.bad_checksums += 1;
+                block_damaged = true;
+            }
+            match record::decode(bytes, header.effective_bitmask()) {
+                Ok(point) => {
+                    // A record with neither a time nor a position carries no
+                    // information, so it is dropped rather than exported as an
+                    // empty row.
+                    if point.utc.is_some() || point.latitude.is_some() {
+                        track.points.push(point);
                         report.records += 1;
                     }
                 }

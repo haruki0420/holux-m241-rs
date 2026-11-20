@@ -138,9 +138,15 @@ impl<'a> FirmwareImage<'a> {
         Some(u32::from_le_bytes(array))
     }
 
-    /// Every offset where the GPS epoch constant appears in memory order.
+    /// The offsets that still hold the **stock** GPS epoch constant.
+    ///
+    /// Only occurrences whose value is still [`GPS_EPOCH_UNIX`] are returned, so
+    /// a patched image reports none. That is deliberate — the patch enumerates
+    /// what it would change — but it means an empty result must not be read as
+    /// "this image carries no epoch constant". Use [`Self::effective_epoch`] and
+    /// [`Self::is_patched`] to ask what the constant currently is.
     #[must_use]
-    pub fn epoch_offsets(&self) -> Vec<usize> {
+    pub fn stock_epoch_offsets(&self) -> Vec<usize> {
         EPOCH_CONSTANT_OFFSETS
             .into_iter()
             .filter(|offset| self.u32_at(*offset) == Some(GPS_EPOCH_UNIX))
@@ -218,10 +224,22 @@ mod tests {
     }
 
     #[test]
-    fn both_epoch_occurrences_are_reported() {
+    fn both_epoch_occurrences_are_reported_when_the_image_is_stock() {
         let data = image_with(GPS_EPOCH_UNIX);
         let image = FirmwareImage::new(&data).expect("valid header");
-        assert_eq!(image.epoch_offsets(), vec![0x402DC, 0x402F4]);
+        assert_eq!(image.stock_epoch_offsets(), vec![0x402DC, 0x402F4]);
+    }
+
+    #[test]
+    fn a_patched_image_reports_no_stock_epoch_offsets() {
+        // The list is what the patch would change, so a patched image has none.
+        // It must not be read as "no constant in this image": the constant is
+        // there, carrying the WNRO value.
+        let data = image_with(GPS_EPOCH_UNIX_WNRO);
+        let image = FirmwareImage::new(&data).expect("valid header");
+        assert!(image.stock_epoch_offsets().is_empty());
+        assert_eq!(image.effective_epoch(), Some(GPS_EPOCH_UNIX_WNRO));
+        assert!(image.is_patched());
     }
 
     #[test]

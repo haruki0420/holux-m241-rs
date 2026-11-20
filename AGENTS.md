@@ -11,15 +11,15 @@ expensive to learn so it does not have to be rediscovered.
 ./tools/check.sh
 ```
 
-It runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-`cargo test --workspace`, the docs link check and the design invariant check, and
-prints one line per gate.
+It runs five gates: formatting, lint, the workspace tests, the docs link check
+and the design invariant check. It prints one line per gate.
 
-The design gate (`tools/check_design.py`) is not cosmetic. It fails the build if
-amber appears outside the destructive module, if a corner radius is written as a
-literal instead of `theme::RADIUS`, or if a status colour is used without a text
-label beside it. Those three rules each encode a decision from `DESIGN.md`, and a
-rule enforced only by review holds until the reviewer is busy.
+The design gate (`tools/check_design.py`) is not cosmetic. It checks three
+invariants mechanically: amber appears only in the destructive module, a corner
+radius is always `theme::RADIUS`, and a status colour always sits beside a text
+label. It fails the build when one is broken. Those three rules each encode a
+decision from `DESIGN.md`, and a rule enforced only by review holds until the
+reviewer is busy.
 
 **Long commands go in the background.** A first `cargo build` of the GUI pulls
 in `wgpu` and takes several minutes. Do not block a turn on it.
@@ -198,3 +198,23 @@ Recorded in `docs/dev/06-open-questions.md`. Do not fabricate answers:
 * Whether a Japanese-language firmware SKU exists.
 * Bluetooth SPP was never exercised.
 * The `0xD3` status byte's meaning beyond `0x00` = success.
+
+## 8. Review and fix: three stages, three different agents
+
+A review that finds a problem does not hand it back to the author, and the fix
+is not accepted on the fixer's word. Three stages, each a different agent:
+
+1. **Find.** A reviewer reads the code and writes the findings with
+   `file:line`. They do not fix anything.
+2. **Fix.** A *different* agent applies the fixes. If a finding is wrong, they
+   say so and leave the code alone — silence plus a wrong change is worse than
+   an argued disagreement.
+3. **Verify.** A *third* agent checks the fix against the findings and the
+   tests. They read the findings and the diff. They do not read the fixer's
+   explanation: an explanation is how a bad fix gets talked past.
+
+Why bother: the agent that made the mistake reads its own fix with the same
+assumption it read the original. A different agent reading the same diff with
+the same instructions does not.
+
+Every stage ends with `./tools/check.sh` at 5/5.

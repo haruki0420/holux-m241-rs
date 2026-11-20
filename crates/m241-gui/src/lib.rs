@@ -4,9 +4,13 @@
 //! tokens and the signature move exist once, in one place. Screens are added
 //! against `DESIGN.md`; see `screens/`.
 //!
-//! The GUI calls `m241_core` directly. It never spawns the CLI: a subprocess
-//! would make progress reporting, cancellation and the typed confirmation
-//! impossible to keep honest.
+//! The GUI is **planned** to call `m241_core` directly and never spawn the CLI:
+//! a subprocess would make progress reporting, cancellation and the typed
+//! confirmation impossible to keep honest. That dependency is not declared yet —
+//! today the shell only navigates — so the crate compiles without `m241_core`.
+//! Declaring a dependency before its consumer exists is the warning this crate
+//! deliberately avoids; the path stays reserved for the first screen that does
+//! real work.
 //!
 //! Exposed as a library so integration tests can drive the real [`App`] through
 //! `egui`'s headless context. A GUI that compiles is not a GUI that works.

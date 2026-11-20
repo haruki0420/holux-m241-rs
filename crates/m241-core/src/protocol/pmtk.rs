@@ -254,7 +254,7 @@ pub fn parse_log_chunk(sentence: &Sentence, address: usize) -> Result<Vec<u8>> {
     if returned != address {
         return Err(Error::Framing {
             what: format!("log reply is for address 0x{returned:X}, requested 0x{address:X}"),
-            offset: returned,
+            offset: Some(returned),
         });
     }
     let Some(payload) = sentence.field(2) else {
@@ -540,7 +540,7 @@ impl<T: Transport> PmtkClient<T> {
         if ack.command != 182 {
             return Err(Error::Framing {
                 what: format!("acknowledgement was for command {}, not 182", ack.command),
-                offset: 0,
+                offset: None,
             });
         }
         if !ack.is_ok() {
@@ -629,7 +629,7 @@ impl<T: Transport> PmtkClient<T> {
                         "the device returned no data at 0x{address:X} ({} of {total} bytes)",
                         collected.len()
                     ),
-                    offset: address,
+                    offset: Some(address),
                 });
             }
             if chunk.len() > want {
@@ -638,7 +638,7 @@ impl<T: Transport> PmtkClient<T> {
                         "the device returned {} bytes for a {want}-byte request at 0x{address:X}",
                         chunk.len()
                     ),
-                    offset: address,
+                    offset: Some(address),
                 });
             }
             collected.extend_from_slice(&chunk);

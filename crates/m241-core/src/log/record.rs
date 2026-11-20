@@ -1,9 +1,13 @@
-//! A single record in the M-241's binary track log.
+//! Decoding one record of the M-241's binary track log.
 //!
 //! Records are not fixed-width: the block header's bitmask decides which fields
 //! each record carries, and the fields appear in ascending bit order. This module
 //! decodes one record for a given mask; [`crate::log::parse`] walks a whole dump
 //! and [`crate::log::block`] owns the mask itself.
+//!
+//! A decoded record is a [`crate::types::TrackPoint`], the same type the CLI and
+//! the GUI pass around, so there is one point type in the crate rather than one
+//! per layer.
 //!
 //! Three M-241 differences from generic MTK loggers are handled here, because
 //! each of them silently produces plausible garbage if it is got wrong:
@@ -13,7 +17,7 @@
 //! * the trailer is **one** checksum byte, with no `'*'` separator.
 
 use crate::error::{Error, Result};
-use crate::log::block::{self, bit, field_layout};
+use crate::log::block::{bit, field_layout};
 use crate::types::TrackPoint;
 
 /// Smallest possible record: UTC + lat + lon + height + checksum.
@@ -31,151 +35,91 @@ pub mod bit_index {
     pub use crate::log::block::bit::*;
 }
 
-/// One decoded record, before the dump is stitched into a [`crate::types::Track`].
+/// Decode one record (fields **and** trailer) for `bitmask`.
 ///
-/// It keeps the fix-validity flags, which [`TrackPoint`] has no room for but the
-/// decoder needs to decide whether a position exists at all.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LogRecord {
-    /// UTC as Unix seconds.
-    pub utc: Option<u32>,
-    /// Latitude in degrees, widened from the 4-byte float the device stores.
-    pub latitude: Option<f64>,
-    /// Longitude in degrees.
-    pub longitude: Option<f64>,
-    /// Height in metres, decoded from the 3-byte field.
-    pub height_m: Option<f32>,
-    /// Speed in km/h.
-    pub speed_kmh: Option<f32>,
-    /// Log reason bitmask; bit 3 marks a manual waypoint.
-    pub rcr: Option<u16>,
-    /// Whether the one-byte checksum matched.
-    pub checksum_ok: bool,
+/// `record` may be longer than the record itself — the caller usually hands over
+/// the rest of the block — in which case the layout decides how much is read.
+/// The caller checks the trailer separately with
+/// [`crate::log::block::checksum_matches`]: a bad checksum marks a point, it does
+/// not discard it.
+///
+/// # Errors
+///
+/// [`Error::Log`] when the bytes are too short for the fields the mask selects,
+/// which means the record is truncated.
+pub fn decode(record: &[u8], bitmask: u32) -> Result<TrackPoint> {
+    let layout = field_layout(bitmask, record);
+    let mut point = TrackPoint::default();
+
+    // The fix flags decide whether the position is real. MTK stores
+    // `VALID == 0x0001` for "no fix", and a record with no position must not
+    // claim one — reporting (0, 0) would place the track off West Africa. A mask
+    // without VALID has no flag to contradict the coordinates, so the position is
+    // trusted; that is how the measured 16-byte log behaves.
+    let valid = field(record, &layout, bit::VALID)
+        .and_then(read_u16)
+        .unwrap_or(0);
+    let has_fix = valid & 0x0001 == 0;
+
+    for entry in &layout {
+        let Some(bytes) = record.get(entry.offset..entry.offset.saturating_add(entry.size)) else {
+            return Err(Error::Log {
+                message: format!(
+                    "record is truncated: bit {} needs {} bytes at +{}",
+                    entry.bit, entry.size, entry.offset
+                ),
+                offset: Some(entry.offset),
+            });
+        };
+        match entry.bit {
+            bit::UTC => point.utc = read_u32(bytes),
+            bit::LATITUDE if has_fix => point.latitude = read_f32(bytes).map(f64::from),
+            bit::LONGITUDE if has_fix => point.longitude = read_f32(bytes).map(f64::from),
+            bit::HEIGHT => point.height_m = height_from_u24(bytes).ok(),
+            bit::SPEED => point.speed_kmh = read_f32(bytes),
+            bit::RCR => point.rcr = read_u16(bytes),
+            _ => {}
+        }
+    }
+
+    // The device stores 0 for "no timestamp"; reporting it as 1970 would put a
+    // spurious point at the start of every track.
+    if point.utc == Some(0) || point.utc == Some(u32::MAX) {
+        point.utc = None;
+    }
+    Ok(point)
 }
 
-impl LogRecord {
-    /// Whether this record marks a waypoint (`RCR & 0x0008`).
-    #[must_use]
-    pub fn is_waypoint(&self) -> bool {
-        self.rcr.is_some_and(|rcr| rcr & 0x0008 != 0)
-    }
-
-    /// The smallest record this format can produce, in bytes.
-    ///
-    /// A record shorter than this cannot carry a position, so a dump whose tail
-    /// is shorter is a truncated final write, not a point.
-    #[must_use]
-    pub fn is_plausible_length(length: usize) -> bool {
-        length >= MIN_RECORD_BYTES
-    }
-
-    /// Decode one complete record (fields **and** trailer) for `bitmask`.
-    ///
-    /// `record` may be longer than the record itself — the caller usually hands
-    /// over the rest of the block — in which case the layout decides how much is
-    /// read.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Log`] when the bytes are too short for the fields the mask
-    /// selects, which means the record is truncated.
-    pub fn decode(record: &[u8], bitmask: u32) -> Result<Self> {
-        let layout = field_layout(bitmask, record);
-        let mut decoded = Self {
-            utc: None,
-            latitude: None,
-            longitude: None,
-            height_m: None,
-            speed_kmh: None,
-            rcr: None,
-            checksum_ok: block::checksum_matches(record, bitmask),
-        };
-
-        // The fix flags decide whether the position is real. MTK stores
-        // `VALID == 0x0001` for "no fix", and a record with no position must not
-        // claim one — reporting (0, 0) would place the track off West Africa.
-        // A mask without VALID has no flag to contradict the coordinates, so the
-        // position is trusted; that is how the measured 16-byte log behaves.
-        let valid = field(record, &layout, bit::VALID)
-            .and_then(read_u16)
-            .unwrap_or(0);
-        let has_fix = valid & 0x0001 == 0;
-
-        for entry in &layout {
-            let Some(bytes) = record.get(entry.offset..entry.offset.saturating_add(entry.size))
-            else {
-                return Err(Error::Log {
-                    message: format!(
-                        "record is truncated: bit {} needs {} bytes at +{}",
-                        entry.bit, entry.size, entry.offset
-                    ),
-                    offset: Some(entry.offset),
-                });
-            };
-            match entry.bit {
-                bit::UTC => decoded.utc = read_u32(bytes),
-                bit::LATITUDE => decoded.latitude = read_f32(bytes).map(f64::from),
-                bit::LONGITUDE => decoded.longitude = read_f32(bytes).map(f64::from),
-                bit::HEIGHT => decoded.height_m = Self::height_from_u24(bytes).ok(),
-                bit::SPEED => decoded.speed_kmh = read_f32(bytes),
-                bit::RCR => decoded.rcr = read_u16(bytes),
-                _ => {}
-            }
-        }
-
-        // The device stores 0 for "no timestamp"; reporting it as 1970 would put
-        // a spurious point at the start of every track.
-        if decoded.utc == Some(0) || decoded.utc == Some(u32::MAX) {
-            decoded.utc = None;
-        }
-        if !has_fix {
-            decoded.latitude = None;
-            decoded.longitude = None;
-        }
-        Ok(decoded)
-    }
-
-    /// Convert to the shared [`TrackPoint`] the compiler and the interface use.
-    #[must_use]
-    pub fn to_track_point(&self) -> TrackPoint {
-        TrackPoint {
-            utc: self.utc,
-            latitude: self.latitude,
-            longitude: self.longitude,
-            height_m: self.height_m,
-            speed_kmh: self.speed_kmh,
-            rcr: self.rcr,
-        }
-    }
-
-    /// Decode a 3-byte height as the M-241 stores it.
-    ///
-    /// The three bytes are the *most significant* bytes of a little-endian
-    /// float32, so the implicit zero low byte is prepended. Getting this wrong
-    /// (reading the bytes as a `u24` number) yields heights in the tens of
-    /// millions of metres rather than an error.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Log`] when fewer than three bytes are available.
-    pub fn height_from_u24(bytes: &[u8]) -> Result<f32> {
-        let top: [u8; 3] = bytes
-            .get(..3)
-            .and_then(|slice| slice.try_into().ok())
-            .ok_or_else(|| Error::Log {
-                message: format!("height needs 3 bytes, got {}", bytes.len()),
-                offset: None,
-            })?;
-        // The three bytes are the *most significant* bytes of a little-endian
-        // f32, so the implicit zero byte goes in front. Building the array
-        // directly keeps the zero explicit and needs no mutable slicing.
-        let value = [0u8, top[0], top[1], top[2]];
-        Ok(f32::from_le_bytes(value))
-    }
+/// Decode a 3-byte height as the M-241 stores it.
+///
+/// The three bytes are the *most significant* bytes of a little-endian float32,
+/// so the implicit zero low byte is prepended. Reading them as a `u24` number
+/// instead yields heights in the tens of millions of metres rather than an error.
+///
+/// # Errors
+///
+/// [`Error::Log`] when fewer than three bytes are available.
+pub fn height_from_u24(bytes: &[u8]) -> Result<f32> {
+    let top: [u8; 3] = bytes
+        .get(..3)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| Error::Log {
+            message: format!("height needs 3 bytes, got {}", bytes.len()),
+            offset: None,
+        })?;
+    // The three bytes are the *most significant* bytes of a little-endian f32,
+    // so the implicit zero byte goes in front. Building the array directly keeps
+    // the zero explicit and needs no mutable slicing.
+    let value = [0u8, top[0], top[1], top[2]];
+    Ok(f32::from_le_bytes(value))
 }
 
 /// The bytes of one decoded field, if the layout includes it.
-fn field<'a>(record: &'a [u8], layout: &[block::Field], wanted: u8) -> Option<&'a [u8]> {
+fn field<'a>(
+    record: &'a [u8],
+    layout: &[crate::log::block::Field],
+    wanted: u8,
+) -> Option<&'a [u8]> {
     let entry = layout.iter().find(|entry| entry.bit == wanted)?;
     record.get(entry.offset..entry.offset.saturating_add(entry.size))
 }
@@ -198,6 +142,7 @@ fn read_f32(bytes: &[u8]) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log::block::xor_checksum;
 
     /// The repository's example coordinate, stored as the `f32` the log holds.
     const LAT: f32 = 35.681_236;
@@ -210,7 +155,7 @@ mod tests {
         body.extend_from_slice(&LAT.to_le_bytes());
         body.extend_from_slice(&LON.to_le_bytes());
         body.extend_from_slice(&[0x00, 0xA0, 0x42]); // 80.0 m
-        let checksum = block::xor_checksum(&body);
+        let checksum = xor_checksum(&body);
         body.push(checksum);
         body
     }
@@ -218,29 +163,24 @@ mod tests {
     #[test]
     fn height_prepends_the_implicit_zero_byte() {
         // 0x42 0xA0 0x00 as the top three bytes of a little-endian float.
-        let height = LogRecord::height_from_u24(&[0x00, 0xA0, 0x42]).expect("three bytes");
+        let height = height_from_u24(&[0x00, 0xA0, 0x42]).expect("three bytes");
         assert_eq!(height, 80.0);
     }
 
     #[test]
     fn a_short_height_is_an_error_not_a_panic() {
-        assert!(LogRecord::height_from_u24(&[0x00, 0xA0]).is_err());
+        assert!(height_from_u24(&[0x00, 0xA0]).is_err());
     }
 
     #[test]
     fn rcr_bit_three_marks_a_waypoint() {
-        let waypoint = LogRecord {
-            utc: None,
-            latitude: None,
-            longitude: None,
-            height_m: None,
-            speed_kmh: None,
+        let waypoint = TrackPoint {
             rcr: Some(0x0008),
-            checksum_ok: true,
+            ..TrackPoint::default()
         };
         assert!(waypoint.is_waypoint());
         assert!(
-            !LogRecord {
+            !TrackPoint {
                 rcr: None,
                 ..waypoint
             }
@@ -251,7 +191,7 @@ mod tests {
     #[test]
     fn a_sixteen_byte_record_decodes_its_four_fields() {
         let record = sixteen_byte_record();
-        let decoded = LogRecord::decode(&record, 0x8000_001D).expect("16-byte record");
+        let decoded = decode(&record, 0x8000_001D).expect("16-byte record");
         assert_eq!(decoded.utc, Some(1_700_000_000));
         // The stored type is `f32`, so the comparison is against the same value
         // widened, not against the `f64` the example coordinate is written as.
@@ -259,7 +199,6 @@ mod tests {
         assert_eq!(decoded.longitude, Some(f64::from(LON)));
         assert_eq!(decoded.height_m, Some(80.0));
         assert_eq!(decoded.speed_kmh, None);
-        assert!(decoded.checksum_ok);
     }
 
     #[test]
@@ -270,20 +209,12 @@ mod tests {
         body.extend_from_slice(&LON.to_le_bytes());
         body.extend_from_slice(&[0x00, 0xA0, 0x42]);
         body.extend_from_slice(&42.5f32.to_le_bytes());
-        let checksum = block::xor_checksum(&body);
+        let checksum = xor_checksum(&body);
         body.push(checksum);
 
-        let record = LogRecord::decode(&body, 0x8000_003D).expect("20-byte record");
+        let record = decode(&body, 0x8000_003D).expect("20-byte record");
         assert_eq!(record.speed_kmh, Some(42.5));
         assert_eq!(record.height_m, Some(80.0));
-    }
-
-    #[test]
-    fn a_corrupt_checksum_is_reported_not_hidden() {
-        let mut record = sixteen_byte_record();
-        record[3] ^= 0xFF;
-        let decoded = LogRecord::decode(&record, 0x8000_001D).expect("still decodes");
-        assert!(!decoded.checksum_ok);
     }
 
     #[test]
@@ -297,14 +228,14 @@ mod tests {
         body.extend_from_slice(&0f32.to_le_bytes());
         body.extend_from_slice(&0f32.to_le_bytes());
         body.extend_from_slice(&[0x00, 0x00, 0x00]);
-        let checksum = block::xor_checksum(&body);
+        let checksum = xor_checksum(&body);
         body.push(checksum);
 
-        let record = LogRecord::decode(&body, bitmask).expect("record");
+        let record = decode(&body, bitmask).expect("record");
         assert_eq!(record.utc, Some(1_700_000_000));
         assert_eq!(record.latitude, None);
         assert_eq!(record.longitude, None);
-        assert!(!record.to_track_point().has_position());
+        assert!(!record.has_position());
     }
 
     #[test]
@@ -314,10 +245,10 @@ mod tests {
         body.extend_from_slice(&LAT.to_le_bytes());
         body.extend_from_slice(&LON.to_le_bytes());
         body.extend_from_slice(&[0x00, 0xA0, 0x42]);
-        let checksum = block::xor_checksum(&body);
+        let checksum = xor_checksum(&body);
         body.push(checksum);
 
-        let record = LogRecord::decode(&body, 0x8000_001D).expect("record");
+        let record = decode(&body, 0x8000_001D).expect("record");
         assert_eq!(record.utc, None);
     }
 
@@ -325,13 +256,20 @@ mod tests {
     fn a_truncated_record_is_an_error() {
         let record = sixteen_byte_record();
         let truncated = &record[..8];
-        assert!(LogRecord::decode(truncated, 0x8000_001D).is_err());
+        assert!(decode(truncated, 0x8000_001D).is_err());
     }
 
     #[test]
-    fn a_plausible_length_starts_at_the_minimum_size() {
-        assert!(!LogRecord::is_plausible_length(MIN_RECORD_BYTES - 1));
-        assert!(LogRecord::is_plausible_length(MIN_RECORD_BYTES));
+    fn a_record_without_a_valid_field_trusts_its_coordinates() {
+        // The measured V1.13 default mask has no VALID bit; the position is then
+        // the only evidence there is, and it is kept.
+        let record = sixteen_byte_record();
+        let decoded = decode(&record, 0x8000_001D).expect("record");
+        assert!(decoded.has_position());
+    }
+
+    #[test]
+    fn the_record_constants_are_the_two_documented_sizes() {
         assert_eq!(MIN_RECORD_BYTES, 16);
         assert_eq!(DEFAULT_RECORD_BYTES, 20);
     }
