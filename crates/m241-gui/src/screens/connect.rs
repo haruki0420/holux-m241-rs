@@ -52,9 +52,12 @@ impl ConnectScreen {
         // "next step" block ending at its first line — below the fold, and therefore
         // unreachable rather than merely cropped.
         common::scrolling(ui, "m241-connect-body", |ui| {
+            // The heading is the screen's name, not the product's: the title bar
+            // already says "Holux M-241", and a heading that repeated it made the
+            // screen read as a splash page rather than as the 接続 tab.
             common::heading(
                 ui,
-                "Holux M-241",
+                "接続",
                 "ファームの日付が 19.6 年ずれています。端末をつなぎ、まずファームを吸い出してください。",
             );
             // The sample band sits under the heading, above every figure: it cannot
