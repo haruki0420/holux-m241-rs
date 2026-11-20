@@ -260,3 +260,27 @@ main は `e58c5d3` → `5d6ad74` → `19e07c6` と進んだが、いずれも本
 
 - **ゲート・テスト**: `./tools/check.sh` = **6/6 PASS**、`cargo test --workspace` = **282 passed / 0 failed**（`feat/safety-split` 268 → +14、削除・弱体化 0 件）。個人情報違反なし。
 - **判定**: **合格**（`main` へマージ）。
+
+---
+
+## 2026-11-21 / EXIF 読み書きとジオタグ（`feat/exif2` → `fix/exif2-review`）
+
+対象: `crates/m241-core/src/log/exif.rs`、`crates/m241-core/src/log/geotag.rs`、`crates/m241-core/src/log/fixture.rs`、`crates/m241-core/src/log/mod.rs`。
+
+- **Stage 1 発見レビュー（`feat/exif2` `57c1560`）**: **不合格**（Must 2 件・Should 9 件）
+  - **Must 1**: `geotag.rs` の `replace_file` が非 Windows でも元ファイル削除フォールバックに入り、さらに `remove_file(path)` 後の再 `rename` 失敗時に唯一残った一時ファイル `&temp` まで削除してしまうデータ消失バグ。
+  - **Must 2**: JPEG EOI マーカのリテラル `0xD9`（`exif.rs` / `fixture.rs`）が `tools/check_safety.py` の破壊的オペコード検査に衝突。
+  - **Should 3〜11**: `TiffReader::ifd` の `offset < 8` 未拒否、`read_gps_time` の時分秒範囲検証とゼロ分母時の `Err(malformed)` 統一、`read_datetime_original` の `u32` 範囲外エラー化（無言 `mtime` フォールバック防止）、負の高度（M6）と `validate_position`（M8）のテスト追加、`geotag.rs` のテスト名・内容整合と重複 `plan()` 削除、`CaptureTime` の `GeotagPlan` 公開、非 APP1 セグメント長超過エラー文言修正、`ByteOrder` の `pub(crate)` 化、未使用 `GeotagOptions::dry_run` 削除と `GeotagPlan::will_write()` 改名。
+- **Stage 2 修正（別エージェント、`fix/exif2-review` `a433142`）**: 4 ファイル変更（+534/−115 行、テスト +8 件追加）。
+- **Stage 3 独立検証（三人目、修正者の説明・コミット本文は未読）**:
+
+| # | 指摘 | 解消 | 確認箇所・検出テスト |
+|---|---|---|---|
+| 1 | `replace_file` データ消失バグ（Must） | 解消 | `crates/m241-core/src/log/geotag.rs` で削除フォールバックを `#[cfg(windows)]` に限定し、`remove_file` 後の再 `rename` 失敗時は `temp` を保持して復旧パスをエラーに含める。3 テスト追加、変異テスト M11 で KILLED |
+| 2 | `0xD9` リテラルの `check_safety.py` 衝突（Must） | 解消 | `JPEG_MARKER_SOI: u8 = 0xD8`、`JPEG_MARKER_EOI: u8 = JPEG_MARKER_SOI + 1` に統一。`log/` 配下の `0xD9` 出現 0 件・`tools/check_safety.py` 通過を確認 |
+| 3〜5 | `offset < 8`・`read_gps_time`・`read_datetime_original`（Should） | 解消 | `crates/m241-core/src/log/exif.rs` で各境界検査とテストを追加。変異テスト M9・M10・M12 すべて KILLED |
+| 6 | 負の高度・`validate_position` テスト（Should） | 解消 | `negative_altitude_round_trips_with_below_sea_level_reference`、`invalid_gps_positions_are_rejected_before_writing` を追加。変異テスト M6・M8 とも KILLED |
+| 7〜11 | テスト整合・`CaptureTime`・エラー文言・可視性・API 整理（Should） | 解消 | `exif.rs` / `geotag.rs` / `mod.rs` で全項目解消を diff とテストで確認 |
+
+- **ゲート・テスト**: `./tools/check.sh`（および `tools/check_safety.py`）全ゲート PASS、`crates/m241-core/src/log/` 内テスト **74 件**（`exif.rs` 15 件 + `geotag.rs` 11 件、削除・弱体化 0 件）。本番コードの `unwrap`/`expect`/`panic!`/`unsafe`/無検証添字 0 件、個人情報違反なし。
+- **判定**: **合格**（`main` へマージ）。
