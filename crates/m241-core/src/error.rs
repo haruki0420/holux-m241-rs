@@ -58,8 +58,14 @@ pub enum Error {
     /// The caller asked for something the current state does not allow.
     State(String),
     /// A file could not be read or written.
+    ///
+    /// `path` is the file the caller was working on. It is `None` when the error
+    /// came from a bare [`std::io::Error`], which carries no path: the serial
+    /// port, for instance, is mapped from `serialport::Error` and its own errors
+    /// go through [`Error::Port`]. Display then reads `i/o: …` rather than
+    /// inventing a placeholder path.
     Io {
-        path: String,
+        path: Option<String>,
         source: std::io::Error,
     },
 }
@@ -98,7 +104,10 @@ impl fmt::Display for Error {
             }
             Self::Nmea { message } => write!(f, "NMEA sentence: {message}"),
             Self::State(message) => f.write_str(message),
-            Self::Io { path, source } => write!(f, "i/o on {path}: {source}"),
+            Self::Io { path, source } => match path {
+                Some(path) => write!(f, "i/o on {path}: {source}"),
+                None => write!(f, "i/o: {source}"),
+            },
         }
     }
 }
@@ -180,12 +189,27 @@ impl Error {
     }
 }
 
-impl From<std::io::Error> for Error {
-    fn from(source: std::io::Error) -> Self {
+impl Error {
+    /// Wrap an I/O error with the file it happened on.
+    ///
+    /// Prefer this over [`Error::from`] whenever the path is known: `i/o on
+    /// backup/stock.bin: permission denied` names the file to fix, and a bare
+    /// `i/o: permission denied` does not.
+    #[must_use]
+    pub fn io(path: impl Into<String>, source: std::io::Error) -> Self {
         Self::Io {
-            path: String::from("<unbound>"),
+            path: Some(path.into()),
             source,
         }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(source: std::io::Error) -> Self {
+        // A bare `io::Error` carries no path. Guessing one (`<unbound>`) put a
+        // placeholder in front of the user; `None` lets Display print the OS's
+        // wording alone.
+        Self::Io { path: None, source }
     }
 }
 
@@ -349,11 +373,35 @@ mod tests {
 
     #[test]
     fn an_io_error_keeps_its_source_chain() {
-        let err = Error::Io {
-            path: String::from("backup/stock.bin"),
-            source: std::io::Error::from(std::io::ErrorKind::NotFound),
-        };
+        let err = Error::io(
+            "backup/stock.bin",
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
         assert!(std::error::Error::source(&err).is_some());
         assert!(format!("{err}").contains("backup/stock.bin"));
+    }
+
+    #[test]
+    fn a_bare_io_error_prints_no_placeholder_path() {
+        // `Error::from(io::Error)` has no path to name. It used to print
+        // "i/o on <unbound>: …", which reads as a real file name.
+        let err = Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        let text = format!("{err}");
+        assert!(!text.contains("<unbound>"), "got {text}");
+        assert!(!text.contains("i/o on "), "got {text}");
+        assert!(text.starts_with("i/o: "), "got {text}");
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    #[test]
+    fn an_io_error_with_a_path_names_the_file() {
+        let err = Error::io(
+            "backup/stock.bin",
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert!(
+            format!("{err}").starts_with("i/o on backup/stock.bin: "),
+            "got {err}"
+        );
     }
 }
