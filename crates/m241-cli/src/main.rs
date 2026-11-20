@@ -390,7 +390,7 @@ mod tests {
             (
                 m241_core::Error::Framing {
                     what: String::from("echo"),
-                    offset: 3,
+                    offset: Some(3),
                 },
                 4,
             ),
