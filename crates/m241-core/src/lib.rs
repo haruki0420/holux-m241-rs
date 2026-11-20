@@ -43,8 +43,12 @@ pub mod error;
 pub mod firmware;
 pub mod log;
 pub mod protocol;
+pub mod types;
 
 pub use error::{Error, Result};
+pub use types::{
+    DeviceInfo, ExportFormat, FirmwareProfile, LogSummary, PatchEdit, PatchPlan, Track, TrackPoint,
+};
 
 /// Version of the crate, taken from `Cargo.toml` at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

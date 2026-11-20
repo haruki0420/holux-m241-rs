@@ -29,7 +29,11 @@ LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 SKIP_PREFIXES = ("http://", "https://", "mailto:", "#", "data:")
-SKIP_DIRS = {".git", "target", ".cargo-home", "node_modules"}
+#: Directories that are not part of this checkout's documentation. `.worktrees`
+#: holds the parallel work trees, each a full copy of the repository: scanning
+#: them would check every page once per tree and report paths that are only
+#: missing because that tree is on an older commit.
+SKIP_DIRS = {".git", "target", ".cargo-home", "node_modules", ".worktrees", "vendor"}
 
 #: Directories whose contents are referenced by path in the docs.
 PATH_ROOTS = ("docs/", "crates/", "tools/", ".github/")
