@@ -7,10 +7,10 @@
 
 use m241_core::log::{ParseReport, export, parse_dump};
 use m241_core::protocol::pmtk::{NMEA_BAUD, PmtkClient};
-use m241_core::{LogSummary, Result};
+use m241_core::{LogSummary, Result, Track};
 
 use crate::Session;
-use crate::cli::{DownloadOptions, LogInfoOptions};
+use crate::cli::{DownloadOptions, LogInfoOptions, LogReadOptions};
 use crate::fileio;
 use crate::link;
 use crate::output::Console;
@@ -82,6 +82,78 @@ pub fn download(options: &DownloadOptions, session: Session<'_>) -> Result<()> {
         options.output.display()
     ));
     Ok(())
+}
+
+/// Convert a dumped log to GPX, KML, CSV, NMEA or JSON.
+///
+/// `--utc-offset-days auto` shifts only a log whose newest record is stale — one
+/// written by an unpatched unit, whose every timestamp is 7168 days in the past.
+/// An explicit number is applied as given, including negative values.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the file cannot be read or the output written,
+/// [`Error::Log`] when it is not a dump at all.
+pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
+    let bytes = fileio::read(&options.file)?;
+    let (mut track, report) = parse_dump(&bytes)?;
+    let summary = report.summary(&track);
+    warn_about_damage(session.console, &summary, &report);
+
+    let shift = options
+        .utc_offset_days
+        .shift_for(track_days(&track).unwrap_or_default());
+    if shift != 0 {
+        shift_track(&mut track, shift);
+        session.console.note(&format!(
+            "shifted every timestamp by {shift:+} days: {}",
+            if shift == crate::cal::WNRO_DAYS {
+                String::from(
+                    "the log was written by a unit whose clock is still on the old GPS epoch",
+                )
+            } else {
+                String::from("--utc-offset-days")
+            }
+        ));
+    }
+
+    match &options.output {
+        Some(path) => {
+            fileio::write_text(path, &export(&track, options.format))?;
+            session.console.note(&format!(
+                "wrote {} {} to {}",
+                track.points.len(),
+                if track.points.len() == 1 {
+                    "point"
+                } else {
+                    "points"
+                },
+                path.display()
+            ));
+        }
+        None => session.console.text(&export(&track, options.format)),
+    }
+    Ok(())
+}
+
+/// Which day, in days since the Unix epoch, the log's newest record falls on.
+///
+/// The stale-window test only needs a day, so this drops the time of day rather
+/// than carrying it around.
+fn track_days(track: &Track) -> Option<i64> {
+    track
+        .points
+        .iter()
+        .rev()
+        .find_map(|point| point.utc)
+        .map(|utc| i64::from(utc / 86_400))
+}
+
+/// Add `days` to every timestamp the track carries.
+fn shift_track(track: &mut Track, days: i32) {
+    for point in &mut track.points {
+        point.utc = point.utc.map(|utc| crate::cal::shift_seconds(utc, days));
+    }
 }
 
 /// Summarise a dumped track log.
@@ -430,5 +502,170 @@ mod tests {
         .expect_err("ambiguous");
         assert_eq!(crate::exit::exit_code_for(&err), 3, "got {err}");
         assert!(format!("{err}").contains("--port"), "got {err}");
+    }
+
+    #[test]
+    fn read_exports_gpx_from_a_dump() {
+        let scratch = Scratch::new("read-gpx");
+        let path = write_dump(&scratch, "track.bin", 2);
+        let output = scratch.join("track.gpx");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        read(
+            &LogReadOptions {
+                file: path,
+                format: m241_core::ExportFormat::Gpx,
+                output: Some(output.clone()),
+                utc_offset_days: crate::cal::OffsetSpec::Days(0),
+            },
+            fast(&links, &console, &confirm),
+        )
+        .expect("read");
+        let text = fileio::read_text(&output).expect("gpx");
+        assert!(text.starts_with("<?xml version=\"1.0\""), "got {text}");
+        assert!(text.contains("35.681"), "got {text}");
+    }
+
+    #[test]
+    fn read_writes_to_stdout_when_no_output_is_given() {
+        let scratch = Scratch::new("read-stdout");
+        let path = write_dump(&scratch, "track.bin", 1);
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        read(
+            &LogReadOptions {
+                file: path,
+                format: m241_core::ExportFormat::Csv,
+                output: None,
+                utc_offset_days: crate::cal::OffsetSpec::Days(0),
+            },
+            fast(&links, &console, &confirm),
+        )
+        .expect("read");
+        assert!(
+            console.stdout().starts_with("index,utc,lat,lon"),
+            "got {}",
+            console.stdout()
+        );
+    }
+
+    #[test]
+    fn an_explicit_offset_shifts_every_timestamp() {
+        let scratch = Scratch::new("read-shift");
+        let path = write_dump(&scratch, "track.bin", 1);
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        read(
+            &LogReadOptions {
+                file: path,
+                format: m241_core::ExportFormat::Json,
+                output: None,
+                utc_offset_days: crate::cal::OffsetSpec::Days(1),
+            },
+            fast(&links, &console, &confirm),
+        )
+        .expect("read");
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(
+            document["points"][0]["utc"],
+            1_700_000_000u32 + 86_400,
+            "one day was added"
+        );
+        assert!(
+            console.stderr().contains("+1 days"),
+            "got {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
+    fn auto_shift_leaves_a_modern_log_alone() {
+        let scratch = Scratch::new("read-auto");
+        let path = write_dump(&scratch, "track.bin", 1);
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        read(
+            &LogReadOptions {
+                file: path,
+                format: m241_core::ExportFormat::Json,
+                output: None,
+                utc_offset_days: crate::cal::OffsetSpec::Auto,
+            },
+            fast(&links, &console, &confirm),
+        )
+        .expect("read");
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(document["points"][0]["utc"], 1_700_000_000u32);
+        assert!(
+            !console.stderr().contains("shifted"),
+            "got {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
+    fn an_empty_file_is_an_empty_dump_not_an_error() {
+        let scratch = Scratch::new("read-empty");
+        let path = scratch.join("empty.bin");
+        fileio::write(&path, b"").expect("write");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        read(
+            &LogReadOptions {
+                file: path,
+                format: m241_core::ExportFormat::Csv,
+                output: None,
+                utc_offset_days: crate::cal::OffsetSpec::Auto,
+            },
+            fast(&links, &console, &confirm),
+        )
+        .expect("empty dump");
+        assert!(
+            console.stdout().starts_with("index,utc,lat,lon"),
+            "the header is still written: {}",
+            console.stdout()
+        );
+    }
+
+    #[test]
+    fn damage_is_warned_about_on_stderr_only() {
+        let scratch = Scratch::new("read-damage");
+        // Corrupt one record's checksum byte inside the block.
+        let mut dump = synthetic_dump(2);
+        if let Some(byte) = dump.get_mut(0x200 + 15) {
+            *byte ^= 0xFF;
+        }
+        let path = scratch.join("damaged.bin");
+        fileio::write(&path, &dump).expect("write dump");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        read(
+            &LogReadOptions {
+                file: path,
+                format: m241_core::ExportFormat::Csv,
+                output: None,
+                utc_offset_days: crate::cal::OffsetSpec::Days(0),
+            },
+            fast(&links, &console, &confirm),
+        )
+        .expect("read");
+        assert!(
+            console.stderr().contains("checksum"),
+            "the warning is on stderr: {}",
+            console.stderr()
+        );
+        assert!(
+            !console.stdout().contains("warning"),
+            "stdout must stay machine-readable: {}",
+            console.stdout()
+        );
     }
 }
