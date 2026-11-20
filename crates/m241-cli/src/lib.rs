@@ -224,7 +224,7 @@ pub fn run_with(session: Session<'_>, command: Command) -> Result<()> {
         },
         Command::Log { command } => match command {
             LogCommand::Info(options) => logcmd::info(&options, session),
-            LogCommand::Download(options) => not_implemented_args("log download", &options),
+            LogCommand::Download(options) => logcmd::download(&options, session),
             LogCommand::Read(options) => not_implemented_args("log read", &options),
             LogCommand::Erase => Err(not_implemented("log erase")),
             LogCommand::Geotag => Err(not_implemented("log geotag")),
@@ -296,10 +296,6 @@ mod tests {
         vec![
             (parsed(&["device", "doctor"]), "device doctor"),
             (parsed(&["fw", "flash"]), "fw flash"),
-            (
-                parsed(&["log", "download", "-o", "track.dump"]),
-                "log download",
-            ),
             (parsed(&["log", "read", "track.dump"]), "log read"),
             (parsed(&["log", "erase"]), "log erase"),
             (parsed(&["log", "geotag"]), "log geotag"),
@@ -345,7 +341,6 @@ mod tests {
             vec![
                 "device doctor",
                 "fw flash",
-                "log download",
                 "log read",
                 "log erase",
                 "log geotag",
