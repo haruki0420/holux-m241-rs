@@ -28,6 +28,17 @@ fn context() -> Context {
     ctx
 }
 
+/// The style egui would use for the dark and the light theme right now.
+///
+/// `theme::install` writes both, because the product is dark-only and a light
+/// OS theme must not produce a light widget set.
+fn styles(ctx: &Context) -> (egui::Style, egui::Style) {
+    (
+        (*ctx.style_of(egui::Theme::Dark)).clone(),
+        (*ctx.style_of(egui::Theme::Light)).clone(),
+    )
+}
+
 #[test]
 fn the_shell_draws_a_frame() {
     let ctx = context();
@@ -69,7 +80,41 @@ fn the_selected_screen_survives_a_repaint() {
 
 #[test]
 fn installing_the_theme_twice_is_idempotent() {
-    let ctx = context();
+    let ctx = Context::default();
+    let before = styles(&ctx);
+
     theme::install(&ctx);
-    assert!(render(&ctx, &mut App::default()) > 0);
+    let once = styles(&ctx);
+    assert_ne!(
+        before, once,
+        "install changed nothing; the idempotency check would pass vacuously"
+    );
+
+    theme::install(&ctx);
+    let twice = styles(&ctx);
+    assert_eq!(
+        once, twice,
+        "a second install changed the style; the tokens accumulate instead of being set"
+    );
+
+    // Both theme slots carry the token set: egui stores one style per theme, and
+    // a light OS theme must not hand back egui's light widget set.
+    let expected = theme::text_styles().len();
+    for (name, style) in [("dark", &once.0), ("light", &once.1)] {
+        assert_eq!(
+            style.text_styles.len(),
+            expected,
+            "{name} theme has {} text styles, the token set has {expected}",
+            style.text_styles.len()
+        );
+        assert_eq!(
+            style.visuals.panel_fill,
+            theme::GROUND,
+            "{name} theme kept egui's panel fill instead of theme::GROUND"
+        );
+        assert!(
+            style.visuals.dark_mode,
+            "{name} theme is not dark; the product ships dark only"
+        );
+    }
 }

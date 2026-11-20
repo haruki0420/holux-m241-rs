@@ -30,8 +30,17 @@ impl Screen {
     }
 
     /// Position in the rail, used for the 8px staircase.
+    ///
+    /// An exhaustive match rather than a lookup: a new variant is a compile
+    /// error that demands a position, instead of silently taking indent 0 and
+    /// stacking on top of the first tab.
     #[must_use]
     pub fn index(self) -> usize {
-        Self::ALL.iter().position(|s| *s == self).unwrap_or(0)
+        match self {
+            Self::Connect => 0,
+            Self::Log => 1,
+            Self::Firmware => 2,
+            Self::Settings => 3,
+        }
     }
 }
