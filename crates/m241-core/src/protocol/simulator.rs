@@ -1,19 +1,23 @@
 //! A fake M-241, good enough to drive the real clients in a test.
 //!
 //! The simulator is not a mock: it speaks the same wire protocol as the chip, so
-//! [`crate::protocol::PmtkClient`], [`crate::protocol::MtkBootRom`] and any future
-//! download-agent client run their **real** code against it. A protocol
-//! regression therefore fails a test instead of corrupting a unit, which is the
-//! whole reason this module is shipped rather than hidden in `tests/`.
+//! [`crate::protocol::PmtkClient`] and [`crate::protocol::MtkBootRom`] run their
+//! **real** code against it. A protocol regression therefore fails a test
+//! instead of corrupting a unit, which is the whole reason this module is
+//! shipped rather than hidden in `tests/`.
 //!
 //! # What it models
 //!
 //! * the running firmware: PMTK command/reply framing, NMEA streaming, the
 //!   `$PMTK182` log-transfer family and `$PMTK180` handing the chip to BootROM;
 //! * the BootROM: the four-probe sync, the nine-byte command frames, echo, the
-//!   two read widths and their different byte orders, and the `0xA4` checksum;
-//! * the download agent: the twenty-byte info report after `0xA8`, the two-byte
-//!   `0xD3` reply, the `0xD5` start and the packet acknowledgements.
+//!   two read widths and their different byte orders, and the `0xA4` checksum.
+//!
+//! It stops at the Download Agent on purpose. The DA is what erases and programs
+//! flash, it lives in `m241-flash`, and a fake that modelled it would put the
+//! destructive command set back inside the crate that must stay free of it. A
+//! `0xA8` jump is echoed like any other frame and changes no state; the tests
+//! that pin the DA's behaviour drive `m241_flash`'s own simulator instead.
 //!
 //! # What it deliberately does not model
 //!
@@ -26,8 +30,7 @@ use std::collections::VecDeque;
 
 use crate::error::{Error, Result};
 use crate::protocol::brom::{
-    BASE_ADDR_DA, BASE_ADDR_FIRMWARE, BOOT_REPLY, BOOT_SYNC, OPCODE_CHECKSUM, OPCODE_JUMP,
-    OPCODE_READ16, OPCODE_READ32,
+    BASE_ADDR_FIRMWARE, BOOT_REPLY, BOOT_SYNC, OPCODE_CHECKSUM, OPCODE_READ16, OPCODE_READ32,
 };
 use crate::protocol::frame::{checksum_xor16, swap_pairs};
 use crate::protocol::pmtk::{checksum, line as pmtk_line};
@@ -35,30 +38,6 @@ use crate::protocol::port::Transport;
 
 /// The firmware base the fake chip maps its flash window at.
 pub const FLASH_BASE: u32 = BASE_ADDR_FIRMWARE;
-
-/// Status byte the fake DA returns after a successful `0xD3`.
-pub const STATUS_OK: u8 = 0x00;
-
-/// Acknowledge byte used by the download agent.
-pub const ACK: u8 = 0x5A;
-
-/// Negative acknowledge byte.
-pub const NAK: u8 = 0xA5;
-
-/// "Continue": the DA accepted one packet and wants the next.
-pub const CONT: u8 = 0x69;
-
-/// Opcode that sets the DA's memory range (and erases it).
-pub const OPCODE_MEM_CMD: u8 = 0xD3;
-
-/// Opcode that starts a packet write.
-pub const OPCODE_WRITE: u8 = 0xD5;
-
-/// Opcode that restarts the chip.
-pub const OPCODE_RESTART: u8 = 0xD9;
-
-/// Payload bytes per DA packet, as the vendor tool sends them.
-pub const WRITE_PACKET_LEN: usize = 0x100;
 
 /// `$PMTK180*3B`: the only way into BootROM from a running firmware.
 const PMTK180_BODY: &str = "PMTK180";
@@ -69,9 +48,11 @@ pub enum Mode {
     /// Firmware running: NMEA and PMTK.
     Running,
     /// BootROM: the four-probe sync, then nine-byte frames.
+    ///
+    /// A jump (`0xA8`) is echoed here like any other frame and then ignored:
+    /// the fake does not model the Download Agent, which is the write crate's
+    /// job. See the module documentation.
     BootRom,
-    /// Download agent: twenty-byte info report, then DA commands.
-    DownloadAgent,
 }
 
 /// Where the BootROM state machine has got to.
@@ -81,15 +62,6 @@ enum BootRomStage {
     Sync { index: usize },
     /// Accepting nine-byte frames.
     Command,
-}
-
-/// Where the download-agent state machine has got to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DaStage {
-    /// Accepting ten-byte (or shorter) command frames.
-    Command,
-    /// Accepting one packet: payload plus a two-byte sum.
-    Packet,
 }
 
 /// A fake M-241 that implements [`Transport`].
@@ -111,7 +83,6 @@ pub struct FakeDevice {
     commands: Vec<String>,
     mode: Mode,
     bootrom_stage: BootRomStage,
-    da_stage: DaStage,
     /// Whether the firmware is currently streaming NMEA sentences.
     streaming: bool,
     /// Whether the firmware is currently writing to its log.
@@ -125,22 +96,9 @@ pub struct FakeDevice {
     build: String,
     model: String,
     sdk: String,
-    /// DA memory range start/end, and the write cursor inside it.
-    da_range: (u32, u32),
-    da_cursor: u32,
-    da_packet_len: usize,
-    /// Force the next DA packet to be rejected; zero means "accept".
-    reject_packets: u32,
     /// Number of upcoming log reads the device will answer only after the
     /// client's timeout (zero means "answer normally").
     drop_log_replies: u32,
-    /// Whether the frame currently being assembled is echoed back.
-    ///
-    /// Reads, writes and checksums are echoed byte for byte; a jump is not,
-    /// because the chip hands control over part-way through the frame (measured:
-    /// only part of a jump's echo ever arrives). Requiring the echo there would
-    /// desynchronise the next command, so the simulator does not produce one.
-    echo_frame: bool,
 }
 
 impl FakeDevice {
@@ -161,7 +119,6 @@ impl FakeDevice {
             commands: Vec::new(),
             mode: Mode::Running,
             bootrom_stage: BootRomStage::Sync { index: 1 },
-            da_stage: DaStage::Command,
             // A live logger streams NMEA from the moment it is powered on, which
             // is exactly the condition `$PMTK180` needs.
             streaming: true,
@@ -172,12 +129,7 @@ impl FakeDevice {
             build: build.to_owned(),
             model: model.to_owned(),
             sdk: sdk.to_owned(),
-            da_range: (0, 0),
-            da_cursor: 0,
-            da_packet_len: WRITE_PACKET_LEN,
-            reject_packets: 0,
             drop_log_replies: 0,
-            echo_frame: true,
         }
     }
 
@@ -227,13 +179,6 @@ impl FakeDevice {
     #[must_use]
     pub fn dropping_log_replies(mut self, count: u32) -> Self {
         self.drop_log_replies = count;
-        self
-    }
-
-    /// Reject the next `count` download-agent packets.
-    #[must_use]
-    pub fn rejecting_packets(mut self, count: u32) -> Self {
-        self.reject_packets = count;
         self
     }
 
@@ -503,20 +448,12 @@ impl FakeDevice {
                     }
                     return;
                 }
-                if self.line.is_empty() {
-                    // The first byte of a frame decides whether this frame is
-                    // echoed at all: a jump is not, everything else is.
-                    self.echo_frame = byte != OPCODE_JUMP;
-                }
                 self.line.push(byte);
-                if self.echo_frame {
-                    self.queue_bytes(&[byte]);
-                }
+                self.queue_bytes(&[byte]);
                 if self.line.len() < 9 {
                     return;
                 }
                 let frame = std::mem::take(&mut self.line);
-                self.echo_frame = true;
                 self.dispatch_bootrom(&frame);
             }
         }
@@ -556,34 +493,21 @@ impl FakeDevice {
                 let data = self.read_flash(address, count as usize * 2);
                 self.queue_bytes(&checksum_xor16(&data).to_be_bytes());
             }
-            OPCODE_JUMP if address == BASE_ADDR_DA => {
-                // Measured: the chip echoes only part of a jump frame and then
-                // hands control over, so this does not queue the nine echoed
-                // bytes the other opcodes do.
-                self.mode = Mode::DownloadAgent;
-                self.da_stage = DaStage::Command;
-                self.queue_bytes(&self.da_info_report());
-            }
-            // A jump anywhere else is ignored: there is nothing to jump to.
+            // A jump hands the chip to the Download Agent, which this fake does
+            // not model: the DA erases and programs flash, and putting that
+            // state machine back here would defeat the crate split. Every frame
+            // is echoed above, so a jump answers with its echo and nothing else;
+            // a read path never sends one, because reading never leaves the
+            // BootROM.
             _ => {}
         }
     }
 
-    /// The twenty-byte download-agent report, `>BHBLHHHHL`.
-    fn da_info_report(&self) -> Vec<u8> {
-        let mut report = Vec::with_capacity(20);
-        report.push(0xC0); // report marker
-        report.extend_from_slice(&0x0308u16.to_be_bytes()); // DA version 3.8
-        report.push(0x49); // flash device id
-        report.extend_from_slice(&0x0008_0000u32.to_be_bytes()); // 512 KiB
-        report.extend_from_slice(&0x00C2u16.to_be_bytes()); // manufacturer
-        report.extend_from_slice(&0x22BAu16.to_be_bytes()); // device code
-        report.extend_from_slice(&0x22u16.to_be_bytes());
-        report.extend_from_slice(&0xBAu16.to_be_bytes());
-        report.extend_from_slice(&0x0000_0000u32.to_be_bytes()); // no ext SRAM
-        report
-    }
-
+    /// Copy `length` bytes of the flash window, zero-filled past its end.
+    ///
+    /// Reads past the image are not an error on the wire: the chip answers with
+    /// whatever the bus returns, and the client's own length checks are what
+    /// catch a request that was too long.
     fn read_flash(&self, address: u32, length: usize) -> Vec<u8> {
         let offset = address.saturating_sub(FLASH_BASE) as usize;
         let mut out = vec![0u8; length];
@@ -595,123 +519,11 @@ impl FakeDevice {
         out
     }
 
-    // -- the download agent -------------------------------------------------
-
-    fn process_download_agent(&mut self, byte: u8) {
-        self.line.push(byte);
-        match self.da_stage {
-            DaStage::Command => self.dispatch_da_command(),
-            DaStage::Packet => self.dispatch_da_packet(),
-        }
-    }
-
-    fn dispatch_da_command(&mut self) {
-        let Some(opcode) = self.line.first().copied() else {
-            return;
-        };
-        let needed = match opcode {
-            OPCODE_MEM_CMD => 10,
-            OPCODE_WRITE => 5,
-            OPCODE_RESTART => 1,
-            _ => 1,
-        };
-        if self.line.len() < needed {
-            return;
-        }
-        let frame = std::mem::take(&mut self.line);
-        match opcode {
-            OPCODE_MEM_CMD => {
-                let start = be_u32(&frame, 2).unwrap_or(0);
-                let end = be_u32(&frame, 6).unwrap_or(start);
-                // Measured: the real DA erases every sector the range covers.
-                // Modelling that is what makes an erase-then-write test honest,
-                // so it happens here even though no client writes yet.
-                self.da_range = (start, end);
-                self.erase_range(start, end);
-                self.da_cursor = start;
-                // Measured: `0xD3` answers with **two** bytes, ACK then status.
-                // A client that reads one leaves the status byte in the buffer
-                // and shifts every later frame.
-                self.queue_bytes(&[ACK, STATUS_OK]);
-            }
-            OPCODE_WRITE => {
-                self.da_packet_len = be_u32(&frame, 1)
-                    .and_then(|length| usize::try_from(length).ok())
-                    .filter(|length| *length > 0)
-                    .unwrap_or(WRITE_PACKET_LEN);
-                self.da_stage = DaStage::Packet;
-                self.queue_bytes(&[ACK, ACK]);
-            }
-            OPCODE_RESTART => {
-                // Back to a freshly booted chip: firmware running, BootROM sync
-                // not yet started.
-                self.mode = Mode::Running;
-                self.streaming = true;
-                self.bootrom_stage = BootRomStage::Sync { index: 1 };
-            }
-            _ => self.queue_bytes(&[NAK]),
-        }
-    }
-
-    fn dispatch_da_packet(&mut self) {
-        let needed = self.da_packet_len.saturating_add(2);
-        if self.line.len() < needed {
-            return;
-        }
-        let frame = std::mem::take(&mut self.line);
-        let Some((payload, trailer)) = frame.split_at_checked(self.da_packet_len) else {
-            return;
-        };
-        if self.reject_packets > 0 {
-            self.reject_packets -= 1;
-            self.queue_bytes(&[NAK]);
-            return;
-        }
-        let Some(checksum) = trailer
-            .get(..2)
-            .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
-            .map(u16::from_be_bytes)
-        else {
-            self.queue_bytes(&[NAK]);
-            return;
-        };
-        let expected: u16 = payload
-            .iter()
-            .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)));
-        if checksum != expected {
-            self.queue_bytes(&[NAK]);
-            return;
-        }
-        let offset = self.da_cursor.saturating_sub(FLASH_BASE) as usize;
-        for (index, byte) in payload.iter().enumerate() {
-            if let Some(slot) = self.memory.get_mut(offset.saturating_add(index)) {
-                *slot = *byte;
-            }
-        }
-        self.da_cursor = self.da_cursor.saturating_add(payload.len() as u32);
-        self.queue_bytes(&[CONT]);
-        if self.da_cursor > self.da_range.1 {
-            self.da_stage = DaStage::Command;
-            self.queue_bytes(&[ACK, ACK]);
-        }
-    }
-
-    fn erase_range(&mut self, start: u32, end: u32) {
-        let from = start.saturating_sub(FLASH_BASE) as usize;
-        let to = end.saturating_sub(FLASH_BASE) as usize;
-        for at in from..=to.min(self.memory.len().saturating_sub(1)) {
-            if let Some(slot) = self.memory.get_mut(at) {
-                *slot = 0xFF;
-            }
-        }
-    }
-
     /// Push one byte into the state machine, whichever mode is active.
     fn consume(&mut self, byte: u8) {
         match self.mode {
             Mode::Running => self.process_running(byte),
             Mode::BootRom => self.process_bootrom(byte),
-            Mode::DownloadAgent => self.process_download_agent(byte),
         }
     }
 }
@@ -752,13 +564,6 @@ impl Transport for FakeDevice {
         self.control_lines = asserted;
         Ok(())
     }
-}
-
-fn be_u32(frame: &[u8], at: usize) -> Option<u32> {
-    frame
-        .get(at..at.saturating_add(4))
-        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-        .map(u32::from_be_bytes)
 }
 
 /// NMEA checksum over `body`, for building replies in tests.
@@ -949,97 +754,27 @@ mod tests {
     }
 
     #[test]
-    fn the_da_handshake_reports_twenty_bytes_starting_with_c0() {
-        // The measured fact that matters most here: `0xD3` answers with a second
-        // byte, and the info report starts with 0xC0.
+    fn a_jump_frame_is_echoed_and_changes_nothing() {
+        // The fake stops at the BootROM: the Download Agent is the write crate's
+        // subject, and modelling it here would put the erase/program state
+        // machine back inside the read-only crate. A jump therefore behaves like
+        // any other frame — echo, no data, mode unchanged — and a read-path test
+        // never sends one.
+        use crate::protocol::brom::OPCODE_JUMP;
+
         let mut device = FakeDevice::new().with_firmware(&[0u8; 16]).in_bootrom();
         let jump = [OPCODE_JUMP, 0x00, 0x10, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
         device.write_all(&jump).expect("write the jump frame");
-        let mut report = [0u8; 20];
-        device.read(&mut report).expect("read the report");
-        assert_eq!(report.first().copied(), Some(0xC0));
-        assert_eq!(device.mode(), Mode::DownloadAgent);
-    }
-
-    #[test]
-    fn the_memory_range_command_answers_with_ack_and_status() {
-        // Two bytes, not one: reading only the ACK shifts every later frame by a
-        // byte, which is the trap the hardware notes record.
-        let mut device = FakeDevice::new().with_firmware(&[0xFFu8; 32]).in_bootrom();
-        device
-            .write_all(&[OPCODE_JUMP, 0, 0x10, 0x08, 0, 0, 0, 0, 0])
-            .expect("jump");
-        device.read(&mut [0u8; 20]).expect("drain the report");
-        let mut command = vec![OPCODE_MEM_CMD, 0x01];
-        command.extend_from_slice(&0u32.to_be_bytes());
-        command.extend_from_slice(&31u32.to_be_bytes());
-        device.write_all(&command).expect("mem cmd");
-        let mut reply = [0u8; 2];
-        device.read(&mut reply).expect("read the two-byte reply");
-        assert_eq!(reply, [ACK, STATUS_OK]);
-    }
-
-    #[test]
-    fn a_write_packet_is_acknowledged_and_stored() {
-        let mut device = FakeDevice::new().with_firmware(&[0xFFu8; 16]).in_bootrom();
-        device
-            .write_all(&[OPCODE_JUMP, 0, 0x10, 0x08, 0, 0, 0, 0, 0])
-            .expect("jump");
-        device.read(&mut [0u8; 20]).expect("drain the report");
-
-        // Range 0..=3, then a four-byte packet.
-        let mut range = vec![OPCODE_MEM_CMD, 0x01];
-        range.extend_from_slice(&0u32.to_be_bytes());
-        range.extend_from_slice(&3u32.to_be_bytes());
-        device.write_all(&range).expect("range");
-        device.read(&mut [0u8; 2]).expect("ack+status");
-
-        let mut write = vec![OPCODE_WRITE];
-        write.extend_from_slice(&4u32.to_be_bytes());
-        device.write_all(&write).expect("write command");
-        device.read(&mut [0u8; 2]).expect("two acks");
-
-        let payload = [0xDE, 0xAD, 0xBE, 0xEF];
-        let sum: u16 = payload
-            .iter()
-            .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)));
-        let mut packet = payload.to_vec();
-        packet.extend_from_slice(&sum.to_be_bytes());
-        device.write_all(&packet).expect("packet");
-        let mut reply = [0u8; 3];
-        device.read(&mut reply).expect("reply");
-        assert_eq!(reply.first().copied(), Some(CONT));
-        assert_eq!(&device.memory()[..4], &payload);
-    }
-
-    #[test]
-    fn a_rejected_packet_draws_a_nak() {
-        let mut device = FakeDevice::new()
-            .with_firmware(&[0xFFu8; 16])
-            .rejecting_packets(1)
-            .in_bootrom();
-        device
-            .write_all(&[OPCODE_JUMP, 0, 0x10, 0x08, 0, 0, 0, 0, 0])
-            .expect("jump");
-        device.read(&mut [0u8; 20]).expect("drain");
-        let mut range = vec![OPCODE_MEM_CMD, 0x01];
-        range.extend_from_slice(&0u32.to_be_bytes());
-        range.extend_from_slice(&3u32.to_be_bytes());
-        device.write_all(&range).expect("range");
-        device.read(&mut [0u8; 2]).expect("ack+status");
-        let mut write = vec![OPCODE_WRITE];
-        write.extend_from_slice(&4u32.to_be_bytes());
-        device.write_all(&write).expect("write");
-        device.read(&mut [0u8; 2]).expect("acks");
-        // A correct packet: the rejection must come from `rejecting_packets`,
-        // not from a checksum error, or the test would pass for the wrong reason.
-        let mut packet = vec![1u8, 2, 3, 4];
-        let sum = 1u16 + 2 + 3 + 4;
-        packet.extend_from_slice(&sum.to_be_bytes());
-        device.write_all(&packet).expect("packet");
-        let mut reply = [0u8; 1];
-        device.read(&mut reply).expect("reply");
-        assert_eq!(reply.first().copied(), Some(NAK));
+        let mut echo = [0u8; 9];
+        device.read(&mut echo).expect("read the echo");
+        assert_eq!(echo, jump, "the BootROM echoes every frame byte");
+        assert_eq!(device.mode(), Mode::BootRom);
+        let mut nothing = [0u8; 1];
+        assert_eq!(
+            device.read(&mut nothing).expect("no data follows"),
+            0,
+            "a jump must not queue a download-agent report"
+        );
     }
 
     #[test]

@@ -45,9 +45,11 @@
 
 pub mod da;
 pub mod erase;
+pub mod simulator;
 
 pub use da::DownloadAgent;
 pub use erase::{BackupProof, ERASE_SUBCOMMAND, LogEraser};
+pub use simulator::FakeDa;
 
 /// Version of the crate, taken from `Cargo.toml` at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
