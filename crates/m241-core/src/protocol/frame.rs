@@ -84,13 +84,34 @@ mod tests {
     }
 
     #[test]
-    fn a_thumb_vector_table_survives_a_round_trip() {
-        // `ldr pc, [pc, #-0x18]` repeated: exactly what a real M-241 dump starts
-        // with, and what the firmware base address was identified by.
-        let table: Vec<u8> = std::iter::repeat_n([0x18u8, 0xf0, 0x9f, 0xe5], 8)
+    fn word_reversal_restores_the_vector_table_from_the_wire() {
+        // A real M-241 dump starts with `18 f0 9f e5` (`ldr pc, [pc, #-0x18]`)
+        // repeated, which is what identified the firmware base. `0xAF` returns
+        // each dword byte-reversed, so that word arrives as `e5 9f f0 18`.
+        //
+        // The expected value is spelled out rather than compared against
+        // `reverse_words32` applied twice: a round trip also passes for a
+        // function that returns its input unchanged.
+        let wire: Vec<u8> = std::iter::repeat_n([0xe5u8, 0x9f, 0xf0, 0x18], 8)
             .flatten()
             .collect();
-        assert_eq!(reverse_words32(&reverse_words32(&table)), table);
+        let memory: Vec<u8> = std::iter::repeat_n([0x18u8, 0xf0, 0x9f, 0xe5], 8)
+            .flatten()
+            .collect();
+        assert_eq!(reverse_words32(&wire), memory);
+    }
+
+    #[test]
+    fn word_reversal_of_a_single_dword_is_spelled_out() {
+        assert_eq!(
+            reverse_words32(&[0x18, 0xf0, 0x9f, 0xe5]),
+            vec![0xe5, 0x9f, 0xf0, 0x18]
+        );
+        // Two words are reversed independently, not as one run of eight bytes.
+        assert_eq!(
+            reverse_words32(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]),
+            vec![0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05]
+        );
     }
 
     #[test]
