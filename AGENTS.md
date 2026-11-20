@@ -34,6 +34,10 @@ real M-241, the docs say 未検証 and so does your report. The hardware session
 `docs/dev/05-verification.md` is the only file allowed to move a claim from
 unverified to verified.
 
+**Read §9 before merging or accepting a fix.** It records what has already gone
+wrong here, including the two times 5/5 and a readable diff were mistaken for
+verification.
+
 ## 1. What this project is
 
 A cross-platform (Windows / Linux / macOS) tool for the **Holux M-241** GPS
@@ -256,3 +260,97 @@ assumption it read the original. A different agent reading the same diff with
 the same instructions does not.
 
 Every stage ends with `./tools/check.sh` at 5/5.
+
+## 9. What went wrong here
+
+2026-11-20, the review-and-fix round. This section records failures that
+actually happened — symptom, cause, and the check that catches it next time. It
+is evidence for §8, not general advice.
+
+### 9.1 Four fix branches went in with stage three unstarted
+
+**Symptom.** `fix/fix-core`, `fix/fix-gui`, `fix/fix-cli` and `fix/fix-docs`
+went into `main` (`52f023e`) while the verification column of
+`docs/dev/10-review-log.md` still read 未検証 for all four. The merge commit
+itself says "Gates 5/5 after the merge".
+
+**Cause.** A green `./tools/check.sh` was read as "the fixes are good".
+
+**Check.** 5/5 proves the tree is not broken; it does not prove the findings are
+resolved. A gate cannot see a finding that was never fixed — the test for it
+does not exist, so nothing fails. No merge until the verification column is
+filled: 未検証 is a stop sign, not a default.
+
+### 9.2 The agent handing out the findings started writing the fix
+
+**Symptom.** After the readability review, the lead began editing
+`crates/m241-core/src/error.rs` and `crates/m241-cli/src/main.rs` directly
+instead of assigning the findings.
+
+**Cause.** Speed: the change looked small and the reason was already known.
+
+**Check.** §8 admits no exception, and it applies to the agent coordinating the
+round too. The user stopped this one: 修正はあなたが直すのではなく割り振って
+(assign the fix, do not write it yourself). A fixer who is also the reviewer
+re-reads the changed line with the assumption that produced the bug.
+
+### 9.3 A diff was read and declared sound
+
+**Symptom.** `fix/simulator-d3` added 302 lines to the simulator's `0xD3` /
+`0xD5` model. The diff was read, judged sound, and was about to be committed.
+
+**Cause.** "I can read this fix" was treated as "this fix was verified".
+
+**Check.** Reading a diff is stage one (discovery). Accepting a fix is stage
+three (§8). One head cannot do both: a reader who wants the change to be
+correct stops looking for what it misses. Acceptance is another agent re-running
+`./tools/check.sh` and matching each finding to a hunk.
+
+### 9.4 An agent's failure was read as its artifact failing
+
+**Symptom.** The `stream-f-exif` agent wrote a 1389-line EXIF module under
+`crates/m241-core/src/log/` and then failed. The next step considered was to
+abandon that worktree and start a fresh one.
+
+**Cause.** The worker's failure was taken as the work being invalid.
+
+**Check.** `git status` and `git log` in that worktree first. An agent can die
+after committing, or with the files already complete. The module was carried
+into `feat/exif2` instead of being written again; discarding the tree would have
+thrown 1389 lines away.
+
+### 9.5 `.cargo-home` showed as untracked in every worktree
+
+**Symptom.** The parallel worktrees symlink `.cargo-home` to one shared cache.
+`/.cargo-home/` in `.gitignore` did not match, so `git status` listed the link
+as untracked in every worktree — one `git add -A` from being committed.
+
+**Cause.** A pattern ending in a slash matches a directory, and a symlink is not
+a directory.
+
+**Check.** `/.cargo-home`, with no trailing slash. Fixed in `7edfadd`; the
+comment above the pattern in `.gitignore` keeps the reason attached.
+
+### 9.6 Ten worktrees filled the disk to 85%
+
+**Symptom.** 214 GB used; each worktree's `target/` was about 3 GB.
+
+**Cause.** `[profile.dev]` defaulted to full debug info, and every worktree
+built and kept its own copy.
+
+**Check.** `debug = 0` in `Cargo.toml` (done in `b818676`), raised to 1 locally
+only when a debugger is actually needed, and a finished worktree's `target/`
+deleted. Dev builds here answer "does it compile and pass", nothing else.
+
+### 9.7 The same incomplete work was reported twice
+
+**Symptom.** On `feat/exif2`, 3 clippy warnings and zero tests remained while
+the owner twice reported the work complete.
+
+**Cause.** Completion was self-assessed. The stated conditions — 5/5 and at
+least one test — were never checked against the artifact.
+
+**Check.** Count what the report claims. "Tests added" means
+`grep -c '#\[test\]'` finds them in the diff. "5/5" means `./tools/check.sh`
+was run by the reader, not quoted from the report. A report is a claim; the
+artifact is the evidence.
