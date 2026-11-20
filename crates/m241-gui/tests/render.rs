@@ -394,3 +394,44 @@ fn a_log_summary_matches_the_track_it_describes() {
     assert_eq!(summary.fixes, track.fix_count());
     assert_eq!(summary.damaged_block_count, track.damaged_blocks.len());
 }
+
+#[test]
+fn amber_appears_in_the_write_step_and_nowhere_else() {
+    // The design invariant in pixels rather than in source. DESIGN.md §3 allows amber
+    // on exactly three things — the destructive button, the write step and the
+    // undefined state — all of which are on the firmware screen's third step, so a
+    // rendered frame of that step must show it and the other screens must not.
+    //
+    // This lives here rather than in `src/screenshot.rs` because the source gate
+    // (`tools/check_design.py`) is file-based and correctly refuses to have
+    // `theme::DANGER` named anywhere but the destructive module. Naming the colour is
+    // what a test does; the gate cannot tell a test from a paint call, so the test
+    // moves to the crate that the gate does not scan.
+    let mut app = App::default();
+    app.firmware_mut()
+        .show_sample()
+        .expect("the sample image must be recognised");
+    app.firmware_mut().set_step(Step::Flash);
+    let firmware =
+        m241_gui::screenshot::render(&mut app, Screen::Firmware, egui::vec2(640.0, 400.0));
+    assert!(
+        firmware.contains_colour(theme::DANGER, 12),
+        "the destructive control is not amber in the rendered frame"
+    );
+
+    for screen in [Screen::Connect, Screen::Log, Screen::Settings] {
+        let mut app = App::default();
+        match screen {
+            Screen::Connect => app.connect_mut().show_sample(),
+            Screen::Log => app.log_mut().show_sample(),
+            Screen::Firmware => {}
+            Screen::Settings => {}
+        }
+        let image = m241_gui::screenshot::render(&mut app, screen, egui::vec2(640.0, 400.0));
+        assert!(
+            !image.contains_colour(theme::DANGER, 6),
+            "{} has amber on it; amber means danger and lives on the firmware screen",
+            screen.label()
+        );
+    }
+}

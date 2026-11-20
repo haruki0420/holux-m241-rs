@@ -100,10 +100,13 @@ impl LogScreen {
             return;
         }
 
-        // The three-zone layout collapses below 1100pt (DESIGN.md §9). Content
-        // width, not window width: the rail already took its share, so measuring
-        // the window would keep the columns on a screen that has no room for them.
-        let wide = ui.available_width() >= metric::NARROW;
+        // The three-zone layout collapses below 1100pt (DESIGN.md §9). The figure is
+        // a *window* size in the design, and it has to be read as one: the rail and the
+        // content margins have already taken ~216pt by the time this runs, so measuring
+        // the content would collapse the layout at the 1280-wide window the design
+        // calls wide.
+        let window_width = ui.ctx().content_rect().width();
+        let wide = window_width >= metric::NARROW;
         if wide {
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(

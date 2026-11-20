@@ -1951,7 +1951,9 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "egui_system_font_provider",
  "m241-core",
+ "png",
 ]
 
 [[package]]

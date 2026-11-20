@@ -29,6 +29,11 @@ pub enum Status {
     Unverified,
     /// The next move is physical — press the button, pull the battery.
     Waiting,
+    /// Not done yet. Used for the items of a checklist whose other items are [`Ok`],
+    /// where "状態" would read as a statement about the device rather than a to-do.
+    ///
+    /// [`Ok`]: Self::Ok
+    Todo,
 }
 
 impl Status {
@@ -44,6 +49,7 @@ impl Status {
             Self::Info => (theme::MUTE, "状態"),
             Self::Unverified => (theme::MUTE, "未検証"),
             Self::Waiting => (theme::MUTE, "操作待ち"),
+            Self::Todo => (theme::MUTE, "未"),
         }
     }
 }
@@ -315,6 +321,7 @@ mod tests {
             Status::Info,
             Status::Unverified,
             Status::Waiting,
+            Status::Todo,
         ] {
             let (_colour, word) = status.voice();
             assert!(!word.is_empty(), "{status:?} has a colour but no word");

@@ -16,6 +16,15 @@ path = "src/main.rs"
 m241-core.workspace = true
 egui.workspace = true
 eframe.workspace = true
+# Writing the PNGs that `--screenshot` produces. Chosen over a hand-written
+# compressor because a screenshot is a review artifact and a byte-exact encoder
+# is not this crate's subject; `png` is already in the tree through eframe's
+# image support, so this costs no new build.
+png = "0.18"
+# The same system-font fallback `eframe` installs when it opens a window. The
+# screenshots are rendered without `eframe` (no window), and without this the
+# Japanese labels rasterise as empty boxes — an image that misrepresents the UI.
+egui_system_font_provider = "0.37"
 
 # walkers (map tiles) is deliberately not a dependency yet: it fetches tiles over
 # the network at runtime and cannot be exercised headlessly. The Log screen draws

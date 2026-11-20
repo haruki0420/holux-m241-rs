@@ -39,6 +39,7 @@
 
 pub mod app;
 pub mod screens;
+pub mod screenshot;
 pub mod theme;
 pub mod widgets;
 

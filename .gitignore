@@ -28,3 +28,6 @@
 /.cargo-home
 /.rustup-home
 /.worktrees/
+
+# Rendered screen captures are build output; regenerate with `m241-gui --screenshot`.
+/.design/

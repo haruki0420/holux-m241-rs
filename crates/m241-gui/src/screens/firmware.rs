@@ -362,13 +362,16 @@ impl FirmwareScreen {
     /// amber, which is not a progress colour.
     fn step_row(&self, ui: &mut Ui) {
         let width = ui.available_width();
+        // Two rows tall: the dots sit on the line and the labels hang below it, so a
+        // one-row allocation clips exactly the words that say which step is which.
         let (rect, _response) =
-            ui.allocate_exact_size(Vec2::new(width, metric::ROW), Sense::hover());
+            ui.allocate_exact_size(Vec2::new(width, metric::ROW * 2.0), Sense::hover());
         let painter = ui.painter_at(rect);
         let padding = space::L;
         let count = Step::ALL.len();
         let span = rect.width() - padding * 2.0;
-        let line_y = rect.center().y;
+        // The line sits one row down, leaving the second row for the labels.
+        let line_y = rect.top() + metric::ROW;
         let step_width = span / (count - 1) as f32;
 
         let positions: Vec<egui::Pos2> = (0..count)
@@ -801,7 +804,7 @@ impl FirmwareScreen {
                 "WRITE と入力してある",
             ),
         ] {
-            common::status_line(ui, if held { Status::Ok } else { Status::Info }, text);
+            common::status_line(ui, if held { Status::Ok } else { Status::Todo }, text);
         }
     }
 
