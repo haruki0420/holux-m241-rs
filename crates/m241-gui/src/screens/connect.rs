@@ -48,30 +48,35 @@ enum Listing {
 impl ConnectScreen {
     /// Draw the screen body. The rail is drawn by the shell, not here.
     pub fn ui(&mut self, ui: &mut Ui) {
-        common::heading(
-            ui,
-            "Holux M-241",
-            "ファームの日付が 19.6 年ずれています。端末をつなぎ、まずファームを吸い出してください。",
-        );
+        // At 1024×640 the body is taller than the window, and the review found the
+        // "next step" block ending at its first line — below the fold, and therefore
+        // unreachable rather than merely cropped.
+        common::scrolling(ui, "m241-connect-body", |ui| {
+            common::heading(
+                ui,
+                "Holux M-241",
+                "ファームの日付が 19.6 年ずれています。端末をつなぎ、まずファームを吸い出してください。",
+            );
 
-        // Lazy first enumeration: asking the OS for ports every frame would spin a
-        // udev walk at 60 Hz for a list that changes when a cable moves.
-        if matches!(&self.ports, Listing::Unread) {
-            self.refresh();
-        }
+            // Lazy first enumeration: asking the OS for ports every frame would spin a
+            // udev walk at 60 Hz for a list that changes when a cable moves.
+            if matches!(&self.ports, Listing::Unread) {
+                self.refresh();
+            }
 
-        ui.add_space(space::XL);
-        self.port_panel(ui);
+            ui.add_space(space::XL);
+            self.port_panel(ui);
 
-        ui.add_space(space::L);
-        ui.columns_const::<2, _>(|columns| {
-            let [left, right] = columns;
-            self.device_panel(left);
-            self.log_panel(right);
+            ui.add_space(space::L);
+            ui.columns_const::<2, _>(|columns| {
+                let [left, right] = columns;
+                self.device_panel(left);
+                self.log_panel(right);
+            });
+
+            ui.add_space(space::L);
+            self.next_steps(ui);
         });
-
-        ui.add_space(space::L);
-        self.next_steps(ui);
     }
 
     /// Fill the panels with the sample unit's figures.

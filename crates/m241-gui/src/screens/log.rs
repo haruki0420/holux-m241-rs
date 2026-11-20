@@ -88,55 +88,59 @@ impl LogScreen {
 
     /// Draw the screen body. The rail is drawn by the shell, not here.
     pub fn ui(&mut self, ui: &mut Ui) {
-        common::heading(
-            ui,
-            "ログ",
-            "吸い出したログを地図に描き、写真の時刻と突き合わせて GPX に書き出します。",
-        );
-        ui.add_space(space::L);
+        // The export bar is pinned: it is the reason the screen exists, and at
+        // 1024×640 it used to be the part that fell off the bottom.
+        common::footer(ui, "m241-log-export", |ui| self.export_bar(ui));
 
-        if self.track.points.is_empty() {
-            self.empty_state(ui);
-            return;
-        }
+        common::scrolling(ui, "m241-log-body", |ui| {
+            common::heading(
+                ui,
+                "ログ",
+                "吸い出したログを地図に描き、写真の時刻と突き合わせて GPX に書き出します。",
+            );
+            ui.add_space(space::L);
 
-        // The three-zone layout collapses below 1100pt (DESIGN.md §9). The figure is
-        // a *window* size in the design, and it has to be read as one: the rail and the
-        // content margins have already taken ~216pt by the time this runs, so measuring
-        // the content would collapse the layout at the 1280-wide window the design
-        // calls wide.
-        let window_width = ui.ctx().content_rect().width();
-        let wide = window_width >= metric::NARROW;
-        if wide {
-            ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(metric::RAIL_BLOCK, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| self.rail_block(ui),
-                );
-                ui.add_space(space::L);
-                ui.vertical(|ui| {
-                    self.map_panel(ui);
-                    self.speed_panel(ui);
-                    self.selected_panel(ui);
+            if self.track.points.is_empty() {
+                self.empty_state(ui);
+                return;
+            }
+
+            // The three-zone layout collapses below 1100pt (DESIGN.md §9). The figure is
+            // a *window* size in the design, and it has to be read as one: the rail and
+            // the content margins have already taken ~216pt by the time this runs, so
+            // measuring the content would collapse the layout at the 1280-wide window
+            // the design calls wide.
+            let window_width = ui.ctx().content_rect().width();
+            let wide = window_width >= metric::NARROW;
+            if wide {
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(metric::RAIL_BLOCK, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| self.rail_block(ui),
+                    );
+                    ui.add_space(space::L);
+                    ui.vertical(|ui| {
+                        self.map_panel(ui);
+                        self.speed_panel(ui);
+                        self.selected_panel(ui);
+                    });
                 });
-            });
-        } else {
-            self.map_panel(ui);
-            ui.add_space(space::M);
-            ui.horizontal_top(|ui| {
-                ui.vertical(|ui| self.summary_block(ui));
-                ui.add_space(space::L);
-                ui.vertical(|ui| self.selected_panel(ui));
-            });
-            ui.add_space(space::M);
-            self.speed_panel(ui);
-        }
+            } else {
+                self.map_panel(ui);
+                ui.add_space(space::M);
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| self.summary_block(ui));
+                    ui.add_space(space::L);
+                    ui.vertical(|ui| self.selected_panel(ui));
+                });
+                ui.add_space(space::M);
+                self.speed_panel(ui);
+            }
 
-        ui.add_space(space::L);
-        self.point_table(ui);
-        ui.add_space(space::L);
-        self.export_bar(ui);
+            ui.add_space(space::L);
+            self.point_table(ui);
+        });
     }
 
     /// Empty log: the action that fills it, not a shrug (DESIGN.md §6).

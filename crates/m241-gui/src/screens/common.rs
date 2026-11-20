@@ -98,6 +98,47 @@ pub fn panel_with_border(ui: &mut Ui, title: &str, border: Color32, body: impl F
         });
 }
 
+/// The body of a screen: one vertical scroll area.
+///
+/// 1024×640 is a supported window size (DESIGN.md §8), and at that height the
+/// screens' content is taller than the content area. Anything not in a scroll
+/// area is *unreachable*, not merely cropped, which is what the review found:
+/// the log's last row missing at y=639, the firmware's checklist cut in half,
+/// the Connect screen's "next step" block ending at its first line.
+pub fn scrolling(ui: &mut Ui, id: &str, body: impl FnOnce(&mut Ui)) {
+    egui::ScrollArea::vertical()
+        .id_salt(id)
+        .auto_shrink([false, false])
+        .show(ui, body);
+}
+
+/// A footer pinned below the scroll area: the actions a person can take without
+/// scrolling.
+///
+/// The export bar and the wizard's 中止 / 続行 / 書き込む buttons moved here. They
+/// are the reason the screen exists, so they must not be the part that falls off
+/// the bottom of a small window. A hairline separates them from the scrolling
+/// body, in place of a fill or a shadow (§3: elevation is a rule).
+pub fn footer(ui: &mut Ui, id: &str, body: impl FnOnce(&mut Ui)) {
+    egui::Panel::bottom(id)
+        .show_separator_line(false)
+        .frame(
+            egui::Frame::new()
+                .fill(theme::GROUND)
+                .inner_margin(egui::Margin {
+                    left: 0,
+                    right: 0,
+                    top: space::M as i8,
+                    bottom: 0,
+                }),
+        )
+        .show(ui, |ui| {
+            hairline(ui);
+            ui.add_space(space::S);
+            body(ui);
+        });
+}
+
 /// One status line: coloured swatch, the word for that colour, then the text.
 ///
 /// The swatch exists because the colour is a scan aid; the word is the signal.

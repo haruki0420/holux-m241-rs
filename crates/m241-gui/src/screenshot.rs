@@ -599,7 +599,12 @@ mod tests {
         // The track line is the one place `theme::DATA` is spent on geometry. If the
         // projection drew outside the canvas or the path were culled, the colour would
         // be absent from the pixels while the shape count in `render.rs` stayed green.
-        let image = frame(Screen::Log);
+        //
+        // Rendered at the smallest documented window rather than at the suite's cheap
+        // 640×400: the body scrolls now (the review's fix for 1024×640), and below the
+        // documented height the map is legitimately below the fold. Asserting the track
+        // at a size the design does not support would pin the wrong property.
+        let image = frame_at(Screen::Log, Vec2::new(1024.0, 640.0));
         assert!(
             image.contains_colour(theme::DATA, 16),
             "the track did not rasterise in theme::DATA"

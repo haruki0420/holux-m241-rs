@@ -69,6 +69,16 @@ impl Step {
             Self::Flash => 2,
         }
     }
+
+    /// The step after this one, or `None` on the last.
+    #[must_use]
+    pub fn next(self) -> Option<Self> {
+        match self {
+            Self::Dump => Some(Self::Patch),
+            Self::Patch => Some(Self::Flash),
+            Self::Flash => None,
+        }
+    }
 }
 
 /// The three places amber may appear (DESIGN.md §3).
@@ -325,33 +335,82 @@ impl FirmwareScreen {
 
     /// Draw the screen body. The rail is drawn by the shell, not here.
     pub fn ui(&mut self, ui: &mut Ui) {
-        common::heading(
-            ui,
-            "ファームを書き換える",
-            "本体のファームを吸い出し、日付定数を書き換えて書き戻します。",
-        );
-        ui.add_space(space::L);
-        self.step_row(ui);
-        ui.add_space(space::L);
+        // The actions are pinned. At 1024×640 the wizard's own body is taller than
+        // the window; the review found the checklist cut in half and 書き込む below
+        // the bottom edge, and an action that cannot be reached is not a disabled
+        // action, it is a missing one.
+        common::footer(ui, "m241-firmware-actions", |ui| self.action_bar(ui));
 
-        if self.undefined {
-            self.undefined_panel(ui);
+        common::scrolling(ui, "m241-firmware-body", |ui| {
+            common::heading(
+                ui,
+                "ファームを書き換える",
+                "本体のファームを吸い出し、日付定数を書き換えて書き戻します。",
+            );
             ui.add_space(space::L);
-        }
+            self.step_row(ui);
+            ui.add_space(space::L);
 
-        match self.step {
-            Step::Dump => self.dump_step(ui),
-            Step::Patch => self.patch_step(ui),
-            Step::Flash => self.flash_step(ui),
-        }
+            if self.undefined {
+                self.undefined_panel(ui);
+                ui.add_space(space::L);
+            }
 
-        if let Some((status, text)) = &self.message {
-            ui.add_space(space::M);
-            common::status_line(ui, *status, text);
-        }
+            match self.step {
+                Step::Dump => self.dump_step(ui),
+                Step::Patch => self.patch_step(ui),
+                Step::Flash => self.flash_step(ui),
+            }
 
-        ui.add_space(space::L);
-        self.sample_toggle(ui);
+            if let Some((status, text)) = &self.message {
+                ui.add_space(space::M);
+                common::status_line(ui, *status, text);
+            }
+
+            ui.add_space(space::L);
+            self.sample_toggle(ui);
+        });
+    }
+
+    /// 中止 / 続行 on the first two steps, 中止 / 書き込む on the third.
+    ///
+    /// The footer form of the old `step_nav` and of the write row: the same
+    /// controls, moved out of the scrolling body so they are on screen at every
+    /// window height.
+    fn action_bar(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.step == Step::Flash {
+                    let response = self.write_button(ui);
+                    if response.clicked() {
+                        let refusal = self.attempt_flash();
+                        self.message = Some((Status::Err, refusal));
+                    }
+                } else if let Some(next) = self.step.next()
+                    && ui
+                        .add(
+                            egui::Button::new(RichText::new("続行").size(size::UI))
+                                .corner_radius(theme::RADIUS)
+                                .min_size(Vec2::new(metric::ACTION_WIDTH, 0.0)),
+                        )
+                        .clicked()
+                {
+                    self.step = next;
+                }
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("中止").size(size::UI))
+                            .corner_radius(theme::RADIUS)
+                            .min_size(Vec2::new(metric::ACTION_WIDTH * 0.7, 0.0)),
+                    )
+                    .clicked()
+                {
+                    self.step = Step::Dump;
+                    self.confirmation.clear();
+                    self.undefined = false;
+                }
+            });
+        });
     }
 
     /// 1 吸い出し 2 書き換え 3 書き戻し, drawn as a rail of its own.
@@ -544,8 +603,6 @@ impl FirmwareScreen {
                 .color(theme::MUTE),
             );
         });
-
-        self.step_nav(ui, Step::Dump);
     }
 
     /// Step 2: rewrite the constant in a file. Real work, no device.
@@ -588,8 +645,6 @@ impl FirmwareScreen {
             ui.add_space(space::M);
             self.plan_panel(ui);
         });
-
-        self.step_nav(ui, Step::Patch);
     }
 
     /// The 差分 block: what the plan would change, byte by byte.
@@ -756,22 +811,6 @@ impl FirmwareScreen {
             ui.add_space(space::S);
             self.gate_rows(ui);
         });
-
-        ui.add_space(space::M);
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let response = self.write_button(ui);
-                if response.clicked() {
-                    let refusal = self.attempt_flash();
-                    self.message = Some((Status::Err, refusal));
-                }
-                let _ignored = ui.add(
-                    egui::Button::new(RichText::new("中止").size(size::UI))
-                        .corner_radius(theme::RADIUS)
-                        .min_size(Vec2::new(metric::ACTION_WIDTH * 0.7, 0.0)),
-                );
-            });
-        });
     }
 
     /// The write button, the only amber-filled control in the product.
@@ -863,43 +902,6 @@ impl FirmwareScreen {
                     .clicked()
                 {
                     ui.ctx().copy_text(command.clone());
-                }
-            });
-        });
-    }
-
-    /// 中止 / 続行, shared by the first two steps.
-    fn step_nav(&mut self, ui: &mut Ui, step: Step) {
-        ui.add_space(space::M);
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let next = match step {
-                    Step::Dump => Some(Step::Patch),
-                    Step::Patch => Some(Step::Flash),
-                    Step::Flash => None,
-                };
-                if let Some(next) = next
-                    && ui
-                        .add(
-                            egui::Button::new(RichText::new("続行").size(size::UI))
-                                .corner_radius(theme::RADIUS)
-                                .min_size(Vec2::new(metric::ACTION_WIDTH, 0.0)),
-                        )
-                        .clicked()
-                {
-                    self.step = next;
-                }
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("中止").size(size::UI))
-                            .corner_radius(theme::RADIUS)
-                            .min_size(Vec2::new(metric::ACTION_WIDTH * 0.7, 0.0)),
-                    )
-                    .clicked()
-                {
-                    self.step = Step::Dump;
-                    self.confirmation.clear();
-                    self.undefined = false;
                 }
             });
         });
