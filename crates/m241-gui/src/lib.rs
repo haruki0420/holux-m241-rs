@@ -1,16 +1,20 @@
 //! `m241-gui` — the desktop interface.
 //!
-//! The shell is built before any screen content so that the navigation, the
-//! tokens and the signature move exist once, in one place. Screens are added
-//! against `DESIGN.md`; see `screens/`.
+//! The shell was built before any screen content so that the navigation, the
+//! tokens and the signature move exist once, in one place. The three screens in
+//! [`screens`] are written against `DESIGN.md` §5.
 //!
-//! The GUI is **planned** to call `m241_core` directly and never spawn the CLI:
-//! a subprocess would make progress reporting, cancellation and the typed
-//! confirmation impossible to keep honest. That dependency is not declared yet —
-//! today the shell only navigates — so the crate compiles without `m241_core`.
-//! Declaring a dependency before its consumer exists is the warning this crate
-//! deliberately avoids; the path stays reserved for the first screen that does
-//! real work.
+//! The GUI calls `m241_core` directly and never spawns the CLI: a subprocess would
+//! make progress reporting, cancellation and the typed confirmation impossible to
+//! keep honest. The Firmware screen runs the real patch planner and the real
+//! exporter, so the plan a person reviews here is the byte-for-byte plan the CLI
+//! would apply.
+//!
+//! What the screens do *not* do yet is drive the device: the session layer that
+//! would read a firmware image or download a log is not written, and
+//! `m241_core::protocol::DownloadAgent` refuses by design until the vendor binary
+//! has been disassembled. Those paths are visible on the screens as disabled
+//! controls labelled 未検証, never as buttons that quietly do nothing.
 //!
 //! Exposed as a library so integration tests can drive the real [`App`] through
 //! `egui`'s headless context. A GUI that compiles is not a GUI that works.

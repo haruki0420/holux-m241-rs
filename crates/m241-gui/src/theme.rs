@@ -62,6 +62,56 @@ pub mod space {
     pub const XXXL: f32 = 48.0;
 }
 
+/// Type sizes, in points, for `RichText::size` call sites.
+///
+/// These are the same five numbers [`text_styles`] installs into egui's named
+/// slots. They are named here because a screen that writes `13.0` by hand is
+/// one edit away from a sixth step in a scale that is specified as five
+/// (DESIGN.md §3: 11 → 13 → 16 → 20 → 24).
+pub mod size {
+    /// Screen title, one per screen.
+    pub const DISPLAY: f32 = 24.0;
+    /// Section heading.
+    pub const TITLE: f32 = 20.0;
+    /// Prose and labels.
+    pub const BODY: f32 = 16.0;
+    /// Buttons, tabs, table cells.
+    pub const UI: f32 = 13.0;
+    /// Units, timestamps, footnotes.
+    pub const CAPTION: f32 = 11.0;
+}
+
+/// Fixed metrics that are not spacing but are still part of the composed page.
+///
+/// Row heights and hairlines come from DESIGN.md §3. The canvas sizes are here
+/// for the same reason the spacing scale is: a screen that writes `220.0` by
+/// hand has invented a second grid, and the next screen copies it.
+pub mod metric {
+    /// One table row.
+    pub const ROW: f32 = 32.0;
+    /// A table's header row, one step tighter than its body.
+    pub const TABLE_HEADER: f32 = 28.0;
+    /// A hairline rule, and the width of any ordinary divider.
+    pub const HAIRLINE: f32 = 1.0;
+    /// Stroke width of the focus ring (DESIGN.md §6).
+    pub const FOCUS_RING: f32 = 2.0;
+    /// Width of a track line, a chart series, or a plotted path.
+    pub const TRACK_LINE: f32 = 2.0;
+    /// Radius of one plotted point.
+    pub const POINT_DOT: f32 = 3.0;
+    /// Width of a screen's subordinate rail block (DESIGN.md §5, ログ).
+    pub const RAIL_BLOCK: f32 = 220.0;
+    /// Height of the track canvas.
+    pub const PLOT: f32 = 240.0;
+    /// Height of the speed chart.
+    pub const CHART: f32 = 120.0;
+    /// Minimum width of a dialog's primary action, so two buttons line up.
+    pub const ACTION_WIDTH: f32 = 128.0;
+    /// Below this content width the Log screen stacks instead of splitting
+    /// (DESIGN.md §9 leaves the breakpoint open; this is the one it names).
+    pub const NARROW: f32 = 1_100.0;
+}
+
 /// Type scale (DESIGN.md §3): 11 / 13 / 16 / 20 / 24.
 ///
 /// egui has five named slots, so `display` (24) is [`TextStyle::Heading`] and
