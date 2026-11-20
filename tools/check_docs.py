@@ -33,7 +33,7 @@ SKIP_PREFIXES = ("http://", "https://", "mailto:", "#", "data:")
 #: holds the parallel work trees, each a full copy of the repository: scanning
 #: them would check every page once per tree and report paths that are only
 #: missing because that tree is on an older commit.
-SKIP_DIRS = {".git", "target", ".cargo-home", "node_modules", ".worktrees", "vendor"}
+SKIP_DIRS = {".git", "target", ".cargo-home", "node_modules", ".worktrees", "vendor", "_scratch", ".inbox"}
 
 #: Directories whose contents are referenced by path in the docs.
 PATH_ROOTS = ("docs/", "crates/", "tools/", ".github/")
@@ -105,7 +105,10 @@ def resolves(document: Path, token: str) -> bool:
         return True
     if cleaned.startswith(PATH_ROOTS) or "/" in cleaned:
         return (document.parent / cleaned).resolve().exists() or (REPO / cleaned).exists()
-    return any(REPO.rglob(cleaned))
+    return any(
+        not any(part in SKIP_DIRS for part in match.relative_to(REPO).parts)
+        for match in REPO.rglob(cleaned)
+    )
 
 
 def main() -> int:
