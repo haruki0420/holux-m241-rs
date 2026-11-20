@@ -70,6 +70,90 @@ impl Step {
             Self::Flash => 2,
         }
     }
+
+    /// The step after this one, or `None` on the last.
+    #[must_use]
+    pub fn next(self) -> Option<Self> {
+        match self {
+            Self::Dump => Some(Self::Patch),
+            Self::Patch => Some(Self::Flash),
+            Self::Flash => None,
+        }
+    }
+}
+
+/// How one step's marker is drawn: a shape first, a colour second.
+///
+/// The review found the reached and unreached markers told apart by lightness
+/// alone — two identical rings, one a shade brighter — which is exactly the
+/// "colour is never the only signal" failure DESIGN.md §3 forbids. The three
+/// states are now three shapes (filled, larger filled, open ring) *and* three
+/// colours, so the row still reads in monochrome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepMarker {
+    /// A finished step: a filled dot.
+    Done,
+    /// The step the wizard is on: the same dot, larger.
+    Current,
+    /// A step not started: an open ring.
+    Ahead,
+}
+
+impl StepMarker {
+    /// Which marker a step gets, given the step the wizard is on.
+    #[must_use]
+    fn of(step: Step, current: Step) -> Self {
+        if step == current {
+            Self::Current
+        } else if step.index() < current.index() {
+            Self::Done
+        } else {
+            Self::Ahead
+        }
+    }
+
+    /// Radius of the dot or ring.
+    #[must_use]
+    fn radius(self) -> f32 {
+        match self {
+            Self::Current => metric::POINT_DOT + 1.0,
+            Self::Done | Self::Ahead => metric::POINT_DOT,
+        }
+    }
+
+    /// Whether the marker is a filled dot (`true`) or an open ring (`false`).
+    ///
+    /// Held alongside [`Self::radius`] so the three states' shape distinction has
+    /// one source of truth that [`FirmwareScreen::step_row`] consumes and the unit
+    /// tests assert on directly.
+    #[must_use]
+    fn is_filled(self) -> bool {
+        match self {
+            Self::Done | Self::Current => true,
+            Self::Ahead => false,
+        }
+    }
+
+    /// The colour of the marker.
+    #[must_use]
+    fn colour(self) -> Color32 {
+        match self {
+            Self::Current => theme::INK,
+            Self::Done => theme::DATA,
+            Self::Ahead => theme::RULE,
+        }
+    }
+
+    /// The label is never the divider colour: a rule is a hairline and cannot
+    /// carry a word (§3), so the words are ink for the current step and mute
+    /// for the others.
+    #[must_use]
+    fn label_colour(self) -> Color32 {
+        match self {
+            Self::Current => theme::INK,
+            Self::Done | Self::Ahead => theme::MUTE,
+        }
+    }
 }
 
 /// The three places amber may appear (DESIGN.md §3).
@@ -328,33 +412,86 @@ impl FirmwareScreen {
 
     /// Draw the screen body. The rail is drawn by the shell, not here.
     pub fn ui(&mut self, ui: &mut Ui) {
-        common::heading(
-            ui,
-            "ファームを書き換える",
-            "本体のファームを吸い出し、日付定数を書き換えて書き戻します。",
-        );
-        ui.add_space(space::L);
-        self.step_row(ui);
-        ui.add_space(space::L);
+        // The actions are pinned. At 1024×640 the wizard's own body is taller than
+        // the window; the review found the checklist cut in half and 書き込む below
+        // the bottom edge, and an action that cannot be reached is not a disabled
+        // action, it is a missing one.
+        common::footer(ui, "m241-firmware-actions", |ui| self.action_bar(ui));
 
-        if self.undefined {
-            self.undefined_panel(ui);
+        common::scrolling(ui, "m241-firmware-body", |ui| {
+            common::heading(
+                ui,
+                "ファームを書き換える",
+                "本体のファームを吸い出し、日付定数を書き換えて書き戻します。",
+            );
+            if self.sample {
+                ui.add_space(space::S);
+                common::sample_marker(ui);
+            }
             ui.add_space(space::L);
-        }
+            self.step_row(ui);
+            ui.add_space(space::L);
 
-        match self.step {
-            Step::Dump => self.dump_step(ui),
-            Step::Patch => self.patch_step(ui),
-            Step::Flash => self.flash_step(ui),
-        }
+            if self.undefined {
+                self.undefined_panel(ui);
+                ui.add_space(space::L);
+            }
 
-        if let Some((status, text)) = &self.message {
-            ui.add_space(space::M);
-            common::status_line(ui, *status, text);
-        }
+            match self.step {
+                Step::Dump => self.dump_step(ui),
+                Step::Patch => self.patch_step(ui),
+                Step::Flash => self.flash_step(ui),
+            }
 
-        ui.add_space(space::L);
-        self.sample_toggle(ui);
+            if let Some((status, text)) = &self.message {
+                ui.add_space(space::M);
+                common::status_line(ui, *status, text);
+            }
+
+            ui.add_space(space::L);
+            self.sample_toggle(ui);
+        });
+    }
+
+    /// 中止 / 続行 on the first two steps, 中止 / 書き込む on the third.
+    ///
+    /// The footer form of the old `step_nav` and of the write row: the same
+    /// controls, moved out of the scrolling body so they are on screen at every
+    /// window height.
+    fn action_bar(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.step == Step::Flash {
+                    let response = self.write_button(ui);
+                    if response.clicked() {
+                        let refusal = self.attempt_flash();
+                        self.message = Some((Status::Err, refusal));
+                    }
+                } else if let Some(next) = self.step.next()
+                    && ui
+                        .add(
+                            egui::Button::new(RichText::new("続行").size(size::UI))
+                                .corner_radius(theme::RADIUS)
+                                .min_size(Vec2::new(metric::ACTION_WIDTH, 0.0)),
+                        )
+                        .clicked()
+                {
+                    self.step = next;
+                }
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("中止").size(size::UI))
+                            .corner_radius(theme::RADIUS)
+                            .min_size(Vec2::new(metric::ACTION_WIDTH * 0.7, 0.0)),
+                    )
+                    .clicked()
+                {
+                    self.step = Step::Dump;
+                    self.confirmation.clear();
+                    self.undefined = false;
+                }
+            });
+        });
     }
 
     /// 1 吸い出し 2 書き換え 3 書き戻し, drawn as a rail of its own.
@@ -388,21 +525,17 @@ impl FirmwareScreen {
             let Some(center) = positions.get(step.index()).copied() else {
                 continue;
             };
-            let reached = step.index() <= self.step.index();
-            let colour = if step == self.step {
-                theme::INK
-            } else if reached {
-                theme::DATA
-            } else {
-                theme::RULE
-            };
-            if step == self.step {
-                painter.circle_filled(center, metric::POINT_DOT + 1.0, colour);
+            // Shape first, colour second: the review found a reached step and an
+            // unreached one were the same ring in two shades, which is the
+            // colour-is-the-only-signal failure §3 forbids.
+            let marker = StepMarker::of(step, self.step);
+            if marker.is_filled() {
+                painter.circle_filled(center, marker.radius(), marker.colour());
             } else {
                 painter.circle_stroke(
                     center,
-                    metric::POINT_DOT,
-                    Stroke::new(metric::HAIRLINE, colour),
+                    marker.radius(),
+                    Stroke::new(metric::HAIRLINE, marker.colour()),
                 );
             }
             painter.text(
@@ -410,11 +543,7 @@ impl FirmwareScreen {
                 egui::Align2::CENTER_TOP,
                 format!("{} {}", step.index() + 1, step.label()),
                 egui::FontId::proportional(size::CAPTION),
-                if step == self.step {
-                    theme::INK
-                } else {
-                    theme::MUTE
-                },
+                marker.label_colour(),
             );
         }
     }
@@ -547,13 +676,12 @@ impl FirmwareScreen {
                 .color(theme::MUTE),
             );
         });
-
-        self.step_nav(ui, Step::Dump);
     }
 
     /// Step 2: rewrite the constant in a file. Real work, no device.
     fn patch_step(&mut self, ui: &mut Ui) {
-        common::panel(ui, "書き換え", |ui| {
+        let sample = self.sample;
+        common::sample_panel(ui, "書き換え", sample, |ui| {
             ui.label(
                 RichText::new("PC の中のファイルだけを書き換えます。本体には触れません。")
                     .size(size::UI)
@@ -591,8 +719,6 @@ impl FirmwareScreen {
             ui.add_space(space::M);
             self.plan_panel(ui);
         });
-
-        self.step_nav(ui, Step::Patch);
     }
 
     /// The 差分 block: what the plan would change, byte by byte.
@@ -701,8 +827,13 @@ impl FirmwareScreen {
 
     /// Step 3: write to the device. The only destructive act in the product.
     fn flash_step(&mut self, ui: &mut Ui) {
-        let (_border, title) = Destructive::WriteStep.voice();
-        common::panel_with_border(ui, title, Destructive::WriteStep.voice().0, |ui| {
+        let (border, voice_title) = Destructive::WriteStep.voice();
+        let title = if self.sample {
+            format!("{voice_title}／{}", common::SAMPLE_WORD)
+        } else {
+            String::from(voice_title)
+        };
+        common::panel_with_border(ui, &title, border, |ui| {
             ui.label(
                 RichText::new(
                     "本体のファームを上書きします。失敗すると使えなくなる場合があります。",
@@ -759,34 +890,36 @@ impl FirmwareScreen {
             ui.add_space(space::S);
             self.gate_rows(ui);
         });
+    }
 
-        ui.add_space(space::M);
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // The only amber-filled control in the product. It is disabled until
-                // every gate holds, which is why the fill is applied unconditionally:
-                // a button that changes colour on hover would be amber doing a second
-                // job.
-                let armed = self.write_armed();
-                let label = Destructive::ConfirmButton.voice().1;
-                let response = ui.add_enabled(
-                    armed,
-                    egui::Button::new(RichText::new(label).size(size::UI))
-                        .fill(Destructive::ConfirmButton.voice().0)
-                        .corner_radius(theme::RADIUS)
-                        .min_size(Vec2::new(metric::ACTION_WIDTH, 0.0)),
-                );
-                if response.clicked() {
-                    let refusal = self.attempt_flash();
-                    self.message = Some((Status::Err, refusal));
-                }
-                let _ignored = ui.add(
-                    egui::Button::new(RichText::new("中止").size(size::UI))
-                        .corner_radius(theme::RADIUS)
-                        .min_size(Vec2::new(metric::ACTION_WIDTH * 0.7, 0.0)),
-                );
-            });
-        });
+    /// The write button, the only amber-filled control in the product.
+    ///
+    /// Both states are readable, and amber stays on the surface and the frame.
+    /// The review measured the old button at 2.2–2.4:1: `ink` on the amber fill
+    /// is 1.8:1 by itself, and `add_enabled(false, …)` then multiplies both fill
+    /// and label by `disabled_alpha`, which turned a bad pair into an unreadable
+    /// one. So the label colour is chosen from the surface it sits on — `ground`
+    /// on the amber face (7.9:1), `ink` on the dark face (14.3:1) — and the
+    /// disabled dimming is overridden for this one control so the pair survives
+    /// with the ratio it was designed for. The button is still non-interactive
+    /// and still reported as disabled to assistive technology.
+    fn write_button(&mut self, ui: &mut Ui) -> egui::Response {
+        let armed = self.write_armed();
+        let (amber, label) = Destructive::ConfirmButton.voice();
+        let (fill, ink) = confirm_button_colours(amber, armed);
+        let button = egui::Button::new(RichText::new(label).size(size::UI).color(ink))
+            .fill(fill)
+            .stroke(Stroke::new(metric::HAIRLINE, amber))
+            .corner_radius(theme::RADIUS)
+            .min_size(Vec2::new(metric::ACTION_WIDTH, 0.0));
+        ui.scope(|ui| {
+            // The pair above already states "locked" (dark face, ink text); egui's
+            // 0.5 opacity on top would dim the label toward the dark face and take
+            // it back under 4.5:1, which is the defect being fixed.
+            ui.style_mut().visuals.disabled_alpha = 1.0;
+            ui.add_enabled(armed, button)
+        })
+        .inner
     }
 
     /// The prerequisites of the write, each with its state in words.
@@ -853,43 +986,6 @@ impl FirmwareScreen {
         });
     }
 
-    /// 中止 / 続行, shared by the first two steps.
-    fn step_nav(&mut self, ui: &mut Ui, step: Step) {
-        ui.add_space(space::M);
-        ui.horizontal(|ui| {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let next = match step {
-                    Step::Dump => Some(Step::Patch),
-                    Step::Patch => Some(Step::Flash),
-                    Step::Flash => None,
-                };
-                if let Some(next) = next
-                    && ui
-                        .add(
-                            egui::Button::new(RichText::new("続行").size(size::UI))
-                                .corner_radius(theme::RADIUS)
-                                .min_size(Vec2::new(metric::ACTION_WIDTH, 0.0)),
-                        )
-                        .clicked()
-                {
-                    self.step = next;
-                }
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("中止").size(size::UI))
-                            .corner_radius(theme::RADIUS)
-                            .min_size(Vec2::new(metric::ACTION_WIDTH * 0.7, 0.0)),
-                    )
-                    .clicked()
-                {
-                    self.step = Step::Dump;
-                    self.confirmation.clear();
-                    self.undefined = false;
-                }
-            });
-        });
-    }
-
     /// The sample switch, last on the screen so it never sits where a real action
     /// would be.
     fn sample_toggle(&mut self, ui: &mut Ui) {
@@ -902,7 +998,6 @@ impl FirmwareScreen {
         if !self.sample {
             return;
         }
-        common::sample_marker(ui);
         // The sample runs the real planner against a synthesised image, so what is
         // drawn is the real diff table rather than a hand-written one. If the planner
         // changes, the sample changes with it.
@@ -1016,6 +1111,21 @@ fn recovery_command(source: &str, patched: &str) -> String {
     format!("m241 fw flash PORT --da DA_v3.8.4.bin --fw {image} --backup {backup} --yes")
 }
 
+/// The write button's (surface, label) pair for its two states.
+///
+/// Amber is the surface and the frame; the label is `ground` on the amber face
+/// (7.9:1) and `ink` on the dark face (14.3:1). One function for both states so
+/// the pair cannot be half-changed: the review found the two ratios 1.8:1 and
+/// 2.2:1, which is what happens when a fill and a label are chosen apart.
+#[must_use]
+fn confirm_button_colours(amber: Color32, armed: bool) -> (Color32, Color32) {
+    if armed {
+        (amber, theme::GROUND)
+    } else {
+        (theme::GROUND, theme::INK)
+    }
+}
+
 /// A label/value row that takes a whole line, for a long figure.
 fn table_row(ui: &mut Ui, label: &str, value: &str, note: &str) {
     ui.horizontal(|ui| {
@@ -1047,11 +1157,98 @@ mod tests {
         FirmwareScreen::default()
     }
 
+    /// WCAG relative luminance, so the button's contrast is measured rather than
+    /// claimed. Duplicated from `theme`'s test module on purpose: the token tests
+    /// assert the palette, this one asserts a pair the palette does not fix.
+    fn luminance(colour: Color32) -> f64 {
+        let channel = |value: u8| {
+            let v = f64::from(value) / 255.0;
+            if v <= 0.039_28 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(colour.r()) + 0.7152 * channel(colour.g()) + 0.0722 * channel(colour.b())
+    }
+
+    fn contrast(a: Color32, b: Color32) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
     #[test]
     fn the_wizard_starts_at_the_read_only_step() {
         let screen = screen();
         assert_eq!(screen.step(), Step::Dump);
         assert_eq!(screen.dump_state(), &DumpState::Idle);
+    }
+
+    #[test]
+    fn the_step_markers_are_told_apart_by_shape_not_only_by_colour() {
+        // The invariant that survives a monochrome screenshot: shape, before colour.
+        let markers = [
+            StepMarker::of(Step::Dump, Step::Patch),
+            StepMarker::of(Step::Patch, Step::Patch),
+            StepMarker::of(Step::Flash, Step::Patch),
+        ];
+        assert_eq!(
+            markers,
+            [StepMarker::Done, StepMarker::Current, StepMarker::Ahead]
+        );
+        // Filled dot, larger filled dot, open ring: three shapes from two primitives.
+        assert!(markers[0].is_filled(), "Done must be a filled dot");
+        assert!(markers[1].is_filled(), "Current must be a filled dot");
+        assert!(!markers[2].is_filled(), "Ahead must be an open ring");
+        assert_eq!(markers[0].radius(), markers[2].radius());
+        assert!(markers[1].radius() > markers[0].radius());
+
+        let shapes = markers.map(|marker| (marker.radius().to_bits(), marker.is_filled()));
+        for (index, left) in shapes.iter().enumerate() {
+            for right in shapes.iter().skip(index + 1) {
+                assert_ne!(
+                    left, right,
+                    "two step markers share the same (radius, filled) shape: {shapes:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_step_label_is_never_a_rule_colour() {
+        // RULE clears about 1.5:1 on the ground: fine for a hairline, not for text.
+        for step in Step::ALL {
+            for current in Step::ALL {
+                assert_ne!(StepMarker::of(step, current).label_colour(), theme::RULE);
+            }
+        }
+    }
+
+    #[test]
+    fn the_write_button_label_clears_wcag_aa_in_both_states() {
+        // The defect the review found: ink on amber is 1.8:1, and the disabled
+        // treatment dimmed both until the label was a lighter patch on a lighter
+        // patch. Measured here rather than asserted in a comment, because the two
+        // colours are chosen in different branches and only the pair has a ratio.
+        let (amber, _label) = Destructive::ConfirmButton.voice();
+        for armed in [false, true] {
+            let (fill, ink) = confirm_button_colours(amber, armed);
+            let ratio = contrast(ink, fill);
+            assert!(
+                ratio >= 4.5,
+                "the {} write button is {ratio:.2}:1, below 4.5:1 (ink {ink:?}, fill {fill:?})",
+                if armed { "armed" } else { "locked" }
+            );
+        }
+    }
+
+    #[test]
+    fn the_armed_write_button_puts_ground_text_on_amber() {
+        // DESIGN.md's answer to "how is amber spent on text": it is not. The face
+        // is amber and the word on it is `ground`, which is 7.9:1.
+        let (amber, _label) = Destructive::ConfirmButton.voice();
+        assert_eq!(confirm_button_colours(amber, true), (amber, theme::GROUND));
     }
 
     #[test]

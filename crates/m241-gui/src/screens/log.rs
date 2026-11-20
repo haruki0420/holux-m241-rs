@@ -88,55 +88,70 @@ impl LogScreen {
 
     /// Draw the screen body. The rail is drawn by the shell, not here.
     pub fn ui(&mut self, ui: &mut Ui) {
-        common::heading(
-            ui,
-            "ログ",
-            "吸い出したログを地図に描き、写真の時刻と突き合わせて GPX に書き出します。",
-        );
-        ui.add_space(space::L);
-
-        if self.track.points.is_empty() {
-            self.empty_state(ui);
-            return;
+        if !self.track.points.is_empty() {
+            // The export bar is pinned: it is the reason the screen exists, and at
+            // 1024×640 it used to be the part that fell off the bottom. Omitted
+            // when there is no track yet so the empty state does not offer to
+            // export nothing.
+            common::footer(ui, "m241-log-export", |ui| self.export_bar(ui));
         }
 
-        // The three-zone layout collapses below 1100pt (DESIGN.md §9). The figure is
-        // a *window* size in the design, and it has to be read as one: the rail and the
-        // content margins have already taken ~216pt by the time this runs, so measuring
-        // the content would collapse the layout at the 1280-wide window the design
-        // calls wide.
-        let window_width = ui.ctx().content_rect().width();
-        let wide = window_width >= metric::NARROW;
-        if wide {
-            ui.horizontal_top(|ui| {
-                ui.allocate_ui_with_layout(
-                    Vec2::new(metric::RAIL_BLOCK, ui.available_height()),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| self.rail_block(ui),
-                );
-                ui.add_space(space::L);
-                ui.vertical(|ui| {
-                    self.map_panel(ui);
-                    self.speed_panel(ui);
-                    self.selected_panel(ui);
+        common::scrolling(ui, "m241-log-body", |ui| {
+            common::heading(
+                ui,
+                "ログ",
+                "吸い出したログを地図に描き、写真の時刻と突き合わせて GPX に書き出します。",
+            );
+            // The review's fourth finding: this screen showed sample coordinates and
+            // sample speeds with no marking at all. The band is under the heading and
+            // above every figure, so it cannot be scrolled or cropped away from them.
+            if self.sample {
+                ui.add_space(space::S);
+                common::sample_marker(ui);
+            }
+            ui.add_space(space::L);
+
+            if self.track.points.is_empty() {
+                self.empty_state(ui);
+                return;
+            }
+
+            // The three-zone layout collapses below 1100pt (DESIGN.md §9). The figure is
+            // a *window* size in the design, and it has to be read as one: the rail and
+            // the content margins have already taken ~216pt by the time this runs, so
+            // measuring the content would collapse the layout at the 1280-wide window
+            // the design calls wide.
+            let window_width = ui.ctx().content_rect().width();
+            let wide = window_width >= metric::NARROW;
+            if wide {
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(metric::RAIL_BLOCK, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| self.rail_block(ui),
+                    );
+                    ui.add_space(space::L);
+                    ui.vertical(|ui| {
+                        self.map_panel(ui);
+                        self.speed_panel(ui);
+                        self.selected_panel(ui);
+                    });
                 });
-            });
-        } else {
-            self.map_panel(ui);
-            ui.add_space(space::M);
-            ui.horizontal_top(|ui| {
-                ui.vertical(|ui| self.summary_block(ui));
-                ui.add_space(space::L);
-                ui.vertical(|ui| self.selected_panel(ui));
-            });
-            ui.add_space(space::M);
-            self.speed_panel(ui);
-        }
+            } else {
+                self.map_panel(ui);
+                ui.add_space(space::M);
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| self.summary_block(ui));
+                    ui.add_space(space::L);
+                    ui.vertical(|ui| self.selected_panel(ui));
+                });
+                ui.add_space(space::M);
+                self.speed_panel(ui);
+            }
 
-        ui.add_space(space::L);
-        self.point_table(ui);
-        ui.add_space(space::L);
-        self.export_bar(ui);
+            ui.add_space(space::L);
+            self.point_table(ui);
+        });
     }
 
     /// Empty log: the action that fills it, not a shrug (DESIGN.md §6).
@@ -181,7 +196,7 @@ impl LogScreen {
     /// The 集計 figures: distance, duration, average speed.
     fn summary_block(&self, ui: &mut Ui) {
         let summary = LogSummary::of(&self.track);
-        ui.label(RichText::new("集計").size(size::CAPTION).color(theme::MUTE));
+        common::block_title(ui, "集計", self.sample);
         common::hairline(ui);
         ui.add_space(space::XS);
         for (label, value) in [
@@ -215,11 +230,7 @@ impl LogScreen {
     /// The left rail block: days, photos, totals. Subordinate to the tab rail: the
     /// same staircase rhythm, no fill (DESIGN.md §5).
     fn rail_block(&mut self, ui: &mut Ui) {
-        ui.label(
-            RichText::new("トラック")
-                .size(size::CAPTION)
-                .color(theme::MUTE),
-        );
+        common::block_title(ui, "トラック", self.sample);
         common::hairline(ui);
         ui.add_space(space::XS);
         for (day, count) in self.days() {
@@ -253,7 +264,8 @@ impl LogScreen {
 
     /// 地図: the track painted from latitude and longitude.
     fn map_panel(&mut self, ui: &mut Ui) {
-        common::panel(ui, "地図", |ui| {
+        let sample = self.sample;
+        common::sample_panel(ui, "地図", sample, |ui| {
             let height = metric::PLOT;
             let (rect, response) =
                 ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
@@ -314,19 +326,32 @@ impl LogScreen {
 
     /// 速度: one series, baseline at zero, no smoothing.
     fn speed_panel(&mut self, ui: &mut Ui) {
-        common::panel(ui, "速度", |ui| {
+        let speeds: Vec<f32> = self
+            .track
+            .points
+            .iter()
+            .filter_map(|point| point.speed_kmh)
+            .collect();
+        let maximum = speeds.iter().copied().reduce(f32::max);
+        // The maximum is a figure *about* the panel, so it belongs on the panel's
+        // caption row. Drawn inside the plot it sat on the first peak of the series —
+        // the review read the line as running through its own label.
+        let note = maximum.map(|maximum| format!("最大 {maximum:.0} km/h"));
+        // The sample word travels in the caption even when the caption carries a
+        // figure too: `sample_panel` cannot be used here because this panel already
+        // spends its note slot on the maximum.
+        let title = if self.sample {
+            format!("速度／{}", common::SAMPLE_WORD)
+        } else {
+            String::from("速度")
+        };
+        common::panel_captioned(ui, &title, note.as_deref(), |ui| {
             let (rect, _ignored) = ui.allocate_exact_size(
                 Vec2::new(ui.available_width(), metric::CHART),
                 Sense::hover(),
             );
             let painter = ui.painter_at(rect);
-            let speeds: Vec<f32> = self
-                .track
-                .points
-                .iter()
-                .filter_map(|point| point.speed_kmh)
-                .collect();
-            let Some(maximum) = speeds.iter().copied().reduce(f32::max) else {
+            let Some(maximum) = maximum else {
                 painter.text(
                     rect.center(),
                     Align2::CENTER_CENTER,
@@ -365,13 +390,6 @@ impl LogScreen {
                 ));
             }
             painter.text(
-                rect.left_top() + Vec2::new(space::XS, space::XS),
-                Align2::LEFT_TOP,
-                format!("{maximum:.0} km/h"),
-                FontId::monospace(size::CAPTION),
-                theme::MUTE,
-            );
-            painter.text(
                 rect.right_bottom() + Vec2::new(-space::XS, -space::XS),
                 Align2::RIGHT_BOTTOM,
                 "0",
@@ -383,7 +401,8 @@ impl LogScreen {
 
     /// 選択した点: the figures for one record, right-aligned in a ruled block.
     fn selected_panel(&mut self, ui: &mut Ui) {
-        common::panel(ui, "選択した点", |ui| {
+        let sample = self.sample;
+        common::sample_panel(ui, "選択した点", sample, |ui| {
             let Some(point) = self.selected.and_then(|index| self.track.points.get(index)) else {
                 common::status_line(ui, Status::Info, "点を選んでください");
                 return;
@@ -427,11 +446,7 @@ impl LogScreen {
     /// `show_rows` keeps the frame cost independent of the length.
     fn point_table(&mut self, ui: &mut Ui) {
         let shown = self.visible_indices();
-        ui.label(
-            RichText::new("点の一覧")
-                .size(size::CAPTION)
-                .color(theme::MUTE),
-        );
+        common::block_title(ui, "点の一覧", self.sample);
         common::hairline(ui);
         egui::ScrollArea::vertical()
             .id_salt("m241-log-points")

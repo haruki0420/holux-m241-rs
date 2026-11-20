@@ -284,3 +284,27 @@ main は `e58c5d3` → `5d6ad74` → `19e07c6` と進んだが、いずれも本
 
 - **ゲート・テスト**: `./tools/check.sh`（および `tools/check_safety.py`）全ゲート PASS、`crates/m241-core/src/log/` 内テスト **74 件**（`exif.rs` 15 件 + `geotag.rs` 11 件、削除・弱体化 0 件）。本番コードの `unwrap`/`expect`/`panic!`/`unsafe`/無検証添字 0 件、個人情報違反なし。
 - **判定**: **合格**（`main` へマージ）。
+
+---
+
+## 2026-11-21 / GUI 設計レビュー修正（`fix/design-review2` → `fix/design-review2-v2`）
+
+対象: `crates/m241-gui/`（レール段差・固定幅、書き込みボタン可読性、ステップマーカー形状区別、1024×640 スクロール・フッター、見本表示、設定画面 5 行、接続画面見出し・数値右揃え、速度チャート最大値位置）。
+
+- **初回 Stage 3 検証（`fix/design-review2` `0321bef`）**: **不合格**（要修正 3 件・推奨整理 3 件）
+  1. `crates/m241-gui/src/screens/connect.rs` の `log_panel` のみ `common::figure_line`（右揃え）に変更され、隣の `device_panel` が左揃え `egui::Grid` のまま残存（コメントも事実誤認で並列 2 パネルが不揃い）。
+  2. `crates/m241-gui/src/screens/firmware.rs` のステップマーカー塗り／中抜き区別がテストで担保されておらず、`Done` を中抜きに戻す変異テスト M3 が生存。
+  3. `crates/m241-gui/src/screens/settings.rs` の UI 文言に内部仕様書名（`DESIGN.md §9`）が露出。
+  - 推奨整理: 空ログ時の書き出しフッター非表示化（`log.rs`）、見本モード時の `sample_marker` 重複除去とパネル見出しキャプション統一（`firmware.rs`）、左レール固定幅の回帰テスト追加（M5、`app.rs`）。
+- **Stage 2 修正（別エージェント、`fix/design-review2-v2` `1f97b24`）**: 5 ファイル変更（+331/−38 行、テスト +6 件追加）。
+- **Stage 3 独立検証（三人目、修正者の説明・コミット本文は未読）**:
+
+| # | 指摘 | 解消 | 確認箇所・検出テスト |
+|---|---|---|---|
+| 1 | `device_panel` 右揃え統一・コメント修正 | 解消 | `crates/m241-gui/src/screens/connect.rs` で `common::figure_line` に統一。`the_connect_panels_align_their_figures_to_the_right_edge` 追加、変異テスト M1 で FAIL |
+| 2 | `StepMarker` 塗り／中抜き単一ソース化・描画検証 | 解消 | `StepMarker::is_filled` 新設、`the_step_markers_are_told_apart_by_shape_not_only_by_colour` 強化 + `the_firmware_step_row_paints_distinct_circle_primitives` 追加。変異テスト M3a・M3b とも FAIL |
+| 3 | `settings.rs` 内部仕様書名露出の除去 | 解消 | UI 文言から内部参照を除去し `no_row_exposes_internal_document_names` 追加。変異テスト M_S3 で FAIL |
+| 4〜6 | 空ログフッター・見本キャプション・レール固定幅テスト | 解消 | `an_empty_log_omits_the_export_footer_until_a_track_exists`、`the_firmware_sample_renders_one_sample_banner_and_captions_its_panels`、`the_rail_keeps_its_fixed_width_across_every_screen` 追加。変異テスト M_L4・M_F5a・M_F5b・M5 すべて FAIL |
+
+- **ゲート・テスト**: `./tools/check.sh` 全ゲート PASS、`crates/m241-gui/` テスト **93 件**（`main` 79 → `0321bef` 87 → `1f97b24` 93、削除・弱体化 0 件）。本番コードの `unwrap`/`expect`/`panic!`/`unsafe`/無検証添字 0 件、個人情報違反なし。
+- **判定**: **合格**（`main` へマージ）。

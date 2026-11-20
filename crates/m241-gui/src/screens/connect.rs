@@ -48,30 +48,45 @@ enum Listing {
 impl ConnectScreen {
     /// Draw the screen body. The rail is drawn by the shell, not here.
     pub fn ui(&mut self, ui: &mut Ui) {
-        common::heading(
-            ui,
-            "Holux M-241",
-            "ファームの日付が 19.6 年ずれています。端末をつなぎ、まずファームを吸い出してください。",
-        );
+        // At 1024×640 the body is taller than the window, and the review found the
+        // "next step" block ending at its first line — below the fold, and therefore
+        // unreachable rather than merely cropped.
+        common::scrolling(ui, "m241-connect-body", |ui| {
+            // The heading is the screen's name, not the product's: the title bar
+            // already says "Holux M-241", and a heading that repeated it made the
+            // screen read as a splash page rather than as the 接続 tab.
+            common::heading(
+                ui,
+                "接続",
+                "ファームの日付が 19.6 年ずれています。端末をつなぎ、まずファームを吸い出してください。",
+            );
+            // The sample band sits under the heading, above every figure: it cannot
+            // be scrolled away from the numbers it qualifies, and a crop that keeps
+            // the figures keeps the word too.
+            if self.sample {
+                ui.add_space(space::S);
+                common::sample_marker(ui);
+            }
 
-        // Lazy first enumeration: asking the OS for ports every frame would spin a
-        // udev walk at 60 Hz for a list that changes when a cable moves.
-        if matches!(&self.ports, Listing::Unread) {
-            self.refresh();
-        }
+            // Lazy first enumeration: asking the OS for ports every frame would spin a
+            // udev walk at 60 Hz for a list that changes when a cable moves.
+            if matches!(&self.ports, Listing::Unread) {
+                self.refresh();
+            }
 
-        ui.add_space(space::XL);
-        self.port_panel(ui);
+            ui.add_space(space::XL);
+            self.port_panel(ui);
 
-        ui.add_space(space::L);
-        ui.columns_const::<2, _>(|columns| {
-            let [left, right] = columns;
-            self.device_panel(left);
-            self.log_panel(right);
+            ui.add_space(space::L);
+            ui.columns_const::<2, _>(|columns| {
+                let [left, right] = columns;
+                self.device_panel(left);
+                self.log_panel(right);
+            });
+
+            ui.add_space(space::L);
+            self.next_steps(ui);
         });
-
-        ui.add_space(space::L);
-        self.next_steps(ui);
     }
 
     /// Fill the panels with the sample unit's figures.
@@ -169,32 +184,22 @@ impl ConnectScreen {
     }
 
     fn device_panel(&mut self, ui: &mut Ui) {
-        common::panel(ui, "デバイス", |ui| {
-            if self.sample {
+        let sample = self.sample;
+        common::sample_panel(ui, "デバイス", sample, |ui| {
+            if sample {
                 let info = sample_device();
-                common::sample_marker(ui);
-                ui.add_space(space::S);
-                egui::Grid::new("m241-device-figures")
-                    .num_columns(2)
-                    .spacing([space::L, space::S])
-                    .show(ui, |ui| {
-                        for (label, value) in [
-                            ("firmware", info.release.clone()),
-                            ("build", info.build.clone()),
-                            ("model", info.model.clone()),
-                            ("flash", String::from("512 KiB")),
-                            ("日付", format!("{} 日ずれ", 7168)),
-                        ] {
-                            ui.label(RichText::new(label).size(size::CAPTION).color(theme::MUTE));
-                            ui.label(
-                                RichText::new(value)
-                                    .size(size::UI)
-                                    .color(theme::INK)
-                                    .monospace(),
-                            );
-                            ui.end_row();
-                        }
-                    });
+                // One figure per row with the value on the panel's right edge,
+                // matching `log_panel` beside it (DESIGN.md §2, §5: right-aligned
+                // figures).
+                for (label, value) in [
+                    ("firmware", info.release),
+                    ("build", info.build),
+                    ("model", info.model),
+                    ("flash", String::from("512 KiB")),
+                    ("日付", format!("{} 日ずれ", 7168)),
+                ] {
+                    common::figure_line(ui, label, &value);
+                }
             } else {
                 // No device: say what is missing, in the order to check it
                 // (DESIGN.md §6, "No port found").
@@ -217,29 +222,21 @@ impl ConnectScreen {
     }
 
     fn log_panel(&mut self, ui: &mut Ui) {
-        common::panel(ui, "ログ", |ui| {
-            if self.sample {
+        let sample = self.sample;
+        common::sample_panel(ui, "ログ", sample, |ui| {
+            if sample {
                 let summary = sample_summary();
-                egui::Grid::new("m241-log-figures")
-                    .num_columns(2)
-                    .spacing([space::L, space::S])
-                    .show(ui, |ui| {
-                        for (label, value) in [
-                            ("使用量", common::bytes(212_860)),
-                            ("点数", summary.records.to_string()),
-                            ("期間", String::from("11/14 → 11/15")),
-                            ("記録", String::from("有効")),
-                        ] {
-                            ui.label(RichText::new(label).size(size::CAPTION).color(theme::MUTE));
-                            ui.label(
-                                RichText::new(value)
-                                    .size(size::UI)
-                                    .color(theme::INK)
-                                    .monospace(),
-                            );
-                            ui.end_row();
-                        }
-                    });
+                // One figure per row with the value on the panel's right edge,
+                // matching `device_panel` beside it so both side-by-side panels
+                // share the same label-left / value-right alignment (DESIGN.md §2, §5).
+                for (label, value) in [
+                    ("使用量", common::bytes(212_860)),
+                    ("点数", summary.records.to_string()),
+                    ("期間", String::from("11/14 → 11/15")),
+                    ("記録", String::from("有効")),
+                ] {
+                    common::figure_line(ui, label, &value);
+                }
             } else {
                 common::status_line(ui, Status::Info, "未取得 — ログはまだ読んでいません");
                 ui.add_space(space::S);

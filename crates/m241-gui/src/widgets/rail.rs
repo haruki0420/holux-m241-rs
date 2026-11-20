@@ -7,7 +7,7 @@
 //! has no stepped tab index, and because the move must appear in exactly one
 //! place.
 
-use egui::{Color32, Response, Sense, Stroke, StrokeKind, Ui, Vec2};
+use egui::{Color32, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2, pos2};
 
 use crate::screens::Screen;
 use crate::theme::{self, INK, MUTE, PANEL, metric, size, space};
@@ -20,6 +20,24 @@ pub const TAB_HEIGHT: f32 = 40.0;
 
 /// Left inset of the shallowest tab.
 pub const INSET: f32 = space::M;
+
+/// The rail's fixed width, outer margin included (DESIGN.md §4).
+///
+/// Fixed rather than content-sized: the rail's width used to be whatever its
+/// widest tab happened to be, which made it 164pt on 接続 and 176pt on the other
+/// three screens, so the heading started at two different x positions.
+pub const WIDTH: f32 = 176.0;
+
+/// The left edge of a tab, relative to the rail.
+///
+/// The step is applied to the *left* edge and the right edge is pinned to the
+/// rail's width. Indenting by allocating a narrower widget instead would leave
+/// the left edge at zero and shrink the right edge, which reads as tabs getting
+/// narrower rather than deeper — the opposite of a thumb index (DESIGN.md §4).
+#[must_use]
+pub fn tab_left(screen: Screen) -> f32 {
+    INSET + STEP * screen.index() as f32
+}
 
 /// Draw the rail. Returns `Some(screen)` only when the selection changed this
 /// frame, so the caller can cancel in-flight work for the screen it left.
@@ -38,9 +56,20 @@ pub fn rail(ui: &mut Ui, current: Screen) -> Option<Screen> {
 }
 
 fn tab(ui: &mut Ui, screen: Screen, active: bool) -> Response {
-    let indent = INSET + STEP * screen.index() as f32;
-    let width = (ui.available_width() - indent).max(0.0);
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, TAB_HEIGHT), Sense::click());
+    // The row claims the rail's full width so every tab ends on the same right
+    // edge; the tab is painted and hit-tested from its stepped left edge to that
+    // right edge inside the row.
+    let (row, _row) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), TAB_HEIGHT), Sense::hover());
+    let rect = Rect::from_min_max(
+        pos2(row.left() + tab_left(screen), row.top()),
+        row.right_bottom(),
+    );
+    let response = ui.interact(
+        rect,
+        ui.scope_id().with(("m241-rail-tab", screen.index())),
+        Sense::click(),
+    );
 
     let fill = if active {
         PANEL
@@ -77,13 +106,30 @@ mod tests {
 
     #[test]
     fn the_staircase_stays_inside_the_rail() {
-        // The deepest tab plus its inset must leave room for content: the rail
-        // panel is sized by its children, so a tab that overflows would widen it.
-        let deepest = INSET + STEP * (Screen::ALL.len() - 1) as f32;
+        // The deepest tab must still start left of the rail's right edge: the tab
+        // keeps its right edge pinned, so only its left edge can run out of room.
+        let deepest = tab_left(Screen::ALL[Screen::ALL.len() - 1]);
         assert!(
-            deepest < 96.0,
-            "deepest indent {deepest} overflows a 96pt rail"
+            deepest + STEP < WIDTH,
+            "deepest indent {deepest} leaves no width for a tab in a {WIDTH}pt rail"
         );
+    }
+
+    #[test]
+    fn the_stairs_step_right_by_eight_points() {
+        // DESIGN.md §4: each tab is indented 8pt more than the one above it, so the
+        // left edges form the staircase and the right edges do not move.
+        let lefts: Vec<f32> = Screen::ALL.iter().copied().map(tab_left).collect();
+        assert_eq!(lefts.len(), 4, "the rail has four tabs");
+        for pair in lefts.windows(2) {
+            let (Some(first), Some(second)) = (pair.first(), pair.get(1)) else {
+                continue;
+            };
+            assert!(
+                (second - first - STEP).abs() < f32::EPSILON,
+                "tabs at {first} and {second} are not one step apart"
+            );
+        }
     }
 
     #[test]

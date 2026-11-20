@@ -98,6 +98,117 @@ pub fn panel_with_border(ui: &mut Ui, title: &str, border: Color32, body: impl F
         });
 }
 
+/// The body of a screen: one vertical scroll area.
+///
+/// 1024×640 is a supported window size (DESIGN.md §8), and at that height the
+/// screens' content is taller than the content area. Anything not in a scroll
+/// area is *unreachable*, not merely cropped, which is what the review found:
+/// the log's last row missing at y=639, the firmware's checklist cut in half,
+/// the Connect screen's "next step" block ending at its first line.
+pub fn scrolling(ui: &mut Ui, id: &str, body: impl FnOnce(&mut Ui)) {
+    egui::ScrollArea::vertical()
+        .id_salt(id)
+        .auto_shrink([false, false])
+        .show(ui, body);
+}
+
+/// A footer pinned below the scroll area: the actions a person can take without
+/// scrolling.
+///
+/// The export bar and the wizard's 中止 / 続行 / 書き込む buttons moved here. They
+/// are the reason the screen exists, so they must not be the part that falls off
+/// the bottom of a small window. A hairline separates them from the scrolling
+/// body, in place of a fill or a shadow (§3: elevation is a rule).
+pub fn footer(ui: &mut Ui, id: &str, body: impl FnOnce(&mut Ui)) {
+    egui::Panel::bottom(id)
+        .show_separator_line(false)
+        .frame(
+            egui::Frame::new()
+                .fill(theme::GROUND)
+                .inner_margin(egui::Margin {
+                    left: 0,
+                    right: 0,
+                    top: space::M as i8,
+                    bottom: 0,
+                }),
+        )
+        .show(ui, |ui| {
+            hairline(ui);
+            ui.add_space(space::S);
+            body(ui);
+        });
+}
+
+/// The one word that marks a figure as not read from a device.
+///
+/// A constant rather than a literal per call site: the review found the word on
+/// two screens' toggles and on none of the figures those toggles produced, which
+/// is what happens when the marker is a sentence each screen writes for itself.
+pub const SAMPLE_WORD: &str = "見本";
+
+/// A panel whose caption row carries a right-aligned note as well as the title.
+///
+/// The note is where a figure about the panel as a whole belongs — the speed
+/// chart's maximum, for instance. Drawing it inside the plot put it on top of
+/// the series the review had to read (DESIGN.md §3: a label never overlaps the
+/// data it labels).
+pub fn panel_captioned(ui: &mut Ui, title: &str, note: Option<&str>, body: impl FnOnce(&mut Ui)) {
+    egui::Frame::new()
+        .fill(theme::GROUND)
+        .stroke(Stroke::new(metric::HAIRLINE, theme::RULE))
+        .corner_radius(theme::RADIUS)
+        .inner_margin(space::L)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(title).size(size::CAPTION).color(theme::MUTE));
+                if let Some(note) = note {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(RichText::new(note).size(size::CAPTION).color(theme::MUTE));
+                    });
+                }
+            });
+            ui.add_space(space::S);
+            body(ui);
+        });
+}
+
+/// A panel whose caption carries the word [`SAMPLE_WORD`] when the figures in it
+/// are sample values.
+///
+/// Every panel that can show sample figures uses this instead of [`panel`], so
+/// the word travels with the numbers: a screenshot cropped to one panel still
+/// says the figures were not read from a device (DESIGN.md §6, PRODUCT.md). The
+/// review found the word only on the toggles at the bottom of two screens — far
+/// from the numbers, and absent altogether on the Log screen.
+pub fn sample_panel(ui: &mut Ui, title: &str, sample: bool, body: impl FnOnce(&mut Ui)) {
+    if sample {
+        panel_captioned(ui, &format!("{title}／{SAMPLE_WORD}"), None, body);
+    } else {
+        panel(ui, title, body);
+    }
+}
+
+/// A block caption, with the sample word on the right when the block is sample.
+///
+/// The counterpart of [`sample_panel`] for the ruled blocks that are not panels
+/// (the Log screen's 集計 and 点の一覧): same word, same place, so the marker is
+/// one convention rather than a per-screen habit.
+pub fn block_title(ui: &mut Ui, title: &str, sample: bool) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(title).size(size::CAPTION).color(theme::MUTE));
+        if sample {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(SAMPLE_WORD)
+                        .size(size::CAPTION)
+                        .color(theme::MUTE),
+                );
+            });
+        }
+    });
+}
+
 /// One status line: coloured swatch, the word for that colour, then the text.
 ///
 /// The swatch exists because the colour is a scan aid; the word is the signal.
