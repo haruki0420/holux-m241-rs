@@ -42,6 +42,7 @@ pub mod fileio;
 pub mod fw;
 pub mod link;
 pub mod logcmd;
+pub mod nmea;
 pub mod output;
 
 #[cfg(test)]
@@ -230,7 +231,7 @@ pub fn run_with(session: Session<'_>, command: Command) -> Result<()> {
             LogCommand::Geotag => Err(not_implemented("log geotag")),
         },
         Command::Nmea { command } => match command {
-            NmeaCommand::Repair(options) => not_implemented_args("nmea repair", &options),
+            NmeaCommand::Repair(options) => nmea::repair(&options, session),
             NmeaCommand::Proxy => Err(not_implemented("nmea proxy")),
         },
     }
@@ -241,14 +242,6 @@ pub fn run_with(session: Session<'_>, command: Command) -> Result<()> {
 /// The message names the command the user actually typed and says where to find
 /// one that works. "not implemented yet" on its own leaves them with no next
 /// step, and naming internal work items tells them nothing they can act on.
-/// The same, for a verb whose options are parsed but whose handler is absent.
-///
-/// Taking the options keeps the match exhaustive without `_ =>`, so wiring a
-/// command later is a handler call and nothing else.
-fn not_implemented_args<T>(command: &str, _options: &T) -> Result<()> {
-    Err(not_implemented(command))
-}
-
 fn not_implemented(command: &str) -> m241_core::Error {
     m241_core::Error::State(format!(
         "このビルドでは `m241 {command}` は未実装です。\
@@ -298,7 +291,6 @@ mod tests {
             (parsed(&["fw", "flash"]), "fw flash"),
             (parsed(&["log", "erase"]), "log erase"),
             (parsed(&["log", "geotag"]), "log geotag"),
-            (parsed(&["nmea", "repair"]), "nmea repair"),
             (parsed(&["nmea", "proxy"]), "nmea proxy"),
         ]
     }
@@ -342,7 +334,6 @@ mod tests {
                 "fw flash",
                 "log erase",
                 "log geotag",
-                "nmea repair",
                 "nmea proxy",
             ]
         );
