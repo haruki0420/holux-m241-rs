@@ -243,10 +243,10 @@ Facts, not code:
 - The dump-twice-and-compare gate. Nekoba's dumper reads twice, asks for a
   power-cycle between the passes, compares SHA-256 and keeps the second file when
   they differ (`scripts/dump_firmware.py:136-174`); this project keeps that gate.
-- One idea worth adopting that neither prior project's write path has: Nekoba
-  reads the DA's first four bytes back after uploading it and refuses to jump if
-  the read fails (`scripts/mtk_proto.py`, `DownloadAgent.start`). A dead DA is
-  otherwise only visible as a timeout after the jump.
+- One idea from Nekoba worth adopting here: after uploading the DA it reads the
+  first four bytes back and refuses to jump if the read fails
+  (`scripts/mtk_proto.py`, `DownloadAgent.start`). A dead DA is otherwise only
+  visible as a timeout after the jump. v1 does not do this.
 
 ## Licences, and why no code was copied
 
