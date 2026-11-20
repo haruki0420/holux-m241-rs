@@ -51,12 +51,14 @@ Should 10 件、Could 2 件。全文は各修正担当への指示に転記し�
 
 | 修正ストリーム | 範囲 | 検証ストリーム | 検証の状態 |
 |---|---|---|---|
-| `fix/fix-core` | `crates/m241-core/src/` 全体 | verify-merged | 不合格 |
+| `fix/fix-core` | `crates/m241-core/src/` 全体 | verify-merged → sync-probe-test | 不合格 → **合格**（`33b3838`） |
 | `fix/fix-gui` | `crates/m241-gui/` | verify-merged | 合格 |
 | `fix/fix-cli` | `crates/m241-cli/`（core の `Error::Safety` 追加後） | verify-merged | 合格 |
 | `fix/fix-docs` | `docs/`、`AGENTS.md`、`tools/` | verify-merged | 合格 |
 
-不合格の理由: `fix/fix-core` — Must 2 の引用行（`crates/m241-core/src/protocol/brom.rs` の sync プローブ側 `Framing`）に検出テストが無く、`offset: None` を `Some(0)` に戻す変異が全テストを通過する（エコー側のテストだけでは引用行を守れない）。
+不合格の理由: `fix/fix-core` — Must 2 の引用行（`crates/m241-core/src/protocol/brom.rs` の sync プローブ側 `Framing`）に検出テストが無く、`offset: None` を `Some(0)` に戻す変異が全テストを通過していた（エコー側のテストだけでは引用行を守れない）。
+
+**解消** (`33b3838`, 別エージェント): `a_sync_probe_mismatch_does_not_claim_to_be_at_offset_zero` と `every_probe_byte_that_disagrees_reports_no_position` を追加。変異を入れると 2 件とも落ちることを、修正担当と lead の両方が独立に確認した。コード本体は未変更（テスト追加のみ）。
 
 検証ストリームは、修正ストリームに**参加していない**エージェントが担当する
 （[`09-review-protocol.md`](09-review-protocol.md) の三段構成）。検証担当が読むのは
