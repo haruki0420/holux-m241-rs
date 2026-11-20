@@ -1,81 +1,86 @@
-# Holux M-241 — Rust rewrite
+# Holux M-241 の日付が 19.6 年ずれる問題を直す（holux-m241-rs）
 
-Tools for the **Holux M-241** GPS logger (MediaTek MT3318). The device records
-dates 19.6 years in the past because its 2006 firmware hard-codes the GPS epoch
-offset and never accounts for the 2019 week-number rollover. This project repairs
-it, and reads the track log off the device onto a map.
+Holux M-241 は MediaTek MT3318 を積んだ GPS ロガーである。2006 年製のファームウェアは、
+GPS エポックから Unix 時刻への変換に使う定数 `315964800` を直書きしており、2019 年 4 月 6 日に
+起きた 2 回目の GPS ウィークナンバーロールオーバーを考慮していない。そのため、記録される
+日時はすべて 19.6 年（7168 日）過去になる。このツールは、`0x402F4` にある 4 バイトの定数を
+`315964800` から `935280000` に置き換えてこのずれを直し（イメージ全体で実際に値が変わるのは
+3 バイト）、あわせて記録した軌跡を端末から吸い出して地図に出す。
 
-**Status: skeleton.** The shell, the protocol frame layer and the token set exist
-and are tested; the screens and the flash path do not. Nothing here has been run
-against a real device yet — see [`docs/dev/05-verification.md`](docs/dev/05-verification.md).
+**状態: 骨組み。** シェル、プロトコルのフレーム層、デザイントークンは実装済みで、テストも
+ある。画面とフラッシュ処理はまだ実装していない。このリポジトリのコードはまだ実機の M-241 で
+動かしておらず、動作は未検証である。何が未検証かは
+[`docs/dev/05-verification.md`](docs/dev/05-verification.md) に列挙してある。
 
-## What it will do
+## 提供予定の機能
 
-| Job | Command |
+| やること | コマンド |
 |---|---|
-| Find the logger's port | `m241 device ports` |
-| Read its identity | `m241 device info` |
-| Dump the firmware (read-only, safe) | `m241 fw dump` |
-| Apply the date fix to the dump, on the PC | `m241 fw patch` |
-| Write the fixed image back | `m241 fw flash` |
-| Pull the track log off the device | `m241 log download` |
-| Convert it to GPX / KML / CSV / NMEA / JSON | `m241 log read` |
-| Put the track's coordinates into photos | `m241 log geotag` |
-| Correct a live NMEA stream without flashing | `m241 nmea proxy` |
+| 端末のシリアルポートを探す | `m241 device ports` |
+| 端末の識別情報を読む | `m241 device info` |
+| ファームウェアを吸い出す（読み取りのみ、安全） | `m241 fw dump` |
+| PC 上で、吸い出したイメージに日付修正を当てる | `m241 fw patch` |
+| 修正したイメージを書き戻す | `m241 fw flash` |
+| 軌跡ログを端末から吸い出す | `m241 log download` |
+| 軌跡ログを GPX / KML / CSV / NMEA / JSON に変換する | `m241 log read` |
+| 写真の EXIF に軌跡の座標を書き込む | `m241 log geotag` |
+| 書き換えずに、流れている NMEA の日付を補正して中継する | `m241 nmea proxy` |
 
-The GUI (`m241-gui`) offers the same jobs as four screens: 接続, ログ, ファーム,
-設定. It calls the same core functions the CLI does.
+GUI（`m241-gui`）は同じ仕事を 4 画面（接続 / ログ / ファーム / 設定）で提供する予定である。
+呼ぶのは CLI と同じコア関数で、別実装ではない。
 
-## Building
+## ビルド方法
 
 ```bash
 cargo build --release
 cargo test --workspace
-./tools/check.sh          # fmt + clippy + tests + docs links + design invariants
+./tools/check.sh          # fmt / clippy / test / docs リンク / design の 5 ゲート
 ```
 
-Rust 1.85 or newer. The only runtime dependency is `serialport`, and the offline
-commands never open a port.
+Rust 1.95 以降が必要（`Cargo.toml` の `rust-version`）。端末に触れるのは `serialport`
+クレート経由だけである。オフラインのコマンドはシリアルポートを開かない。
 
-## What this repository does not contain
+## このリポジトリに含まれないもの
 
-The Holux firmware images, the download agent, the vendor DLLs and the vendor
-executables are proprietary and are **not** distributed here. `tools/` reads them
-from a local folder you supply; `.gitignore` blocks the common filenames so an
-accidental `git add .` cannot publish them.
+Holux のファームウェアイメージ、ダウンロードエージェント（`DA_v3.8.4.bin`）、ベンダーの DLL、
+ベンダーの実行ファイルはプロプライエタリであり、このリポジトリでは再配布していない。これらの
+ベンダーファイルは利用者が用意したローカルのフォルダから読み込む。`.gitignore` がよくある
+ファイル名を塞いでいるため、誤って `git add .` しても公開されない。
 
-## The flash path is being rebuilt from the binary
+`DA_v3.8.4.bin` を必要とするのはファームウェアの書き込み（`m241 fw flash`）だけで、端末の
+読み取りや PC 上でのパッチ適用には要らない。入手方法と置き場所は
+[`docs/user/01-install.md`](docs/user/01-install.md) に書いてある。
 
-The two existing Python implementations disagree about the download agent's
-command semantics, and both were written against the same incomplete picture.
-Rather than port either, this project disassembles `DA_v3.8.4.bin` and records the
-command set in [`docs/reference/01-da-protocol.md`](docs/reference/01-da-protocol.md)
-before implementing it. `crates/m241-core/src/protocol/da.rs` currently refuses to
-operate and says why.
+## フラッシュ処理はバイナリの逆解析から作り直す
 
-[`docs/dev/04-prior-art.md`](docs/dev/04-prior-art.md) records what was taken from
-where, and which prior claims are still hypotheses.
+ダウンロードエージェントのコマンドの意味づけについて、既存の Python 実装 2 つは互いに
+食い違っており、どちらも同じ不完全な理解の上に書かれている。どちらかを移植するのではなく、
+このプロジェクトは `DA_v3.8.4.bin` を逆アセンブルし、コマンド体系を
+[`docs/reference/01-da-protocol.md`](docs/reference/01-da-protocol.md) に記録してから実装する。
+`crates/m241-core/src/protocol/da.rs` は現時点では処理を拒否し、その理由を返す。
 
-## Safety
+どこから何を取り入れたか、どの主張がまだ仮説かは
+[`docs/dev/04-prior-art.md`](docs/dev/04-prior-art.md) に書いてある。
 
-Firmware modification of a discontinued device with no JTAG. Read
-[`DISCLAIMER.md`](DISCLAIMER.md) before flashing anything. The short version:
-take your own dump first, keep it, and only ever flash an image you built from it.
+## 安全について
 
-## Documentation
+JTAG を持たない、生産終了から年数が経つ機器のファームウェアを書き換えるツールである。
+書き込む前に [`DISCLAIMER.md`](DISCLAIMER.md) を読むこと。まず自分でファームウェアを吸い出して
+保管し、書き込むのはそこから作ったイメージだけにする。
 
-| Page | What it answers |
+## ドキュメント
+
+| ページ | 何が分かるか |
 |---|---|
-| [`docs/dev/03-hardware-facts.md`](docs/dev/03-hardware-facts.md) | every measured constant, and how it was measured |
-| [`docs/dev/05-verification.md`](docs/dev/05-verification.md) | what was verified, and what was not |
-| [`docs/dev/04-prior-art.md`](docs/dev/04-prior-art.md) | what came from where |
-| [`docs/dev/06-open-questions.md`](docs/dev/06-open-questions.md) | the questions with no answer yet |
-| [`docs/reference/02-cli.md`](docs/reference/02-cli.md) | the command surface and exit codes |
-| [`DESIGN.md`](DESIGN.md) | the interface: direction, tokens, screens |
-| [`PRODUCT.md`](PRODUCT.md) | who this is for and what it must not do |
-| [`AGENTS.md`](AGENTS.md) | working notes for automated contributors |
+| [`docs/dev/03-hardware-facts.md`](docs/dev/03-hardware-facts.md) | 実測した定数すべてと、その測定方法 |
+| [`docs/dev/05-verification.md`](docs/dev/05-verification.md) | 何を検証済みで、何が未検証か |
+| [`docs/dev/04-prior-art.md`](docs/dev/04-prior-art.md) | どこから何を持ってきたか |
+| [`docs/dev/06-open-questions.md`](docs/dev/06-open-questions.md) | まだ答えの出ていない問い |
+| [`docs/reference/02-cli.md`](docs/reference/02-cli.md) | コマンド体系と終了コード |
+| [`DESIGN.md`](DESIGN.md) | 画面の設計（方向、トークン、各画面） |
+| [`PRODUCT.md`](PRODUCT.md) | 誰のためのもので、何をしてはいけないか |
+| [`AGENTS.md`](AGENTS.md) | 自動化されたコントリビューター向けの作業メモ |
 
-## Licence
+## ライセンス
 
-MIT for the code and documentation. The proprietary binaries remain the property
-of their owners.
+コードとドキュメントは MIT。プロプライエタリなバイナリの権利は、それぞれの所有者に帰属する。
