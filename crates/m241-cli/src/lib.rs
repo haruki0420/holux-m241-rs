@@ -41,6 +41,7 @@ pub mod exit;
 pub mod fileio;
 pub mod fw;
 pub mod link;
+pub mod logcmd;
 pub mod output;
 
 #[cfg(test)]
@@ -222,7 +223,7 @@ pub fn run_with(session: Session<'_>, command: Command) -> Result<()> {
             FwCommand::Flash => Err(not_implemented("fw flash")),
         },
         Command::Log { command } => match command {
-            LogCommand::Info(options) => not_implemented_args("log info", &options),
+            LogCommand::Info(options) => logcmd::info(&options, session),
             LogCommand::Download(options) => not_implemented_args("log download", &options),
             LogCommand::Read(options) => not_implemented_args("log read", &options),
             LogCommand::Erase => Err(not_implemented("log erase")),
@@ -295,7 +296,6 @@ mod tests {
         vec![
             (parsed(&["device", "doctor"]), "device doctor"),
             (parsed(&["fw", "flash"]), "fw flash"),
-            (parsed(&["log", "info", "track.dump"]), "log info"),
             (
                 parsed(&["log", "download", "-o", "track.dump"]),
                 "log download",
@@ -345,7 +345,6 @@ mod tests {
             vec![
                 "device doctor",
                 "fw flash",
-                "log info",
                 "log download",
                 "log read",
                 "log erase",
