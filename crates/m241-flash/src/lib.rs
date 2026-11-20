@@ -3,8 +3,9 @@
 //! The repository is split in two along the line that matters:
 //!
 //! * [`m241_core`] reads. It talks to the PMTK channel and the BootROM, dumps
-//!   firmware, downloads the log and parses it. Nothing in it can erase,
-//!   program or restart a device.
+//!   firmware, downloads the log and parses it. It contains no routines that
+//!   erase, program or restart a device (low-level transport and framing
+//!   primitives remain public only because this crate builds on them).
 //! * this crate writes. Log erasure ([`erase`]) and the Download Agent driver
 //!   ([`da`]) live here, and this crate is the only one that may name them.
 //!

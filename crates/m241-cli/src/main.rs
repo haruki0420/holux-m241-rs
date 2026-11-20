@@ -177,7 +177,7 @@ fn run(command: Command) -> m241_core::Result<()> {
     }
 }
 
-/// The error for a command this build parses but cannot carry out yet./// The error for a command this build parses but cannot carry out yet.
+/// The error for a command this build parses but cannot carry out yet.
 ///
 /// The message names the command the user actually typed and says where to find
 /// one that works. "not implemented yet" on its own leaves them with no next

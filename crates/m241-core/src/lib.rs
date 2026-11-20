@@ -2,8 +2,9 @@
 //!
 //! The crate is split along the same three seams as the device's own software:
 //!
-//! * [`protocol`] — the serial wire: MTK BootROM frames, the Download Agent's
-//!   flash commands, PMTK sentences the firmware understands.
+//! * [`protocol`] — the serial wire: MTK BootROM read frames, PMTK read
+//!   sentences the firmware understands, and the serial port abstraction
+//!   (log erasure and the Download Agent live in `m241-flash`).
 //! * [`firmware`] — the image on the flash chip: header, profiles, the
 //!   week-number-rollover patch.
 //! * [`log`] — the binary track log the recorder writes, its exporters, and

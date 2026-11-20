@@ -23,11 +23,15 @@ reviewer is busy.
 
 The safety gate (`tools/check_safety.py`) is the other mechanical one, and it is
 what keeps reading and writing apart. `m241-core` reads; `m241-flash` writes.
-The gate fails if a destructive command (`$PMTK182,6`, `0xD3`, `0xD5`, `0xD9`) or a
-write-shaped identifier appears in `m241-core`, if its dependency tree contains
-`m241-flash`, or if `set_control_lines` is named outside the BootROM entry path.
-A binary built from `m241-core` therefore cannot link a write routine, and that
-is a compile-time fact rather than a review finding. See
+The gate fails if a destructive command (`$PMTK182,6`, `0xD3`, `0xD4`, `0xD5`,
+`0xD9`, including byte-literal / `\xNN` escape forms) or a write-shaped
+identifier appears in `m241-core` (`src/` or `tests/`), if `m241-core`'s or
+`m241-gui`'s dependency tree contains `m241-flash`, or if `set_control_lines` is
+named outside the exact BootROM entry/port/simulator paths. A binary built from
+`m241-core` alone therefore cannot link or call the write/erase routines in
+`m241-flash` — though raw transport and framing primitives (`Port::open`,
+`Transport::write_all`, `pmtk::line`, `Frame`) remain public in `m241-core`
+because `m241-flash` builds on them. See
 [`docs/dev/11-safety-review.md`](docs/dev/11-safety-review.md).
 
 **Long commands go in the background.** A first `cargo build` of the GUI pulls

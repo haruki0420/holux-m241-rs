@@ -10,9 +10,12 @@
 //!   BootROM frames  ── 9-byte opcode+address+count frames, every byte echoed
 //! ```
 //!
-//! Everything in this module reads. The Download Agent — the half of the
-//! protocol that erases and programs flash — is in `m241-flash`, so a binary
-//! that links only this crate cannot write to a device.
+//! Every high-level routine in this module is read-only. Log erasure and the
+//! Download Agent — the half of the protocol that erases and programs flash —
+//! live in `m241-flash`, so a binary that links only `m241-core` contains no
+//! write or erase routines to call. Low-level transport and framing primitives
+//! ([`Port`], [`port::Transport::write_all`], [`pmtk::line`], [`brom::Frame`])
+//! remain public because `m241-flash` builds on them.
 //!
 //! Only [`Port`] touches the operating system. Everything above it is pure
 //! byte-in, byte-out so the simulator can stand in for the chip.

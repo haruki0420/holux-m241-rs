@@ -7,7 +7,7 @@
 //! that page.
 //!
 //! It lives in `m241-flash`, not in `m241-core`: the DA writes flash, and a
-//! crate whose whole contract is "cannot change the device" must not carry it.
+//! crate whose contract is to carry no write or erase routines must not carry it.
 //! See `tools/check_safety.py`, which fails the build if the two crates are ever
 //! reversed.
 //!

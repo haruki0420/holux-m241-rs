@@ -310,24 +310,20 @@ impl FirmwareScreen {
         Ok(())
     }
 
+    /// Refusal text returned while `m241-gui` does not depend on `m241-flash`.
+    const FLASH_REFUSAL_REASON: &str = "この画面からはまだ本体へ書き込めません。書き込みは別クレート（m241-flash）に \
+         分離されており、GUI はそれを含んでいません。";
+
     /// Attempt the write.
     ///
-    /// Returns the refusal text. It is a plain string now that the write crate is
-    /// not a dependency of this one; the button still reaches a named guard with
-    /// its own reason, which is what stops this screen from one day growing a
-    /// "well, try it anyway" path.
+    /// Always refuses and returns [`Self::FLASH_REFUSAL_REASON`]. `m241-gui` does
+    /// not depend on `m241-flash` (enforced by `tools/check_safety.py`), so there
+    /// is no `DownloadAgent` routine linked into this crate to call. Keeping the
+    /// refusal in one method makes the 未検証 boundary explicit until the GUI is
+    /// deliberately wired to the write crate.
     fn attempt_flash(&mut self) -> String {
-        // This screen cannot write, and the reason is now a compile-time fact
-        // rather than a runtime refusal: `m241-flash` is not a dependency of
-        // `m241-gui`, so there is no `DownloadAgent` here to call. Reaching the
-        // device stays a visible 未検証 control; when the session layer lands,
-        // the GUI gets the write crate deliberately or the button keeps this
-        // message.
         self.undefined = false;
-        String::from(
-            "この画面からはまだ本体へ書き込めません。書き込みは別クレート（m241-flash）に \
-             分離されており、GUI はそれを含んでいません。",
-        )
+        String::from(Self::FLASH_REFUSAL_REASON)
     }
 
     /// Draw the screen body. The rail is drawn by the shell, not here.
