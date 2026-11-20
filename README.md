@@ -31,7 +31,7 @@ The GUI (`m241-gui`) offers the same jobs as four screens: 接続, ログ, フ�
 ```bash
 cargo build --release
 cargo test --workspace
-./tools/check.sh          # fmt + clippy + tests + docs links
+./tools/check.sh          # fmt + clippy + tests + docs links + design invariants
 ```
 
 Rust 1.85 or newer. The only runtime dependency is `serialport`, and the offline
