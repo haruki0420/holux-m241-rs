@@ -1,0 +1,18 @@
+[package]
+name = "m241-flash"
+description = "The write path for the Holux M-241: log erasure and firmware flashing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+# The dependency direction is the safety property: this crate may depend on the
+# read-only crate, never the other way round. `tools/check_safety.py` fails the
+# build if that direction is ever reversed.
+[dependencies]
+m241-core.workspace = true
+
+[lints]
+workspace = true

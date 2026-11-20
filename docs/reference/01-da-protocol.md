@@ -2,7 +2,9 @@
 
 **Status: the write path and the command dispatch are fully determined; the
 read-back and baud paths are determined in shape but not measured on hardware.**
-This page is the authority that `crates/m241-core/src/protocol/da.rs` cites.
+This page is the authority that `crates/m241-flash/src/da.rs` cites. The DA
+lives in the write crate, not in `m241-core`, so a read-only binary cannot link
+it.
 Every constant in the driver must point at a row of the opcode table below,
 which in turn gives the address and the instruction range that produce the
 behaviour.

@@ -37,7 +37,7 @@ GUI（`m241-gui`）は同じ仕事を 4 画面（接続 / ログ / ファーム 
 ```bash
 cargo build --release
 cargo test --workspace
-./tools/check.sh          # fmt / clippy / test / docs リンク / design の 5 ゲート
+./tools/check.sh          # fmt / clippy / test / docs リンク / design / safety の 6 ゲート
 ```
 
 Rust 1.95 以降が必要（`Cargo.toml` の `rust-version`）。端末に触れるのは `serialport`
@@ -60,7 +60,9 @@ Holux のファームウェアイメージ、ダウンロードエージェン�
 食い違っており、どちらも同じ不完全な理解の上に書かれている。どちらかを移植するのではなく、
 このプロジェクトは `DA_v3.8.4.bin` を逆アセンブルし、コマンド体系を
 [`docs/reference/01-da-protocol.md`](docs/reference/01-da-protocol.md) に記録してから実装する。
-`crates/m241-core/src/protocol/da.rs` は現時点では処理を拒否し、その理由を返す。
+ダウンロードエージェントのドライバは読み取り側とは別クレートの
+`crates/m241-flash/src/da.rs` にあり、現時点では処理を拒否してその理由を返す。
+読み取り専用の `m241-core` は書き込み・消去ルーチンを持たない。
 
 どこから何を取り入れたか、どの主張がまだ仮説かは
 [`docs/dev/04-prior-art.md`](docs/dev/04-prior-art.md) に書いてある。
@@ -79,6 +81,7 @@ JTAG を持たない、生産終了から年数が経つ機器のファームウ
 | [`docs/dev/05-verification.md`](docs/dev/05-verification.md) | 何を検証済みで、何が未検証か |
 | [`docs/dev/04-prior-art.md`](docs/dev/04-prior-art.md) | どこから何を持ってきたか |
 | [`docs/dev/06-open-questions.md`](docs/dev/06-open-questions.md) | まだ答えの出ていない問い |
+| [`docs/dev/11-safety-review.md`](docs/dev/11-safety-review.md) | 読み取りと書き込みの分離、書き込み・読み取り経路のレビュー観点 |
 | [`docs/reference/02-cli.md`](docs/reference/02-cli.md) | コマンド体系と終了コード |
 | [`DESIGN.md`](DESIGN.md) | 画面の設計（方向、トークン、各画面） |
 | [`PRODUCT.md`](PRODUCT.md) | 誰のためのもので、何をしてはいけないか |

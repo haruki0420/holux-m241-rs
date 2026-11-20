@@ -17,17 +17,18 @@
 //!
 //! # What actually happens today
 //!
-//! Steps 1 and 3 need the device; the session layer is not written and
-//! [`m241_core::protocol::DownloadAgent`] refuses by design until the vendor
-//! binary has been disassembled. Step 2 is real work on a file and is implemented:
+//! Steps 1 and 3 need the device; the session layer is not written, and step 3
+//! needs the Download Agent, which lives in the separate `m241-flash` crate
+//! precisely so this screen — and any binary that only reads — does not link it.
+//! Step 2 is real work on a file and is implemented:
 //! it reads an image from disk, plans the patch with `m241_core::firmware`, shows the
 //! byte-level difference, and writes the patched image beside the original. The
 //! write button is present so the confirmation gate can be exercised and reviewed;
-//! pressing it reaches the download agent's own refusal rather than a silent nothing.
+//! pressing it reaches the refusal in [`FirmwareScreen::attempt_flash`] rather than
+//! a silent nothing.
 
 use egui::{Color32, RichText, Sense, Stroke, Ui, Vec2};
 use m241_core::firmware::{self, FirmwareImage, PROFILE_V1_13};
-use m241_core::protocol::DownloadAgent;
 use m241_core::{PatchPlan, VERSION};
 use std::path::Path;
 
@@ -309,18 +310,20 @@ impl FirmwareScreen {
         Ok(())
     }
 
+    /// Refusal text returned while `m241-gui` does not depend on `m241-flash`.
+    const FLASH_REFUSAL_REASON: &str = "この画面からはまだ本体へ書き込めません。書き込みは別クレート（m241-flash）に \
+         分離されており、GUI はそれを含んでいません。";
+
     /// Attempt the write.
     ///
-    /// Returns the download agent's refusal. It is called rather than short-circuited
-    /// on purpose: the button reaching a real guard, which names its own reason, is
-    /// what stops this screen from one day growing a "well, try it anyway" path.
+    /// Always refuses and returns [`Self::FLASH_REFUSAL_REASON`]. `m241-gui` does
+    /// not depend on `m241-flash` (enforced by `tools/check_safety.py`), so there
+    /// is no `DownloadAgent` routine linked into this crate to call. Keeping the
+    /// refusal in one method makes the 未検証 boundary explicit until the GUI is
+    /// deliberately wired to the write crate.
     fn attempt_flash(&mut self) -> String {
-        let refusal = DownloadAgent::unsupported()
-            .err()
-            .map(|err| err.to_string())
-            .unwrap_or_else(|| String::from("拒否されましたが理由がありません"));
         self.undefined = false;
-        refusal
+        String::from(Self::FLASH_REFUSAL_REASON)
     }
 
     /// Draw the screen body. The rail is drawn by the shell, not here.

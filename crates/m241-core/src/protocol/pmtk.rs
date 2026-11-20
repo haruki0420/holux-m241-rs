@@ -28,6 +28,15 @@
 //! that leaves the unit not recording is worse than the failure itself, so
 //! [`PmtkClient::download_log`] always resumes logging, even when the transfer
 //! fails.
+//!
+//! # What is deliberately absent
+//!
+//! `$PMTK182,6` erases the log, and this client does not have it. Reading and
+//! writing are split into two crates so that a read-only binary cannot link the
+//! erase at all; the command lives in `m241_flash::erase` with the rest of the
+//! write path. `log_stop` and `log_resume` stay, because pausing recording is
+//! part of downloading, and they are the only two log commands that leave the
+//! data on the device.
 
 use std::time::{Duration, Instant};
 
@@ -645,30 +654,6 @@ impl<T: Transport> PmtkClient<T> {
             progress(collected.len(), total);
         }
         Ok(collected)
-    }
-
-    /// Erase the log on the device (`$PMTK182,6`). **Destroys the log.**
-    ///
-    /// The caller is responsible for having a copy: this module cannot know
-    /// whether the bytes on the device are the only ones.
-    ///
-    /// # Errors
-    ///
-    /// As [`Self::log_stop`].
-    pub fn erase_log(&mut self) -> Result<()> {
-        let reply = self.await_reply(
-            "PMTK182,6",
-            "$PMTK001,182,6",
-            self.reply_timeout,
-            "$PMTK001,182,6 erase acknowledgement",
-        )?;
-        let ack = parse_ack(&parse_sentence(&reply)?)?;
-        if !ack.is_ok() {
-            return Err(Error::Rejected {
-                what: format!("$PMTK182,6 (status {})", ack.status),
-            });
-        }
-        Ok(())
     }
 
     /// Send one sentence and wait for the first reply that starts with `prefix`.

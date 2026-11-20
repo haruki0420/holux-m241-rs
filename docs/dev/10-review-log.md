@@ -63,7 +63,7 @@ Should 10 件、Could 2 件。全文は各修正担当への指示に転記し�
 検証ストリームは、修正ストリームに**参加していない**エージェントが担当する
 （[`09-review-protocol.md`](09-review-protocol.md) の三段構成）。検証担当が読むのは
 指摘リストと修正の差分とテストだけで、修正者の説明は読まない。合格条件は
-「指摘がすべて解消 / 新たな問題を入れていない / `./tools/check.sh` が 5/5」の 3 つ。
+「指摘がすべて解消 / 新たな問題を入れていない / `./tools/check.sh` が 6/6」の 3 つ。
 状態は `未検証` → `合格` / `不合格` で更新する。
 
 ---
@@ -118,6 +118,13 @@ HEAD `a9171fb`、分岐点 `e58c5d3`（main は検証中に `5d6ad74` まで進�
   モデル自身の選択」と明記されている。ただし仕様 §6 は記述子の先頭ワードを列挙しており
   `0x00004000` が 2 回現れる（`docs/reference/01-da-protocol.md:601`）。「cite できない」
   はやや強いが、値の裏付けが §6 にあること自体は問題ない。
+
+> この DA モデル（`0xD3` / `0xD5` / `0xD9` の状態機械、`erase_range`、パケット会計）は
+> 後に `feat/safety-split` で `crates/m241-flash/src/simulator.rs` へ移設された。
+> `m241-core` は読み取り専用クレートとして DA を一切持たないため、この節が指す行番号は
+> main の時点のものであり、現在の `m241-core/src/protocol/simulator.rs` には存在しない。
+> モデルの内容は移設先で上表の変異テストごと維持されている（`tools/check_safety.py` が
+> `m241-core` に DA が戻らないことを検査する）。
 - `accepted_da_range` の `start > end` 拒否（`simulator.rs:851`）は、仕様 §4.2 の
   3 条件をそのまま写したものではないが、§4.2 は判定を `FUN_00100A34(start, end-start+1)`
   と書いており（`docs/reference/01-da-protocol.md:226-227`）、`start > end` なら長さが
@@ -227,3 +234,29 @@ main は `e58c5d3` → `5d6ad74` → `19e07c6` と進んだが、いずれも本
 変異で実際に落ちることを確認した。残る 1 件（Must 2）はコードは両方の site で
 直っているが、指摘が引用した sync プローブ側に検出テストが無く、退行を止められない。
 `fix/fix-gui` / `fix/fix-cli` / `fix/fix-docs` は合格。
+
+---
+
+## 2026-11-21 / 読み取り・書き込みの分離（`feat/safety-split` → `fix/safety-split-v2`）
+
+対象: 読み取り専用クレート `m241-core` と書き込みクレート `m241-flash` の分離および `tools/check_safety.py` ゲート追加。
+
+- **初回検証（`feat/safety-split` `323baa0`、`verify/safety-split` `176e384`）**: **不合格**
+  1. `docs/dev/11-safety-review.md` / `AGENTS.md` / `crates/m241-core/src/protocol/mod.rs` の「コンパイルで保証」「持てない」が、`m241-core` 公開 API（`Frame::to_bytes` + `Transport::write_all` + `Port::open` + `pmtk::line`）で反証された。
+  2. `tools/check.sh` の `safety` 行を削除しても 5/5 緑になる（配線テスト欠如）。
+  3. `crates/m241-flash/src/erase.rs` の消去 ACK 判定が `command == 182` のみに後退し、`$PMTK001,182,5,3` を消去成功として受理。`BackupProof::of_bytes` の doc と実装も矛盾。
+  4. `tools/check_safety.py` の穴（`0xD4`・`\xNN`・`m241-core/tests/`・basename 一致 allowlist・`m241-gui` 依存未検査）と行末コメントの過剰検出。
+  5. `11-safety-review.md` の未実装項目への `✓` / 存在しない `brom.rs` 呼び出し記述、`attempt_flash` docstring ずれ、`crates/m241-cli/src/main.rs` の重複 doc 行、`crates/m241-core/src/lib.rs` の古い記述。
+- **Stage 2 修正（別エージェント、`fix/safety-split-v2` `020ac82`）**: 3 コミット（`2db5ed2`, `fbfa356`, `020ac82`、12 ファイル +731/−115）。
+- **Stage 3 独立検証（三人目、修正者の説明・コミット本文は未読）**:
+
+| # | 指摘 | 解消 | 確認箇所・検出テスト |
+|---|---|---|---|
+| 1 | 過度な「コンパイル時保証」主張 | 解消 | `docs/dev/11-safety-review.md`、`AGENTS.md`、`crates/m241-core/src/protocol/mod.rs` ほかで「書き込み・消去ルーチンを持たない（生トランスポートプリミティブは共有のため公開）」に一貫して限定 |
+| 2 | `check_safety.py` 配線・有効性テスト | 解消 | `crates/m241-flash/tests/safety_gate.rs`（12 テスト）。`tools/check.sh` から `safety` 行削除で `the_safety_gate_is_still_wired_into_check_sh` が失敗することを変異テストで実証 |
+| 3 | `erase.rs` ACK 後退・doc 矛盾 | 解消 | `crates/m241-flash/src/erase.rs` で `$PMTK001,182,6,<status>` の 3 フィールド＋サブコマンド `6` を厳格検証。変異テストで 2 テスト失敗を実証。`BackupProof::of_bytes` doc 整合 |
+| 4 | `check_safety.py` の穴と過剰検出 | 解消 | `0xD4`・`\xNN`・`m241-core/tests/`・完全相対パス allowlist・`m241-gui` 依存検査・文字列認識つき `//` 除去を実装。9 件の変異テストすべて期待どおり（行末コメント `// the erase` は PASS、文字列内 `"//"` 後の違反は FAIL） |
+| 5 | 文書・コード不整合と重複行 | 解消 | `11-safety-review.md` の `✓` / 呼出数、`firmware.rs` の `attempt_flash`、`main.rs` 重複行、`m241-core/src/lib.rs` をすべて修正 |
+
+- **ゲート・テスト**: `./tools/check.sh` = **6/6 PASS**、`cargo test --workspace` = **282 passed / 0 failed**（`feat/safety-split` 268 → +14、削除・弱体化 0 件）。個人情報違反なし。
+- **判定**: **合格**（`main` へマージ）。

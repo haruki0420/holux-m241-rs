@@ -11,8 +11,8 @@ expensive to learn so it does not have to be rediscovered.
 ./tools/check.sh
 ```
 
-It runs five gates: formatting, lint, the workspace tests, the docs link check
-and the design invariant check. It prints one line per gate.
+It runs six gates: formatting, lint, the workspace tests, the docs link check,
+the design invariant check and the safety check. It prints one line per gate.
 
 The design gate (`tools/check_design.py`) is not cosmetic. It checks three
 invariants mechanically: amber appears only in the destructive module, a corner
@@ -20,6 +20,19 @@ radius is always `theme::RADIUS`, and a status colour always sits beside a text
 label. It fails the build when one is broken. Those three rules each encode a
 decision from `DESIGN.md`, and a rule enforced only by review holds until the
 reviewer is busy.
+
+The safety gate (`tools/check_safety.py`) is the other mechanical one, and it is
+what keeps reading and writing apart. `m241-core` reads; `m241-flash` writes.
+The gate fails if a destructive command (`$PMTK182,6`, `0xD3`, `0xD4`, `0xD5`,
+`0xD9`, including byte-literal / `\xNN` escape forms) or a write-shaped
+identifier appears in `m241-core` (`src/` or `tests/`), if `m241-core`'s or
+`m241-gui`'s dependency tree contains `m241-flash`, or if `set_control_lines` is
+named outside the exact BootROM entry/port/simulator paths. A binary built from
+`m241-core` alone therefore cannot link or call the write/erase routines in
+`m241-flash` — though raw transport and framing primitives (`Port::open`,
+`Transport::write_all`, `pmtk::line`, `Frame`) remain public in `m241-core`
+because `m241-flash` builds on them. See
+[`docs/dev/11-safety-review.md`](docs/dev/11-safety-review.md).
 
 **Long commands go in the background.** A first `cargo build` of the GUI pulls
 in `wgpu` and takes several minutes. Do not block a turn on it.
@@ -259,7 +272,7 @@ Why bother: the agent that made the mistake reads its own fix with the same
 assumption it read the original. A different agent reading the same diff with
 the same instructions does not.
 
-Every stage ends with `./tools/check.sh` at 5/5.
+Every stage ends with `./tools/check.sh` at 6/6.
 
 ## 9. What went wrong here
 
@@ -272,11 +285,11 @@ is evidence for §8, not general advice.
 **Symptom.** `fix/fix-core`, `fix/fix-gui`, `fix/fix-cli` and `fix/fix-docs`
 went into `main` (`52f023e`) while the verification column of
 `docs/dev/10-review-log.md` still read 未検証 for all four. The merge commit
-itself says "Gates 5/5 after the merge".
+itself says "Gates 6/6 after the merge".
 
 **Cause.** A green `./tools/check.sh` was read as "the fixes are good".
 
-**Check.** 5/5 proves the tree is not broken; it does not prove the findings are
+**Check.** 6/6 proves the tree is not broken; it does not prove the findings are
 resolved. A gate cannot see a finding that was never fixed — the test for it
 does not exist, so nothing fails. No merge until the verification column is
 filled: 未検証 is a stop sign, not a default.
@@ -347,10 +360,10 @@ deleted. Dev builds here answer "does it compile and pass", nothing else.
 **Symptom.** On `feat/exif2`, 3 clippy warnings and zero tests remained while
 the owner twice reported the work complete.
 
-**Cause.** Completion was self-assessed. The stated conditions — 5/5 and at
+**Cause.** Completion was self-assessed. The stated conditions — 6/6 and at
 least one test — were never checked against the artifact.
 
 **Check.** Count what the report claims. "Tests added" means
-`grep -c '#\[test\]'` finds them in the diff. "5/5" means `./tools/check.sh`
+`grep -c '#\[test\]'` finds them in the diff. "6/6" means `./tools/check.sh`
 was run by the reader, not quoted from the report. A report is a claim; the
 artifact is the evidence.

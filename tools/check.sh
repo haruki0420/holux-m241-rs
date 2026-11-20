@@ -10,6 +10,7 @@ gates=(
   "test|cargo test --workspace"
   "docs|python3 tools/check_docs.py"
   "design|python3 tools/check_design.py"
+  "safety|python3 tools/check_safety.py"
 )
 
 failed=0

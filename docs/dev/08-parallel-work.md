@@ -9,7 +9,7 @@
 - `m241-core`: `frame` / `port` / `brom` / `error` / `firmware::image` / `log::record`
 - `m241-cli`: サブコマンド体系（`device|fw|log|nmea`）と終了コード対応
 - `m241-gui`: レール（階段状タブ）、トークン、ヘッドレス描画テスト
-- CI 3 OS、`./tools/check.sh` 5 ゲート
+- CI 3 OS、`./tools/check.sh` 6 ゲート
 
 ## 並列に走らせる 6 本
 
@@ -22,7 +22,7 @@
 | E | GUI 3画面（接続・ログ・ファーム） | `crates/m241-gui/src/screens/*` | D（型が要る。スタブで開始可） |
 | F | 写真ジオタグ（EXIF 自前実装） | `crates/m241-core/src/log/` 配下に exif / geotag を追加 | D | <!-- path-check: ignore -->
 
-**A が終わるまで flash の実装は始めない。** `protocol/da.rs` は A の成果物を
+**A が終わるまで flash の実装は始めない。** `m241-flash/src/da.rs` は A の成果物を
 引用できない限り書かない、が現行のルール（`CONTRIBUTING.md`）。
 
 **E は D の型に依存する。** D が先に型（`DeviceInfo`、`TrackPoint` など）を
@@ -30,7 +30,7 @@
 
 ## 共通の決まり
 
-- `./tools/check.sh` が 5/5 でない状態でコミットしない
+- `./tools/check.sh` が 6/6 でない状態でコミットしない
 - `clippy::unwrap_used` / `expect_used` / `panic` / `unsafe` はテスト以外で禁止
 - コメントは「何を」ではなく「なぜ」。特に安全ゲートの理由は消さない
 - 実機で見ていないものは 未検証 と書く。`docs/dev/05-verification.md` が唯一の昇格先
