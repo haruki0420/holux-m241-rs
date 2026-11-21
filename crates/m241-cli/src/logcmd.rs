@@ -320,6 +320,7 @@ pub fn geotag(options: &LogGeotagOptions, session: Session<'_>) -> Result<()> {
 
     let geotag_options = GeotagOptions {
         max_gap_seconds: options.max_gap,
+        ..GeotagOptions::default()
     };
     let mut plans = geotag::plan(&photo_paths, &matching_track, &geotag_options)?;
     if tz_delta_seconds != 0 {

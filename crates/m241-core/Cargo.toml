@@ -11,6 +11,9 @@ repository.workspace = true
 [dependencies]
 thiserror.workspace = true
 serialport.workspace = true
+# JPEG decode/encode for the KMZ long-edge limit (spec §6.3). `jpeg` is the
+# only feature enabled in the workspace declaration.
+image.workspace = true
 
 # serde / serde_json / tracing return when the profile database and the
 # structured output land. Leaving them declared now only produces warnings.
