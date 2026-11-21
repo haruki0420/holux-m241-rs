@@ -195,6 +195,17 @@ pub struct FakeDa {
     /// How many sync probes have been answered since the last complete sync,
     /// or `0` when no sync is in progress.
     bootrom_sync: usize,
+    /// Bytes the host has taken off the wire, in total.
+    ///
+    /// A read returns what is buffered and `Ok(0)` once it is empty, so an extra
+    /// read leaves no trace in the bytes that follow — the next reply simply
+    /// starts at the same place. This half of the pair says *how much left*.
+    read_bytes: usize,
+    /// How many times the host has called `read`, empty results included.
+    ///
+    /// The other half of the pair: an extra read that finds nothing moves
+    /// `read_bytes` by zero but still shows up here.
+    read_polls: usize,
 }
 
 impl FakeDa {
@@ -224,6 +235,8 @@ impl FakeDa {
             last_read_address: None,
             echo_frame: true,
             bootrom_sync: 0,
+            read_bytes: 0,
+            read_polls: 0,
         }
     }
 
@@ -266,6 +279,14 @@ impl FakeDa {
         self.refuse_ranges = false;
     }
 
+    /// Start refusing every `0xD3` on a fake that already exists.
+    ///
+    /// The counterpart of [`FakeDa::set_accepting_ranges`], so one fake can
+    /// serve an accepted range, a refusal, and an accepted range again.
+    pub fn set_refusing_ranges(&mut self, refuse: bool) {
+        self.refuse_ranges = refuse;
+    }
+
     /// How many packets the fake accepted and programmed.
     #[must_use]
     pub fn accepted_packets(&self) -> usize {
@@ -300,6 +321,31 @@ impl FakeDa {
     #[must_use]
     pub fn last_read_address(&self) -> Option<u32> {
         self.last_read_address
+    }
+
+    /// How many bytes the host has taken off the wire since the fixture was
+    /// created.
+    ///
+    /// Paired with [`FakeDa::read_polls`], this is how a test observes what the
+    /// client *read* rather than what the chip offered.
+    #[must_use]
+    pub fn read_bytes(&self) -> usize {
+        self.read_bytes
+    }
+
+    /// How many times the host has called `read`, empty results included.
+    ///
+    /// `read_bytes` counts only bytes that left, so a read that finds an empty
+    /// buffer moves it by zero. This counts the attempt itself.
+    #[must_use]
+    pub fn read_polls(&self) -> usize {
+        self.read_polls
+    }
+
+    /// How many reply bytes are still waiting to be read.
+    #[must_use]
+    pub fn output_len(&self) -> usize {
+        self.output.len()
     }
 
     /// Whether a `0xD5` arrived before any `0xD3` was accepted.
@@ -388,6 +434,7 @@ impl FakeDa {
     }
 
     fn take_output(&mut self, buf: &mut [u8]) -> usize {
+        self.read_polls = self.read_polls.saturating_add(1);
         let mut written = 0usize;
         for slot in buf.iter_mut() {
             match self.output.pop_front() {
@@ -398,6 +445,7 @@ impl FakeDa {
                 None => break,
             }
         }
+        self.read_bytes = self.read_bytes.saturating_add(written);
         written
     }
 
@@ -639,6 +687,11 @@ impl FakeDa {
                     self.erase_sector(start);
                 }
                 self.da_cursor = start;
+                // The packet count belongs to this command, not to the fake:
+                // a `0xD5` after a completed one must start counting from zero
+                // again, exactly as the cursor does. Left over, it makes the
+                // next command's first packet look like its last.
+                self.accepted_packets = 0;
                 self.da_stage = DaStage::Packet;
                 self.queue_bytes(&[ACK]);
             }
@@ -1023,6 +1076,37 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_memory_range_leaves_nothing_behind_for_the_next_reply() {
+        // A refused `0xD3` is one byte on the wire. The fixture may need an
+        // empty poll first (output is produced while the command's last byte is
+        // consumed), so what is invariant is *how much left*: one byte, and an
+        // empty queue behind it.
+        let mut device = download_agent(&[0xFFu8; 16]);
+        let bytes_before = device.read_bytes();
+        // `end` must be odd, so this range is refused.
+        device
+            .write_all(&memory_range(0x0000_4000, 0x0000_40FE))
+            .expect("range");
+        assert_eq!(device.output_len(), 1, "the refusal is exactly one byte");
+        assert_eq!(read_reply(&mut device, 4), [NAK]);
+        assert_eq!(
+            device.read_bytes() - bytes_before,
+            1,
+            "one byte left the wire for a refused 0xD3"
+        );
+        assert_eq!(device.output_len(), 0, "and nothing followed it");
+
+        // A success leaves two, so "one" above is the refusal's own property and
+        // not the fixture having gone quiet.
+        let bytes_before = device.read_bytes();
+        device
+            .write_all(&memory_range(0x0000_4000, 0x0000_40FF))
+            .expect("range");
+        assert_eq!(read_reply(&mut device, 4), [ACK, STATUS_OK]);
+        assert_eq!(device.read_bytes() - bytes_before, 2);
+    }
+
+    #[test]
     fn a_refused_memory_range_keeps_the_range_recorded_before_it() {
         // The DA returns before it overwrites the range table, so `A5` does not
         // mean "nothing is recorded". The refused range below lies in a *later*
@@ -1253,6 +1337,169 @@ mod tests {
         write_packet(&mut device, &[5, 6]);
         assert_eq!(read_reply(&mut device, 3), [CONT, ACK, ACK]);
         assert_eq!(&device.memory()[..6], &[1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn one_byte_range_with_a_full_size_packet_is_one_packet_not_a_cursor_walk() {
+        // The sharpest case where the DA's `ceil((end - start + 1) / length)` and
+        // "the cursor passed `end`" are different questions: a *short* range with
+        // a long packet is `ceil` = 1, while one `0x100`-byte packet lifts the
+        // cursor far past `end`. The DA ends the command on the count, so the fake
+        // must finish after exactly one packet and refuse a second — it must not
+        // work out "the cursor is somewhere past the end, so keep going" or "the
+        // range is short, so take more packets".
+        //
+        // `(0, 0)` cannot be used: the fake reads it as "nothing recorded" and
+        // refuses the `0xD5`, which is the safety property its own test pins.
+        let mut device = download_agent(&vec![0xFFu8; 0x200]);
+        // Two bytes: `end` odd, span 2, `ceil(2 / 0x100)` = 1.
+        device.write_all(&memory_range(0, 1)).expect("range");
+        assert_eq!(read_reply(&mut device, 2), [ACK, STATUS_OK]);
+        write_command(&mut device, 0x100);
+        assert_eq!(read_reply(&mut device, 2), [ACK, ACK]);
+
+        write_packet(&mut device, &[0x44; 0x100]);
+        assert_eq!(
+            read_reply(&mut device, 3),
+            [CONT, ACK, ACK],
+            "a range shorter than one packet is one packet"
+        );
+        assert_eq!(device.accepted_packets(), 1);
+        assert_eq!(device.memory()[0], 0x44);
+
+        write_packet(&mut device, &[0x55; 0x100]);
+        let after = read_reply(&mut device, 0x100 + 2);
+        assert!(
+            after.iter().all(|byte| *byte == NAK),
+            "a packet past the count is refused, never acknowledged: {after:02X?}"
+        );
+        assert!(
+            !after.contains(&CONT) && !after.contains(&ACK),
+            "no 0x69 and no 0x5A may answer it: {after:02X?}"
+        );
+        assert_eq!(device.accepted_packets(), 1);
+        assert_ne!(
+            device.memory()[0x100],
+            0x55,
+            "the extra packet was not programmed"
+        );
+    }
+
+    #[test]
+    fn a_packet_beyond_a_short_range_is_refused_before_it_is_programmed() {
+        // A two-byte range at `0x100` per packet is `ceil` = 1: the command is
+        // over after the first packet, and the packet stage has ended. The
+        // fixture's pre-packet guard is what answers the stray packet with a
+        // single `A5` *and keeps it out of flash*; without it the bytes would be
+        // parsed as unknown commands, drawing one `A5` per byte and possibly
+        // reaching the next write's range.
+        let mut device = download_agent(&vec![0xFFu8; 0x200]);
+        device.write_all(&memory_range(0, 1)).expect("range");
+        assert_eq!(read_reply(&mut device, 2), [ACK, STATUS_OK]);
+        write_command(&mut device, 0x100);
+        assert_eq!(read_reply(&mut device, 2), [ACK, ACK]);
+        write_packet(&mut device, &[0x44; 0x100]);
+        assert_eq!(read_reply(&mut device, 3), [CONT, ACK, ACK]);
+        assert_eq!(
+            device.mode(),
+            Mode::DownloadAgent,
+            "the transfer ends, it does not restart the chip"
+        );
+
+        write_packet(&mut device, &[0x99; 0x100]);
+        let after = read_reply(&mut device, 0x102);
+        assert!(
+            after.iter().all(|byte| *byte == NAK),
+            "the stray packet is refused: {after:02X?}"
+        );
+        assert_eq!(
+            device.accepted_packets(),
+            1,
+            "the stray packet must not count as programmed"
+        );
+        assert!(
+            device.memory()[0x100..0x200]
+                .iter()
+                .all(|byte| *byte == 0xFF),
+            "nothing from the stray packet may reach flash"
+        );
+    }
+
+    #[test]
+    fn a_packet_past_the_two_packet_count_is_refused() {
+        // The count rules that must hold once a range needs more than one
+        // packet: exactly two complete it, and a third is refused. This is the
+        // "extra packet" case the one-packet tests cannot reach, because there
+        // the count and the cursor agree after the first.
+        let mut device = download_agent(&vec![0xFFu8; 0x400]);
+        device.write_all(&memory_range(0, 0x1FF)).expect("range");
+        assert_eq!(read_reply(&mut device, 2), [ACK, STATUS_OK]);
+        write_command(&mut device, 0x100);
+        assert_eq!(read_reply(&mut device, 2), [ACK, ACK]);
+        write_packet(&mut device, &[0x11; 0x100]);
+        assert_eq!(read_reply(&mut device, 2), [CONT], "one packet of two");
+        write_packet(&mut device, &[0x22; 0x100]);
+        assert_eq!(
+            read_reply(&mut device, 3),
+            [CONT, ACK, ACK],
+            "the second packet completes a two-packet range"
+        );
+        write_packet(&mut device, &[0x33; 0x100]);
+        let after = read_reply(&mut device, 0x100 + 2);
+        assert!(
+            after.iter().all(|byte| *byte == NAK),
+            "a third packet is one too many and is refused, not acknowledged: {after:02X?}"
+        );
+        assert!(
+            !after.contains(&CONT) && !after.contains(&ACK),
+            "{after:02X?}"
+        );
+        assert_eq!(device.accepted_packets(), 2);
+        assert_eq!(&device.memory()[..0x100], &[0x11u8; 0x100]);
+        assert_eq!(&device.memory()[0x100..0x200], &[0x22u8; 0x100]);
+        assert_ne!(device.memory()[0x200], 0x33);
+    }
+
+    #[test]
+    fn a_second_write_command_still_counts_its_own_packets() {
+        // The cursor is reset by each `0xD5`, so "the cursor passed `end`" can
+        // say a command is finished when it has not started; the accepted count
+        // is not reset, so the DA's own rule does not have that blind spot. With
+        // the cursor rule, this second command would answer its *first* packet
+        // as if it were the last: `5A 5A` straight after one `0x69`, and a real
+        // unit would still be waiting for the rest of the range.
+        let mut device = download_agent(&vec![0xFFu8; 0x400]);
+        device.write_all(&memory_range(0, 0x1FF)).expect("range");
+        assert_eq!(read_reply(&mut device, 2), [ACK, STATUS_OK]);
+        write_command(&mut device, 0x100);
+        assert_eq!(read_reply(&mut device, 2), [ACK, ACK]);
+        write_packet(&mut device, &[0x11; 0x100]);
+        assert_eq!(read_reply(&mut device, 2), [CONT]);
+        write_packet(&mut device, &[0x22; 0x100]);
+        assert_eq!(read_reply(&mut device, 3), [CONT, ACK, ACK]);
+
+        // The same range and length again. The cursor is back at 0.
+        write_command(&mut device, 0x100);
+        assert_eq!(read_reply(&mut device, 2), [ACK, ACK]);
+        write_packet(&mut device, &[0x33; 0x100]);
+        assert_eq!(
+            read_reply(&mut device, 3),
+            [CONT],
+            "the second command's first packet is not its last: exactly one 0x69, no 0x5A"
+        );
+        write_packet(&mut device, &[0x44; 0x100]);
+        assert_eq!(
+            read_reply(&mut device, 3),
+            [CONT, ACK, ACK],
+            "and its second packet completes it"
+        );
+        assert_eq!(
+            device.accepted_packets(),
+            2,
+            "the second command counted its own two packets"
+        );
+        assert_eq!(&device.memory()[..0x100], &[0x33u8; 0x100]);
+        assert_eq!(&device.memory()[0x100..0x200], &[0x44u8; 0x100]);
     }
 
     #[test]

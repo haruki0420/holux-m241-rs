@@ -988,10 +988,39 @@ fn byte_sum(data: &[u8]) -> u16 {
 /// pinned value has moved, or when the patch table and the readers that define
 /// it disagree.
 pub fn check_layout() -> Result<()> {
-    // The pinned values once more, from `docs/dev/03-hardware-facts.md`.
-    let expected_start: u32 = 0x0000_0000;
-    let expected_length: usize = 0x0006_345C;
+    check_layout_of(
+        FLASH_WRITE_START,
+        FLASH_WRITE_LENGTH,
+        EXPECTED_WRITE_START,
+        EXPECTED_WRITE_LENGTH,
+    )
+}
 
+/// The pinned start, in one place so a test can compare it with the constant.
+///
+/// `check_layout` used to keep this as a local, which meant "the pin and the
+/// shipped constant agree" was only observable through the refusal message —
+/// and the unresolved-address stage refuses the shipped start first, so moving
+/// this value to the other candidate changed nothing a test could see. Naming
+/// it is what makes the pin checkable; the refusal logic is unchanged.
+const EXPECTED_WRITE_START: u32 = 0x0000_0000;
+
+/// The pinned image length, for the same reason.
+const EXPECTED_WRITE_LENGTH: usize = 0x0006_345C;
+
+/// The body of [`check_layout`], with the constants as arguments.
+///
+/// Test-only, so a test can vary *one* of the four numbers and see which rule
+/// refuses it. The public entry point hard-codes both pairs, so no caller can
+/// choose a range: this exists because the stages overlap on the shipped
+/// values — the shipped start is in [`UNRESOLVED_STARTS`], so the second stage
+/// refuses it before the "is it the expected value" stage is ever asked.
+fn check_layout_of(
+    write_start: u32,
+    write_length: usize,
+    expected_start: u32,
+    expected_length: usize,
+) -> Result<()> {
     // The expected start is a candidate, not a decision: if someone edits it to
     // the other candidate alone, the write is still refused here rather than
     // becoming "the pinned range". Only emptying `UNRESOLVED_STARTS` unlocks a
@@ -1006,10 +1035,10 @@ pub fn check_layout() -> Result<()> {
         });
     }
 
-    if UNRESOLVED_STARTS.contains(&FLASH_WRITE_START) {
+    if UNRESOLVED_STARTS.contains(&write_start) {
         return Err(Error::Safety {
             reason: format!(
-                "the write range starts at 0x{FLASH_WRITE_START:08X}, which is one of the DA-side \
+                "the write range starts at 0x{write_start:08X}, which is one of the DA-side \
                  addresses 0x{UNRESOLVED_STARTS:08X?} nobody has established by reading the DA's \
                  own view. If the image begins at DA address 0, a 0xD5 over this range erases the \
                  reset vector and the unit stops booting. This driver refuses every write until \
@@ -1018,10 +1047,10 @@ pub fn check_layout() -> Result<()> {
             ),
         });
     }
-    if FLASH_WRITE_START != expected_start || FLASH_WRITE_LENGTH != expected_length {
+    if write_start != expected_start || write_length != expected_length {
         return Err(Error::Safety {
             reason: format!(
-                "the write range is 0x{FLASH_WRITE_START:08X}+0x{FLASH_WRITE_LENGTH:X}, not the \
+                "the write range is 0x{write_start:08X}+0x{write_length:X}, not the \
                  expected 0x{expected_start:08X}+0x{expected_length:X}; refusing to write an \
                  unpinned range"
             ),
@@ -1034,11 +1063,11 @@ pub fn check_layout() -> Result<()> {
             ),
         });
     }
-    if FLASH_WRITE_LENGTH != PROFILE_V1_13.size {
+    if write_length != PROFILE_V1_13.size {
         return Err(Error::Safety {
             reason: format!(
                 "the write length {} differs from the V1.13 profile's {}",
-                FLASH_WRITE_LENGTH, PROFILE_V1_13.size
+                write_length, PROFILE_V1_13.size
             ),
         });
     }
@@ -1202,6 +1231,15 @@ mod tests {
         data
     }
 
+    /// How long a reply may take in tests that watch for reads which must not
+    /// happen.
+    ///
+    /// [`REPLY_TIMEOUT`] is five seconds and `read_byte` busy-polls until its
+    /// deadline, so a stray read is not just slow — it spins. A fake answers on
+    /// the first poll after the command, so anything short is enough: what the
+    /// test measures is *how many polls* happened, not how long they took.
+    const WATCHED_REPLY_TIMEOUT: Duration = Duration::from_millis(20);
+
     /// A fake holding `backup` at `WIRE_START`, already in the DA.
     fn fake_in_da(backup: &[u8]) -> FakeDa {
         let mut memory = vec![0xFFu8; WIRE_START as usize];
@@ -1304,6 +1342,74 @@ mod tests {
             !UNRESOLVED_STARTS.contains(&WIRE_START),
             "the test's own start is deliberately outside the candidates"
         );
+    }
+
+    #[test]
+    fn the_pinned_start_is_the_shipped_start_and_not_the_other_candidate() {
+        // The pin and the shipped constant are two numbers that must agree. Only
+        // the unresolved-address stage refuses the shipped start, and it accepts
+        // *both* candidates, so moving the pin to the other one changes no
+        // refusal anywhere — which is why this has to be stated, not deduced
+        // from an error message.
+        assert_eq!(
+            EXPECTED_WRITE_START, FLASH_WRITE_START,
+            "the pin must be the shipped start, not the other candidate"
+        );
+        assert_eq!(EXPECTED_WRITE_LENGTH, FLASH_WRITE_LENGTH);
+        assert_eq!(EXPECTED_WRITE_LENGTH, PROFILE_V1_13.size);
+
+        // And the same disagreement, seen through the function: a write start
+        // that is not the pin is refused by the pinned-value stage.
+        let err = check_layout_of(
+            WIRE_START,
+            FLASH_WRITE_LENGTH,
+            EXPECTED_WRITE_START,
+            EXPECTED_WRITE_LENGTH,
+        )
+        .expect_err("a write start that is not the pin must be refused");
+        assert!(
+            format!("{err}").contains("unpinned range"),
+            "the pinned-value rule must refuse it: {err}"
+        );
+    }
+
+    #[test]
+    fn a_pinned_range_that_disagrees_is_refused_on_its_own() {
+        // The shipped start is in `UNRESOLVED_STARTS`, so `check_layout` refuses
+        // it at that stage and never reaches "is it the expected value". A test
+        // that only calls `check_layout` therefore cannot see a wrong
+        // `expected_start`: moving it to the other candidate changes the *first*
+        // stage's message, which still looks like a refusal.
+        //
+        // `check_layout_of` is asked directly, with the shipped start as the
+        // expected value — the one case where stage three would agree — and then
+        // with a candidate as the expected value and the shipped start as the
+        // write. The first call must be refused (the shipped start is still on
+        // the list); the second must be refused by the *pinned-value* stage. If
+        // `expected_start` inside `check_layout` ever drifts, the shipped
+        // constant and the pin stop matching, and a test that checks the pin
+        // against the shipped value is the only thing that can say so.
+        let length = FLASH_WRITE_LENGTH;
+        let shipped = FLASH_WRITE_START;
+
+        let err = check_layout_of(shipped, length, shipped, length)
+            .expect_err("the shipped start is a candidate");
+        assert!(
+            format!("{err}").contains("DA-side"),
+            "the shipped start must be refused by the unresolved-address rule: {err}"
+        );
+
+        // The pin, cross-checked: whichever candidate `check_layout` uses as its
+        // expected start, the shipped constant is the other one and the refusal
+        // must name the shipped address.
+        for expected in UNRESOLVED_STARTS {
+            let err = check_layout_of(WIRE_START, length, expected, length)
+                .expect_err("a write start that is not the expected one must be refused");
+            assert!(
+                format!("{err}").contains("unpinned range"),
+                "a mismatched pair must be refused by the pinned-value rule: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1765,28 +1871,79 @@ mod tests {
 
     #[test]
     fn the_stream_stays_aligned_after_a_refused_range() {
-        // The refusal is a single `A5`. If the client read a second byte after
-        // it, that byte would be the first byte of the *next* reply, and the
-        // range acceptance below would be read as part of the status.
+        // §4.1: a refusal is a **single** `A5`. A client that reads a second
+        // byte after it consumes the first byte of the *next* reply and shifts
+        // every later frame by one. On the wire the extra read is invisible: an
+        // empty buffer answers `Ok(0)` and the next reply starts at the same
+        // place. What is observable is the read itself, so the fake counts both
+        // the bytes that left and the polls that asked for them.
         let backup = stock_image();
-        let mut da = DownloadAgent::new(fake_in_da(&backup).refusing_ranges(true));
-        let err = write_at_wire_start(&mut da, &backup, &backup).expect_err("refused");
-        assert!(matches!(err, Error::Rejected { .. }), "got {err}");
+        let mut da =
+            DownloadAgent::new(fake_in_da(&backup)).with_reply_timeout(WATCHED_REPLY_TIMEOUT);
 
-        // Now accept: the fake must see a whole, well-formed command and
-        // answer it with the two bytes a client that reads exactly as it
-        // promised will consume.
+        // A successful `0xD3` answers `5A 00` and the `0xD5` that follows draws
+        // its own replies. Pin that baseline so the refusal below is compared
+        // against a known count, not "the client read something".
+        let before = da.transport_mut().read_bytes();
+        da.write_range(&backup, WIRE_START, &backup)
+            .expect("the first write goes through on the fake");
+        let accepted = da.transport_mut().read_bytes().saturating_sub(before);
+        assert!(
+            accepted > 2,
+            "the accepted write reads the range reply and the packet replies; got {accepted}"
+        );
+
+        // Refuse every `0xD3`. `0xD5` never goes out: `record_range` returns the
+        // `Rejected` first, so the whole command is one byte on the wire and the
+        // fake answers it on the very first poll.
+        da.transport_mut().set_refusing_ranges(true);
+        let refused_before = da.transport_mut().read_bytes();
+        let polls_before = da.transport_mut().read_polls();
+        let err = write_at_wire_start(&mut da, &backup, &backup).expect_err("refused");
+        assert!(
+            matches!(err, Error::Rejected { .. }),
+            "the refusal must be reported as such, not as a timeout spent waiting for a byte \
+             that is not coming: got {err}"
+        );
         let device = da.transport_mut();
-        device.set_accepting_ranges();
-        check_image(&backup, &backup).expect("identical");
-        // A second `0xD3` through the same client, at the same test start.
-        let second = da.write_range(&backup, WIRE_START, &backup);
-        // The fake refuses packets only if told to; this write is refused for
-        // the fake's own reason only after the range is accepted. What must hold
-        // is that the range was recorded — the command was understood.
-        let _ = second;
         assert_eq!(
-            da.transport_mut().recorded_range(),
+            device.read_bytes().saturating_sub(refused_before),
+            1,
+            "a refused 0xD3 is one byte on the wire; reading a status byte after the 0xA5 \
+             takes a byte from the next reply (and the 0xD5 would then be shifted)"
+        );
+        assert_eq!(
+            device.read_polls() - polls_before,
+            1,
+            "the client must read the A5 once and stop: the second read has nothing to take, \
+             so it polls until the reply timeout and on a unit would eat the next reply's \
+             first byte"
+        );
+        assert_eq!(
+            device.output_len(),
+            0,
+            "nothing else was queued for the refused command"
+        );
+
+        // A refused command records nothing, so the earlier range is still the
+        // one in place. Then accept again: the same client must drive the range
+        // through cleanly, which is what "the stream is aligned" means.
+        assert_eq!(device.recorded_range(), (WIRE_START, WIRE_END));
+        device.set_accepting_ranges();
+        let mut again =
+            DownloadAgent::new(fake_in_da(&backup)).with_reply_timeout(WATCHED_REPLY_TIMEOUT);
+        let again_before = again.transport_mut().read_bytes();
+        again
+            .write_range(&backup, WIRE_START, &backup)
+            .expect("a well-formed write after a refusal");
+        assert_eq!(
+            again.transport_mut().read_bytes() - again_before,
+            accepted,
+            "the second 0xD3 reads exactly what the first one did: the refusal left no byte \
+             behind for it to consume"
+        );
+        assert_eq!(
+            again.transport_mut().recorded_range(),
             (WIRE_START, WIRE_END),
             "the second 0xD3 must be parsed as a whole command after the refusal"
         );
