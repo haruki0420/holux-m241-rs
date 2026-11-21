@@ -219,9 +219,9 @@ pub struct FakeDa {
     retries_sent: usize,
     /// Bytes the fake puts in front of the next `0xD6` page, once.
     ///
-    /// The unit sent four bytes after its banner that landed in front of the
-    /// first page (measured 2026-11-21). A retry must be clean, so the prefix is
-    /// taken on the first send only.
+    /// Defensive model for leading bytes ahead of the first page (whether a
+    /// unit emits any is ⚠️ 未検証 in `docs/dev/05-verification.md`). A retry
+    /// must be clean, so the prefix is taken on the first send only.
     page_prefix: Option<Vec<u8>>,
     /// Every opcode the host sent, in order: the BootROM's frames and the DA's.
     opcodes: Vec<u8>,
@@ -430,14 +430,14 @@ impl FakeDa {
         self.output.len()
     }
 
-    /// Put bytes on the line as if the DA had sent them before the next command.
+    /// Put bytes on the line as if stale data arrived before the next command.
     ///
-    /// The unit emits four bytes after its banner that the twenty-byte report
-    /// read does not consume (measured 2026-11-21). A test uses this to put the
-    /// same leftovers in front of the first `0xD6`, which is the shape that
-    /// shifted the read by four bytes on hardware.
+    /// Whether a real unit emits trailing bytes after its twenty-byte report
+    /// is ⚠️ 未検証 in `docs/dev/05-verification.md`. A test uses this to put
+    /// stale leftovers ahead of `0xD6` and confirm the pre-read drain drops
+    /// them.
     pub fn queue_output(&mut self, bytes: &[u8]) {
-        self.output.extend(bytes);
+        self.queue_bytes(bytes);
     }
 
     /// The DA's RAM as the loader left it.
@@ -494,10 +494,11 @@ impl FakeDa {
 
     /// Put bytes in front of the next `0xD6` page, once.
     ///
-    /// The unit sent four bytes after its banner that arrived in front of the
-    /// first page (measured 2026-11-21). The prefix is taken on the first send
-    /// only: a page asked for again with `0xA5` comes back clean, which is what
-    /// lets the client drop the leftover bytes and resynchronise.
+    /// Defensive simulation of stale leading bytes arriving in front of the
+    /// first page (⚠️ 未検証 in `docs/dev/05-verification.md`). The prefix is
+    /// taken on the first send only: a page asked for again with `0xA5` comes
+    /// back clean, which is what lets the client drop the leftover bytes and
+    /// resynchronise.
     pub fn prefix_next_page(&mut self, bytes: &[u8]) {
         self.page_prefix = Some(bytes.to_vec());
     }
