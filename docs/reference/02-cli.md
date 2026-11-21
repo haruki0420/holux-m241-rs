@@ -130,6 +130,11 @@ bases. **Writes no flash:** only the BootROM's `0xA1` RAM writes and one `0xA8`
 jump are sent, plus the DA's read-only `0xD6`. `0xD3` / `0xD4` / `0xD5` / `0xD9`
 are never sent, and the DA is gone at the next power-on.
 
+The client sends no destructive opcode, but the DA it jumps to can erase or
+program flash itself. `--yes` is therefore an approval gate, not a formality:
+`AGENTS.md` §2.5 covers this command, requires the `--da` full SHA-256 to match
+the vendor value, and applies the same independent-review rule as `fw flash`.
+
 Flags: `--da <FILE>` (the vendor `DA_v3.8.4.bin`, exactly 14,896 bytes starting
 `00 00 A0 E1`; never committed here), `--port <PORT|auto>` (default `auto`),
 `--yes` (required: without it the command stops before opening a port; there is

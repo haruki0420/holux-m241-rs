@@ -30,8 +30,10 @@
 //! 2. **A confirmation token must be passed** ([`Confirmation`]). It has one
 //!    public constructor, [`Confirmation::granted`], and [`DownloadAgent::write`]
 //!    takes one as its first argument and refuses a token that is not given.
-//!    That makes the prompt a step every caller goes through; it is a convention
-//!    of the call site, not a type-level proof that a person was asked.
+//!    That makes confirmation a named step at every call site; it only records
+//!    that `--yes` was passed via [`Confirmation::of_command_line`] and does
+//!    not mechanically verify a reviewer record or session ID (`AGENTS.md` §2.5
+//!    defines the procedural gate).
 //! 3. **The device must still hold the image the write was planned from.**
 //!    [`DownloadAgent::verify_device`] compares the whole span, read back by
 //!    `m241_core`'s BootROM reader, with the user's own backup, so a backup from
@@ -479,7 +481,8 @@ pub const DA_JUMP_COUNT: u32 = 0;
 /// The first four bytes of `DA_v3.8.4.bin`.
 ///
 /// Read from the vendor image (`holux/M-241 Firmware V1.13 update package/
-/// DA_v3.8.4.bin`, 14,896 bytes, SHA-256 `190d7064…9aa`). The four ARM
+/// DA_v3.8.4.bin`, 14,896 bytes, SHA-256 `190d7064…9aa`; the full value is
+/// recorded in `AGENTS.md` §2.5). The four ARM
 /// instructions are `mov r0, r0` (`00 00 A0 E1`, NOP), `mrs r0, CPSR`
 /// (`00 00 0F E1`), `mov r0, #C0_32` (`C0 10 A0 E3`) and
 /// `orr r0, r0, r1` (`01 00 80 E1`) — `docs/reference/01-da-protocol.md` §2
@@ -582,20 +585,21 @@ pub const PROBE_PAGE_SIZE: usize = 64;
 /// short enough that a wrong cable is reported instead of hammered.
 pub const READ_RETRIES: usize = 3;
 
-/// The evidence that a person asked for this write.
+/// A call-site confirmation token indicating that `--yes` (or an interactive
+/// confirmation) was supplied for this operation.
 ///
 /// No `Default`, no public field: the only way to obtain one is
 /// [`Confirmation::granted`] — the token [`Confirmation::of_command_line`]
-/// returns for `--yes`. [`DownloadAgent::write`] takes one as its first
-/// argument and refuses a token whose flag is not set, so "write the firmware"
-/// cannot appear in code without a line that says who said so.
-/// [`DaLoader::load`] takes one for the same reason: loading the DA is what
-/// hands the device to a program that can erase and program flash.
+/// returns when `--yes` is `true` (and [`Confirmation::of_probe_command_line`]
+/// returns for `fw probe-da --yes`). [`DownloadAgent::write`] takes one as its
+/// first argument so confirmation is an explicit step at every call site.
+/// [`DaLoader::load`] takes one for the same reason: loading the DA hands the
+/// device to a program that can erase and program flash.
 ///
-/// That is a convention of the call site, not a proof: the type carries no
-/// information a plain `bool` does not. What it buys is a named step at every
-/// call site and one place ([`Self::of_command_line`]) where the flag is
-/// turned into a token.
+/// This is strictly a call-site convention, not a proof: the type carries no
+/// information a plain `bool` does not, and [`Self::of_command_line`] only
+/// checks that `--yes` was passed. It does **not** mechanically verify a
+/// reviewer record, approval ledger, or session ID (`AGENTS.md` §2.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Confirmation {
     /// Always `true`; a token that exists was given.
@@ -606,7 +610,11 @@ impl Confirmation {
     /// The word a typed prompt accepts as the confirmation (`AGENTS.md` §2.2).
     pub const WORD: &'static str = "WRITE";
 
-    /// The token for "the caller was told and said yes".
+    /// Construct the confirmation token indicating that the call-site
+    /// confirmation flag was supplied.
+    ///
+    /// Like [`Self::of_command_line`], this performs no mechanical verification
+    /// of an external reviewer record or session ID (`AGENTS.md` §2.5).
     #[must_use]
     pub fn granted() -> Self {
         Self { given: true }
@@ -954,11 +962,13 @@ pub const REPORT_SCAN_LIMIT: usize = 256;
 ///    instruction (`mov r0, r0`), so a 14,896-byte file that is not the DA is
 ///    refused before anything is written to RAM.
 ///
-/// Content is not hashed, and deliberately so: the DA is a user's own copy of a
-/// vendor binary, never committed here, so no hash could be checked in
-/// (`docs/reference/01-da-protocol.md` §9 records where the bytes came from, not
-/// what they hash to). A four-byte head narrows "the right size" to "the right
-/// image"; what makes the load safe is still the steps after it
+/// Content is not hashed **yet**. The DA is a user's own copy of a vendor
+/// binary, never committed here, but its SHA-256 is known (the full value is in
+/// `AGENTS.md` §2.5), so the hash can be checked without committing the image.
+/// A four-byte head still narrows "the right size" to "the right image"; adding
+/// the full SHA-256 comparison here is follow-up W2a, and until then the
+/// approval rule requires the approver to compare it manually. What makes the
+/// load safe in the meantime is still the steps after it
 /// ([`parse_report`] refusing any other version, flash part or region, and
 /// [`DaLoader::read_back`] refusing to jump at RAM that did not take the write).
 ///
