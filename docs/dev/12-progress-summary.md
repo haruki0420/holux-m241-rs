@@ -69,7 +69,7 @@
 
 | 優先度 | 機能 | 現状と不足 |
 |---|---|---|
-| **P0** | **KMZ 書き出し** | 写真同梱（`photo/`）＋ zip 化（Store）＋ 色/幅＋ `<Point>`／`<TimeStamp>` は実装済み。**長辺縮小（`kmzMaxPhotoEdgeSize`）は未実装**: JPEG を復号・再符号化するコーデックがこのクレートに無く、依存追加は方針として保留。現状は上限値を受け取り、超える写真を**縮小せずに `Error::State` で拒否**する（黙って原寸を入れることはない）。実装には `image` 等の JPEG codec 依存（Stage 1 修正の報告で提案）か、外部プロセスによる縮小のどちらかが要る |
+| **P0** | **KMZ 書き出し** | 写真同梱（`photo/`）＋ zip 化（Store）＋ 色/幅＋ `<Point>`／`<TimeStamp>` は実装済み。**長辺縮小（`kmzMaxPhotoEdgeSize`）は実装済み・レビュー中（Stage 3 前）**: `KmzPhoto::max_edge_pixels` が `Some(limit)` で長辺が `limit` を超える写真だけ JPEG を復号し、アスペクト比を保って長辺 = `limit` に縮小（Lanczos3）、JPEG 品質 85 で再符号化して `photo/` に入れる。上限以内と `None` の写真は**元のバイト列のまま**（再エンコードしないので EXIF は残る）。縮小した写真はメタデータ（EXIF 等）が落ちる可能性がある（`kmz.rs` のモジュール doc に明記）。上限超過で復号できないバイト列は `Error::State`（写真名と理由つき）。依存は `image` の `jpeg` feature のみを追加。**残る未実装**: spec §6.3 の `icon/` サムネイル、`kmzMaxPhotoEdgeSize` を CLI/GUI から渡す経路（crate 内から呼ぶ箇所のみ）。実写真での縮小結果は未検証 |
 | **P0** | **GUI の実データ接続・地図体験** | サンプル描画のみ。実ポート接続・実ログ読込・全点 fit・現在位置追従（zoom ≥ 12）・再生（Play）・写真同期・POI 表示が未実装 |
 | **P1** | **写真ジオタグ拡充** | `exif.rs` / `geotag.rs` に実装済み: `GPSVersionID`・`_original` バックアップ・距離グループ化（推移的／順序非依存）・時刻シフト後の再マッチング（`plan_with_shift` で再計画、`apply` が `DateTimeOriginal` を書き換え、次回はシフト無しで一致）。未実装: 写真タイムゾーン変換（§6.1-2、呼び出し側の責務のまま）、日/時/分/秒の個別シフトと `byCamera`/`selPhotos`/`allPhotos` の適用範囲、非 JPEG（動画）の「紐づけのみ」、CLI/GUI 連携 |
 | **P1** | **トラック編集** | 分割（Split）・結合（Merge）・点削除・Undo/Redo は `edit.rs` に実装済み。GUI の操作体系（範囲選択）は未着手 |

@@ -1677,6 +1677,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1950,6 +1952,7 @@ dependencies = [
 name = "m241-core"
 version = "0.1.0"
 dependencies = [
+ "image",
  "serialport",
  "thiserror 2.0.21",
 ]

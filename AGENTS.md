@@ -67,9 +67,10 @@ Three jobs:
    time.
 3. **Repair or relay a live NMEA stream** for hosts that cannot be patched.
 
-The only runtime dependency is `pyserial`… no: in v2 the only dependency at all
-is the Rust standard library plus `serialport`, and the offline commands never
-open a port.
+The only runtime dependency is `pyserial`… no: in v2 the dependencies are the
+Rust standard library, `serialport` (the only code that touches a terminal) and
+`image` with only its `jpeg` feature (KMZ long-edge reduction, spec §6.3); the
+offline commands never open a port.
 
 ## 2. Non-negotiable safety rules
 

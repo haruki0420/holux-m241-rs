@@ -10,17 +10,35 @@
 //! # Photo size
 //!
 //! `07-eztour-spec.ja.md` §6.3 asks for a long-edge limit (`kmzMaxPhotoEdgeSize`)
-//! on the embedded photos. Reducing a JPEG means decoding and re-encoding it,
-//! which this crate cannot do without an image codec, so this module does not
-//! perform the reduction. Instead [`KmzPhoto::max_edge_pixels`] records the
-//! limit the caller asked for, and [`export_kmz`] **fails** when an image is
-//! larger than it rather than silently shipping the wrong size: a request that
-//! cannot be honoured is reported, not dropped. At the time of writing the
-//! export path therefore cannot produce a reduced photo at all, and callers
-//! that need one have to reduce it before handing the bytes over.
+//! on the embedded photos. [`KmzPhoto::max_edge_pixels`] carries that limit and
+//! [`export_kmz`] reduces the photo to it:
+//!
+//! * a photo whose long edge is **at or under** the limit, or one with no limit
+//!   (`None`), is stored **byte for byte** — it is never re-encoded, so its EXIF
+//!   and every other metadata block survive untouched;
+//! * only a photo **over** the limit is decoded, scaled to `long edge = limit`
+//!   with the aspect ratio kept, and re-encoded as JPEG.
+//!
+//! The re-encode **may drop metadata**: `image` writes a bare JFIF frame, so
+//! EXIF (camera time, GPS tags), ICC profiles and comments in a reduced photo
+//! are not carried over. A photo read back out of a reduced KMZ will therefore
+//! look like one with no EXIF. The KML `<TimeStamp>` and `<Point>` are written
+//! from [`KmzPhoto`] before the reduction and are unaffected.
+//!
+//! The quality of that re-encode is fixed at [`RESIZE_JPEG_QUALITY`] = 85,
+//! the usual "visually near-lossless, much smaller" point for a thumbnail-sized
+//! image; a KMZ photo is displayed on a map at well under its pixel size, so
+//! lower quality would lose detail nobody sees and higher would mostly cost
+//! bytes.
+//!
+//! A photo over the limit that **cannot be decoded** is an [`Error::State`]
+//! naming the photo and the decoder's reason: the bytes it holds are not a JPEG
+//! this build can read, and embedding them at full size would ignore the limit
+//! the caller asked for.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::io::Cursor;
 
 use crate::error::{Error, Result};
 use crate::log::exif::{JPEG_MARKER_EOI, JPEG_MARKER_SOI};
@@ -59,6 +77,15 @@ const DEFAULT_LINE_COLOR: &str = "b3ff0080";
 /// Default track polyline width in pixels, from the same §5 measurement.
 const DEFAULT_LINE_WIDTH: u8 = 5;
 
+/// JPEG quality used when a photo over the long-edge limit is re-encoded.
+///
+/// Fixed rather than configurable: the spec gives one setting
+/// (`kmzMaxPhotoEdgeSize`) and no quality knob. 85 is the point where the
+/// artefacts of a further compression of an already-JPEG photo stay below what
+/// a map-sized view shows, while the file is a small fraction of the original.
+/// See the module doc.
+const RESIZE_JPEG_QUALITY: u8 = 85;
+
 /// A photo to embed in a KMZ archive under `photo/`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KmzPhoto {
@@ -82,9 +109,9 @@ pub struct KmzPhoto {
     /// Largest long edge the caller will accept for this photo, in pixels
     /// (`kmzMaxPhotoEdgeSize`). `None` accepts the bytes as they are.
     ///
-    /// This module cannot reduce a JPEG (see the module doc), so a value that
-    /// [`jpeg_dimensions`] reports as exceeded is an [`Error::State`], not a
-    /// silent full-size embed.
+    /// A photo over the limit is decoded, scaled down to it and re-encoded;
+    /// one at or under it keeps its exact bytes. See the module doc for what a
+    /// re-encode costs.
     pub max_edge_pixels: Option<u32>,
     /// Raw JPEG bytes to store in the archive.
     pub jpeg_bytes: Vec<u8>,
@@ -127,9 +154,9 @@ impl KmzPhoto {
 /// # Errors
 ///
 /// Returns [`Error::State`] if a photo coordinate or altitude is non-finite or
-/// out of range, or if a photo's long edge exceeds [`KmzPhoto::max_edge_pixels`]
-/// (see the module doc for why that is reported rather than reduced), and
-/// [`Error::Log`] if the archive exceeds ZIP32 limits.
+/// out of range, or if a photo exceeds [`KmzPhoto::max_edge_pixels`] and its
+/// bytes cannot be decoded as a JPEG (see the module doc), and [`Error::Log`]
+/// if the archive exceeds ZIP32 limits.
 pub fn export_kmz(track: &Track, photos: &[KmzPhoto]) -> Result<Vec<u8>> {
     let mut used_names = HashSet::with_capacity(photos.len());
     let mut resolved: Vec<(String, &KmzPhoto)> = Vec::with_capacity(photos.len());
@@ -144,16 +171,23 @@ pub fn export_kmz(track: &Track, photos: &[KmzPhoto]) -> Result<Vec<u8>> {
     let kml = build_kml(track, &resolved);
     let kml_utc = track.time_span().map(|(_, end)| end);
 
+    // Reduced bytes live here, not beside the photo, so the entries can borrow
+    // either the caller's slice or this buffer for the life of the write.
+    let mut reduced: Vec<Option<Vec<u8>>> = Vec::with_capacity(resolved.len());
+    for (_, photo) in &resolved {
+        reduced.push(reduce_to_edge_limit(photo)?);
+    }
+
     let mut entries: Vec<ZipInput<'_>> = Vec::with_capacity(1 + resolved.len());
     entries.push(ZipInput {
         path: String::from("doc.kml"),
         data: kml.as_bytes(),
         utc: kml_utc,
     });
-    for (name, photo) in &resolved {
+    for ((name, photo), reduced_bytes) in resolved.iter().zip(&reduced) {
         entries.push(ZipInput {
             path: format!("photo/{name}"),
-            data: &photo.jpeg_bytes,
+            data: reduced_bytes.as_deref().unwrap_or(&photo.jpeg_bytes),
             utc: photo.zip_utc(),
         });
     }
@@ -180,20 +214,75 @@ fn validate_photo(photo: &KmzPhoto) -> Result<()> {
             photo.name
         )));
     }
-    if let Some(max_edge) = photo.max_edge_pixels
-        && let Some((width, height)) = jpeg_dimensions(&photo.jpeg_bytes)
-    {
-        let long_edge = width.max(height);
-        if long_edge > max_edge {
-            return Err(Error::State(format!(
-                "photo {:?} is {width} pixels wide and {height} high, and its long edge \
-                 {long_edge} exceeds the {max_edge} pixel limit; this build cannot resize a \
-                 JPEG, so reduce the photo first",
-                photo.name
-            )));
-        }
-    }
     Ok(())
+}
+
+/// The bytes to store for `photo`: its own when the limit is absent or met, a
+/// re-encoded reduction when the long edge is over it.
+///
+/// `Ok(None)` means "store [`KmzPhoto::jpeg_bytes`] unchanged". The size is read
+/// from the frame header first, so a photo within the limit is never decoded.
+fn reduce_to_edge_limit(photo: &KmzPhoto) -> Result<Option<Vec<u8>>> {
+    let Some(max_edge) = photo.max_edge_pixels.filter(|limit| *limit > 0) else {
+        return Ok(None);
+    };
+    let bytes = photo.jpeg_bytes.as_slice();
+    // A byte stream with no frame header cannot be measured; it is stored as it
+    // is, as before the reduction existed. Every decodable JPEG carries a SOF.
+    let Some((width, height)) = jpeg_dimensions(bytes) else {
+        return Ok(None);
+    };
+    let long_edge = width.max(height);
+    if long_edge <= max_edge {
+        return Ok(None);
+    }
+
+    let decoded =
+        image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg).map_err(|err| {
+            Error::State(format!(
+                "photo {:?} is {width} pixels wide and {height} high, and its long edge \
+                 {long_edge} exceeds the {max_edge} pixel limit, but it could not be decoded \
+                 to be reduced: {err}",
+                photo.name
+            ))
+        })?;
+
+    // Keep the aspect ratio: scale the long edge to the limit and round the
+    // short edge to the nearest proportional value, never below one pixel.
+    let (target_width, target_height) = if width >= height {
+        (max_edge, scale_short_edge(height, width, max_edge))
+    } else {
+        (scale_short_edge(width, height, max_edge), max_edge)
+    };
+    let resized = decoded.resize_exact(
+        target_width,
+        target_height,
+        image::imageops::FilterType::Lanczos3,
+    );
+
+    let mut out = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+        Cursor::new(&mut out),
+        RESIZE_JPEG_QUALITY,
+    );
+    encoder.encode_image(&resized).map_err(|err| {
+        Error::State(format!(
+            "photo {:?} could not be re-encoded: {err}",
+            photo.name
+        ))
+    })?;
+    Ok(Some(out))
+}
+
+/// The short edge after scaling `long` down to `limit`, rounded to nearest and
+/// held at one pixel.
+fn scale_short_edge(short: u32, long: u32, limit: u32) -> u32 {
+    if long == 0 {
+        return 1;
+    }
+    // Rounded half up without a float: (short * limit + long / 2) / long.
+    let rounded = (u64::from(short) * u64::from(limit) + u64::from(long) / 2) / u64::from(long);
+    u32::try_from(rounded).unwrap_or(1).max(1)
 }
 
 /// Read a JPEG's pixel dimensions from its first Start-Of-Frame segment.
@@ -565,7 +654,8 @@ mod tests {
     /// A JPEG-shaped byte stream whose SOF0 declares `width` x `height`.
     ///
     /// Every segment carries the length it declares: an APP0 with a one-byte
-    /// payload, then SOF0 with precision, height, width and one component.
+    /// payload, then SOF0 with precision, height, width and one component. It
+    /// has no scan data, so [`jpeg_dimensions`] reads it but no decoder can.
     fn jpeg_with_size(width: u16, height: u16) -> Vec<u8> {
         let mut out = vec![0xFF, 0xD8];
         // APP0, length 6: the two length bytes plus four payload bytes.
@@ -578,6 +668,34 @@ mod tests {
         out.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
         out.extend_from_slice(&[0xFF, JPEG_MARKER_EOI]);
         out
+    }
+
+    /// A real, decodable JPEG of `width` x `height`, built in memory.
+    ///
+    /// Generated rather than checked in as a fixture: the resize tests need
+    /// bytes `image` can decode, and a synthetic image of one pixel value is
+    /// small, compresses well and carries no personal data.
+    fn synthetic_jpeg(width: u32, height: u32) -> Vec<u8> {
+        let image = image::RgbImage::from_pixel(width, height, image::Rgb([120, 60, 30]));
+        let mut out = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+            Cursor::new(&mut out),
+            RESIZE_JPEG_QUALITY,
+        );
+        encoder
+            .encode_image(&image)
+            .expect("encode a synthetic JPEG");
+        out
+    }
+
+    /// Decode `bytes` and return `(width, height)` as the decoder sees them.
+    ///
+    /// The SOF header is written by the encoder, so this is what a viewer will
+    /// render; reading it back also proves the reduced bytes are a JPEG.
+    fn decoded_dimensions(bytes: &[u8]) -> (u32, u32) {
+        let decoded = image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg)
+            .expect("a stored photo must decode");
+        (decoded.width(), decoded.height())
     }
 
     struct ParsedZipEntry {
@@ -831,22 +949,199 @@ mod tests {
     }
 
     #[test]
-    fn a_photo_longer_than_the_size_limit_is_refused_not_embedded_in_full() {
-        // kmzMaxPhotoEdgeSize (spec §6.3). This build has no JPEG codec, so the
-        // limit cannot be met by reducing the image; it is met by saying so.
+    fn a_photo_longer_than_the_size_limit_is_reduced_to_it() {
+        // kmzMaxPhotoEdgeSize (spec §6.3): the limit is a target, not a filter.
+        // Landscape 100x50 with a 40-pixel limit becomes 40x20, aspect kept.
+        let original = synthetic_jpeg(100, 50);
         let mut big = photo("big.jpg");
-        big.jpeg_bytes = jpeg_with_size(4000, 3000);
-        big.max_edge_pixels = Some(1024);
-        let err = export_kmz(&sample_track(), &[big]).expect_err("an oversized photo must fail");
+        big.jpeg_bytes = original.clone();
+        big.max_edge_pixels = Some(40);
+        let kmz = export_kmz(&sample_track(), &[big]).expect("export kmz");
+        let entries = parse_zip_and_verify(&kmz);
+        let stored = entries.get(1).expect("the photo entry").data.clone();
+        assert_ne!(stored, original, "an oversized photo must be re-encoded");
+        assert_eq!(
+            jpeg_dimensions(&stored),
+            Some((40, 20)),
+            "the long edge becomes the limit and the short edge keeps the ratio"
+        );
+        assert_eq!(decoded_dimensions(&stored), (40, 20));
+    }
+
+    #[test]
+    fn a_portrait_photo_over_the_limit_is_reduced_through_its_height() {
+        // 50x100 with a 40-pixel limit becomes 20x40: the height is the long
+        // edge, so scaling the width alone would leave the photo over the limit.
+        let original = synthetic_jpeg(50, 100);
+        let mut portrait = photo("portrait.jpg");
+        portrait.jpeg_bytes = original.clone();
+        portrait.max_edge_pixels = Some(40);
+        let kmz = export_kmz(&sample_track(), &[portrait]).expect("export kmz");
+        let entries = parse_zip_and_verify(&kmz);
+        let stored = entries.get(1).expect("the photo entry").data.clone();
+        assert_ne!(stored, original, "an oversized photo must be re-encoded");
+        assert_eq!(jpeg_dimensions(&stored), Some((20, 40)));
+        assert_eq!(decoded_dimensions(&stored), (20, 40));
+    }
+
+    #[test]
+    fn a_photo_exactly_at_the_limit_keeps_its_bytes() {
+        // The limit is a maximum. A photo already within it must not be
+        // re-encoded: that would drop its EXIF and lose quality for nothing.
+        let original = synthetic_jpeg(100, 50);
+        let mut exact = photo("exact.jpg");
+        exact.jpeg_bytes = original.clone();
+        exact.max_edge_pixels = Some(100);
+        let kmz = export_kmz(&sample_track(), &[exact]).expect("export kmz");
+        let entries = parse_zip_and_verify(&kmz);
+        assert_eq!(
+            entries.get(1).map(|entry| entry.data.clone()),
+            Some(original),
+            "a photo exactly at the limit keeps its exact bytes"
+        );
+    }
+
+    #[test]
+    fn a_photo_with_no_limit_keeps_its_bytes() {
+        let original = synthetic_jpeg(100, 50);
+        let mut unlimited = photo("unlimited.jpg");
+        unlimited.jpeg_bytes = original.clone();
+        unlimited.max_edge_pixels = None;
+        let kmz = export_kmz(&sample_track(), &[unlimited]).expect("export kmz");
+        let entries = parse_zip_and_verify(&kmz);
+        assert_eq!(
+            entries.get(1).map(|entry| entry.data.clone()),
+            Some(original),
+            "without a limit the bytes are stored unchanged"
+        );
+    }
+
+    #[test]
+    fn an_oversized_photo_that_cannot_be_decoded_is_reported_not_embedded() {
+        // A SOF0 header that claims 4000x3000 but has no scan data: measurable,
+        // undecodable. Falling back to the full-size bytes would ignore the
+        // limit the caller set, so this must be an error naming the photo.
+        let mut broken = photo("broken.jpg");
+        broken.jpeg_bytes = jpeg_with_size(4000, 3000);
+        broken.max_edge_pixels = Some(1024);
+        let err = export_kmz(&sample_track(), &[broken]).expect_err("undecodable must fail");
         let message = err.to_string();
         assert!(
-            message.contains("4000 pixels wide and 3000 high") && message.contains("1024"),
-            "the error must name the size and the limit: {message}"
+            message.contains("broken.jpg") && message.contains("1024"),
+            "the error must name the photo and the limit: {message}"
         );
         assert!(
-            matches!(err, Error::State(_)),
-            "a refused photo is a State error, got {err:?}"
+            message.contains("could not be decoded"),
+            "the error must say the decode failed: {message}"
         );
+        assert!(matches!(err, Error::State(_)));
+    }
+
+    #[test]
+    fn only_the_oversized_photo_of_a_batch_is_re_encoded() {
+        // One archive, one reduced photo and one untouched photo: the reduction
+        // must be decided per photo, not for the whole export.
+        let small_bytes = synthetic_jpeg(100, 50);
+        let large_bytes = synthetic_jpeg(200, 100);
+
+        let mut small = photo("small.jpg");
+        small.jpeg_bytes = small_bytes.clone();
+        small.max_edge_pixels = Some(150);
+        let mut large = photo("large.jpg");
+        large.jpeg_bytes = large_bytes.clone();
+        large.max_edge_pixels = Some(150);
+
+        let kmz = export_kmz(&sample_track(), &[small, large]).expect("export kmz");
+        let entries = parse_zip_and_verify(&kmz);
+        assert_eq!(
+            entries.get(1).map(|entry| entry.data.clone()),
+            Some(small_bytes),
+            "the photo under the limit keeps its bytes"
+        );
+        let reduced = entries.get(2).expect("the second photo entry").data.clone();
+        assert_ne!(reduced, large_bytes);
+        assert_eq!(decoded_dimensions(&reduced), (150, 75));
+    }
+
+    /// A colour-ramp JPEG with a two-pixel checker, smooth in both directions.
+    ///
+    /// A flat-colour image compresses the same at every quality, so it cannot
+    /// tell quality 85 from 1. The ramp (red rising, blue falling across x)
+    /// and the checker (green alternating every two pixels in x and y) make
+    /// both reducers' choices measurable: the checker is finer than the 2x
+    /// downscale grid, yet survives Lanczos3 as a mid-grey instead of aliasing.
+    fn detailed_jpeg(width: u32, height: u32) -> Vec<u8> {
+        let image = image::RgbImage::from_fn(width, height, |x, y| {
+            let ramp = u8::try_from(x * 255 / width.max(1)).unwrap_or(0);
+            let checker = if ((x + y) / 2) % 2 == 0 { 255 } else { 0 };
+            image::Rgb([ramp, checker, 255 - ramp])
+        });
+        let mut out = Vec::new();
+        let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+            Cursor::new(&mut out),
+            RESIZE_JPEG_QUALITY,
+        );
+        encoder
+            .encode_image(&image)
+            .expect("encode a detailed JPEG");
+        out
+    }
+
+    #[test]
+    fn the_reduction_keeps_detail_rather_than_flattening_it() {
+        // Two settings that are choices, not accidents: JPEG quality 85 (not
+        // something far lower) and Lanczos3 resampling (not nearest-neighbour).
+        // Measured with this fixture, reduction by Lanczos3 then quality 85
+        // keeps a green range of about 128; nearest-neighbour then quality 85
+        // flattens it to about 1, and Lanczos3 then quality 1 to about 43.
+        // The thresholds below leave headroom on both sides of 128.
+        let original = detailed_jpeg(200, 200);
+        let mut shot = photo("detail.jpg");
+        shot.jpeg_bytes = original;
+        shot.max_edge_pixels = Some(100);
+        let kmz = export_kmz(&sample_track(), &[shot]).expect("export kmz");
+        let entries = parse_zip_and_verify(&kmz);
+        let stored = entries.get(1).expect("the photo entry").data.clone();
+
+        let reduced = image::load_from_memory_with_format(&stored, image::ImageFormat::Jpeg)
+            .expect("a reduced photo must decode")
+            .to_rgb8();
+        assert_eq!(reduced.dimensions(), (100, 100));
+
+        let channel_range = |channel: usize| {
+            let values = reduced.pixels().map(|pixel| u32::from(pixel.0[channel]));
+            let min = values.clone().min().unwrap_or(u32::MAX);
+            let max = values.max().unwrap_or(0);
+            max.saturating_sub(min)
+        };
+        assert!(
+            channel_range(0) > 150,
+            "the red ramp survived: range {}",
+            channel_range(0)
+        );
+        assert!(
+            channel_range(2) > 150,
+            "the blue ramp survived: range {}",
+            channel_range(2)
+        );
+        assert!(
+            channel_range(1) > 100,
+            "the checker survived as texture rather than being flattened: range {}",
+            channel_range(1)
+        );
+        assert!(
+            channel_range(1) < 160,
+            "the checker was resampled smoothly rather than aliased: range {}",
+            channel_range(1)
+        );
+    }
+
+    #[test]
+    fn scale_short_edge_rounds_to_nearest_and_never_reaches_zero() {
+        assert_eq!(scale_short_edge(50, 100, 40), 20);
+        assert_eq!(scale_short_edge(100, 200, 41), 21); // 20.5 rounds up
+        assert_eq!(scale_short_edge(1, 10_000, 1), 1); // not 0
+        assert_eq!(scale_short_edge(7, 0, 10), 1); // degenerate guard
     }
 
     #[test]
@@ -866,18 +1161,15 @@ mod tests {
     #[test]
     fn the_long_edge_is_the_height_when_the_photo_is_portrait() {
         // A portrait photo breaches the limit through its height; measuring
-        // only the width would let it through.
+        // only the width would let it through at full size.
         let mut portrait = photo("portrait.jpg");
-        portrait.jpeg_bytes = jpeg_with_size(1080, 1920);
+        portrait.jpeg_bytes = synthetic_jpeg(1080, 1920);
         portrait.max_edge_pixels = Some(1600);
-        let err = export_kmz(&sample_track(), &[portrait])
-            .expect_err("a 1920-pixel long edge exceeds 1600");
-        let message = err.to_string();
-        assert!(
-            message.contains("1080 pixels wide and 1920 high")
-                && message.contains("long edge 1920"),
-            "the long edge is the larger of the two: {message}"
-        );
+        let kmz = export_kmz(&sample_track(), &[portrait]).expect("export kmz");
+        let entries = parse_zip_and_verify(&kmz);
+        let stored = entries.get(1).expect("the photo entry").data.clone();
+        assert_eq!(jpeg_dimensions(&stored), Some((900, 1600)));
+        assert_eq!(decoded_dimensions(&stored), (900, 1600));
     }
 
     #[test]
