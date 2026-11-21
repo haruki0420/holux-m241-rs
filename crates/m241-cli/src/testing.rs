@@ -615,6 +615,15 @@ pub mod fake_da {
         pub reads: Vec<(u32, u32, u32)>,
         /// Whether `$PMTK180` arrived while the firmware streamed.
         pub pmtk180: bool,
+        /// How many NMEA lines the fake put on the wire before `$PMTK180` and
+        /// after it.
+        ///
+        /// A second `probe_stream` — what `enter_bootrom` does when the caller
+        /// did not pass its state — pulls considerably more before the sentence
+        /// and is what the real unit rejected.
+        pub nmea_before: usize,
+        /// Lines emitted after `$PMTK180`; on a successful switch this stays 0.
+        pub nmea_after: usize,
         /// Whether any reset line was asserted (`set_control_lines(true)`).
         pub control_lines_asserted: bool,
     }
@@ -745,12 +754,13 @@ pub mod fake_da {
 
         fn consume(&mut self, byte: u8) {
             // A running firmware never runs dry: it emits a sentence a second,
-            // and a probe that eavesdrops for a window must see one. Re-queueing
-            // after every byte is what makes `probe_stream` find a `$` instead
-            // of looping until its deadline and reporting silence.
+            // and a probe that eavesdrops for a window must see one. The
+            // sentence is queued by `read` when it finds the buffer empty, not
+            // here: queueing on every byte would leave whole sentences in the
+            // buffer at the moment `$PMTK180` switches the chip, and the entry's
+            // observation window would read them as a live stream.
             if self.mode() == Mode::Firmware {
                 self.consume_firmware(byte);
-                self.queue(NMEA_LINE);
                 return;
             }
             match self.mode() {
@@ -975,6 +985,12 @@ pub mod fake_da {
                     // buffer empty is answered with the next sentence, the same
                     // way the stream arrives once a second on the wire.
                     self.queue(NMEA_LINE);
+                    let mut record = self.record.borrow_mut();
+                    if record.pmtk180 {
+                        record.nmea_after += 1;
+                    } else {
+                        record.nmea_before += 1;
+                    }
                 }
                 let Some(byte) = self.output.pop_front() else {
                     break;
@@ -984,7 +1000,6 @@ pub mod fake_da {
             }
             Ok(count)
         }
-
         fn write_all(&mut self, buf: &[u8]) -> Result<()> {
             for byte in buf {
                 self.consume(*byte);
@@ -998,6 +1013,10 @@ pub mod fake_da {
 
         fn clear_input(&mut self) -> Result<()> {
             self.output.clear();
+            // A half-assembled line belongs to the traffic being dropped: keeping
+            // it would prefix the next sentence with stale bytes, and a
+            // `$PMTK180` that arrived as `...$PMTK180` would not be recognised.
+            self.line.clear();
             Ok(())
         }
 

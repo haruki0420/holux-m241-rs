@@ -78,6 +78,84 @@ pub const DEFAULT_STREAM_WINDOW: Duration = Duration::from_millis(1500);
 /// How long to wait for a direct reply to one command.
 pub const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long the line is drained *before* `$PMTK180` is sent.
+///
+/// The drain exists to let sentences already in the UART queue finish. Sending
+/// into a busy line is what the previous Python client avoided, and it is the
+/// sequence that worked on this unit (`python/src/m241/protocol/brom.py`,
+/// `_send_pmtk180`).
+pub const DEFAULT_ENTRY_QUIET_BUDGET: Duration = Duration::from_millis(350);
+
+/// How long the client stays quiet after `$PMTK180` before it listens again.
+///
+/// The firmware needs a moment to stop streaming and re-enter its BootROM
+/// listener; listening immediately reads the tail of the old mode and calls a
+/// successful switch a failure.
+pub const DEFAULT_ENTRY_SETTLE: Duration = Duration::from_millis(200);
+
+/// How long the client watches for bytes *after* `$PMTK180`.
+///
+/// Anything here means the sentence was not honoured. The window is short on
+/// purpose: the firmware streams at 1 Hz, so a live stream is unmissable in
+/// half a second, and a BootROM that switched writes nothing.
+pub const DEFAULT_ENTRY_WATCH: Duration = Duration::from_millis(500);
+
+/// How much of the observed traffic an error message quotes.
+///
+/// Enough to tell a `$GPGGA` (the stream is still live) from an echo or an
+/// `$PMTK001` acknowledgement (the sentence was parsed but not acted on) without
+/// pasting a kilobyte of NMEA into a terminal.
+pub const ENTRY_EVIDENCE_BYTES: usize = 96;
+
+/// The timing of the `$PMTK180` hand-over, in the order it happens.
+///
+/// The defaults reproduce the sequence the previous Python client used on this
+/// unit (`python/src/m241/protocol/brom.py:228-277`, `_send_pmtk180`), which is
+/// the only `$PMTK180` route verified on hardware. Tests shrink it so they do
+/// not spend a second per case.
+#[derive(Debug, Clone, Copy)]
+pub struct EntryTiming {
+    /// How long the line is drained before the sentence is written.
+    pub quiet_budget: Duration,
+    /// How long the client is silent after writing, before it listens.
+    pub settle: Duration,
+    /// How long the client listens for traffic after writing.
+    pub watch: Duration,
+}
+
+impl EntryTiming {
+    /// The hardware-verified timings.
+    #[must_use]
+    pub fn real() -> Self {
+        Self {
+            quiet_budget: DEFAULT_ENTRY_QUIET_BUDGET,
+            settle: DEFAULT_ENTRY_SETTLE,
+            watch: DEFAULT_ENTRY_WATCH,
+        }
+    }
+
+    /// The same sequence with every wait shortened, for tests.
+    ///
+    /// The windows are not zero: `read_line`-style loops are deadline-driven, and
+    /// a window shorter than the time a debug-build loop needs to pull one line
+    /// off a fake turns "the stream is live" into "the stream is silent". The
+    /// values here are the smallest that consistently distinguish the two.
+    #[must_use]
+    pub fn fast() -> Self {
+        Self {
+            quiet_budget: Duration::from_millis(50),
+            settle: Duration::from_millis(10),
+            watch: Duration::from_millis(100),
+        }
+    }
+}
+
+impl Default for EntryTiming {
+    fn default() -> Self {
+        Self::real()
+    }
+}
+
 /// The XOR checksum of a sentence body (the text between `$` and `*`).
 #[must_use]
 pub fn checksum(body: &str) -> u8 {
@@ -353,6 +431,7 @@ pub struct PmtkClient<T: Transport> {
     transport: T,
     reply_timeout: Duration,
     stream_window: Duration,
+    entry_timing: EntryTiming,
 }
 
 impl<T: Transport> PmtkClient<T> {
@@ -363,7 +442,18 @@ impl<T: Transport> PmtkClient<T> {
             transport,
             reply_timeout: DEFAULT_REPLY_TIMEOUT,
             stream_window: DEFAULT_STREAM_WINDOW,
+            entry_timing: EntryTiming::real(),
         }
+    }
+
+    /// Override the `$PMTK180` hand-over timings.
+    ///
+    /// The defaults are the hardware-verified ones; this exists so a test can
+    /// run the same code path without the second of real waiting it needs.
+    #[must_use]
+    pub fn with_entry_timing(mut self, timing: EntryTiming) -> Self {
+        self.entry_timing = timing;
+        self
     }
 
     /// Override how long a direct reply may take.
@@ -437,15 +527,46 @@ impl<T: Transport> PmtkClient<T> {
     /// them at a running firmware leaves the unit unresponsive until the battery
     /// is removed.
     ///
+    /// The probe is taken here and handed to [`Self::enter_bootrom_after`]. A
+    /// caller that has already probed should use that method instead: probing
+    /// twice reads the stream twice, and the second read starts from a line the
+    /// first one left half-consumed.
+    ///
     /// On success the transport is left at [`DEFAULT_BOOTROM_BAUD`], where the
     /// four-byte BootROM sync will be answered.
     ///
     /// # Errors
     ///
     /// [`Error::State`] when no live stream is present, when the stream cannot
-    /// be classified, or when the unit keeps streaming after the sentence.
+    /// be classified, or when the unit keeps talking after the sentence.
     pub fn enter_bootrom(&mut self) -> Result<()> {
-        match self.probe_stream()? {
+        let state = self.probe_stream()?;
+        self.enter_bootrom_after(state)
+    }
+
+    /// Hand the unit over using the stream state a caller's own probe produced.
+    ///
+    /// The sequence is the previous Python client's `_send_pmtk180`, which is
+    /// the only `$PMTK180` route verified on this unit:
+    ///
+    /// 1. clear the input, then drain the line for
+    ///    [`EntryTiming::quiet_budget`] so sentences already queued are not
+    ///    mistaken for an answer to a sentence not yet sent;
+    /// 2. clear the input again, write `$PMTK180*3B` and flush;
+    /// 3. stay silent for [`EntryTiming::settle`];
+    /// 4. listen for [`EntryTiming::watch`]: **any** byte means the firmware did
+    ///    not switch, and the error quotes what arrived so "NMEA still streaming"
+    ///    can be told from "an acknowledgement, but no switch".
+    ///
+    /// Draining *before* the write is the part the earlier Rust version lacked,
+    /// and it is what the unit rejected. Nothing here asserts DTR or RTS.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::State`] when `state` is not [`StreamState::Streaming`] (nothing
+    /// is written then), or when the unit keeps talking after the sentence.
+    pub fn enter_bootrom_after(&mut self, state: StreamState) -> Result<()> {
+        match state {
             StreamState::Streaming => {}
             StreamState::Silent => {
                 return Err(Error::State(String::from(
@@ -461,17 +582,34 @@ impl<T: Transport> PmtkClient<T> {
             }
         }
 
-        self.send("PMTK180")?;
-        // Anything already queued belongs to the old mode; keeping it would make
-        // the "did the stream stop?" test read a sentence that predates the
-        // switch.
+        let timing = self.entry_timing;
         self.transport.clear_input()?;
-        let deadline = Instant::now() + self.stream_window;
-        if read_line(&mut self.transport, deadline)?.is_some() {
-            return Err(Error::State(String::from(
-                "the logger kept streaming NMEA after $PMTK180: the sentence was not honoured",
+        let _ = drain_for(&mut self.transport, timing.quiet_budget)?;
+        self.transport.clear_input()?;
+
+        self.send("PMTK180")?;
+        self.transport.flush()?;
+
+        std::thread::sleep(timing.settle);
+        let observed = drain_for(&mut self.transport, timing.watch)?;
+        if !observed.bytes.is_empty() {
+            return Err(Error::State(format!(
+                "the logger kept talking after $PMTK180 ({} bytes within {} ms): {}{}; the \
+                 sentence was not honoured",
+                observed.bytes.len(),
+                timing.watch.as_millis(),
+                observed.evidence(),
+                if observed.complete_line {
+                    ""
+                } else {
+                    " (no complete line)"
+                }
             )));
         }
+
+        // The drain before the write is for the line's benefit, not a verdict:
+        // a quiet line here is not a reason to refuse, because the caller's
+        // probe is what decided the firmware was running.
         self.transport.set_baud(DEFAULT_BOOTROM_BAUD)?;
         Ok(())
     }
@@ -723,6 +861,72 @@ fn read_line<T: Transport>(transport: &mut T, deadline: Instant) -> Result<Optio
     }
 }
 
+/// What arrived inside a [`drain_for`] window.
+///
+/// The bytes are kept so a failure can quote the traffic that contradicted the
+/// command: "the stream is still live" and "something answered, but not with a
+/// switch" are different faults with different fixes.
+#[derive(Debug, Default, Clone)]
+struct Observed {
+    /// The first [`ENTRY_EVIDENCE_BYTES`] bytes that arrived.
+    bytes: Vec<u8>,
+    /// Whether any of them completed a line, i.e. a `\n` arrived.
+    complete_line: bool,
+}
+
+impl Observed {
+    /// The traffic as an error message can carry it.
+    ///
+    /// Printable ASCII is shown escaped so a real NMEA line reads as itself;
+    /// anything else is shown as hex, so a binary reply is not mangled into
+    /// replacement characters that hide what the chip said.
+    fn evidence(&self) -> String {
+        if self.bytes.is_empty() {
+            return String::from("nothing arrived");
+        }
+        let text = String::from_utf8_lossy(&self.bytes);
+        let printable = self
+            .bytes
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() || matches!(*byte, b' ' | b'\r' | b'\n'));
+        if printable {
+            format!("{text:?}")
+        } else {
+            self.bytes
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
+}
+
+/// Read whatever arrives within `window`, keeping the first bytes for evidence.
+///
+/// The deadline is **fixed**: it is not pushed forward when data arrives. A
+/// re-arming deadline cannot expire while a stream is flowing, and this is
+/// called precisely when NMEA may still be streaming (the previous Python
+/// client learned that the hard way; see its `_drain_for`).
+fn drain_for<T: Transport>(transport: &mut T, window: Duration) -> Result<Observed> {
+    let deadline = Instant::now() + window;
+    let mut observed = Observed::default();
+    let mut buf = [0u8; 64];
+    while Instant::now() < deadline {
+        let count = transport.read(&mut buf)?;
+        if count == 0 {
+            continue;
+        }
+        let chunk = buf.get(..count).unwrap_or_default();
+        observed.complete_line |= chunk.contains(&b'\n');
+        let room = ENTRY_EVIDENCE_BYTES.saturating_sub(observed.bytes.len());
+        let keep = room.min(chunk.len());
+        observed
+            .bytes
+            .extend_from_slice(chunk.get(..keep).unwrap_or_default());
+    }
+    Ok(observed)
+}
+
 /// Read lines until one starts with `prefix`, or the deadline passes.
 fn read_line_until<T: Transport>(
     transport: &mut T,
@@ -822,6 +1026,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_drain_keeps_the_first_bytes_and_notes_a_complete_line() {
+        // A regression this caught for real: the keep-count was the free room
+        // instead of `min(room, chunk.len())`, so every read chunk longer than
+        // the room was dropped and the evidence came back empty.
+        let mut stream =
+            crate::protocol::simulator::QuietTransport::streaming(b"$GPGGA,1,2,3*5A\r\n");
+        let observed = drain_for(&mut stream, Duration::from_millis(20)).expect("drain");
+        assert_eq!(
+            observed.bytes.len(),
+            ENTRY_EVIDENCE_BYTES,
+            "the evidence is capped at {ENTRY_EVIDENCE_BYTES} bytes"
+        );
+        assert!(observed.complete_line, "the `\\r\\n` must be noticed");
+        let evidence = observed.evidence();
+        assert!(evidence.starts_with("\"$GPGGA"), "got {evidence}");
+    }
+
+    #[test]
+    fn a_drain_of_a_quiet_line_reports_nothing_and_says_so() {
+        let mut quiet = crate::protocol::simulator::QuietTransport::quiet();
+        let observed = drain_for(&mut quiet, Duration::from_millis(10)).expect("drain");
+        assert!(observed.bytes.is_empty());
+        assert_eq!(observed.evidence(), "nothing arrived");
+    }
     #[test]
     fn the_measured_705_reply_parses_into_device_info() {
         let reply = format!(

@@ -275,7 +275,8 @@ pub(crate) fn open_pmtk(
     let transport = links.open(name, m241_core::protocol::pmtk::NMEA_BAUD)?;
     Ok(PmtkClient::new(transport)
         .with_reply_timeout(timings.reply)
-        .with_stream_window(timings.stream))
+        .with_stream_window(timings.stream)
+        .with_entry_timing(timings.entry))
 }
 
 #[cfg(test)]

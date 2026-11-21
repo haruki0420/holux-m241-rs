@@ -77,6 +77,10 @@ tri-state — streaming, silent, cannot tell — and asserting the lines is allo
 only on "definitively silent" (`AGENTS.md` §2.1, `StreamState` and `probe_stream`
 in `crates/m241-core/src/protocol/pmtk.rs`, and the warning on
 `set_control_lines` in `crates/m241-core/src/protocol/port.rs:44`).
+For a live stream it writes `$PMTK180*3B` with the same timing as Nekoba's
+flashing path: the previous Python client's `_send_pmtk180`, which is the route
+measured on this unit — clear, drain 350 ms, clear, write, flush, 200 ms quiet,
+500 ms of observation (`AGENTS.md` §4.6).
 
 **Verdict: deliberate divergence.** Both projects know the vendor utility asserts
 the lines — Nekoba's own notes trace `EscapeCommFunction(SETRTS/SETDTR)` through

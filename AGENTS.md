@@ -199,6 +199,20 @@ If the stream has already stopped the sentence is ignored, so the client checks
 for the stream first and reports a precise error instead of a bare sync timeout.
 Send at the NMEA baud, then switch to 115200.
 
+A live stream is necessary but not sufficient: the timing around the sentence
+is part of the sequence. `PmtkClient::enter_bootrom_after` clears the input,
+drains the line for 350 ms, clears again, writes `$PMTK180*3B`, flushes, stays
+silent for 200 ms and then listens for 500 ms. **Any** byte in that window means
+the sentence was not honoured, and the error quotes it so "still NMEA" can be
+told from "answered, but did not switch".
+
+Probing the stream twice is a bug, not a harmless extra check: the caller probes
+once and passes its `StreamState` to `enter_bootrom_after`, because a second
+probe consumes the line the hand-over depends on. The timing is the previous
+Python client's `_send_pmtk180` (`python/src/m241/protocol/brom.py:228-277`),
+the only `$PMTK180` route measured on this unit. ⚠️ 未検証 in the Rust client:
+the same sequence has not yet been re-run on hardware from `m241` itself.
+
 ### 4.7 The three sync probes must be back to back
 
 `0xA0` → `0x5F`, then `0x0A`→`0xF5`, `0x50`→`0xAF`, `0x05`→`0xFA` with no pause.
