@@ -894,6 +894,30 @@ fn the_map_track_is_five_points_wide_at_seventy_percent_opacity() {
     let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
     let mut flat = Vec::new();
     flatten_shapes(&shapes, &mut flat);
+
+    // The ten-colour cycle is only as real as the dots it paints. Reading
+    // `record_fill` in a unit test would pass with `map_panel` painting one
+    // colour over the whole track, so at least three palette hues have to appear
+    // among the filled point circles (the selection marker is ink, the rings are
+    // unfilled).
+    let dot_colours: std::collections::BTreeSet<[u8; 4]> = flat
+        .iter()
+        .filter_map(|shape| match shape {
+            egui::Shape::Circle(circle)
+                if circle.fill != egui::Color32::TRANSPARENT
+                    && (circle.radius - theme::metric::POINT_DOT).abs() < 0.01 =>
+            {
+                Some(circle.fill.to_array())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        dot_colours.len() >= 3,
+        "the plotted points use {} colour(s); the ten-colour cycle is not in the paint",
+        dot_colours.len()
+    );
+
     let track = flat
         .iter()
         .find_map(|shape| match shape {
@@ -964,4 +988,243 @@ fn settings_screen_renders_live_controls_and_applies_reduced_motion_to_rail() {
         _ => false,
     });
     assert!(has_zero_ms, "reduced motion 0 ms note did not render");
+}
+
+/// A minimal JPEG whose bytes carry no position, timestamped for the sample track.
+fn write_jpeg(dir: &std::path::Path, name: &str, utc: u32) -> std::path::PathBuf {
+    let mut bytes = vec![0xFF, 0xD8];
+    // JFIF APP0
+    bytes.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x10]);
+    bytes.extend_from_slice(b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0");
+    // EOI
+    bytes.extend_from_slice(&[0xFF, 0xD9]);
+    let path = dir.join(name);
+    std::fs::write(&path, &bytes).expect("write jpeg");
+    let file = std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .expect("open jpeg for mtime");
+    let times = std::fs::FileTimes::new()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::from(utc)));
+    file.set_times(times).expect("set jpeg mtime");
+    path
+}
+
+/// A scratch directory the test removes on drop.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(label: &str) -> Self {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "m241-gui-render-{}-{label}-{serial}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).expect("create scratch dir");
+        Self(path)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The first text shape whose label is exactly `label`, as its painted rect.
+fn text_rect(shapes: &[egui::Shape], label: &str) -> Option<egui::Rect> {
+    let mut flat = Vec::new();
+    flatten_shapes(shapes, &mut flat);
+    flat.iter().find_map(|shape| match shape {
+        egui::Shape::Text(text) if text.galley.job.text == label => {
+            Some(text.galley.rect.translate(text.pos.to_vec2()))
+        }
+        _ => None,
+    })
+}
+
+/// Draw one pass with the events given, at a fixed window size.
+fn draw_with(ctx: &Context, app: &mut App, events: Vec<egui::Event>, width: f32, height: f32) {
+    let input = RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(width, height),
+        )),
+        events,
+        ..RawInput::default()
+    };
+    let output = ctx.run_ui(input, |ui| app.draw(ui));
+    output.drop_without_applying_deltas();
+}
+
+/// Click the centre of the first shape labelled `label`, the way a person does.
+fn click_label(ctx: &Context, app: &mut App, label: &str) {
+    let shapes = render_shapes_at(ctx, app, 1280.0, 900.0);
+    let rect =
+        text_rect(&shapes, label).unwrap_or_else(|| panic!("the label {label:?} did not render"));
+    let at = rect.center();
+    let press = egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let release = egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    draw_with(
+        ctx,
+        app,
+        vec![egui::Event::PointerMoved(at), press],
+        1280.0,
+        900.0,
+    );
+    draw_with(ctx, app, vec![release], 1280.0, 900.0);
+    // One more pass so the immediate-mode screen settles on the new state.
+    draw_with(ctx, app, Vec::new(), 1280.0, 900.0);
+}
+
+#[test]
+fn pressing_geotag_writes_nothing_until_the_write_button_is_pressed() {
+    // M2 from the Stage 3 review: adding `apply_geotags(GeotagConfirmation(()))`
+    // right after 「写真に位置」 opened the prompt wrote the files with no
+    // confirmation, and the old tests — which called the screen's methods
+    // directly — still passed. This test only uses the UI: a real click on
+    // 「写真に位置」 must open the prompt and leave the bytes alone; only a click
+    // on 「書き込む」 may change them. The token type is not nameable from outside
+    // its module, so this is the route a person actually takes.
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Log);
+
+    let dir = Scratch::new("geotag-ui");
+    let photo_a = write_jpeg(&dir.0, "a.jpg", 1_763_000_000);
+    let photo_b = write_jpeg(&dir.0, "b.jpg", 1_763_000_900);
+    let orig_a = std::fs::read(&photo_a).expect("orig a");
+    let orig_b = std::fs::read(&photo_b).expect("orig b");
+
+    // Load the sample track and plan the photos through the screen's own loader.
+    app.log_mut().show_sample();
+    assert_eq!(
+        app.log_mut().load_photos_from_path(&dir.0).expect("plan"),
+        2
+    );
+    assert!(!app.log_mut().geotag_confirmation_open());
+
+    // 「写真に位置」 is in the pinned footer, so a click on it needs no scrolling.
+    click_label(&ctx, &mut app, "写真に位置 (2 枚)");
+    assert!(
+        app.log_mut().geotag_confirmation_open(),
+        "clicking 写真に位置 did not open the confirmation prompt"
+    );
+    assert_eq!(
+        std::fs::read(&photo_a).expect("after asking a"),
+        orig_a,
+        "clicking 写真に位置 wrote to a.jpg before the prompt was answered"
+    );
+    assert_eq!(
+        std::fs::read(&photo_b).expect("after asking b"),
+        orig_b,
+        "clicking 写真に位置 wrote to b.jpg before the prompt was answered"
+    );
+
+    // 「キャンセル」 answers the prompt without writing.
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 900.0);
+    assert!(
+        text_rect(&shapes, "書き込む").is_some(),
+        "the prompt did not offer 書き込む"
+    );
+    click_label(&ctx, &mut app, "キャンセル");
+    assert!(
+        !app.log_mut().geotag_confirmation_open(),
+        "キャンセル did not close the prompt"
+    );
+    assert_eq!(std::fs::read(&photo_a).expect("after cancel a"), orig_a);
+    assert_eq!(std::fs::read(&photo_b).expect("after cancel b"), orig_b);
+
+    // Ask again and answer with 「書き込む」: now the bytes change.
+    click_label(&ctx, &mut app, "写真に位置 (2 枚)");
+    assert!(app.log_mut().geotag_confirmation_open());
+    click_label(&ctx, &mut app, "書き込む");
+    assert!(
+        !app.log_mut().geotag_confirmation_open(),
+        "the prompt stayed open after 書き込む"
+    );
+    assert_ne!(
+        std::fs::read(&photo_a).expect("after write a"),
+        orig_a,
+        "書き込む did not write a position into a.jpg"
+    );
+    assert_ne!(
+        std::fs::read(&photo_b).expect("after write b"),
+        orig_b,
+        "書き込む did not write a position into b.jpg"
+    );
+}
+
+#[test]
+fn the_map_marks_the_start_and_the_end_of_the_track_in_ink() {
+    // ezTour §5 draws a `line_start` and a `line_end` icon; DESIGN.md §5's map
+    // has no icon set, so this screen separates them by ring radius and keeps
+    // both in ink. Nothing tested that until the Stage 3 review (N6): deleting
+    // the rings, or painting them amber, left the other tests green.
+    //
+    // The sample track selects point 0, which suppresses the start ring on that
+    // frame; `select_point(len - 1)` moves the suppression to the end, and the
+    // start ring is then visible. Both frames are measured so neither ring can
+    // be missing.
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Log);
+    app.log_mut().show_sample();
+
+    let ring_radii = |app: &mut App| -> Vec<(f32, egui::Color32)> {
+        let shapes = render_shapes_at(&ctx, app, 1280.0, 2400.0);
+        let mut flat = Vec::new();
+        flatten_shapes(&shapes, &mut flat);
+        flat.iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Circle(circle)
+                    if circle.fill == egui::Color32::TRANSPARENT && circle.stroke.width > 0.0 =>
+                {
+                    Some((circle.radius, circle.stroke.color))
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
+    let dot = theme::metric::POINT_DOT;
+    let start_radius = dot * 1.5;
+    let end_radius = dot * 2.5;
+    let find = |rings: &[(f32, egui::Color32)], radius: f32| {
+        rings
+            .iter()
+            .find(|(r, _)| (r - radius).abs() < 0.01)
+            .map(|(_, colour)| *colour)
+    };
+
+    // The last point selected: the end ring is suppressed, the start is drawn.
+    let last = app.log_mut().track().points.len() - 1;
+    app.log_mut().select_point(Some(last));
+    let rings = ring_radii(&mut app);
+    assert_eq!(
+        find(&rings, start_radius),
+        Some(theme::INK),
+        "the start ring at {start_radius}pt is not drawn in ink; rings were {rings:?}"
+    );
+
+    // The start selected instead: the start is suppressed, the end is drawn.
+    app.log_mut().select_point(Some(0));
+    let rings = ring_radii(&mut app);
+    assert_eq!(
+        find(&rings, end_radius),
+        Some(theme::INK),
+        "the end ring at {end_radius}pt is not drawn in ink; rings were {rings:?}"
+    );
 }

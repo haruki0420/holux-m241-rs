@@ -55,6 +55,9 @@ pub fn tab_left_at(screen: Screen, progress: f32) -> f32 {
 /// edge only, because the right edge stays pinned to the content.
 pub const ACTIVE_STEP_OUT: f32 = space::XS;
 
+/// The rail's transition when motion is allowed (DESIGN.md §3: 150 ms).
+pub const TRANSITION_MOTION_SECS: f32 = 0.15;
+
 /// Draw the rail. Returns `Some(screen)` only when the selection changed this
 /// frame, so the caller can cancel in-flight work for the screen it left.
 #[must_use]
@@ -65,6 +68,48 @@ pub fn rail(ui: &mut Ui, current: Screen) -> Option<Screen> {
         crate::screens::settings::AppSettings::DEFAULT_RAIL_TRANSITION_SECS,
     )
 }
+
+/// The transition duration the shell hands to [`rail_with_transition`].
+///
+/// The shell could inline `app.settings().rail_transition_secs()` into its
+/// `rail_with_transition` call, and then the only thing connecting the setting
+/// to the rail is the argument at that one call site — which is what the Stage 3
+/// review found untested (hard-coding 0.15 there left every test green; N5).
+/// Naming the derivation here gives the shell and its test the same function.
+#[doc(hidden)]
+#[must_use]
+pub fn rail_transition_secs_for(app: &crate::App) -> f32 {
+    app.settings().rail_transition_secs()
+}
+
+/// The last `transition_secs` [`rail_with_transition`] was actually called with,
+/// for the calling thread.
+///
+/// Test-side recording of the real argument: a test cannot see the shell's call
+/// stack, so the rail writes down what it was handed. It answers "what did the
+/// shell pass", which `rail_transition_secs_for` alone cannot — a hard-coded
+/// literal at the call site leaves that function correct and unused. Keyed by
+/// thread id because the render tests run in parallel and call the rail too.
+#[cfg(test)]
+pub(crate) fn last_transition_secs() -> Option<f32> {
+    let me = format!("{:?}", std::thread::current().id());
+    LAST_TRANSITION_SECS
+        .lock()
+        .ok()
+        .and_then(|records| records.get(&me).copied())
+}
+
+#[cfg(test)]
+pub(crate) fn record_transition_secs(secs: f32) {
+    if let Ok(mut records) = LAST_TRANSITION_SECS.lock() {
+        let me = format!("{:?}", std::thread::current().id());
+        let _previous = records.insert(me, secs);
+    }
+}
+
+#[cfg(test)]
+static LAST_TRANSITION_SECS: std::sync::Mutex<std::collections::BTreeMap<String, f32>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// The horizontal movement a tab makes when its selection changes.
 ///
@@ -88,11 +133,23 @@ pub fn active_step_out(progress: f32) -> f32 {
 /// offset is applied at once instead of being animated.
 #[must_use]
 pub fn rail_with_transition(ui: &mut Ui, current: Screen, transition_secs: f32) -> Option<Screen> {
+    #[cfg(test)]
+    record_transition_secs(transition_secs);
     let mut selected = None;
     ui.add_space(space::XL);
     ui.vertical(|ui| {
         for screen in Screen::ALL {
-            if tab(ui, screen, screen == current, transition_secs).clicked() && screen != current {
+            // The caller's duration is used here, once; `tab` only paints at the
+            // progress that animation reached.
+            let animation_id = ui.scope_id().with(("m241-rail-active", screen.index()));
+            let progress = ui.ctx().animate_bool_with_time(
+                animation_id,
+                screen == current,
+                // egui rejects a negative animation time; the caller passing a
+                // negative number of seconds means "none", not "go backwards".
+                transition_secs.max(0.0),
+            );
+            if tab(ui, screen, progress).clicked() && screen != current {
                 selected = Some(screen);
             }
         }
@@ -100,19 +157,17 @@ pub fn rail_with_transition(ui: &mut Ui, current: Screen, transition_secs: f32) 
     selected
 }
 
-fn tab(ui: &mut Ui, screen: Screen, active: bool, transition_secs: f32) -> Response {
+/// One tab, painted at the selection progress the caller's animation reached.
+///
+/// Split from [`rail_with_transition`] so the drawing can be measured in a test
+/// while keeping the animation in one place: the progress is an argument, and
+/// nothing here can re-create the animation with a different duration.
+fn tab(ui: &mut Ui, screen: Screen, progress: f32) -> Response {
     // The row claims the rail's full width so every tab ends on the same right
     // edge; the tab is painted and hit-tested from its stepped left edge to that
     // right edge inside the row.
     let (row, _row) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), TAB_HEIGHT), Sense::hover());
-    let progress = ui.ctx().animate_bool_with_time(
-        ui.scope_id().with(("m241-rail-active", screen.index())),
-        active,
-        // egui rejects a negative animation time; the caller passing a negative
-        // number of seconds means "none", not "go backwards".
-        transition_secs.max(0.0),
-    );
     let rect = Rect::from_min_max(
         pos2(row.left() + tab_left_at(screen, progress), row.top()),
         row.right_bottom(),
@@ -123,7 +178,7 @@ fn tab(ui: &mut Ui, screen: Screen, active: bool, transition_secs: f32) -> Respo
         Sense::click(),
     );
 
-    let fill = if active && progress >= 0.99 {
+    let fill = if progress >= 0.99 {
         PANEL
     } else if progress > 0.0 {
         PANEL.gamma_multiply(progress)
@@ -139,7 +194,7 @@ fn tab(ui: &mut Ui, screen: Screen, active: bool, transition_secs: f32) -> Respo
         egui::Align2::LEFT_TOP,
         screen.label(),
         egui::FontId::proportional(size::UI),
-        if active { INK } else { MUTE },
+        if progress >= 0.99 { INK } else { MUTE },
     );
 
     // Focus ring: 2pt ink, never amber. Amber means danger, not "here".
@@ -157,6 +212,79 @@ fn tab(ui: &mut Ui, screen: Screen, active: bool, transition_secs: f32) -> Respo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run eight rail passes, moving the selection from `from` to `to` after two
+    /// frames, and return the x where `label`'s tab was painted in the last pass.
+    ///
+    /// Measured from the primitives, not from `tab_left_at`: the point of the
+    /// test is the duration the *caller* passed, so re-reading the pure function
+    /// would prove nothing about the wiring.
+    fn measure_labelled_tab(label: &str, seconds: f32, from: Screen, to: Option<Screen>) -> f32 {
+        let ctx = egui::Context::default();
+        let mut time = 0.0_f64;
+        let mut left = f32::NAN;
+        for pass in 0..8 {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(WIDTH, 400.0),
+                )),
+                time: Some(time),
+                // A real frame clock: egui only advances an animation when the
+                // time between frames is a positive fraction of a second, and
+                // moving back onto the same target frame by frame keeps the
+                // animation running the way a selection change does.
+                predicted_dt: 1.0 / 60.0,
+                ..egui::RawInput::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                let current = if pass < 2 { from } else { to.unwrap_or(from) };
+                let _selected = rail_with_transition(ui, current, seconds);
+            });
+            if pass == 7 {
+                for clipped in &output.shapes {
+                    if let egui::Shape::Text(text) = &clipped.shape
+                        && text.galley.job.text == label
+                    {
+                        left = text.pos.x;
+                    }
+                }
+            }
+            output.drop_without_applying_deltas();
+            time += 1.0 / 60.0;
+        }
+        left
+    }
+
+    #[test]
+    fn the_tab_slides_at_the_transition_time_the_caller_passed() {
+        // DESIGN.md §3: 150 ms by default, and reduced motion drops the duration
+        // to 0 without dropping the 4pt offset. Frames are driven at the real
+        // rate and 「ログ」 is measured where it was painted after the selection
+        // moved onto it. Seven frames is ~117 ms: less than 150 ms, so a tab
+        // animating for the passed duration must still be between the two ends;
+        // at 0 s it is home at once.
+        let moving = measure_labelled_tab(
+            Screen::Log.label(),
+            0.15,
+            Screen::Connect,
+            Some(Screen::Log),
+        );
+        let at_once =
+            measure_labelled_tab(Screen::Log.label(), 0.0, Screen::Connect, Some(Screen::Log));
+        // Text is drawn at the tab's left edge plus `space::L`.
+        let home = tab_left(Screen::Log) - ACTIVE_STEP_OUT + space::L;
+        let seated = tab_left(Screen::Log) + space::L;
+        assert!(
+            (at_once - home).abs() < 0.5,
+            "with a 0 s transition the selected tab painted at {at_once}, expected {home}"
+        );
+        assert!(
+            (moving - home).abs() > 0.05 && (moving - seated).abs() > 0.05,
+            "a 0.15 s transition finished within seven frames: it painted at {moving}, \
+             home is {home} and the staircase is {seated}"
+        );
+    }
 
     #[test]
     fn the_staircase_stays_inside_the_rail() {

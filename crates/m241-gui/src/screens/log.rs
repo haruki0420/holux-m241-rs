@@ -14,6 +14,10 @@
 //! disk can only be written back into the photos and the export file, never the
 //! logger.
 
+// The write token lives one level down, where this module cannot construct it:
+// see `geotag_gate` for why the privacy below `log.rs` is what closes M2.
+mod geotag_gate;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -26,6 +30,8 @@ use m241_core::{ExportFormat, LogSummary, Track, TrackPoint};
 use crate::screens::common::{self, Status};
 use crate::screens::settings::AppSettings;
 use crate::theme::{self, metric, size, space};
+
+use self::geotag_gate::GeotagConfirmation;
 
 /// Rows the point list shows before it scrolls.
 ///
@@ -79,14 +85,6 @@ pub struct PhotoEntry {
     /// without re-linking would make it point at a different record.
     pub point_index: Option<usize>,
 }
-
-/// Proof that the user answered the geotag confirmation prompt.
-///
-/// Only [`LogScreen::confirm_geotag_write`] can produce one, and it hands it
-/// straight to [`LogScreen::apply_geotags`]: there is no constructor, so a second
-/// call site cannot start writing EXIF tags without going through the prompt.
-#[derive(Debug, Clone, Copy)]
-pub struct GeotagConfirmation(());
 
 /// The photos a confirmed geotag write will touch, as file names in plan order.
 ///
@@ -566,13 +564,22 @@ impl LogScreen {
     /// Takes the [`GeotagConfirmation`] the prompt produced, so this cannot be
     /// reached without it: a second caller (a future 「保存して次へ」, a bulk path,
     /// a test) has to ask [`Self::confirm_geotag_write`], which is the button the
-    /// person pressed. On success the confirmation is closed and the plans are
-    /// re-planned, because those photos now carry a position.
+    /// person pressed. The type lives in the private child module
+    /// [`geotag_gate`], so this module cannot mint one either — the argument is a
+    /// compile-time proof, not a convention. On success the confirmation is
+    /// closed and the plans are re-planned, because those photos now carry a
+    /// position.
+    ///
+    /// **Private on purpose.** The only caller is the 「書き込む」 button in
+    /// [`Self::export_bar`]. A public writer would hand every future call site a
+    /// function it can only call from inside this module — the compiler would say
+    /// "unreachable type", and the temptation is to make the token public again.
+    /// A screen-private writer with a private token is the pair that holds.
     ///
     /// # Errors
     ///
     /// Returns a Japanese error string if no matched photos exist or writing EXIF fails.
-    pub fn apply_geotags(&mut self, _confirmation: GeotagConfirmation) -> Result<usize, String> {
+    fn apply_geotags(&mut self, _confirmation: GeotagConfirmation) -> Result<usize, String> {
         let plans: Vec<GeotagPlan> = self
             .photo_entries
             .iter()
@@ -626,13 +633,14 @@ impl LogScreen {
 
     /// Answer the open confirmation prompt with 「書き込む」.
     ///
-    /// The one producer of [`GeotagConfirmation`]. Returns `None` when no prompt
-    /// is open, so a click that arrives after the prompt closed writes nothing.
+    /// The one producer of [`GeotagConfirmation`], and the caller is the one
+    /// 「書き込む」 button. Returns `None` when no prompt is open, so a click that
+    /// arrives after the prompt closed writes nothing.
     fn confirm_geotag_write(&mut self) -> Option<GeotagConfirmation> {
         if !self.confirm_geotag {
             return None;
         }
-        Some(GeotagConfirmation(()))
+        Some(GeotagConfirmation::answered_confirmation())
     }
 
     /// Draw the screen body using default settings.
@@ -1095,9 +1103,14 @@ impl LogScreen {
                 }
 
                 // 始点 / 終点 (DESIGN.md §5 through ezTour §5): the start is a small
-                // ring, the end a large one, both ink. Sizes rather than hues: the
-                // palette holds one data colour and one ink, and the selected
-                // marker already owns "what you are looking at".
+                // ring, the end a large one, and both are ink. Size and ink are a
+                // deliberate reading of ezTour's `line_start` / `line_end` icons:
+                // the ten-colour palette from `track_palette_colour` is reserved
+                // for the records themselves, so a ring in a palette hue would
+                // read as an eleventh record, and the selected marker (3×, ink,
+                // filled) already says "what you are looking at". The ring radius
+                // is what separates start from end, so keep both off the waypoint
+                // ring's 2× radius (`a_waypoint_is_drawn_as_a_ring`).
                 for (index, radius) in [
                     (first_index, metric::POINT_DOT * 1.5),
                     (last_index, metric::POINT_DOT * 2.5),
@@ -2540,6 +2553,92 @@ mod tests {
     }
 
     #[test]
+    fn a_photo_at_a_half_positioned_point_is_not_a_geotag_target() {
+        // The intermediate state the invariant exists for: a record with a
+        // latitude but no longitude (or the other way round) is not a position.
+        // `has_position()` is `latitude.is_some() && longitude.is_some()`, and
+        // matching on one of the two would pair a photo with a point the map
+        // cannot draw and a frame cannot write. Both halves are exercised,
+        // because a mutation that drops only one conjunct is the likely one.
+        for missing_longitude in [false, true] {
+            let dir = ScratchDir::new("photos-half-position");
+            let _jpeg = minimal_jpeg_with_mtime(&dir.0, "half.jpg", 1_763_000_000);
+            let mut track = sample_track();
+            // Every record loses one coordinate; the half that remains still
+            // looks like a fix to a single-field check.
+            for point in &mut track.points {
+                if missing_longitude {
+                    point.longitude = None;
+                } else {
+                    point.latitude = None;
+                }
+            }
+            let mut screen = LogScreen::default();
+            screen.set_track(track, ParseReport::default());
+            assert_eq!(
+                screen.load_photos_from_path(&dir.0).expect("plan"),
+                0,
+                "missing longitude = {missing_longitude}: a photo matched a point \
+                 that has only one coordinate"
+            );
+            assert!(screen.geotag_targets().is_empty());
+            for entry in screen.photo_entries() {
+                assert_eq!(
+                    entry.point_index, None,
+                    "missing longitude = {missing_longitude}: the photo was paired \
+                     with an unplottable point"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_matched_index_is_always_a_point_with_both_coordinates() {
+        // `find_matching_point_index` decides which index the map draws a photo
+        // at, so it has to apply the same rule `geotag` applies: a record with one
+        // coordinate is not a position. The photo-level tests cannot see this —
+        // `geotag::plan` already refuses a half-positioned record, so the photo
+        // is skipped before the index is asked for; the plan is therefore built
+        // here, from point 0, and the track is damaged after it exists the way a
+        // truncated record would be.
+        let mut track = sample_track();
+        let Some(point) = track.points.first().copied() else {
+            panic!("the sample has points");
+        };
+        let plan = GeotagPlan {
+            photo: PathBuf::from("a.jpg"),
+            capture_time: None,
+            point: Some(point),
+            gap_seconds: Some(0),
+            skipped: None,
+        };
+        assert_eq!(
+            find_matching_point_index(&track, &plan),
+            Some(0),
+            "the nearest positioned record is point 0 to begin with"
+        );
+        if let Some(point) = track.points.first_mut() {
+            point.longitude = None;
+        }
+        assert_eq!(
+            find_matching_point_index(&track, &plan),
+            Some(1),
+            "a half-positioned record was returned as a photo's point: the map \
+             cannot draw it and a frame cannot write it"
+        );
+        // The other half of the same rule, for a mutation that keeps only one.
+        if let Some(point) = track.points.first_mut() {
+            point.latitude = None;
+            point.longitude = Some(139.767_125);
+        }
+        assert_eq!(
+            find_matching_point_index(&track, &plan),
+            Some(1),
+            "a record with only a longitude was returned as a photo's point"
+        );
+    }
+
+    #[test]
     fn a_new_screen_writes_nothing_without_a_confirmation() {
         // The token is the only way into `apply_geotags`; a screen that never
         // opened the prompt has none, which is the state a second call site must
@@ -2606,6 +2705,122 @@ mod tests {
         // A further tick changes nothing and asks for no repaint.
         assert!(!screen.advance_playback(start + interval * 3, interval));
         assert_eq!(screen.selected_index(), Some(last));
+    }
+
+    #[test]
+    fn a_finished_playback_asks_for_no_further_frame() {
+        // M3 from the Stage 3 review, whose symptom was "the repaint never
+        // stops": `advance_playback`'s return value is the contract (`true` means
+        // "still running, ask for another frame"), so an idle screen must answer
+        // `false` on every tick once the last point is reached — not just stop
+        // the marker. (Deleting the `self.playing = false` at the end changes no
+        // state, because `step_next` already clears it; this pins the answer that
+        // actually decides whether egui is asked to draw again.)
+        let mut screen = sample();
+        let last = screen.track().points.len() - 1;
+        screen.toggle_play();
+        assert!(screen.is_playing());
+        screen.select_point(Some(last - 1));
+        let start = Instant::now();
+        screen.last_step_at = Some(start);
+        let interval = PLAY_STEP;
+
+        assert!(screen.advance_playback(start + interval, interval));
+        assert_eq!(screen.selected_index(), Some(last));
+        // The next due tick is the one where "nothing to advance" happens.
+        assert!(!screen.advance_playback(start + interval * 2, interval));
+        // …and it must stay false: a run that kept the flag would answer `true`
+        // here, which is the bug.
+        for tick in 3..6 {
+            assert!(
+                !screen.advance_playback(start + interval * tick, interval),
+                "tick {tick} after the end still asked for a repaint"
+            );
+        }
+        assert!(!screen.is_playing());
+    }
+
+    #[test]
+    fn a_finished_playback_asks_egui_for_no_further_frame() {
+        // The same rule through the draw pass rather than through the return
+        // value: egui's observer sees every `request_repaint_after` the context
+        // makes, including the one `advance_playback_if_due` asks for while
+        // playback runs. Only the two playback intervals are counted, so egui's
+        // own scheduling does not answer the question.
+        use std::sync::{Arc, Mutex};
+
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let mut screen = sample();
+        let last = screen.track().points.len() - 1;
+        screen.select_point(Some(0));
+        let frames = Arc::new(Mutex::new(Vec::<Duration>::new()));
+        let seen = Arc::clone(&frames);
+        ctx.set_repaint_observer(move |info| {
+            // Playback is the only thing in this crate that asks for a delayed
+            // frame, and its two intervals are the two constants below. egui's
+            // own requests are for 0 ms (a pass) or its tooltip delays, so a
+            // count restricted to these two durations is a count of ours.
+            let ours = info.delay == PLAY_STEP || info.delay == PLAY_STEP_REDUCED;
+            if ours {
+                seen.lock().expect("repaint log").push(info.delay);
+            }
+        });
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(1280.0, 2400.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let draw = |screen: &mut LogScreen| {
+            let output = ctx.run_ui(input.clone(), |ui| screen.ui(ui));
+            output.drop_without_applying_deltas();
+        };
+
+        // Idle: no playback, no request.
+        draw(&mut screen);
+        assert!(
+            frames.lock().expect("repaint log").is_empty(),
+            "an idle screen asked for a playback frame"
+        );
+
+        // Playing somewhere in the middle: a frame is asked for.
+        screen.select_point(Some(last - 1));
+        screen.toggle_play();
+        draw(&mut screen);
+        assert!(
+            !frames.lock().expect("repaint log").is_empty(),
+            "a running playback did not ask for its next frame"
+        );
+
+        // Park it on the last point with nothing to advance. The interval decides
+        // when the next tick is due, so wait for it rather than assuming a fast
+        // frame: from the first due frame on, playback must be over and no
+        // further frame may be asked for.
+        screen.select_point(Some(last));
+        std::thread::sleep(PLAY_STEP_REDUCED + Duration::from_millis(50));
+        frames.lock().expect("repaint log").clear();
+        let mut finished_at: Option<usize> = None;
+        for frame in 0..6 {
+            draw(&mut screen);
+            let asked = frames.lock().expect("repaint log").len();
+            if !screen.is_playing() {
+                if finished_at.is_none() {
+                    finished_at = Some(frame);
+                }
+                assert!(
+                    asked == 0,
+                    "frame {frame} drew a finished playback and still asked egui to \
+                     repaint ({asked} requests); it would repaint forever"
+                );
+            }
+        }
+        assert!(
+            finished_at.is_some(),
+            "playback never stopped after reaching the last point"
+        );
+        assert!(!screen.is_playing());
     }
 
     #[test]

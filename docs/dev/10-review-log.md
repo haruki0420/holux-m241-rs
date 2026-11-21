@@ -353,11 +353,15 @@ main は `e58c5d3` → `5d6ad74` → `19e07c6` と進んだが、いずれも本
   M7 速度パネル常時メートル、M8 rail transition 無視、M9 rail の 4px を 0）。仕様違反は
   E5（軌跡が単色・幅 2）、E6（始点／終点マーカー無し）、E4（`fit_all` 後の追従が点を選ばない）。
 - **Stage 2 修正（別エージェント）**: 6 ファイル＋設計記録 1 ファイル。
+- **Stage 3 独立検証（三人目、修正者の説明・コミット本文は未読）**: **不合格**。Must 1 件（N1、下記の v2 節）。テスト数は 82 + 30 + 6 で、Stage 3 の独立変異 15 件（M7a を除く）のうち **12 件検出・3 件生存**（M2・M3・M13/M14 群）。**Stage 2 追記にあった「変異 8 件中 7 件検出」はこの結果と食い違うため撤回する**（M3 は「M4a は生存、M4c は検出」と書かれていたが、独立変異では末尾の `playing = false` 削除 M3 が生存し、M13（`has_position()` を落とす）・M14（`latitude.is_some()` に変える）も生存した。検出できたのは M4b/M4c 相当のみ）。
+  - Must: `GeotagConfirmation(())` が `log.rs` から自由に構築でき、「写真に位置」クリック直後に `apply_geotags(GeotagConfirmation(()))` を足す M2 が全テスト通過（テストが UI 経路を通していなかった）。
+  - Should: M3（末尾の repaint 要求が止まらない）、M13/M14（片方だけ座標を持つ点の不変条件が未テスト）、M11b（`app.rs` の rail 配線が未検証）、E6 始点・終点マーカーが無テスト・コメントが 10 色パレットと矛盾、`01-design-decisions.ja.md` の「10 色はトラックごと」の断定が仕様書より強い。
+
 
 | # | 指摘 | 解消 | 確認箇所・検出テスト |
 |---|---|---|---|
 | 1 | `probe_client` の送信内容が未固定（M2） | 解消 | `probe_client` を crate 内に落とし、`probe_client_sends_only_read_requests` で `$PMTK605` / `$PMTK182,2,8` / `$PMTK182,2,1` の 3 通だけを assert。変異 M2 で FAIL |
-| 2 | ジオタグの確認ゲートが未固定（M3、可読性 Must 1） | 解消 | `GeotagConfirmation` トークン（`confirm_geotag_write` だけが発行）を `apply_geotags` が要求。`asking_to_geotag_changes_no_bytes_until_the_write_is_confirmed` / `confirming_needs_an_open_prompt` を追加。変異 M3 で FAIL |
+| 2 | ジオタグの確認ゲートが未固定（M3、可読性 Must 1） | 解消 | `GeotagConfirmation` トークン（`confirm_geotag_write` だけが発行）を `apply_geotags` が要求。`asking_to_geotag_changes_no_bytes_until_the_write_is_confirmed` / `confirming_needs_an_open_prompt` を追加。~~変異 M3 で FAIL~~ **Stage 3 の訂正: トークンは `log.rs` 内から構築でき、M2（「写真に位置」直後に書き込む）は生存した。v2 節でトークンを子モジュールへ移し、UI 経路のテストで閉じた** |
 | 3 | 再生の自動前進が未検証（M4） | 解消 | `advance_playback(now, interval)` に時計を引数化し、`playback_only_steps_once_the_interval_has_passed` / `playback_stops_at_the_last_point_and_does_not_run_on` / `reduced_motion_slows_playback_to_the_longer_interval` を追加。M4b・M4c で FAIL |
 | 4 | スライダーの確定が未検証（M6） | 解消 | `egui::Slider` を自前のトラックに置き換え、押下→ドラッグ→解放を実イベントで流す `dragging_the_playback_slider_moves_the_selected_point` を追加。変異 M6 で FAIL |
 | 5 | 軌跡の 10 色・幅 5・不透明度 0.7（E5） | 部分解消＋記録 | 線は幅 5・不透明度 0.7（`theme::metric::track`）、10 色は点の塗りに移した（`theme::TRACK_PALETTE`）。理由は `01-design-decisions.ja.md` §8。`the_track_uses_the_specified_width_and_opacity` / `the_map_track_is_five_points_wide_at_seventy_percent_opacity`。変異 M5 で FAIL |
@@ -373,5 +377,26 @@ main は `e58c5d3` → `5d6ad74` → `19e07c6` と進んだが、いずれも本
   - 上書き拒否の TOCTOU（Should 3）、単位切替の不揃い（2）、`pub` 範囲の残り（1）: 実害の判断が必要で、範囲外の `m241-core` か設計判断に属する。
   - 可読性 Should 11（エラー経路の重複）、27（bounds の 3 重走査）: 挙動を変えない整理で、今回の検証対象外。
 - **ゲート・テスト**: `./tools/check.sh` 6/6 PASS。`crates/m241-gui` テスト **112 件**（`ec06f03` の 93 → 112、+19、削除・弱体化 0 件）。
-- **変異テスト**: 8 変異を実行し 7 検出。M4a（末尾で `playing = false` を消し `last_step_at` だけ更新）は生存 — 次のティックで再度 `step_next` が失敗して停止するため、状態は 1 フレーム遅れて同じ結果になる。害がない変異として記録する。M4c（`self.playing` を停止前に返す）は検出。
+- **変異テスト**: Stage 2 の「8 変異を実行し 7 検出／M4a のみ生存」は、Stage 3 の独立変異（15 件、M7a を除く）で **12 検出・3 生存**（M2 確認なしジオタグ、M3 末尾 repaint、M13・M14 `has_position()`）と判明したため**撤回**する。M4a の生存という判断はそのまま（末尾で `playing = false` を消しても選択位置は止まる）。生存 3 件は v2 節で解消。
 - **未検証**: `probe_serial_port` の実機動作、追従の実描画、GUI 経由の実 JPEG 書き込みは 05-verification.md に記録が無く、**未検証**のまま（合格に含めない）。
+
+### Stage 2 v2（別エージェント、`fix/gui-eztour-live-v2`、main `8170c4e` を先にマージ）
+
+変更は `crates/m241-gui/` と `docs/dev/` のみ（`m241-core` / `m241-cli` / `m241-flash` は未変更）。実機ポートは開いていない。
+
+| # | Stage 3 の指摘 | 対応 | 確認箇所・検出テスト・変異 |
+|---|---|---|---|
+| N1（Must） | `GeotagConfirmation` を `log.rs` 内から構築でき、M2（「写真に位置」直後に書き込み）が全テスト通過 | **解消** | トークンを子モジュール `crates/m241-gui/src/screens/log/geotag_gate.rs` へ移し、フィールドを完全私有（`pub(super)` にすると親の `log.rs` に再び開くため不可）に。`apply_geotags` も画面私有に下げた。唯一の入口は `confirm_geotag_write`（「書き込む」ハンドラのみが呼ぶ）。UI 経路テスト `pressing_geotag_writes_nothing_until_the_write_button_is_pressed`（実クリック → プロンプト表示 → バイト不変 → キャンセル → 再度押下 → 「書き込む」で初めて変化）を追加。M2 の主形（`GeotagConfirmation(())`）は**コンパイル不能**、構築子を使う形は UI テストが **FAIL** |
+| N2 | 末尾で `playing = false` を消しても検出されない | **解消（指摘の一部は事実と異なる）** | 末尾の代入自体は `step_next` が既に `playing` を落とすため**もともと冗長**で、削除しても状態は変わらない。実際に有害なのは「`advance_playback_if_due` が終了後も repaint を要求し続ける」形なので、`a_finished_playback_asks_for_no_further_frame`（戻り値）と `a_finished_playback_asks_egui_for_no_further_frame`（`set_repaint_observer` で実フレームの 250/500 ms 要求を数える）を追加。`if true` 変異（終了後も要求する）で **FAIL** |
+| N3 | 片方だけ座標を持つ点のテストが無い | **解消** | `the_matched_index_is_always_a_point_with_both_coordinates`（経時点が半分だけ位置を持つ状態を作り、添字が次の実測点へ移ることを要求）と `a_photo_at_a_half_positioned_point_is_not_a_geotag_target`。M13（`has_position()` を落とす）・M14（`latitude.is_some()`）・M14b（`longitude.is_some()`）で **FAIL**。なお写真単位のテストだけでは検出できない（`m241-core` の `geotag::plan` が先に半端な点を拒否するため）ことが分かり、不変条件が効く関数を直接試す形にした |
+| N4 | スライダーのキーボード変更・accesskit 値が後退 | **見送り** | 理由は下記 |
+| N5 | rail の reduced motion 配線が未検証（M11b） | **解消** | `App::draw` が `rail::rail_transition_secs_for` で求めた値を渡し、`rail_with_transition` が受け取った値を記録する（`#[cfg(test)]`、スレッド単位）。`the_shell_hands_the_reduced_motion_setting_to_the_rail` が実シェルを描いて **0 s / 0.15 s の引数そのもの**を assert。`app.rs` を 0.15 直書きにした M11b で **FAIL**。アニメーション自体も `the_tab_slides_at_the_transition_time_the_caller_passed` が描画位置で測り、M11a・M11c（引数を無視）で **FAIL** |
+| N6 | 始点・終点マーカーが無テスト・コメントが 10 色と矛盾 | **解消（削除せず固定）** | コメントをパレットの実態に合わせ、`the_map_marks_the_start_and_the_end_of_the_track_in_ink`（1.5 倍・2.5 倍のリングが ink で描かれる）を追加。削除 → **FAIL**、amber 化 → **FAIL**（design ゲートも検出）。設計判断は `01-design-decisions.ja.md` §8.1 に記録 |
+| N7 | `01-design-decisions.ja.md` の「10 色はトラックごと」という断定 | **解消** | 仕様書が明記しているのは「既定色は 10 色パレットの巡回」までであると書き直した |
+
+- **見送った Should と理由**
+  - **N4（スライダーのキーボード・accesskit）**: 対象の `playback_controls` は今回まったく変更していない（後退は Stage 2 の変更で入ったもの）。直すには egui の focus と accesskit の値変更を headless で再現する必要があり、テストで固定できない変更は Review の対象外になる。代替経路（`Space`/`←`/`→`、「前の点」「次の点」）は残っているので、必須の「任意位置へ飛ぶ」操作以外は満たす。設計判断として未解決のまま残す。
+  - N1 の追加として、パレットの色が**描画**に現れることを `the_map_track_is_five_points_wide_at_seventy_percent_opacity` に追加した（3 種類以上）。色を 1 色に潰す M9 で **FAIL**。
+- **ゲート・テスト**: `./tools/check.sh` 6/6 PASS。`crates/m241-gui` テスト **132 件**（lib 88 + render 32 + design_gate 6 + design_invariants 6。Stage 2 の 112 → 132、+20、削除・弱体化 0 件）。
+- **変異テスト（v2 で追加）**: M2（コンパイル不能／UI テスト FAIL）、M3 相当（終了後 repaint、FAIL）、M13・M14・M14b（FAIL）、M11a・M11b・M11c（FAIL）、N6a マーカー削除（FAIL）、N6b amber（FAIL）、M9 点の色（FAIL）。**v2 のテストで生き残る変異は 0 件**。ただし末尾の `playing = false` の削除は、`step_next` が同じことをするため**状態に影響しない**（テストでは検出できないが、害もない。冗長な代入として残した）。
+- **実機未検証**: Stage 3 と同じ 3 項目（`probe_serial_port`、追従の実描画、GUI 経由の実 JPEG 書き込み）は未検証。

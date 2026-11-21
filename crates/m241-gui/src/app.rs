@@ -104,7 +104,7 @@ impl App {
         // because the staircase is not a widget egui has. The width is pinned
         // rather than content-sized: otherwise the current screen's deepest tab
         // decides the rail width, and the heading shifts sideways when you navigate.
-        let transition_secs = self.settings.rail_transition_secs();
+        let transition_secs = rail::rail_transition_secs_for(self);
         egui::Panel::left("rail")
             .exact_size(rail::WIDTH)
             .show_separator_line(false)
@@ -146,6 +146,47 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shell_hands_the_reduced_motion_setting_to_the_rail() {
+        // Stage 3 review, N5: the settings getter was tested and the rail's
+        // duration parameter was tested, but nothing checked what `App::draw`
+        // actually passes — hard-coding 0.15 at the call site (M11b) left every
+        // test green.
+        //
+        // So this draws the real shell and asks the rail what it was handed. The
+        // draw runs on its own thread because the rail records per thread: the
+        // parallel render tests draw the rail too, and this thread must read its
+        // own frame rather than whichever one finished last.
+        let draw_and_read = |reduced_motion: bool| -> Option<f32> {
+            std::thread::spawn(move || {
+                let ctx = egui::Context::default();
+                crate::theme::install(&ctx);
+                let mut app = App::default();
+                app.settings_mut().reduced_motion = reduced_motion;
+                let output = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+                output.drop_without_applying_deltas();
+                rail::last_transition_secs()
+            })
+            .join()
+            .ok()
+            .flatten()
+        };
+
+        let reduced = draw_and_read(true);
+        assert_eq!(
+            reduced,
+            Some(0.0),
+            "with reduced motion on the shell handed the rail {reduced:?}s, expected 0"
+        );
+        let motion = draw_and_read(false);
+        assert_eq!(
+            motion,
+            Some(rail::TRANSITION_MOTION_SECS),
+            "with reduced motion off the shell handed the rail {motion:?}s, expected {}",
+            rail::TRANSITION_MOTION_SECS
+        );
+    }
 
     #[test]
     fn the_shell_starts_on_connect() {
