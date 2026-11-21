@@ -37,43 +37,40 @@
 //! sync, which is what a write client has to do next anyway. Also absent:
 //! timing, the progress frames `0xD4` emits, and the flash driver's own error
 //! codes. The tests that need a failure ask for one explicitly
-//! ([`FakeDa::rejecting_packets`]).
+//! ([`FakeDa::refusing_packets_from`], [`FakeDa::set_failing_first_erase`]).
+//!
+//! Nothing here has been checked against a unit: the fake is a model of
+//! `docs/reference/01-da-protocol.md`, not of measured behaviour.
 
 use std::collections::VecDeque;
 
 use m241_core::Result;
 use m241_core::protocol::brom::{
-    BASE_ADDR_DA, BASE_ADDR_FIRMWARE, BOOT_REPLY, BOOT_SYNC, OPCODE_READ16, OPCODE_READ32,
+    BASE_ADDR_DA, BASE_ADDR_FIRMWARE, BOOT_REPLY, BOOT_SYNC, Frame, OPCODE_READ16, OPCODE_READ32,
 };
 use m241_core::protocol::frame::swap_pairs;
 use m241_core::protocol::port::Transport;
 
-use crate::da::{OPCODE_MEM_CMD, OPCODE_RESTART, OPCODE_WRITE};
+use crate::da::{ACK, CONT, NAK, OPCODE_MEM_CMD, OPCODE_RESTART, OPCODE_WRITE};
 
 /// Status byte the fake DA returns after a successful `0xD3`.
-pub const STATUS_OK: u8 = 0x00;
-
-/// Acknowledge byte used by the download agent.
-pub const ACK: u8 = 0x5A;
-
-/// Negative acknowledge byte.
-pub const NAK: u8 = 0xA5;
-
-/// "Continue": the DA accepted one packet and wants the next.
-pub const CONT: u8 = 0x69;
+const STATUS_OK: u8 = 0x00;
 
 /// Opcode that hands the chip from the BootROM to the DA.
-pub const OPCODE_JUMP: u8 = 0xA8;
+const OPCODE_JUMP: u8 = 0xA8;
 
-/// Payload bytes per DA packet, as the vendor tool sends them.
-pub const WRITE_PACKET_LEN: usize = 0x100;
+/// Default payload bytes per DA packet.
+///
+/// Only the fallback when a `0xD5` carries a zero length; the client's value is
+/// [`crate::da::PACKET_SIZE`].
+const WRITE_PACKET_LEN: usize = 0x100;
 
 /// Bytes of flash the fake DA reports, and the span a `0xD3` range may cover.
 ///
-/// `Measured:` the retail unit's 20-byte report carries `0x0008_0000` in its
-/// total-bytes field; the DA's own linear view of the part is therefore
+/// `measured elsewhere:` the retail unit's 20-byte report carries `0x0008_0000`
+/// in its total-bytes field; the DA's own linear view of the part is therefore
 /// `0x0000_0000`–`0x0007_FFFF` (`docs/reference/01-da-protocol.md` §4.2).
-pub const FLASH_SIZE: u32 = 0x0008_0000;
+const FLASH_SIZE: u32 = 0x0008_0000;
 
 /// Erase granularity the fake chip models, in bytes.
 ///
@@ -85,7 +82,7 @@ pub const FLASH_SIZE: u32 = 0x0008_0000;
 /// and the fake collapses that to one uniform sector. What the model enforces,
 /// and the tests pin, is the property a client has to live with: `0xD5` erases
 /// whole sectors, so the bytes around a written range are destroyed too.
-pub const FLASH_SECTOR_SIZE: u32 = 0x4000;
+const FLASH_SECTOR_SIZE: u32 = 0x4000;
 
 /// The mode the fake chip is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,10 +150,6 @@ pub struct FakeDa {
     da_range: (u32, u32),
     da_cursor: u32,
     da_packet_len: usize,
-    /// Force the next `count` packets to be refused.
-    ///
-    /// Kept for the existing tests, which arm a refusal at packet zero.
-    reject_packets: u32,
     /// The first packet index [`FakeDa::refusing_packets_from`] refuses.
     refuse_from: usize,
     /// How many packets from `refuse_from` on are refused.
@@ -164,19 +157,40 @@ pub struct FakeDa {
     /// How many packets this session accepted, which a test compares with the
     /// client's own `0x69` count.
     accepted_packets: usize,
-    /// Whether the DA has seen `0xD9`.
+    /// Every payload a `0xD5` packet carried, in arrival order.
+    ///
+    /// Recorded so a test can see what the client actually put on the wire —
+    /// the zero padding of the short final packet, and its checksum — rather
+    /// than inferring it from the flash window.
+    packets: Vec<Vec<u8>>,
+    /// The two-byte trailer of each packet, as it arrived, parallel to
+    /// `packets`.
+    trailers: Vec<[u8; 2]>,
+    /// Whether a `0xD9` has been seen.
     restarted: bool,
     /// Whether every `0xD3` is refused, as an unmappable range would be.
     refuse_ranges: bool,
+    /// Whether the first sector erase of the next `0xD5` fails.
+    ///
+    /// `0x0010253C`–`0x0010254C`: the DA answers a single `0xA5` there instead
+    /// of the second `0x5A` (`docs/reference/01-da-protocol.md` §5.6).
+    fail_first_erase: bool,
+    /// Whether the sector erase inside a `0xD5` has failed.
+    erase_failed: bool,
     /// Whether a `0xD5` arrived while the recorded range was still `(0, 0)`.
     ///
     /// That is the command that erases the reset vector; recording it lets a
     /// test assert the client never sent one.
     wrote_an_empty_range: bool,
+    /// The address of the last BootROM read, `None` before the first.
+    ///
+    /// A test compares it with `BASE_ADDR_FIRMWARE` to see which address the
+    /// client asked for, instead of relying on this fake's own shift.
+    last_read_address: Option<u32>,
     /// Whether the BootROM frame currently being assembled is echoed.
     ///
     /// Reads are echoed; `0xA8` is not, because it hands control over
-    /// part-way through (measured).
+    /// part-way through (`measured elsewhere`).
     echo_frame: bool,
     /// How many sync probes have been answered since the last complete sync,
     /// or `0` when no sync is in progress.
@@ -197,13 +211,17 @@ impl FakeDa {
             da_range: (0, 0),
             da_cursor: 0,
             da_packet_len: WRITE_PACKET_LEN,
-            reject_packets: 0,
             refuse_from: usize::MAX,
             refuse_count: 0,
             accepted_packets: 0,
+            packets: Vec::new(),
+            trailers: Vec::new(),
             restarted: false,
             refuse_ranges: false,
+            fail_first_erase: false,
+            erase_failed: false,
             wrote_an_empty_range: false,
+            last_read_address: None,
             echo_frame: true,
             bootrom_sync: 0,
         }
@@ -221,11 +239,13 @@ impl FakeDa {
         self
     }
 
-    /// Arm the same refusal on an existing fake, as tests that already own one
-    /// need.
-    pub fn set_refusing_packets_from(&mut self, skip: usize, count: usize) {
-        self.refuse_from = skip;
-        self.refuse_count = count;
+    /// Make the first sector erase of the next `0xD5` fail.
+    ///
+    /// `0x0010253C`–`0x0010254C`: the DA answers `0xA5` where the second `0x5A`
+    /// would be, and the command ends there (`docs/reference/01-da-protocol.md`
+    /// §5.6). ⚠️ 未検証 on hardware: read from the instruction sequence.
+    pub fn set_failing_first_erase(&mut self, fail: bool) {
+        self.fail_first_erase = fail;
     }
 
     /// Refuse every `0xD3`, as an unmappable range would be refused.
@@ -238,10 +258,48 @@ impl FakeDa {
         self
     }
 
+    /// Stop refusing `0xD3` on a fake that already exists.
+    ///
+    /// Used to check that a client which met a single-byte refusal can still
+    /// drive the same fake with a well-formed command afterwards.
+    pub fn set_accepting_ranges(&mut self) {
+        self.refuse_ranges = false;
+    }
+
     /// How many packets the fake accepted and programmed.
     #[must_use]
     pub fn accepted_packets(&self) -> usize {
         self.accepted_packets
+    }
+
+    /// Every `0xD5` payload the fake received, in arrival order.
+    ///
+    /// Each entry holds `da_packet_len` bytes as the client sent them,
+    /// padding included. Empty before the first packet.
+    #[must_use]
+    pub fn packets(&self) -> &[Vec<u8>] {
+        &self.packets
+    }
+
+    /// The trailing two bytes of the last packet: the 16-bit sum, on the wire.
+    ///
+    /// `None` before any packet. This is the client's checksum as received, not
+    /// one recomputed here, so a test can compare it with a literal.
+    #[must_use]
+    pub fn last_packet_trailer(&self) -> Option<[u8; 2]> {
+        self.trailers.last().copied()
+    }
+
+    /// The two-byte trailer of packet `index`, as it arrived.
+    #[must_use]
+    pub fn trailer_of(&self, index: usize) -> Option<[u8; 2]> {
+        self.trailers.get(index).copied()
+    }
+
+    /// The address the last BootROM read asked for, if any.
+    #[must_use]
+    pub fn last_read_address(&self) -> Option<u32> {
+        self.last_read_address
     }
 
     /// Whether a `0xD5` arrived before any `0xD3` was accepted.
@@ -254,13 +312,15 @@ impl FakeDa {
         self.wrote_an_empty_range
     }
 
-    /// Damage one byte of the flash window, so a read-back disagrees.
+    /// Damage one byte of the flash window at a DA address, so a read-back
+    /// disagrees.
     ///
     /// Call it after the `0xD5` conversation: it models a half-word that failed
     /// to program without teaching the fake a programming failure mode it has
-    /// no evidence for.
-    pub fn damage(&mut self, offset: usize, mask: u8) {
-        if let Some(slot) = self.memory.get_mut(offset) {
+    /// no evidence for. The address is the DA's, like every other address this
+    /// fake records; use the range the write used.
+    pub fn damage(&mut self, da_address: u32, mask: u8) {
+        if let Some(slot) = self.memory.get_mut(da_address as usize) {
             *slot ^= mask;
         }
     }
@@ -269,21 +329,30 @@ impl FakeDa {
     ///
     /// After `0xD9` a real unit runs its firmware; a read-back then needs the
     /// BootROM again, and this is where a test says so.
+    ///
+    /// What is cleared: both partial-frame buffers, the bytes waiting to be
+    /// read, the sync probe count, and — in the DA mode — the packet stage.
+    /// What deliberately **stays**: the flash window, `da_range`, `da_cursor`,
+    /// `accepted_packets` and `restarted`. Those are the chip's own state, and a
+    /// fake that forgot them on a mode change would hide a test that re-entered
+    /// the DA and then wrote to a range it thought it had just recorded.
     pub fn set_modelled(&mut self, mode: Modelled) {
         self.line.clear();
+        self.bootrom_line.clear();
         self.output.clear();
+        self.bootrom_sync = 0;
         match mode {
             Modelled::Firmware => {
                 self.mode = Mode::Firmware;
             }
             Modelled::BootRom => {
                 self.mode = Mode::BootRom;
-                self.bootrom_line.clear();
             }
             Modelled::DownloadAgent => {
                 self.mode = Mode::DownloadAgent;
                 self.da_stage = DaStage::Command;
-                self.queue_bytes(&self.da_info_report());
+                let report = self.da_info_report();
+                self.queue_bytes(&report);
             }
         }
     }
@@ -292,11 +361,6 @@ impl FakeDa {
     #[must_use]
     pub fn memory(&self) -> &[u8] {
         &self.memory
-    }
-
-    /// The flash window, mutably, for a simulated programming failure.
-    pub fn memory_mut(&mut self) -> &mut [u8] {
-        &mut self.memory
     }
 
     /// The current mode.
@@ -407,23 +471,27 @@ impl FakeDa {
         if is_jump {
             // The jump is the one frame the chip does not echo: it hands
             // control over part-way through and only part of the echo ever
-            // arrives (measured). The DA then answers with its report, so a
-            // client that expects nine echo bytes before the report
-            // desynchronises.
+            // arrives (`measured elsewhere`). The DA then answers with its
+            // report, so a client that expects nine echo bytes before the
+            // report desynchronises.
             self.mode = Mode::DownloadAgent;
             self.da_stage = DaStage::Command;
-            self.queue_bytes(&self.da_info_report());
+            let report = self.da_info_report();
+            self.queue_bytes(&report);
             return;
         }
         match opcode {
             // Counts are in 16-bit units (`docs/dev/03-hardware-facts.md`
             // "Count units"); the wire order swaps each pair (§4.4).
             OPCODE_READ16 => {
+                self.last_read_address = Some(address);
                 let data = self.read_flash(address, count as usize * 2);
-                self.queue_bytes(&swap_pairs(&data));
+                let wire = swap_pairs(&data);
+                self.queue_bytes(&wire);
             }
             // `0xAF` counts dwords and reverses each 32-bit word.
             OPCODE_READ32 => {
+                self.last_read_address = Some(address);
                 let data = self.read_flash(address, count as usize * 4);
                 let mut wire = Vec::with_capacity(data.len());
                 for word in data.chunks(4) {
@@ -439,9 +507,13 @@ impl FakeDa {
     ///
     /// `m241_core` maps the same flash at [`BASE_ADDR_FIRMWARE`], the DA at
     /// zero; this window is the DA's, so a BootROM address is shifted back to
-    /// its offset. Reads past the window are zero-filled: the chip answers with
-    /// whatever the bus returns and the client's length checks catch a request
-    /// that was too long.
+    /// its offset. ⚠️ That shift is the unresolved half of the mapping (see
+    /// [`crate::da::FLASH_WRITE_START`]): the fake subtracts exactly as the
+    /// client adds, so a test that only checks "the read matched" agrees with
+    /// either convention. [`FakeDa::last_read_address`] is what a test compares
+    /// with [`BASE_ADDR_FIRMWARE`] instead. Reads past the window are
+    /// zero-filled: the chip answers with whatever the bus returns and the
+    /// client's length checks catch a request that was too long.
     fn read_flash(&self, address: u32, length: usize) -> Vec<u8> {
         let offset = address.saturating_sub(BASE_ADDR_FIRMWARE);
         (0..length)
@@ -457,6 +529,12 @@ impl FakeDa {
     }
 
     /// The twenty-byte download-agent report, `>BHBLHHHHL`.
+    ///
+    /// The layout and every field follow `docs/dev/03-hardware-facts.md`'s
+    /// table: four middle `H` fields are `00 C2`, `22 BA`, `00 00`, `00 00` —
+    /// manufacturer, device id and two zeros, not the device id twice. The
+    /// trailing `L` comes from a RAM cell on a unit, so the fake may pick it;
+    /// nothing compares it.
     fn da_info_report(&self) -> Vec<u8> {
         let mut report = Vec::with_capacity(20);
         report.push(0xC0); // report marker
@@ -465,8 +543,8 @@ impl FakeDa {
         report.extend_from_slice(&FLASH_SIZE.to_be_bytes()); // 512 KiB
         report.extend_from_slice(&0x00C2u16.to_be_bytes()); // manufacturer
         report.extend_from_slice(&0x22BAu16.to_be_bytes()); // device code
-        report.extend_from_slice(&0x22u16.to_be_bytes());
-        report.extend_from_slice(&0xBAu16.to_be_bytes());
+        report.extend_from_slice(&0x0000u16.to_be_bytes());
+        report.extend_from_slice(&0x0000u16.to_be_bytes());
         report.extend_from_slice(&0x0000_0000u32.to_be_bytes()); // no ext SRAM
         report
     }
@@ -499,17 +577,19 @@ impl FakeDa {
                     self.queue_bytes(&[NAK]);
                     return;
                 };
-                // Measured: `0xD3` records the range and touches no flash at
-                // all -- the handler (`0x00101F98`-`0x00102034`) calls no flash
-                // driver. The erase is in `0xD5`, immediately before the data
-                // is programmed (`docs/reference/01-da-protocol.md` §4.6).
+                // From the disassembly: `0xD3` records the range and touches no
+                // flash at all -- the handler (`0x00101F98`-`0x00102034`) calls
+                // no flash driver. The erase is in `0xD5`, immediately before
+                // the data is programmed (`docs/reference/01-da-protocol.md`
+                // §4.6).
                 let Some(range) = accepted_da_range(start, end).filter(|_| !self.refuse_ranges)
                 else {
-                    // Measured: a refusal is a **single** `A5`; the success
-                    // path's ACK and status byte are both skipped. A client that
-                    // always reads two bytes consumes the first byte of the next
-                    // reply, and one that always reads one leaves the `0x00` of
-                    // a success behind.
+                    // ⚠️ 未検証 from the disassembly, not a measurement: a
+                    // refusal is a **single** `A5`; the success path's ACK and
+                    // status byte are both skipped. A client that always reads
+                    // two bytes consumes the first byte of the next reply, and
+                    // one that always reads one leaves the `0x00` of a success
+                    // behind.
                     //
                     // A refused command records nothing, so the ranges from an
                     // earlier `0xD3` stay in place.
@@ -518,9 +598,9 @@ impl FakeDa {
                 };
                 self.da_range = range;
                 self.da_cursor = start;
-                // Measured: on success `0xD3` answers with **two** bytes, ACK
-                // then status. A client that reads one leaves the status byte in
-                // the buffer and shifts every later frame.
+                // `measured elsewhere:` on success `0xD3` answers with **two**
+                // bytes, ACK then status. A client that reads one leaves the
+                // status byte in the buffer and shifts every later frame.
                 self.queue_bytes(&[ACK, STATUS_OK]);
             }
             OPCODE_WRITE => {
@@ -528,15 +608,11 @@ impl FakeDa {
                     .and_then(|length| usize::try_from(length).ok())
                     .filter(|length| *length > 0)
                     .unwrap_or(WRITE_PACKET_LEN);
-                // Measured: the erase happens here, not at `0xD3` time. The DA
-                // erases the sector holding the first range's start before it
-                // sends the second `0x5A` (`0x0010251C`-`0x00102560`), and every
-                // later sector as the write reaches it
-                // (`0x0010268C`-`0x001026BC`). The fake erases the whole
-                // recorded range as soon as the command is accepted, so a packet
-                // can never be programmed into a sector that was not erased
-                // first; when a sector is erased within the command is not
-                // visible on the wire.
+                // §5.6, in order: the first `0x5A` (`0x00102504`), the erase of
+                // the sector holding the recorded start (`0x0010251C`–
+                // `0x00102540`), then either `0xA5` (`0x0010253C`–`0x0010254C`)
+                // or the second `0x5A` (`0x00102560`). Nothing is erased at
+                // `0xD3` time, so the flash is intact until this point.
                 //
                 // With no `0xD3` accepted first the recorded range is still
                 // `(0, 0)`, so a real DA would erase the sector at address
@@ -545,20 +621,31 @@ impl FakeDa {
                 // failure land somewhere other than the assertion that is
                 // about it, and `wrote_an_empty_range` is what the safety tests
                 // assert stays false.
-                let (start, end) = self.da_range;
+                let (start, _end) = self.da_range;
+                self.queue_bytes(&[ACK]);
+                self.erase_failed = false;
                 if self.da_range == (0, 0) {
                     self.wrote_an_empty_range = true;
+                } else if self.fail_first_erase {
+                    // The DA restarts after this, so nothing else answers, and
+                    // the bytes the host may still have in flight are not a
+                    // packet: leaving the stage on `Packet` would parse them as
+                    // one and answer again.
+                    self.erase_failed = true;
+                    self.da_stage = DaStage::Command;
+                    self.queue_bytes(&[NAK]);
+                    return;
                 } else {
-                    self.erase_range(start, end);
+                    self.erase_sector(start);
                 }
                 self.da_cursor = start;
                 self.da_stage = DaStage::Packet;
-                self.queue_bytes(&[ACK, ACK]);
+                self.queue_bytes(&[ACK]);
             }
             OPCODE_RESTART => {
-                // Measured: no argument, no reply. The real chip then boots its
-                // firmware; a read-back needs the BootROM again, which a test
-                // asks for with `set_modelled`.
+                // From the disassembly: no argument, no reply. The real chip
+                // then boots its firmware; a read-back needs the BootROM again,
+                // which a test asks for with `set_modelled`.
                 self.restarted = true;
                 self.mode = Mode::Firmware;
                 self.line.clear();
@@ -568,6 +655,12 @@ impl FakeDa {
     }
 
     fn dispatch_da_packet(&mut self) {
+        if self.erase_failed {
+            // After `0xA5` the DA restarted; whatever the host sends next is
+            // not part of this command, and the fake must not answer it.
+            self.line.clear();
+            return;
+        }
         let needed = self.da_packet_len.saturating_add(2);
         if self.line.len() < needed {
             return;
@@ -576,11 +669,6 @@ impl FakeDa {
         let Some((payload, trailer)) = frame.split_at_checked(self.da_packet_len) else {
             return;
         };
-        if self.reject_packets > 0 {
-            self.reject_packets -= 1;
-            self.queue_bytes(&[NAK]);
-            return;
-        }
         if self.accepted_packets >= self.refuse_from
             && self.accepted_packets - self.refuse_from < self.refuse_count
         {
@@ -596,62 +684,80 @@ impl FakeDa {
             return;
         };
         // `docs/reference/01-da-protocol.md` §4.4: the trailer is the 16-bit
-        // sum of the **payload bytes only**, big-endian.
-        if checksum != byte_sum(payload) {
+        // sum of the **payload bytes only**, high byte first. The sum is
+        // computed here independently of `crate::da::byte_sum` so a change in
+        // the client's arithmetic is a disagreement, not two sides agreeing on
+        // the same mistake.
+        if checksum != sum_of_bytes(payload) {
             self.queue_bytes(&[NAK]);
             return;
         }
-        // The last packet of a range is short on the wire: the DA zero-fills it
-        // to the command's length before programming (`0x001019C0`–`0x001019D8`,
-        // §4.4), so the tail of the range is zeros, not the old flash content.
+        self.packets.push(payload.to_vec());
+        self.trailers.push([
+            trailer.first().copied().unwrap_or(0),
+            trailer.get(1).copied().unwrap_or(0),
+        ]);
+        // `0x00101B0C`–`0x00101B34` (§5.6): the DA computes the range's packet
+        // count as `ceil((end - start + 1) / length)` and acts on it. Once the
+        // computed count has all arrived, the command is over — two `0x5A`.
+        // Anything the host sends after that is not part of this command: more
+        // data than the range needs is answered `0xA5` and the transfer ends.
+        if self.accepted_packets >= self.expected_packets() {
+            self.da_stage = DaStage::Command;
+            self.queue_bytes(&[NAK]);
+            return;
+        }
+        // The packet is programmed at the cursor. A packet can be shorter than
+        // the command length only if the host sent fewer bytes, and then the
+        // DA zero-fills it before programming (`0x001019C0`–`0x001019D8`,
+        // §4.4); what the host puts on the wire is what `packets()` records.
         // ⚠️ 未検証 for the *write* direction: §4.4 reads that padding off the
         // read serialiser, and `docs/dev/05-verification.md` §1 did not record
-        // whether the final 92-byte packet's tail is padded. The hardware note
-        // that "every packet was accepted" holds either way, because the
-        // padding is inside the payload the sum covers.
-        let leftover = self
-            .da_range
-            .1
-            .saturating_sub(self.da_cursor)
-            .saturating_add(1);
-        let room = usize::try_from(leftover).unwrap_or(usize::MAX);
-        // The DA addresses flash from zero (`BASE_ADDR_FIRMWARE_M3318`), so its
-        // cursor is already an offset into this window; `m241_core`'s fake maps
-        // the same bytes at the BootROM's base instead.
+        // whether the final 92-byte packet's tail is padded.
         let offset = self.da_cursor as usize;
-        for (index, byte) in payload.iter().take(room).enumerate() {
+        for (index, byte) in payload.iter().enumerate() {
             if let Some(slot) = self.memory.get_mut(offset.saturating_add(index)) {
                 *slot = *byte;
             }
         }
-        let advance = payload.len().min(room);
-        self.da_cursor = self.da_cursor.saturating_add(advance as u32);
+        let advance = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+        self.da_cursor = self.da_cursor.saturating_add(advance);
         self.accepted_packets += 1;
         self.queue_bytes(&[CONT]);
-        // The transfer is complete once the cursor has passed the `end` the
-        // accepted `0xD3` recorded -- the real DA counts packets from the range
-        // table, not from the amount of data the host chose to send.
-        if self.da_cursor > self.da_range.1 {
+        if self.accepted_packets == self.expected_packets() {
             self.da_stage = DaStage::Command;
             self.queue_bytes(&[ACK, ACK]);
         }
     }
 
-    /// Erase every modelled sector the range covers, as `0xD5` does before it
-    /// programs data.
+    /// The packet count the DA computes for the recorded range.
+    ///
+    /// `ceil((end - start + 1) / da_packet_len)`, `0x00101B0C`–`0x00101B34`
+    /// (`docs/reference/01-da-protocol.md` §5.6). At least one packet, as the
+    /// DA's own arithmetic yields for a range that recorded anything.
+    fn expected_packets(&self) -> usize {
+        let (start, end) = self.da_range;
+        let bytes = usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX) + 1;
+        bytes.div_ceil(self.da_packet_len.max(1)).max(1)
+    }
+
+    /// Erase the modelled sector that holds `address`, as `0xD5` does before it
+    /// programs data there.
     ///
     /// The real erase is per sector, resolved from the DA's flash descriptor;
     /// the fake aligns to [`FLASH_SECTOR_SIZE`] because that layout is not
-    /// decoded (`docs/reference/01-da-protocol.md` §6).
-    fn erase_range(&mut self, start: u32, end: u32) {
-        let first = start / FLASH_SECTOR_SIZE;
-        let last = end / FLASH_SECTOR_SIZE;
-        for sector in first..=last {
-            let base = sector.saturating_mul(FLASH_SECTOR_SIZE);
-            for at in base..base.saturating_add(FLASH_SECTOR_SIZE) {
-                if let Some(slot) = self.memory.get_mut(at as usize) {
-                    *slot = 0xFF;
-                }
+    /// decoded (`docs/reference/01-da-protocol.md` §6). The sector is clamped to
+    /// the part, so the fake never touches a byte outside [`FLASH_SIZE`]. The
+    /// protocol erases each sector as the write reaches it
+    /// (`0x0010268C`–`0x001026BC`); the fake erases the sector the cursor is in
+    /// before the packet that lands there, so no byte is ever programmed into a
+    /// sector that was not erased first.
+    fn erase_sector(&mut self, address: u32) {
+        let sector = (address / FLASH_SECTOR_SIZE).min(FLASH_SIZE / FLASH_SECTOR_SIZE - 1);
+        let base = sector.saturating_mul(FLASH_SECTOR_SIZE);
+        for at in base..base.saturating_add(FLASH_SECTOR_SIZE) {
+            if let Some(slot) = self.memory.get_mut(at as usize) {
+                *slot = 0xFF;
             }
         }
     }
@@ -687,17 +793,19 @@ impl Transport for FakeDa {
     }
 }
 
-/// The 16-bit sum of the payload bytes, big-endian, as `0xD5` expects it.
+/// The 16-bit sum of the payload bytes the fake checks a `0xD5` trailer against.
 ///
 /// `docs/reference/01-da-protocol.md` §4.4: `FUN_001019F0` compares the two-byte
-/// trailer that follows the payload with the accumulated byte sum, and the
-/// trailer goes high byte first like every other field. The tests compute the
-/// checksum with this function rather than a literal so a change in the
-/// arithmetic cannot silently agree with itself — the two halves of the
-/// protocol are pinned to `docs/reference/01-da-protocol.md` by the citation,
-/// not by sharing an assumption.
-#[must_use]
-pub fn byte_sum(payload: &[u8]) -> u16 {
+/// trailer that follows the payload with the accumulated byte sum.
+///
+/// **Independent of [`crate::da::byte_sum`] on purpose.** The client's function
+/// produces the trailer; this one decides whether to accept it. Sharing one
+/// definition would let a wrong arithmetic agree with itself and keep the fake
+/// green. Two implementations plus a literal test on each
+/// (`crate::da`'s `the_packet_trailer_is_the_sum_in_big_endian` and
+/// `simulator.rs`'s `the_fake_checks_the_sum_independently_of_the_client`)
+/// means a change on either side is a disagreement instead of a silent match.
+fn sum_of_bytes(payload: &[u8]) -> u16 {
     payload
         .iter()
         .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)))
@@ -730,9 +838,16 @@ fn accepted_da_range(start: u32, end: u32) -> Option<(u32, u32)> {
 ///
 /// Returns the report so a test can assert on it; every DA test needs this
 /// sequence first, and repeating it is how the two-byte reply gets miscounted.
+///
+/// The jump frame is built from [`BASE_ADDR_DA`], which is also what
+/// [`FakeDa`] requires for the jump, so the two cannot drift apart.
 pub fn enter_download_agent(device: &mut FakeDa) -> Vec<u8> {
-    let jump = [OPCODE_JUMP, 0x00, 0x10, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
-    if device.write_all(&jump).is_err() {
+    let jump = Frame {
+        opcode: OPCODE_JUMP,
+        address: BASE_ADDR_DA,
+        count: 0,
+    };
+    if device.write_all(&jump.to_bytes()).is_err() {
         return Vec::new();
     }
     let mut report = vec![0u8; 20];
@@ -978,8 +1093,9 @@ mod tests {
         assert_eq!(read_reply(&mut device, 2), [ACK, STATUS_OK]);
         write_command(&mut device, 4);
         assert_eq!(read_reply(&mut device, 2), [ACK, ACK]);
-        // A correct packet: the rejection must come from `rejecting_packets`,
-        // not from a checksum error, or the test would pass for the wrong reason.
+        // A correct packet: the rejection must come from
+        // `refusing_packets_from`, not from a checksum error, or the test would
+        // pass for the wrong reason.
         write_packet(&mut device, &[1u8, 2, 3, 4]);
         assert_eq!(read_reply(&mut device, 1).first().copied(), Some(NAK));
     }
@@ -1041,7 +1157,162 @@ mod tests {
     }
 
     #[test]
-    fn the_simulator_helpers_build_wire_ready_bytes() {
-        assert_eq!(byte_sum(&[0x01, 0x02, 0x03]), 6);
+    fn the_fake_checks_the_sum_independently_of_the_client() {
+        // The fake's threshold arithmetic, pinned by literals rather than by
+        // calling the client's `da::byte_sum`: sharing one definition would let
+        // a mistake on both sides agree.
+        assert_eq!(sum_of_bytes(&[0x01, 0x02, 0x03]), 6);
+        assert_eq!(sum_of_bytes(&[]), 0);
+        assert_eq!(sum_of_bytes(&[0xFF, 0xFF, 0x02]), 0x0200);
+        assert_eq!(sum_of_bytes(&[0xFF; 0x100]), 0xFF00);
+        assert_eq!(sum_of_bytes(&[0xFF, 0xFF]), 0x01FE);
+    }
+
+    #[test]
+    fn a_packet_with_the_wrong_sum_is_refused() {
+        // The independent sum is only meaningful if a wrong trailer draws `A5`
+        // — otherwise the comparison could be bypassed and nothing would say so.
+        let mut device = download_agent(&[0xFFu8; 16]);
+        device.write_all(&memory_range(0, 3)).expect("range");
+        assert_eq!(read_reply(&mut device, 2), [ACK, STATUS_OK]);
+        write_command(&mut device, 4);
+        assert_eq!(read_reply(&mut device, 2), [ACK, ACK]);
+        let mut packet = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        packet.extend_from_slice(&0x0000u16.to_be_bytes());
+        device.write_all(&packet).expect("packet");
+        assert_eq!(read_reply(&mut device, 1), [NAK]);
+        assert_eq!(device.packets(), &[] as &[Vec<u8>]);
+    }
+
+    #[test]
+    fn one_more_packet_than_the_range_needs_is_refused() {
+        // `0x00101B0C`-`0x00101B34`: the DA's packet count is
+        // `ceil((end - start + 1) / length)`, so a range of four bytes with a
+        // four-byte packet is one packet. A second packet has nowhere to go and
+        // is answered `0xA5`, not `0x69`.
+        let mut device = download_agent(&[0xFFu8; 16]);
+        device.write_all(&memory_range(0, 3)).expect("range");
+        assert_eq!(read_reply(&mut device, 2), [ACK, STATUS_OK]);
+        write_command(&mut device, 4);
+        assert_eq!(read_reply(&mut device, 2), [ACK, ACK]);
+
+        write_packet(&mut device, &[1, 2, 3, 4]);
+        assert_eq!(read_reply(&mut device, 3), [CONT, ACK, ACK]);
+
+        write_packet(&mut device, &[5, 6, 7, 8]);
+        assert_eq!(
+            read_reply(&mut device, 1),
+            [NAK],
+            "a packet past the computed count must be refused"
+        );
+        assert_eq!(device.memory()[0], 1, "the extra packet was not programmed");
+    }
+
+    #[test]
+    fn the_packet_count_is_ceil_of_the_range_over_the_length() {
+        // Four bytes with two-byte packets: exactly two packets. The fake must
+        // announce completion after the second, not after a cursor passes the
+        // end, and it must refuse a third.
+        let mut device = download_agent(&[0xFFu8; 16]);
+        device.write_all(&memory_range(0, 3)).expect("range");
+        assert_eq!(read_reply(&mut device, 2), [ACK, STATUS_OK]);
+        write_command(&mut device, 2);
+        assert_eq!(read_reply(&mut device, 2), [ACK, ACK]);
+        write_packet(&mut device, &[1u8, 2]);
+        assert_eq!(read_reply(&mut device, 1), [CONT]);
+        write_packet(&mut device, &[3, 4]);
+        assert_eq!(
+            read_reply(&mut device, 3),
+            [CONT, ACK, ACK],
+            "the second packet completes a four-byte range"
+        );
+        assert_eq!(&device.memory()[..4], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn an_odd_range_with_an_even_length_still_needs_the_ceiling() {
+        // Five bytes at two bytes per packet is 2.5 -> 3 packets. A fake that
+        // completed when the cursor passed `end` would take the third packet as
+        // the first of a new command; the count stops it earlier.
+        let mut device = download_agent(&[0xFFu8; 16]);
+        device.write_all(&memory_range(0, 5)).expect("range");
+        assert_eq!(read_reply(&mut device, 2), [ACK, STATUS_OK]);
+        write_command(&mut device, 2);
+        assert_eq!(read_reply(&mut device, 2), [ACK, ACK]);
+        write_packet(&mut device, &[1u8, 2]);
+        assert_eq!(read_reply(&mut device, 1), [CONT]);
+        write_packet(&mut device, &[3, 4]);
+        assert_eq!(read_reply(&mut device, 1), [CONT]);
+        write_packet(&mut device, &[5, 0]);
+        assert_eq!(read_reply(&mut device, 3), [CONT, ACK, ACK]);
+        assert_eq!(&device.memory()[..6], &[1, 2, 3, 4, 5, 0]);
+    }
+
+    #[test]
+    fn a_failed_first_erase_answers_one_nak_and_ends_the_command() {
+        // §5.6: `erase failed` at `0x0010253C`-`0x0010254C` answers `0xA5`
+        // instead of the second `0x5A`, and the DA restarts.
+        let mut device = download_agent(&[0xFFu8; 16]);
+        device.write_all(&memory_range(0, 3)).expect("range");
+        assert_eq!(read_reply(&mut device, 2), [ACK, STATUS_OK]);
+        device.set_failing_first_erase(true);
+        write_command(&mut device, 4);
+        assert_eq!(
+            read_reply(&mut device, 4),
+            [ACK, NAK],
+            "the first 0x5A, then 0xA5 in place of the second"
+        );
+        // A packet after the failure must not be acknowledged. The fake is back
+        // in its command stage, where those bytes are unknown commands and draw
+        // `A5` — what matters is that no `0x69` and no second `0x5A` appear.
+        write_packet(&mut device, &[1, 2, 3, 4]);
+        let after = read_reply(&mut device, 8);
+        assert!(
+            !after.contains(&CONT) && !after.contains(&ACK),
+            "a packet after a failed erase must not be accepted: {after:02X?}"
+        );
+        assert_eq!(device.accepted_packets(), 0);
+    }
+    #[test]
+    fn the_info_report_is_the_measured_twenty_bytes() {
+        // `docs/dev/03-hardware-facts.md` records the report
+        // `C0 03 08 49 00 08 00 00 00 C2 22 BA 00 00 00 00 …`: the device id
+        // appears once, and the two `H` fields after it are zeros. The trailing
+        // `L` comes from RAM on a unit, so only the first 16 bytes are pinned.
+        let mut device = FakeDa::with_firmware(&[0xFFu8; 16]);
+        let report = enter_download_agent(&mut device);
+        assert_eq!(
+            report.get(..16),
+            Some(
+                [
+                    0xC0, 0x03, 0x08, 0x49, 0x00, 0x08, 0x00, 0x00, 0x00, 0xC2, 0x22, 0xBA, 0x00,
+                    0x00, 0x00, 0x00
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn the_jump_is_built_from_the_da_load_address() {
+        // The fake accepts a jump only at `BASE_ADDR_DA`; the helper must send
+        // exactly that, not a literal that happens to match it today.
+        let jump = Frame {
+            opcode: OPCODE_JUMP,
+            address: BASE_ADDR_DA,
+            count: 0,
+        };
+        assert_eq!(
+            &jump.to_bytes()[1..5],
+            &BASE_ADDR_DA.to_be_bytes(),
+            "the jump's address field is the load address"
+        );
+        let mut other = FakeDa::with_firmware(&[0xFFu8; 16]);
+        let wrong = Frame {
+            address: BASE_ADDR_DA + 4,
+            ..jump
+        };
+        other.write_all(&wrong.to_bytes()).expect("write");
+        assert_eq!(other.mode(), Mode::BootRom, "a wrong address is no jump");
     }
 }

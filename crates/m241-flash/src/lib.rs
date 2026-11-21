@@ -1,5 +1,10 @@
 //! The write path: everything that can destroy a logger lives in this crate.
 //!
+//! What it does: erases the log ([`erase`]) and drives the Download Agent that
+//! programs firmware ([`da`]). Neither has run against a unit in this form —
+//! the write path is exercised only by a simulator, and
+//! `docs/dev/05-verification.md` records what hardware sessions exist.
+//!
 //! The repository is split in two along the line that matters:
 //!
 //! * [`m241_core`] reads. It talks to the PMTK channel and the BootROM, dumps
@@ -46,10 +51,17 @@
 
 pub mod da;
 pub mod erase;
+/// The fake Download Agent the write path's tests run against.
+///
+/// Test-only: no crate outside this one uses it (`m241-cli` only names the crate
+/// for its side effects), and a shipped binary has no reason to carry a
+/// destructive command set's model.
+#[cfg(test)]
 pub mod simulator;
 
 pub use da::DownloadAgent;
 pub use erase::{BackupProof, ERASE_SUBCOMMAND, LogEraser};
+#[cfg(test)]
 pub use simulator::FakeDa;
 
 /// Version of the crate, taken from `Cargo.toml` at build time.

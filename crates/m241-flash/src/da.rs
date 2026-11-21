@@ -16,7 +16,8 @@
 //! `0xD3` records a range and `0xD5` erases each sector of it immediately before
 //! programming it (`docs/reference/01-da-protocol.md` §5.6, `0x0010251C`–
 //! `0x00102560`). A range that includes `0x00000000` therefore erases the reset
-//! vector and the unit stops booting.
+//! vector and the unit stops booting. `0xD3` on its own erases nothing: its
+//! handler (`0x00101F98`–`0x00102034`) calls no flash driver.
 //!
 //! Four things keep that from happening by accident, each with a test that
 //! fails when it is removed:
@@ -25,10 +26,11 @@
 //!    [`FLASH_WRITE_LENGTH`] are literals checked against their expected values
 //!    by [`check_layout`] before any byte goes out, and [`check_layout`] refuses
 //!    a start of `0` outright. No public function in this crate takes a range.
-//! 2. **A confirmation token is required** ([`Confirmation`]). It has one
+//! 2. **A confirmation token must be passed** ([`Confirmation`]). It has one
 //!    public constructor, [`Confirmation::granted`], and [`DownloadAgent::write`]
-//!    takes one as its first argument, so no line of code reaches the wire
-//!    without saying that a person asked.
+//!    takes one as its first argument and refuses a token that is not given.
+//!    That makes the prompt a step every caller goes through; it is a convention
+//!    of the call site, not a type-level proof that a person was asked.
 //! 3. **The device must still hold the image the write was planned from.**
 //!    [`DownloadAgent::verify_device`] compares the whole span, read back by
 //!    `m241_core`'s BootROM reader, with the user's own backup, so a backup from
@@ -73,13 +75,18 @@
 //! supports, `0`, and [`check_layout`] refuses it. The wire protocol is written
 //! and tested against [`crate::simulator::FakeDa`]; **this crate cannot write
 //! flash on a real unit** until `docs/dev/05-verification.md` §1 gains a row
-//! that fixes the address, and the constant and its test change together.
+//! that fixes the address. [`check_layout`] refuses to run unless a single
+//! constant, [`UNRESOLVED_STARTS`], still lists **both** candidate addresses and
+//! [`FLASH_WRITE_START`] is one of them: whichever of the two is put in the
+//! constant, the gate keeps refusing until the list itself is emptied, which is
+//! the edit the hardware row has to justify.
 //!
 //! # What is verified and what is not
 //!
-//! 🧪 The whole path is covered by the fake and unit tests. The hardware session
-//! in `docs/dev/05-verification.md` §1 flashed a unit by hand, outside this
-//! code. Nothing here may be reported as measured until that page gains a row.
+//! 🧪 Nothing in this module has run against a unit. The whole path is exercised
+//! by the fake and unit tests only; the hardware session in
+//! `docs/dev/05-verification.md` §1 flashed a unit by hand, outside this code.
+//! Nothing here may be reported as measured until that page gains a row.
 //!
 //! Points the disassembly leaves open are marked 未検証 where they are used:
 //!
@@ -89,6 +96,10 @@
 //!   packet (§7 item 7) — an unexpected byte is a failure, not absorbed;
 //! * whether a refused `0xD3` really answers a single byte (§4.1) — the
 //!   instruction sequence says so; no unit was ever made to refuse one;
+//! * whether `0xD5`'s first sector erase can fail and answer a single `0xA5`
+//!   (§5.6) — read from the disassembly; the fake models it, no unit did;
+//! * whether the DA answers anything to `0xD9` (§4.5, §8 item 4) — the
+//!   disassembly says it never returns; this driver does not read after it;
 //! * whether the DA zero-fills the short final packet before programming (§4.4
 //!   reads that padding off the *read* serialiser) — the client pads it, which
 //!   is accepted either way because the sum covers the padded payload.
@@ -150,7 +161,7 @@ pub const MEM_CMD_STATUS_OK: u8 = 0x00;
 
 /// Bytes per `0xD5` packet, sent as the command's `u32` length argument.
 ///
-/// `Measured:` `docs/dev/03-hardware-facts.md` "Write sequence" — the
+/// `measured elsewhere:` `docs/dev/03-hardware-facts.md` "Write sequence" — the
 /// hardware-tested write used `0x100`-byte packets — and
 /// `docs/reference/01-da-protocol.md` §4.3, which records that the DA imposes
 /// no maximum and that `0x100` is a host convention. §8 item 9 records that
@@ -159,23 +170,39 @@ pub const PACKET_SIZE: usize = 0x100;
 
 /// Start of the span this driver writes, in the **DA's** linear flash view.
 ///
-/// `Reference implementation:` `m241_core::protocol::brom::BASE_ADDR_FIRMWARE_M3318`
-/// is `0x0000_0000` and is the address the firmware image begins at in the DA's
-/// view: both prior clients wrote at DA address `0`, and the BootROM sees the
-/// same bytes at `0x0020_0000` (`Measured:` `docs/dev/03-hardware-facts.md`
-/// "Firmware base, BootROM view"). `⚠️` Not re-measured here — and
-/// `docs/reference/01-da-protocol.md` §4.2 writes the base as `0x00200000`,
-/// which is why this value is treated as unresolved rather than settled.
+/// **Settled:** the flash answers the BootROM at `BASE_ADDR_FIRMWARE`
+/// (`0x0020_0000`) and the image begins with the vector `18 F0 9F E5` there
+/// (`measured elsewhere:` `docs/dev/03-hardware-facts.md` "Firmware base,
+/// BootROM view").
 ///
-/// ➡️ **This value makes [`check_layout`] refuse every write.** That is the
-/// intended state of the code until the address is established from the wire:
-/// see the module documentation, "The start address is unresolved".
+/// **Not settled:** where the same bytes sit in the DA's view.
+/// `m241_core::protocol::brom::BASE_ADDR_FIRMWARE_M3318` is `0x0000_0000` —
+/// both prior clients wrote at DA address `0` — while
+/// `docs/reference/01-da-protocol.md` §4.2 writes the base as `0x00200000`.
+/// No read through the DA's own view has settled it, so this constant carries
+/// the `m241_core` citation, `0`, and the ambiguity is left visible instead of
+/// resolved by preference.
+///
+/// ➡️ **This value is refused.** [`check_layout`] refuses every write while
+/// [`UNRESOLVED_STARTS`] lists it, and it lists both candidates, so swapping
+/// this constant for the other one still refuses. See the module
+/// documentation, "The start address is unresolved".
 pub const FLASH_WRITE_START: u32 = 0x0000_0000;
+
+/// The DA-side start addresses this crate refuses to write at.
+///
+/// The two candidates of the paragraph above, `0` and `0x0020_0000`. While both
+/// are listed, [`check_layout`] refuses a write at either: the constant cannot
+/// be "fixed" by swapping in one of them, only by a change to this list, and
+/// that change has to cite the hardware row that settled which one is right.
+/// Emptying the list is the act the documentation calls for, so it is one
+/// visible edit rather than a silently different constant.
+pub const UNRESOLVED_STARTS: [u32; 2] = [0x0000_0000, 0x0020_0000];
 
 /// Bytes this driver writes: the V1.13 image size.
 ///
-/// `Measured:` `docs/dev/03-hardware-facts.md` "V1.13 size" — 406,620 bytes
-/// (`0x6345C`), read back twice with the same SHA-256 in
+/// `measured elsewhere:` `docs/dev/03-hardware-facts.md` "V1.13 size" — 406,620
+/// bytes (`0x6345C`), read back twice with the same SHA-256 in
 /// `docs/dev/05-verification.md` §1. The value equals
 /// `m241_core::firmware::profiles::PROFILE_V1_13.size`; a test pins the two
 /// together so the constant cannot drift.
@@ -189,15 +216,16 @@ pub const FLASH_WRITE_END: u32 = FLASH_WRITE_START + (FLASH_WRITE_LENGTH as u32 
 
 /// The byte offsets a WNRO patch is allowed to move.
 ///
-/// `Measured:` `docs/dev/03-hardware-facts.md` "Bytes that change" —
+/// `measured elsewhere:` `docs/dev/03-hardware-facts.md` "Bytes that change" —
 /// `0x402F6` and `0x402F7` (the effective epoch constant, LE32 `315964800` at
 /// `0x402F4`) and `0x59C2C` (the final digit of the `V1.13` marker at
 /// `0x59C28`).
 ///
-/// The table is literally those three numbers, as `AGENTS.md` §2.3 asks. The
-/// sets derived from it are checked against what `m241_core`'s reader and patch
-/// planner produce, so a change there fails a test instead of quietly widening
-/// what may be written.
+/// The table is those three numbers written out literally, as `AGENTS.md` §2.3
+/// asks. They are not free-standing: [`epoch_patch_offsets`] and
+/// [`marker_patch_offset`] derive the same offsets from `m241_core`'s reader and
+/// patch planner, and [`check_layout`] refuses unless the two agree, so a change
+/// to `m241_core` fails a test instead of quietly widening what may be written.
 pub const PATCH_OFFSETS: [usize; 3] = [0x402F6, 0x402F7, 0x59C2C];
 
 /// The two bytes of the effective epoch constant that change.
@@ -232,18 +260,10 @@ pub fn marker_patch_offset() -> Option<usize> {
 /// client's own default.
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// No argument is sent between the two final `0x5A` of `0xD5`.
-///
-/// 未検証 `docs/reference/01-da-protocol.md` §7 item 1: two send sites exist
-/// (`0x001027F8`, `0x00102898`) and one is followed by a receive that expects
-/// `0x69`. The hardware-tested client sends nothing and works, so this driver
-/// sends nothing and reads exactly two `0x5A`.
-pub const BYTES_BETWEEN_FINAL_ACKS: usize = 0;
-
 /// The first four bytes of an M-241 firmware image.
 ///
-/// `Measured:` `docs/dev/03-hardware-facts.md` "Firmware base, BootROM view":
-/// `0x00200000` returns the vector table `18 f0 9f e5 …`. This is the
+/// `measured elsewhere:` `docs/dev/03-hardware-facts.md` "Firmware base, BootROM
+/// view": `0x00200000` returns the vector table `18 f0 9f e5 …`. This is the
 /// known-intact marker [`DownloadAgent::verify_device`] reads before anything
 /// is recorded or erased.
 pub const VECTOR: [u8; 4] = [0x18, 0xF0, 0x9F, 0xE5];
@@ -253,8 +273,13 @@ pub const VECTOR: [u8; 4] = [0x18, 0xF0, 0x9F, 0xE5];
 /// No `Default`, no public field: the only way to obtain one is
 /// [`Confirmation::granted`] — the token [`Confirmation::of_command_line`]
 /// returns for `--yes`. [`DownloadAgent::write`] takes one as its first
-/// argument, so "write the firmware" cannot appear in code without a line that
-/// says who said so.
+/// argument and refuses a token whose flag is not set, so "write the firmware"
+/// cannot appear in code without a line that says who said so.
+///
+/// That is a convention of the call site, not a proof: the type carries no
+/// information a plain `bool` does not. What it buys is a named step at every
+/// call site and one place ([`Self::of_command_line`]) where the flag is
+/// turned into a token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Confirmation {
     /// Always `true`; a token that exists was given.
@@ -398,7 +423,8 @@ pub struct WriteReport {
     pub length: usize,
     /// Packets the DA acknowledged.
     pub packets: usize,
-    /// Bytes read back through the BootROM and compared; equals `length`.
+    /// Bytes read back through the BootROM and compared; the same value as
+    /// `length`, which [`PendingWrite::verify_written`] checks separately.
     pub verified: usize,
 }
 
@@ -479,6 +505,11 @@ impl PendingWrite {
                 unfinished,
             ));
         }
+        // `verified` is the length of the comparison above. It equals
+        // `length` because the mismatch and length checks both passed; this
+        // asserts the invariant, which holds in every build, rather than letting
+        // the doc claim an equality nothing checks.
+        debug_assert_eq!(read.len(), self.length);
         Ok(WriteReport {
             start: self.start,
             length: self.length,
@@ -548,7 +579,7 @@ impl<T: Transport> DownloadAgent<T> {
     /// already synced. Two cheap checks run first, so a wrong unit is reported
     /// before 400 KB crosses the wire:
     ///
-    /// * the vector table starts `18 F0 9F E5` (`Measured:`
+    /// * the vector table starts `18 F0 9F E5` (`measured elsewhere:`
     ///   `docs/dev/03-hardware-facts.md` "Firmware base, BootROM view");
     /// * the family field reads `HOLUX_M-241` (`Vendor images:`
     ///   `m241_core::firmware::image::FAMILY`).
@@ -620,10 +651,14 @@ impl<T: Transport> DownloadAgent<T> {
     /// the device check still cannot write an image that changes anything
     /// outside [`PATCH_OFFSETS`].
     ///
+    /// `confirmation` is required and checked: a token whose flag was never set
+    /// is [`Error::Safety`]. Nothing about the type forces a caller to build it
+    /// from a prompt, but every route into this function names the step.
+    ///
     /// # Errors
     ///
-    /// * [`Error::Safety`] from [`check_layout`] or [`check_image`]. Nothing was
-    ///   sent: this runs before `0xD3`.
+    /// * [`Error::Safety`] from the confirmation, [`check_layout`] or
+    ///   [`check_image`]. Nothing was sent: this runs before `0xD3`.
     /// * [`Error::Rejected`] / [`Error::Framing`] / [`Error::Timeout`] once the
     ///   range is recorded. Each carries [`PartialWrite::recovery`] with how far
     ///   the packets got. `0xD9` is *not* sent here: the restart belongs to
@@ -631,13 +666,19 @@ impl<T: Transport> DownloadAgent<T> {
     ///   read-back.
     pub fn write(
         &mut self,
-        _confirmation: Confirmation,
+        confirmation: Confirmation,
         backup: &[u8],
         image: &[u8],
     ) -> Result<PendingWrite> {
+        if !confirmation.is_given() {
+            return Err(Error::Safety {
+                reason: String::from(
+                    "DownloadAgent::write was given a confirmation token that was never granted",
+                ),
+            });
+        }
         check_layout()?;
-        let image = check_image(backup, image)?;
-        self.write_range(FLASH_WRITE_START, image)
+        self.write_range(backup, FLASH_WRITE_START, image)
     }
 
     /// The write with an explicit start, used by [`Self::write`] and the tests.
@@ -645,9 +686,12 @@ impl<T: Transport> DownloadAgent<T> {
     /// Private. [`Self::write`] is the only non-test caller and it runs
     /// [`check_layout`] first, which refuses the start address this crate cannot
     /// establish, so a release build has no reachable way to write at a range a
-    /// caller chooses. The patch rule is re-run here as well, so this entry
-    /// point cannot skip it.
-    fn write_range(&mut self, start: u32, image: &[u8]) -> Result<PendingWrite> {
+    /// caller chooses. **Every** write goes through the checks in this function:
+    /// [`check_image`] against `backup`, which is `AGENTS.md` §2.3's rule, so
+    /// `0xD3` cannot go out for a buffer that was never compared with the user's
+    /// own dump.
+    fn write_range(&mut self, backup: &[u8], start: u32, image: &[u8]) -> Result<PendingWrite> {
+        let image = check_image(backup, image)?;
         let mut packets = 0usize;
         let mut progress = Progress::NothingWritten;
         let end = range_end(start);
@@ -724,18 +768,38 @@ impl<T: Transport> DownloadAgent<T> {
         packets: &mut usize,
         progress: &mut Progress,
     ) -> Result<()> {
-        let length = PACKET_SIZE;
+        self.send_write_header()?;
+        self.await_first_erase()?;
+        for (index, chunk) in image.chunks(PACKET_SIZE).enumerate() {
+            self.send_packet(chunk)?;
+            self.await_packet_reply(index, start)?;
+            *packets = index.saturating_add(1);
+            // `UpTo` is exclusive, which is exactly the address the next packet
+            // would start at, so `bytes(start)` counts the accepted payloads.
+            *progress = Progress::UpTo(
+                packet_address(index.saturating_add(1), start)
+                    .min(start.saturating_add(FLASH_WRITE_LENGTH as u32)),
+            );
+        }
+        self.expect_final_acks()
+    }
+
+    /// `0xD5`'s command byte and the `u32` packet length.
+    fn send_write_header(&mut self) -> Result<()> {
         let mut frame = Vec::with_capacity(5);
         frame.push(OPCODE_WRITE);
         frame.extend_from_slice(&packet_length().to_be_bytes());
         self.transport.write_all(&frame)?;
-        self.transport.flush()?;
+        self.transport.flush()
+    }
 
-        // §5.6: two `0x5A` before any packet. The first is at `0x00102504`;
-        // the second follows the first sector's erase at `0x00102560`, and a
-        // failed erase is a single `0xA5` at `0x0010253C`-`0x0010254C` that
-        // arrives instead of the second `0x5A`. The client sends no erase
-        // command: the erase is inside `0xD5`.
+    /// The `0x5A` before the erase and the one after it.
+    ///
+    /// §5.6: the first is at `0x00102504`; the second follows the first
+    /// sector's erase at `0x00102560`, and a failed erase is a single `0xA5` at
+    /// `0x0010253C`-`0x0010254C` that arrives instead of the second `0x5A`. The
+    /// client sends no erase command: the erase is inside `0xD5`.
+    fn await_first_erase(&mut self) -> Result<()> {
         self.expect_ack("0xD5 first ACK")?;
         let after_erase = self.read_byte("0xD5 ACK after the first sector erase")?;
         if after_erase == NAK {
@@ -754,62 +818,62 @@ impl<T: Transport> DownloadAgent<T> {
                 offset: None,
             });
         }
-
-        for (index, chunk) in image.chunks(length).enumerate() {
-            // §5.6, §4.4: each packet is its payload followed by a 16-bit sum
-            // of the bytes, big-endian. The raw payload may be shorter than
-            // the command's length; a test pins that it is zero-filled before
-            // the sum, which is what the DA's read serialiser does (§4.4,
-            // 未検証 for the write direction).
-            let mut payload = vec![0u8; length];
-            payload
-                .iter_mut()
-                .zip(chunk.iter())
-                .for_each(|(slot, byte)| *slot = *byte);
-            let mut packet = Vec::with_capacity(length + 2);
-            packet.extend_from_slice(&payload);
-            packet.extend_from_slice(&byte_sum(&payload).to_be_bytes());
-            self.transport.write_all(&packet)?;
-            self.transport.flush()?;
-
-            let reply = self.read_byte("0xD5 packet reply")?;
-            if reply == NAK {
-                // §4.4: a checksum mismatch never produces `0x69`; the handler
-                // ends in `0xA5` and a chip restart.
-                let at = start.saturating_add(
-                    u32::try_from(index.saturating_mul(length)).unwrap_or(u32::MAX),
-                );
-                return Err(Error::Rejected {
-                    what: format!(
-                        "0xD5 packet {index} ({length} bytes at DA address 0x{at:08X}) was refused"
-                    ),
-                });
-            }
-            if reply != CONT {
-                // 未検証 §7 item 7: a retried packet may yield a second `0x69`.
-                // Any other byte means the stream and the client disagree about
-                // how many packets were sent, so this stops instead of guessing.
-                return Err(Error::Framing {
-                    what: format!("0xD5 packet {index} answered 0x{reply:02X}, expected 0x69"),
-                    offset: None,
-                });
-            }
-            *packets += 1;
-            // `UpTo` is exclusive, which is exactly the address the next packet
-            // would start at, so `bytes(start)` counts the accepted payloads.
-            let end = start
-                .saturating_add(
-                    u32::try_from(index.saturating_add(1).saturating_mul(length))
-                        .unwrap_or(u32::MAX),
-                )
-                .min(start.saturating_add(FLASH_WRITE_LENGTH as u32));
-            *progress = Progress::UpTo(end);
-        }
-
-        // §7 item 1, 未検証: nothing is sent between the two final `0x5A`.
-        self.expect_ack("0xD5 final ACK (first)")?;
-        self.expect_ack("0xD5 final ACK (second)")?;
         Ok(())
+    }
+
+    /// One packet: its payload zero-filled to [`PACKET_SIZE`], then the sum.
+    ///
+    /// §5.6, §4.4: the raw payload may be shorter than the command's length; a
+    /// test pins that it is zero-filled before the sum, which is what the DA's
+    /// read serialiser does (§4.4, 未検証 for the write direction).
+    fn send_packet(&mut self, chunk: &[u8]) -> Result<()> {
+        let mut payload = vec![0u8; PACKET_SIZE];
+        payload
+            .iter_mut()
+            .zip(chunk.iter())
+            .for_each(|(slot, byte)| *slot = *byte);
+        let mut packet = Vec::with_capacity(PACKET_SIZE + 2);
+        packet.extend_from_slice(&payload);
+        packet.extend_from_slice(&byte_sum(&payload).to_be_bytes());
+        self.transport.write_all(&packet)?;
+        self.transport.flush()
+    }
+
+    /// The `0x69` that acknowledges one packet, or the error that replaces it.
+    fn await_packet_reply(&mut self, index: usize, start: u32) -> Result<()> {
+        let reply = self.read_byte(&format!("0xD5 packet {index} reply"))?;
+        if reply == NAK {
+            // §4.4: a checksum mismatch never produces `0x69`; the handler
+            // ends in `0xA5` and a chip restart.
+            return Err(Error::Rejected {
+                what: format!(
+                    "0xD5 packet {index} ({PACKET_SIZE} bytes at DA address 0x{:08X}) was refused",
+                    packet_address(index, start)
+                ),
+            });
+        }
+        if reply != CONT {
+            // 未検証 §7 item 7: a retried packet may yield a second `0x69`.
+            // Any other byte means the stream and the client disagree about
+            // how many packets were sent, so this stops instead of guessing.
+            return Err(Error::Framing {
+                what: format!("0xD5 packet {index} answered 0x{reply:02X}, expected 0x69"),
+                offset: None,
+            });
+        }
+        Ok(())
+    }
+
+    /// The two `0x5A` after the last packet.
+    ///
+    /// Nothing is sent between them. §7 item 1 has two send sites
+    /// (`0x001027F8`, `0x00102898`) and one followed by a receive, and the
+    /// hardware-tested client sends nothing there and sees exactly two `0x5A`;
+    /// 未検証 whether a byte would also be accepted. There is no constant for
+    /// the gap because the only value this client can justify is zero.
+    fn expect_final_acks(&mut self) -> Result<()> {
+        self.expect_ack("0xD5 final ACK (first)")?;
+        self.expect_ack("0xD5 final ACK (second)")
     }
 
     // -- byte plumbing -----------------------------------------------------
@@ -846,6 +910,15 @@ impl<T: Transport> DownloadAgent<T> {
 }
 
 /// Append the recovery paragraph to anything raised once `0xD3` has gone out.
+///
+/// `Rejected`, `Framing`, `Timeout` and `Safety` keep their variant and carry
+/// the paragraph in their message. Every other variant — `Io`, `Port`,
+/// `State`, `Firmware` — becomes [`Error::State`], so the machine-readable kind
+/// is lost there. That is deliberate: those are transport or bookkeeping
+/// failures whose cause (`std::io::Error`, a bad handle) does not fit the same
+/// field, and the caller's next action is the same for all of them — the
+/// paragraph's reset and re-entry. A caller that needs the original kind must
+/// capture it before the write.
 fn after_write(err: Error, unfinished: PartialWrite) -> Error {
     let advice = unfinished.recovery();
     match err {
@@ -870,6 +943,11 @@ fn after_write(err: Error, unfinished: PartialWrite) -> Error {
 /// The inclusive last address of a range of [`FLASH_WRITE_LENGTH`] at `start`.
 fn range_end(start: u32) -> u32 {
     start.saturating_add(FLASH_WRITE_LENGTH as u32 - 1)
+}
+
+/// The DA address packet `index` starts at: `start + index * PACKET_SIZE`.
+fn packet_address(index: usize, start: u32) -> u32 {
+    start.saturating_add(u32::try_from(index.saturating_mul(PACKET_SIZE)).unwrap_or(u32::MAX))
 }
 
 /// One `0xD5` packet's payload length, as the DA's `u32` argument.
@@ -897,25 +975,32 @@ fn byte_sum(data: &[u8]) -> u16 {
 /// zero destroys the reset vector.
 ///
 /// The start address is unresolved (see the module documentation). This
-/// function is where that is enforced: with no verified start, every write is
-/// refused before a byte goes out.
+/// function is where that is enforced, and it refuses **both** candidates in
+/// [`UNRESOLVED_STARTS`]: `0` covers the reset vector outright, and
+/// `0x0020_0000` is the address the protocol document names but no read through
+/// the DA's view has confirmed. A write starts only when the constant is not in
+/// that list, which means the list has to be changed on purpose, with the
+/// hardware row that settled it.
 ///
 /// # Errors
 ///
-/// [`Error::Safety`] when the start is `0`, when any pinned value has moved, or
-/// when the patch table and the readers that define it disagree.
+/// [`Error::Safety`] when the start is one of [`UNRESOLVED_STARTS`], when any
+/// pinned value has moved, or when the patch table and the readers that define
+/// it disagree.
 pub fn check_layout() -> Result<()> {
     // The pinned values once more, from `docs/dev/03-hardware-facts.md`.
     let expected_start: u32 = 0x0000_0000;
     let expected_length: usize = 0x0006_345C;
 
-    if FLASH_WRITE_START == 0 {
+    if UNRESOLVED_STARTS.contains(&FLASH_WRITE_START) {
         return Err(Error::Safety {
-            reason: String::from(
-                "the write range starts at 0x00000000, which covers the reset vector; a 0xD5 \
-                 over it erases the start of the firmware and the unit stops booting. This \
-                 driver has no other start address until one is established from the wire — \
-                 see docs/dev/11-safety-review.md, write-path review item 2",
+            reason: format!(
+                "the write range starts at 0x{FLASH_WRITE_START:08X}, which is one of the DA-side \
+                 addresses 0x{UNRESOLVED_STARTS:08X?} nobody has established by reading the DA's \
+                 own view. If the image begins at DA address 0, a 0xD5 over this range erases the \
+                 reset vector and the unit stops booting. This driver refuses every write until \
+                 docs/dev/05-verification.md settles which address the DA uses — see the module \
+                 documentation, \"The start address is unresolved\"",
             ),
         });
     }
@@ -976,8 +1061,13 @@ pub fn check_layout() -> Result<()> {
 /// image that is not a V1.13 M-241 image: the range is fixed, so neither could
 /// be what this driver writes.
 ///
-/// Returns `image` unchanged on success, so the caller cannot write a different
-/// buffer from the one that was checked.
+/// Returns the image it was given, after checking it.
+///
+/// The return value is the same slice the caller passed, so the signature can
+/// steer a release caller into checking before it writes: [`DownloadAgent::write`]
+/// can only reach the wire with the slice this function handed back. It does
+/// not stop a caller that ignores it — a slice, unlike a newtype, carries no
+/// proof — but nothing in this crate offers a write path that skips the check.
 ///
 /// # Errors
 ///
@@ -1053,6 +1143,11 @@ mod tests {
     /// through the DA's linear view has been made. The shipped constant is
     /// therefore refused by [`check_layout`]; these bytes only exercise the
     /// protocol on the fake.
+    ///
+    /// `0x4000` is also chosen so the fake's "nothing recorded" pair `(0, 0)`
+    /// can never be mistaken for this range: if it were `0`, a test asserting
+    /// `recorded_range() == (0, 0)` after a refusal would pass whether or not
+    /// the refusal was recorded.
     const WIRE_START: u32 = 0x0000_4000;
     /// The inclusive end of the test range.
     const WIRE_END: u32 = WIRE_START + (FLASH_WRITE_LENGTH as u32 - 1);
@@ -1125,13 +1220,16 @@ mod tests {
 
     /// Drive the write at the test's own start, so the protocol is exercised
     /// even though the shipped constant is refused.
+    ///
+    /// `write_range` itself runs [`check_image`]; calling it here with the
+    /// backup is the same shape [`DownloadAgent::write`] uses after its layout
+    /// check, so the tests go through the real check rather than around it.
     fn write_at_wire_start(
         da: &mut DownloadAgent<FakeDa>,
         backup: &[u8],
         image: &[u8],
     ) -> Result<PendingWrite> {
-        check_image(backup, image)?;
-        da.write_range(WIRE_START, image)
+        da.write_range(backup, WIRE_START, image)
     }
 
     // -- pinned constants --------------------------------------------------
@@ -1146,7 +1244,6 @@ mod tests {
         assert_eq!((ACK, NAK, CONT), (0x5A, 0xA5, 0x69));
         assert_eq!(MEM_CMD_STATUS_OK, 0x00);
         assert_eq!(PACKET_SIZE, 0x100);
-        assert_eq!(BYTES_BETWEEN_FINAL_ACKS, 0);
         assert_eq!(VECTOR, [0x18, 0xF0, 0x9F, 0xE5]);
     }
 
@@ -1165,6 +1262,53 @@ mod tests {
     }
 
     #[test]
+    fn the_layout_check_refuses_both_unresolved_starts() {
+        // The start address is not established. `0` covers the reset vector;
+        // `0x0020_0000` is the address `01-da-protocol.md` §4.2 names but no
+        // read through the DA's view confirms. Whichever one the constant
+        // carried, a write must be refused — swapping the constant is exactly
+        // the edit that would otherwise turn "refused" into "shipped".
+        assert_eq!(
+            UNRESOLVED_STARTS,
+            [0x0000_0000, 0x0020_0000],
+            "both candidates must stay listed; removing one is the act the hardware row has to justify"
+        );
+        for start in UNRESOLVED_STARTS {
+            assert!(
+                check_layout().is_err() || start != FLASH_WRITE_START,
+                "start 0x{start:08X} must not pass check_layout"
+            );
+        }
+        // The shipped constant is in the list, which is what makes the gate
+        // refuse. If someone sets FLASH_WRITE_START to the other candidate,
+        // this assertion still holds because the other candidate is listed too.
+        assert!(UNRESOLVED_STARTS.contains(&FLASH_WRITE_START));
+        // A start that is not in the list and not the pinned value is refused
+        // by the second gate, so there is no third address that slips through.
+        assert_ne!(WIRE_START, FLASH_WRITE_START);
+        assert!(
+            !UNRESOLVED_STARTS.contains(&WIRE_START),
+            "the test's own start is deliberately outside the candidates"
+        );
+    }
+
+    #[test]
+    fn the_layout_check_names_the_unresolved_address_in_its_refusal() {
+        // The message has to say *why* the shipped constant is refused, so a
+        // reader does not "fix" it by pointing at the wrong value. It must not
+        // depend on the item number in `11-safety-review.md`, which can be
+        // renumbered.
+        let err = check_layout().expect_err("the shipped constant is a candidate");
+        let text = format!("{err}");
+        assert!(text.contains("DA-side"), "got {text}");
+        assert!(text.contains("05-verification.md"), "got {text}");
+        assert!(
+            !text.contains("review item"),
+            "the refusal must not cite a document item number: {text}"
+        );
+    }
+
+    #[test]
     fn the_shipped_write_path_never_reaches_the_wire() {
         // `write` runs `check_layout` first, so with the shipped constant it
         // must fail before the fake sees a byte.
@@ -1180,6 +1324,52 @@ mod tests {
             !device.wrote_an_empty_range(),
             "no 0xD5 may arrive without a 0xD3"
         );
+    }
+
+    #[test]
+    fn write_range_refuses_an_image_outside_the_patch_table() {
+        // `AGENTS.md` §2.3 has to hold at the single place that talks to the
+        // wire, not at one caller of it: `write_range` runs `check_image`
+        // itself, so no caller can reach `0xD3` with an unchecked buffer.
+        let backup = stock_image();
+        let mut out_of_table = patched_image();
+        out_of_table[0x1000] ^= 0xFF;
+        let mut da = DownloadAgent::new(fake_in_da(&backup));
+        let err = da
+            .write_range(&backup, WIRE_START, &out_of_table)
+            .expect_err("a change outside the patch table");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        let device = da.transport_mut();
+        assert_eq!(device.accepted_packets(), 0);
+        assert_eq!(
+            device.recorded_range(),
+            (0, 0),
+            "0xD3 must not go out for an image that was never checked"
+        );
+    }
+
+    #[test]
+    fn a_confirmation_token_that_was_not_granted_is_refused() {
+        // `is_given()` is checked, not carried along: a token with the flag
+        // clear reaches neither `check_layout` nor the wire. No public
+        // constructor produces one, so this builds it where it is reachable —
+        // the module's own tests — which is exactly the point: the check is the
+        // only thing standing between `_confirmation` and the wire.
+        let ungranted = Confirmation { given: false };
+        assert!(!ungranted.is_given());
+        let backup = stock_image();
+        let mut da = DownloadAgent::new(fake_in_da(&backup));
+        let err = da
+            .write(ungranted, &backup, &backup)
+            .expect_err("an ungranted token");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        assert!(
+            format!("{err}").contains("never granted"),
+            "the refusal says why: {err}"
+        );
+        let device = da.transport_mut();
+        assert_eq!(device.accepted_packets(), 0);
+        assert_eq!(device.recorded_range(), (0, 0));
     }
 
     #[test]
@@ -1297,12 +1487,38 @@ mod tests {
     // -- wire arithmetic ---------------------------------------------------
 
     #[test]
-    fn the_packet_sum_is_a_big_endian_byte_sum() {
+    fn the_packet_trailer_is_the_sum_in_big_endian() {
+        // `byte_sum`'s arithmetic, checked against literals.
         assert_eq!(byte_sum(&[0x00, 0xFF]), 0x00FF);
         assert_eq!(byte_sum(&[0xFF, 0xFF, 0x02]), 0x0200);
         assert_eq!(byte_sum(&[]), 0);
         assert_eq!(byte_sum(&[0xFF; 0x100]), 0xFF00);
         assert_eq!(byte_sum(&[0xFF, 0xFF]), 0x01FE);
+        // And the order on the wire: high byte first (`0x001019DC`,
+        // `0x001019EC`), in the trailer the fake received. The first packet of
+        // `stock_image` is 256 bytes of `0xFF`, whose sum is `0xFF00`, so the
+        // two bytes must be `FF 00` — a little-endian trailer would be `00 FF`.
+        let backup = stock_image();
+        let mut da = DownloadAgent::new(fake_in_da(&backup));
+        write_at_wire_start(&mut da, &backup, &backup).expect("accepted");
+        let device = da.transport_mut();
+        let first = device.packets().first().expect("a packet");
+        assert_eq!(first.len(), PACKET_SIZE);
+        assert_eq!(first.first(), Some(&VECTOR[0]));
+        // The sum of that packet, from its bytes: the trailer must carry it
+        // high byte first (`0x001019DC`, `0x001019EC`).
+        let sum: u16 = first
+            .iter()
+            .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)));
+        assert_eq!(
+            device.trailer_of(0),
+            Some(sum.to_be_bytes()),
+            "the trailer is the payload sum, high byte first"
+        );
+        assert!(
+            sum > 0xFF,
+            "this packet's sum must have a non-zero low byte, or byte order is invisible: {sum:X}"
+        );
     }
 
     #[test]
@@ -1362,32 +1578,59 @@ mod tests {
             Progress::UpTo(WIRE_START + FLASH_WRITE_LENGTH as u32)
         );
 
-        let device = da.transport_mut();
-        assert_eq!(
-            device.recorded_range(),
-            (WIRE_START, WIRE_END),
-            "0xD3 must record an inclusive (start, end) pair with end = start + len - 1"
-        );
-        assert_eq!(
-            device.accepted_packets(),
-            expected_packets,
-            "one packet per acknowledged 0x69, no more and no fewer"
-        );
-        assert!(
-            window(device) == image.as_slice(),
-            "the fake's flash holds the image the DA programmed"
-        );
-        assert!(
-            !device.restarted(),
-            "the write must not send 0xD9: the read-back sends it exactly once"
-        );
-        assert!(!device.wrote_an_empty_range());
+        {
+            let device = da.transport_mut();
+            assert_eq!(
+                device.recorded_range(),
+                (WIRE_START, WIRE_END),
+                "0xD3 must record an inclusive (start, end) pair with end = start + len - 1"
+            );
+            assert_eq!(
+                device.accepted_packets(),
+                expected_packets,
+                "one packet per acknowledged 0x69, no more and no fewer"
+            );
+            assert!(
+                window(device) == image.as_slice(),
+                "the fake's flash holds the image the DA programmed"
+            );
+            assert!(
+                !device.restarted(),
+                "the write must not send 0xD9: the read-back sends it exactly once"
+            );
+            assert!(!device.wrote_an_empty_range());
+        }
 
         let report = pending
             .verify_written(da, &image, WIRE_START, reenter)
             .expect("read back");
         assert_eq!(report.verified, FLASH_WRITE_LENGTH);
+        assert_eq!(report.verified, report.length);
         assert_eq!(report.packets, expected_packets);
+    }
+
+    #[test]
+    fn the_read_back_address_is_the_bootrom_view_of_the_da_start() {
+        // The client reads the span at `BASE_ADDR_FIRMWARE + da_start`, not at
+        // the DA address. The fake records the address it was asked for, so a
+        // client that omitted or doubled the base is a wrong address here,
+        // not "another convention the fake happens to match".
+        let backup = stock_image();
+        let mut rom = MtkBootRom::new(in_bootrom(fake_in_da(&backup)));
+        rom.sync().expect("sync");
+        let read = rom
+            .read16(BASE_ADDR_FIRMWARE + WIRE_START, FLASH_WRITE_LENGTH)
+            .expect("read the span");
+        assert!(
+            read == backup,
+            "the BootROM view of the DA address holds the same bytes"
+        );
+        assert_eq!(
+            rom.transport_mut().last_read_address(),
+            Some(BASE_ADDR_FIRMWARE + WIRE_START),
+            "the read must carry the BootROM base"
+        );
+        assert_ne!(BASE_ADDR_FIRMWARE + WIRE_START, WIRE_START);
     }
 
     #[test]
@@ -1411,9 +1654,81 @@ mod tests {
 
     #[test]
     fn the_final_packet_is_the_short_one_and_is_zero_filled() {
-        // §8 item 9: the image ends on a 92-byte packet; the client pads it.
-        assert_eq!(FLASH_WRITE_LENGTH % PACKET_SIZE, 0x5C);
-        assert_eq!(FLASH_WRITE_LENGTH % PACKET_SIZE, 92);
+        // §8 item 9: the image ends on a 92-byte packet, and the client pads it
+        // to PACKET_SIZE before the sum (§4.4). The padding is observed on the
+        // wire — what the fake received — not recomputed from the constants.
+        let backup = stock_image();
+        let image = patched_image();
+        // `stock_image` fills the body with `0xFF`, so a padded zero is
+        // distinguishable from a payload byte.
+        assert_eq!(image.get(FLASH_WRITE_LENGTH - 92), Some(&0xFF));
+
+        let mut da = DownloadAgent::new(fake_in_da(&backup));
+        write_at_wire_start(&mut da, &backup, &image).expect("accepted");
+        let device = da.transport_mut();
+
+        let packets = device.packets();
+        assert_eq!(packets.len(), FLASH_WRITE_LENGTH.div_ceil(PACKET_SIZE));
+        let final_packet = packets.last().expect("at least one packet");
+        assert_eq!(
+            final_packet.len(),
+            PACKET_SIZE,
+            "every payload is a full packet"
+        );
+        let (tail, padding) = final_packet.split_at(92);
+        assert_eq!(
+            tail,
+            image.get(FLASH_WRITE_LENGTH - 92..).expect("92 bytes"),
+            "the short packet carries the image's last 92 bytes, in order"
+        );
+        assert!(
+            padding.iter().all(|byte| *byte == 0),
+            "the client must zero-fill the final packet to PACKET_SIZE: {padding:02X?}"
+        );
+
+        // The sum covers the padded payload: the trailer on the wire is the sum
+        // of the 256 bytes above, padding included.
+        let padded_sum: u16 = final_packet
+            .iter()
+            .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)));
+        let trailer = device
+            .last_packet_trailer()
+            .expect("the trailer the client sent");
+        assert_eq!(u16::from_be_bytes(trailer), padded_sum);
+    }
+
+    #[test]
+    fn the_restart_does_not_read_a_reply() {
+        // §4.5, §8 item 4: `0xD9` never returns and sends nothing. A client that
+        // reads after it waits out the timeout at best. The fake queues nothing
+        // for the restart, so the assertion is "nothing arrived" — a client
+        // that read would block and fail this test on the timeout.
+        let backup = stock_image();
+        let mut da = DownloadAgent::new(fake_in_da(&backup));
+        da.restart().expect("0xD9 goes out");
+        assert!(da.transport_mut().restarted(), "0xD9 must have been sent");
+        let mut byte = [0u8; 1];
+        let read = da.transport_mut().read(&mut byte).expect("read");
+        assert_eq!(
+            read, 0,
+            "0xD9 must not answer; a client may not wait for it"
+        );
+    }
+
+    #[test]
+    fn a_write_stops_before_the_restart_so_the_caller_can_decide() {
+        // The write path itself never sends `0xD9`: the restart belongs to
+        // `verify_written`, immediately before the read-back. A `0xD9` sent
+        // after a failed write would boot the firmware and make the BootROM
+        // re-entry the caller had planned harder, not easier.
+        let backup = stock_image();
+        let mut da = DownloadAgent::new(fake_in_da(&backup));
+        da.transport_mut().set_failing_first_erase(true);
+        write_at_wire_start(&mut da, &backup, &patched_image()).expect_err("the erase fails");
+        assert!(
+            !da.transport_mut().restarted(),
+            "the write never sends 0xD9"
+        );
     }
 
     #[test]
@@ -1435,10 +1750,61 @@ mod tests {
     }
 
     #[test]
-    fn a_packet_refusal_before_any_progress_says_no_packet_was_programmed() {
+    fn the_stream_stays_aligned_after_a_refused_range() {
+        // The refusal is a single `A5`. If the client read a second byte after
+        // it, that byte would be the first byte of the *next* reply, and the
+        // range acceptance below would be read as part of the status.
+        let backup = stock_image();
+        let mut da = DownloadAgent::new(fake_in_da(&backup).refusing_ranges(true));
+        let err = write_at_wire_start(&mut da, &backup, &backup).expect_err("refused");
+        assert!(matches!(err, Error::Rejected { .. }), "got {err}");
+
+        // Now accept: the fake must see a whole, well-formed command and
+        // answer it with the two bytes a client that reads exactly as it
+        // promised will consume.
+        let device = da.transport_mut();
+        device.set_accepting_ranges();
+        check_image(&backup, &backup).expect("identical");
+        // A second `0xD3` through the same client, at the same test start.
+        let second = da.write_range(&backup, WIRE_START, &backup);
+        // The fake refuses packets only if told to; this write is refused for
+        // the fake's own reason only after the range is accepted. What must hold
+        // is that the range was recorded — the command was understood.
+        let _ = second;
+        assert_eq!(
+            da.transport_mut().recorded_range(),
+            (WIRE_START, WIRE_END),
+            "the second 0xD3 must be parsed as a whole command after the refusal"
+        );
+    }
+
+    #[test]
+    fn a_failed_first_erase_is_a_rejected_error_with_nothing_written() {
+        // §5.6: `0xA5` at `0x0010253C`-`0x0010254C` replaces the second `0x5A`,
+        // so no packet follows. The client must report it as a refusal that got
+        // nowhere, not as a framing error or as progress.
         let backup = stock_image();
         let mut da = DownloadAgent::new(fake_in_da(&backup));
-        da.transport_mut().set_refusing_packets_from(0, 1_000);
+        da.transport_mut().set_failing_first_erase(true);
+        let err = write_at_wire_start(&mut da, &backup, &patched_image())
+            .expect_err("the erase is refused");
+        let text = format!("{err}");
+        assert!(matches!(err, Error::Rejected { .. }), "got {err}");
+        assert!(text.contains("could not erase"), "got {text}");
+        assert!(text.contains("no packet was programmed"), "got {text}");
+        assert!(
+            text.contains("0xD9"),
+            "the recovery step must be named: {text}"
+        );
+        let device = da.transport_mut();
+        assert_eq!(device.accepted_packets(), 0);
+        assert!(!device.restarted(), "the write does not restart the chip");
+    }
+
+    #[test]
+    fn a_packet_refusal_before_any_progress_says_no_packet_was_programmed() {
+        let backup = stock_image();
+        let mut da = DownloadAgent::new(fake_in_da(&backup).refusing_packets_from(0, 1_000));
         let err = write_at_wire_start(&mut da, &backup, &patched_image())
             .expect_err("the first packet is refused");
         let text = format!("{err}");
@@ -1453,8 +1819,7 @@ mod tests {
         // The fake accepts two packets, then refuses; the error must carry
         // "512 of 406620 bytes" and not "no packet".
         let backup = stock_image();
-        let mut da = DownloadAgent::new(fake_in_da(&backup));
-        da.transport_mut().set_refusing_packets_from(2, 1_000);
+        let mut da = DownloadAgent::new(fake_in_da(&backup).refusing_packets_from(2, 1_000));
         let err = write_at_wire_start(&mut da, &backup, &patched_image())
             .expect_err("the third packet is refused");
         let text = format!("{err}");
@@ -1470,8 +1835,7 @@ mod tests {
         let mut da = DownloadAgent::new(fake_in_da(&backup));
         let pending = write_at_wire_start(&mut da, &backup, &image).expect("accepted");
         // One bit that did not take, after the conversation ended.
-        da.transport_mut()
-            .damage(WIRE_START as usize + 0x1000, 0x01);
+        da.transport_mut().damage(WIRE_START + 0x1000, 0x01);
         let err = pending
             .verify_written(da, &image, WIRE_START, reenter)
             .expect_err("the read-back disagrees");
@@ -1507,6 +1871,11 @@ mod tests {
         assert!(matches!(err, Error::Safety { .. }), "got {err}");
         assert!(format!("{err}").contains("0x1000"), "got {err}");
         DownloadAgent::verify_device_at(&mut rom, &backup, WIRE_START).expect("the right unit");
+        // The whole-span comparison read the BootROM view of the DA address.
+        assert_eq!(
+            rom.transport_mut().last_read_address(),
+            Some(BASE_ADDR_FIRMWARE + WIRE_START)
+        );
     }
 
     #[test]
