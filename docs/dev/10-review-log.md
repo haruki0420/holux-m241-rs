@@ -340,3 +340,37 @@ main は `e58c5d3` → `5d6ad74` → `19e07c6` と進んだが、いずれも本
 
 - **ゲート・テスト**: `./tools/check.sh` 全ゲート PASS、`m241-cli` テスト **108 件**（84 → 108、削除・弱体化 0 件）。本番コードの `unwrap`/`expect`/`panic!`/`unsafe`/無検証添字 0 件、個人情報違反なし。
 - **判定**: **合格**（`main` へマージ）。
+
+## 2026-11-21 / ezTour core の Stage 2 修正（`fix/eztour-core`）
+
+対象: `crates/m241-core/src/log/` の 8 ファイル（coord / edit / exif / export / geotag / import / kmz / mod）。
+`feat/eztour-core` `8c2ed2a` に対する仕様検収・可読性レビューの Must を解消した。
+
+- **裁定の記録**: 可読性 Must 1（KMZ の CDATA が `]]>` で壊れる）はリードが事実誤認と確認済み。
+  `sanitize_photo_name`（`kmz.rs`）は `]` を `_` に置換するため `]]>` は生成できない。
+  修正は行わず、テスト品質の部分（名前経由で CDATA を閉じられないことを固定するテスト）だけを追加した。
+
+| # | 指摘 | 処置 | 判拠 |
+|---|---|---|---|
+| M1 | KMZ の長辺縮小（`kmzMaxPhotoEdgeSize`）未実装 | **部分的に解消。縮小は未実装のまま明示** | `KmzPhoto::max_edge_pixels` を受ける `jpeg_dimensions`（SOF ヘッダ読取、デコード無し）を追加し、上限超過は `Error::State` で**拒否**（黙って原寸を入れない）。PNG→JPEG に必要なコーデック依存は追加提案のみ。`12-progress-summary.md` §3.2 に明記 |
+| M2 | 時刻シフト後の自動再マッチングが無い | 解消 | `geotag::plan_with_shift`（再計画、dry-run 安全）＋ `exif::write_datetime_original`（`DateTimeOriginal` 書き換え）＋ `apply` が同じリライトで時刻と位置を書く。`FileModified` は昇格させない |
+| M3 | 距離グループ化が推移的でない | 解消 | union-find（path halving）。A-B 10 m / B-C 10 m / A-C 20 m を 1 グループにし、入力順反転でも同じ分割 |
+| M4 | `GPSVersionID` の型・個数不一致が doc 未記載 | 解消 | `GpsTags::version_id` と `read_gps_version` に「型・個数が規格外なら `None`」を明記（`read_coordinate` の慣例に合わせ `Err` にはしない。根拠も doc に記載） |
+
+**仕様検収 Should の処置**: S3/S4（色・`<Point>`）、S30/S31（RMC `V`・GGA 品質 0・RMC→GGA 順）、
+S-d（既定値）、S-f（`KmzPhoto::utc` と EXIF の一致、`CaptureTime` の出自を保持）はテスト／実装で解消。
+S11/S15（タイムゾーン変換・日時分秒の個別シフト・適用範囲）と S21/S22（非 JPEG の紐づけのみ）は
+P1 の範囲外として未実装のまま `12-progress-summary.md` に明記。S-e（GPX 1.1 `<speed>`）は m/s 解釈を doc 化。
+C-c（10 色パレット）は単一トラックなので 1 色のまま、理由を定数 doc に記載。
+
+**可読性 Should の処置**: 4（モジュール doc）、5（`last_bucket` 命名＋日付制約）、6（`hemi` 比較）、
+7（閉じないコメントを `Error::Log` に）、9（色の読み下しと「ezTour 実出力と未照合」）、10（Snyder §8-9、
+`split_track` の複製理由）、11（UTM の範囲 doc）、13（`_original` の命名理由）、14（`civil_from_days` を共用）、
+15（`GeotagPlan::keep_backup` の doc）、16（到達不能分岐を除去）、17（`checked_track` に集約）、
+18（merge の点順序）、19（`gps_entries_for` 削除）、20（`segment_length_for` に集約）、
+21（`crc32_ieee`・`MAX_APP1_PAYLOAD`・`MAX_TIFF_BYTES` を非公開化）、23（`<Point>` と高度既定の doc）、
+25（`min(19)` の理由）、C-a（ノルウェー／スバールバル帯の直接テスト）を解消。
+2（`<wpt>`）と 3（NMEA の落ちた行数）は doc に設計判断を明記して見送り。
+
+**安全ゲートの指摘**: 新規の JPEG サイズ読取が EOI を生の `0xD9` で書いたため `check_safety.py` が
+違反として検出した。`exif::JPEG_MARKER_EOI`（SOI+1）で表すよう修正し、ゲートは一切変更していない。
