@@ -1248,6 +1248,15 @@ impl<T: Transport> DownloadAgent<T> {
     /// retry of its own, so a page that arrives wrong twice is a cable problem
     /// rather than a protocol one.
     ///
+    /// The line is cleared before the command goes out: a byte that arrived
+    /// earlier cannot be this command's answer. Whether the DA emits any
+    /// trailing bytes after its [`DA_REPORT_SIZE`] report or leading bytes
+    /// before the first page is ⚠️ 未検証 (not yet recorded in
+    /// `docs/dev/05-verification.md`), so stale bytes are treated defensively
+    /// on either side of the command: when a page fails its checksum,
+    /// [`Self::read_page`] also clears the line before asking for it again,
+    /// so leftover prefix bytes cannot shift every retry.
+    ///
     /// # Errors
     ///
     /// * [`Error::State`] when `length` is zero or is not a whole number of
@@ -1270,6 +1279,12 @@ impl<T: Transport> DownloadAgent<T> {
                 ))
             })?;
         let pages = length / PROBE_PAGE_SIZE;
+        // Anything already on the line belongs to an earlier exchange. Whether
+        // the DA emits trailing bytes after its twenty-byte report is
+        // ⚠️ 未検証 (not yet recorded in `docs/dev/05-verification.md`), so
+        // drain defensively before sending 0xD6 in case stale bytes sit ahead
+        // of the first page.
+        self.transport.clear_input()?;
         let mut frame = Vec::with_capacity(13);
         frame.push(OPCODE_READ_RANGE);
         frame.extend_from_slice(&u32::try_from(PROBE_PAGE_SIZE).unwrap_or(64).to_be_bytes());
@@ -1320,6 +1335,10 @@ impl<T: Transport> DownloadAgent<T> {
                     offset: Some(page.saturating_mul(PROBE_PAGE_SIZE)),
                 });
             }
+            // A page that failed may not have been the whole page: if extra
+            // bytes arrived ahead of it, the tail is still queued and asking
+            // again would repeat the same shift. Drop what is left, then ask.
+            self.transport.clear_input()?;
             self.transport.write_all(&[PAGE_RETRY])?;
             self.transport.flush()?;
         }
@@ -3420,6 +3439,174 @@ mod loader_tests {
             device.output_len(),
             0,
             "the DA sends nothing when the range is complete"
+        );
+    }
+
+    #[test]
+    fn four_bytes_left_over_from_the_banner_do_not_shift_the_first_page() {
+        let mut window = flash(0x00);
+        let data: Vec<u8> = (0..PROBE_PAGE_SIZE)
+            .map(|index| 0xB0u8.wrapping_add(index as u8))
+            .collect();
+        place(&mut window, 0, &data);
+        let mut device = da_with(&window);
+        // Defensive case (⚠️ 未検証 in `docs/dev/05-verification.md`): if stale
+        // bytes sit on the line after the twenty-byte banner, they remain ahead
+        // of `0xD6` until the pre-read drain clears them.
+        device.queue_output(&[0x7D, 0x00, 0x00, 0x00]);
+
+        let (page, device) = read(device, 0, PROBE_PAGE_SIZE);
+        assert_eq!(
+            page.expect("0xD6 after a leftover prefix"),
+            data,
+            "the read must start at the page, not four bytes into it"
+        );
+        assert_eq!(
+            device.retries_sent(),
+            0,
+            "the pre-read drain must take the leftovers without needing a retry"
+        );
+        assert_eq!(
+            device.output_len(),
+            0,
+            "the drain that starts the read took the leftovers"
+        );
+    }
+
+    #[test]
+    fn a_page_that_arrives_behind_four_bytes_is_asked_for_again_and_read_clean() {
+        let mut window = flash(0x00);
+        let data: Vec<u8> = (0..PROBE_PAGE_SIZE)
+            .map(|index| 0xC0u8.wrapping_add(index as u8))
+            .collect();
+        place(&mut window, 0, &data);
+        let mut device = da_with(&window);
+        // Defensive case (⚠️ 未検証 in `docs/dev/05-verification.md`): leading
+        // bytes arrive after the command, in front of the page, so the clear
+        // that starts the read cannot see them.
+        device.prefix_next_page(&[0x7D, 0x00, 0x00, 0x00]);
+
+        let (page, device) = read(device, 0, PROBE_PAGE_SIZE);
+        assert_eq!(
+            page.expect("0xD6 after a page with a prefix"),
+            data,
+            "the retry must drop the leftovers and start at the page"
+        );
+        assert_eq!(device.retries_sent(), 1, "exactly one re-request");
+        assert_eq!(
+            device.output_len(),
+            0,
+            "nothing is left once the clean page has been read"
+        );
+    }
+
+    #[test]
+    fn a_multi_page_read_resynchronises_after_a_prefix_on_the_first_page() {
+        let mut window = flash(0x00);
+        let expected: Vec<u8> = (0..2 * PROBE_PAGE_SIZE)
+            .map(|index| 0xD0u8.wrapping_add(index as u8))
+            .collect();
+        place(&mut window, 0, &expected);
+        let mut device = da_with(&window);
+        device.prefix_next_page(&[0x7D, 0x00, 0x00, 0x00]);
+
+        let (pages, device) = read(device, 0, 2 * PROBE_PAGE_SIZE);
+        assert_eq!(
+            pages.expect("two pages after a prefix on page 1"),
+            expected,
+            "page 1 retries cleanly and page 2 aligns with PAGE_ADVANCE"
+        );
+        assert_eq!(device.retries_sent(), 1, "only page 1 needed a retry");
+        assert_eq!(
+            read_opcodes(&device),
+            &[OPCODE_READ_RANGE],
+            "one 0xD6; the retry and PAGE_ADVANCE bytes stay inside the page conversation"
+        );
+        assert_eq!(
+            device.output_len(),
+            0,
+            "no leftover bytes remain after the second page"
+        );
+    }
+
+    #[test]
+    fn a_failing_pre_read_drain_propagates_the_error_without_sending_read_range() {
+        let window = flash(0x00);
+        let mut device = da_with(&window);
+        device.failing_clear_input();
+
+        let (result, device) = read(device, 0, PROBE_PAGE_SIZE);
+        let err = result.expect_err("the pre-read drain failed");
+        assert!(matches!(err, Error::Io { .. }), "got {err}");
+        assert!(
+            format!("{err}").contains("went away"),
+            "the port's own error is carried: {err}"
+        );
+        assert_eq!(
+            read_opcodes(&device),
+            &[] as &[u8],
+            "0xD6 must not be sent when clearing the line fails"
+        );
+    }
+
+    #[test]
+    fn a_failing_retry_drain_propagates_the_error_without_sending_retry() {
+        /// Lets the pre-read `clear_input` succeed, then arms `failing_clear_input`
+        /// so the retry-side `clear_input` fails before `0xA5` goes out.
+        #[derive(Debug)]
+        struct FailRetryDrain(FakeDa);
+
+        impl Transport for FailRetryDrain {
+            fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+                self.0.read(buf)
+            }
+
+            fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+                self.0.write_all(buf)
+            }
+
+            fn flush(&mut self) -> Result<()> {
+                self.0.flush()
+            }
+
+            fn clear_input(&mut self) -> Result<()> {
+                let result = self.0.clear_input();
+                self.0.failing_clear_input();
+                result
+            }
+
+            fn set_baud(&mut self, baud: u32) -> Result<()> {
+                self.0.set_baud(baud)
+            }
+
+            fn set_control_lines(&mut self, asserted: bool) -> Result<()> {
+                self.0.set_control_lines(asserted)
+            }
+        }
+
+        let window = flash(0x00);
+        let mut device = da_with(&window);
+        device.prefix_next_page(&[0x7D, 0x00, 0x00, 0x00]);
+        let mut da = DownloadAgent::new(FailRetryDrain(device))
+            .with_reply_timeout(Duration::from_millis(50));
+        let err = da
+            .read_range(0, PROBE_PAGE_SIZE)
+            .expect_err("the retry drain failed");
+        assert!(matches!(err, Error::Io { .. }), "got {err}");
+        assert!(
+            format!("{err}").contains("went away"),
+            "the port's own error is carried: {err}"
+        );
+        let device = da.into_transport().0;
+        assert_eq!(
+            read_opcodes(&device),
+            &[OPCODE_READ_RANGE],
+            "0xD6 was sent before the page checksum failed"
+        );
+        assert_eq!(
+            device.retries_sent(),
+            0,
+            "0xA5 must not be sent when clearing the line on retry fails"
         );
     }
 

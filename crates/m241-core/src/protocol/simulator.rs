@@ -32,11 +32,11 @@ use std::collections::VecDeque;
 
 use crate::error::{Error, Result};
 use crate::protocol::brom::{
-    BASE_ADDR_FIRMWARE, BOOT_REPLY, BOOT_SYNC, OPCODE_CHECKSUM, OPCODE_JUMP, OPCODE_READ16,
-    OPCODE_READ32,
+    BASE_ADDR_FIRMWARE, BOOT_REPLY, BOOT_SYNC, DEFAULT_BOOTROM_BAUD, OPCODE_CHECKSUM, OPCODE_JUMP,
+    OPCODE_READ16, OPCODE_READ32,
 };
 use crate::protocol::frame::{checksum_xor16, swap_pairs};
-use crate::protocol::pmtk::{checksum, line as pmtk_line};
+use crate::protocol::pmtk::{NMEA_BAUD, checksum, line as pmtk_line};
 use crate::protocol::port::Transport;
 
 /// The firmware base the fake chip maps its flash window at.
@@ -83,6 +83,9 @@ pub struct FakeDevice {
     /// Command bodies the host sent, in order (for "which commands, in what
     /// order" assertions in tests).
     commands: Vec<String>,
+    /// One label per transport call, in order, so a test can see that the input
+    /// was cleared and drained *before* the sentence went out.
+    call_log: Vec<String>,
     mode: Mode,
     bootrom_stage: BootRomStage,
     /// Whether the firmware is currently streaming NMEA sentences.
@@ -126,13 +129,14 @@ impl FakeDevice {
             output: VecDeque::new(),
             line: Vec::new(),
             commands: Vec::new(),
+            call_log: Vec::new(),
             mode: Mode::Running,
             bootrom_stage: BootRomStage::Sync { index: 1 },
             // A live logger streams NMEA from the moment it is powered on, which
             // is exactly the condition `$PMTK180` needs.
             streaming: true,
             logging_enabled: true,
-            baud: 115_200,
+            baud: NMEA_BAUD,
             control_lines: false,
             release: release.to_owned(),
             build: build.to_owned(),
@@ -181,6 +185,7 @@ impl FakeDevice {
         self.output.clear();
         self.mode = Mode::BootRom;
         self.bootrom_stage = BootRomStage::Command;
+        self.baud = DEFAULT_BOOTROM_BAUD;
         self
     }
 
@@ -240,6 +245,43 @@ impl FakeDevice {
         &self.commands
     }
 
+    /// One label per transport call, in order: `clear`, `read`, `write`,
+    /// `flush`, `baud`, `lines`.
+    ///
+    /// A command body alone cannot show *when* the host cleared the input, and
+    /// "clear, read, clear, then write" is the whole point of the hand-over
+    /// sequence. The log keeps every call; [`Self::calls_since`] cuts it at a
+    /// marker so a test can look at just this command's traffic.
+    #[must_use]
+    pub fn call_log(&self) -> &[String] {
+        &self.call_log
+    }
+
+    /// How many calls the log holds, as a marker for [`Self::calls_since`].
+    #[must_use]
+    pub fn call_mark(&self) -> usize {
+        self.call_log.len()
+    }
+
+    /// The calls recorded after `mark`, in order.
+    #[must_use]
+    pub fn calls_since(&self, mark: usize) -> Vec<&str> {
+        self.call_log
+            .get(mark..)
+            .unwrap_or_default()
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// How many `$PMTK180` bodies arrived.
+    #[must_use]
+    pub fn pmtk180_count(&self) -> usize {
+        self.commands
+            .iter()
+            .filter(|body| body.as_str() == PMTK180_BODY)
+            .count()
+    }
     /// A device whose NMEA output is already flowing, as it is on a powered-on
     /// logger.
     ///
@@ -557,10 +599,12 @@ impl Default for FakeDevice {
 
 impl Transport for FakeDevice {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.call_log.push(String::from("read"));
         Ok(self.take_output(buf))
     }
 
     fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        self.call_log.push(String::from("write"));
         for byte in buf {
             self.consume(*byte);
         }
@@ -568,20 +612,24 @@ impl Transport for FakeDevice {
     }
 
     fn flush(&mut self) -> Result<()> {
+        self.call_log.push(String::from("flush"));
         Ok(())
     }
 
     fn clear_input(&mut self) -> Result<()> {
+        self.call_log.push(String::from("clear"));
         self.output.clear();
         Ok(())
     }
 
     fn set_baud(&mut self, baud: u32) -> Result<()> {
+        self.call_log.push(format!("baud:{baud}"));
         self.baud = baud;
         Ok(())
     }
 
     fn set_control_lines(&mut self, asserted: bool) -> Result<()> {
+        self.call_log.push(String::from("lines"));
         self.control_lines = asserted;
         Ok(())
     }
@@ -615,16 +663,89 @@ pub fn unsupported(what: &str) -> Error {
     Error::State(format!("the fake device does not model {what}"))
 }
 
+/// A transport that only ever reads: enough to drive a probe or a drain.
+///
+/// It exists so timing tests do not have to build a whole fake chip, and it
+/// lives here rather than beside each test because the safety gate lets
+/// `set_control_lines` be named only in a handful of files, this one included.
+#[cfg(test)]
+#[derive(Debug)]
+pub struct QuietTransport {
+    /// The bytes a read hands back, cycling.
+    line: &'static [u8],
+    /// How far into `line` the previous read got.
+    position: usize,
+}
+
+#[cfg(test)]
+impl QuietTransport {
+    /// A line that always arrives, in pieces as large as the reader asks.
+    #[must_use]
+    pub fn streaming(line: &'static [u8]) -> Self {
+        Self { line, position: 0 }
+    }
+
+    /// A line that never says anything.
+    #[must_use]
+    pub fn quiet() -> Self {
+        Self {
+            line: &[],
+            position: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Transport for QuietTransport {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        if self.line.is_empty() {
+            return Ok(0);
+        }
+        let start = self.position % self.line.len();
+        let room = self.line.len() - start;
+        let count = room.min(buf.len());
+        let chunk = self.line.get(start..start + count).unwrap_or_default();
+        let target = buf.get_mut(..count).unwrap_or_default();
+        target.copy_from_slice(chunk);
+        self.position += count;
+        Ok(count)
+    }
+
+    fn write_all(&mut self, _buf: &[u8]) -> Result<()> {
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn clear_input(&mut self) -> Result<()> {
+        self.position = 0;
+        Ok(())
+    }
+
+    fn set_baud(&mut self, _baud: u32) -> Result<()> {
+        Ok(())
+    }
+
+    fn set_control_lines(&mut self, _asserted: bool) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
     use crate::protocol::brom::MtkBootRom;
-    use crate::protocol::pmtk::PmtkClient;
+    use crate::protocol::pmtk::{DEFAULT_ENTRY_SETTLE, EntryTiming, PmtkClient};
 
     fn client() -> PmtkClient<FakeDevice> {
         PmtkClient::new(FakeDevice::new())
             .with_stream_window(std::time::Duration::from_millis(20))
             .with_reply_timeout(std::time::Duration::from_millis(200))
+            .with_entry_timing(EntryTiming::fast())
     }
 
     #[test]
@@ -672,28 +793,477 @@ mod tests {
         assert!(device.commands().is_empty(), "a bad checksum is dropped");
     }
 
+    /// A firmware that does not honour `$PMTK180`, which keeps streaming: the
+    /// state the unit was in when the earlier Rust entry sequence failed.
+    ///
+    /// The fake proper models a unit that switches, so only the write differs;
+    /// every read still goes through it.
+    #[derive(Debug)]
+    struct DeafFirmware {
+        device: FakeDevice,
+        /// How far into the streamed line the previous read got.
+        pending: usize,
+    }
+
+    impl DeafFirmware {
+        fn new(device: FakeDevice) -> Self {
+            Self { device, pending: 0 }
+        }
+    }
+
+    impl Transport for DeafFirmware {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+            // A firmware that ignored the sentence is still streaming, so it has
+            // a sentence ready whenever the host listens. The line is longer than
+            // some reads, so it is handed out in whatever pieces they ask for;
+            // `pending` is what carries the position from one read to the next.
+            self.device.call_log.push(String::from("read"));
+            let line = nmea_line(GGA_BODY);
+            let bytes = line.as_bytes();
+            let start = self.pending % bytes.len();
+            let room = bytes.len() - start;
+            let count = room.min(buf.len());
+            let chunk = bytes.get(start..start + count).unwrap_or_default();
+            let target = buf.get_mut(..count).unwrap_or_default();
+            target.copy_from_slice(chunk);
+            self.pending += count;
+            Ok(count)
+        }
+
+        fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+            // Record the attempt, but never hand it to the fake state machine:
+            // that one honours `$PMTK180`, and these tests need a unit that does
+            // not.
+            self.device.call_log.push(String::from("write"));
+            if !buf.is_empty() {
+                self.device.commands.push(String::from(PMTK180_BODY));
+            }
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            self.device.call_log.push(String::from("flush"));
+            Ok(())
+        }
+
+        fn clear_input(&mut self) -> Result<()> {
+            // The line is produced by `read`, so a clear must not silence it.
+            self.device.call_log.push(String::from("clear"));
+            self.pending = 0;
+            Ok(())
+        }
+
+        fn set_baud(&mut self, baud: u32) -> Result<()> {
+            self.device.set_baud(baud)
+        }
+
+        fn set_control_lines(&mut self, asserted: bool) -> Result<()> {
+            self.device.set_control_lines(asserted)
+        }
+    }
+
+    /// The sentence a live logger streams, used to build the deaf firmware's
+    /// answer.
+    const GGA_BODY: &str = "GPGGA,221321.00,3540.87416,N,13946.02750,E,1,08,0.9,80.0,M,0.0,M,,";
+
     #[test]
     fn pmtk180_stops_the_stream_and_moves_the_chip_to_the_bootrom() {
         let mut client = client();
         client.transport_mut().queue_nmea(1);
+        assert_eq!(client.transport_mut().baud(), NMEA_BAUD);
+        let mark = client.transport_mut().call_mark();
         client.enter_bootrom().expect("the stream is live");
         let device = client.transport_mut();
         assert_eq!(device.mode(), Mode::BootRom);
         assert!(!device.streaming());
-        assert_eq!(device.baud(), crate::protocol::brom::DEFAULT_BOOTROM_BAUD);
+        assert_eq!(device.baud(), DEFAULT_BOOTROM_BAUD);
+        assert!(
+            device.calls_since(mark).contains(&"baud:115200"),
+            "enter_bootrom must switch the transport to the BootROM baud"
+        );
     }
 
     #[test]
     fn pmtk180_is_refused_when_no_stream_is_running() {
         let mut client = PmtkClient::new(FakeDevice::new().without_nmea())
             .with_stream_window(std::time::Duration::from_millis(20))
-            .with_reply_timeout(std::time::Duration::from_millis(20));
+            .with_reply_timeout(std::time::Duration::from_millis(20))
+            .with_entry_timing(EntryTiming::fast());
         let err = client.enter_bootrom().expect_err("silent unit");
         assert!(format!("{err}").contains("no NMEA stream"), "got {err}");
         // Refusing must not have sent the sentence: at a silent unit it would be
         // ignored anyway, and sending it blind is the habit that later becomes a
         // pulse at a streaming firmware.
         assert!(client.transport_mut().commands().is_empty());
+        assert_eq!(client.transport_mut().baud(), NMEA_BAUD);
+        assert!(
+            !client
+                .transport_mut()
+                .call_log()
+                .iter()
+                .any(|call| call == "baud:115200")
+        );
+    }
+
+    #[test]
+    fn pmtk180_is_refused_when_the_line_cannot_be_classified() {
+        // Bytes arrive but never a complete sentence: neither "streaming" nor
+        // "silent", so the tri-state must refuse rather than guess. The sentence
+        // is not sent either.
+        #[derive(Debug)]
+        struct Noise {
+            /// How much of the line has been handed out.
+            sent: usize,
+        }
+
+        impl Transport for Noise {
+            fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+                // A complete line that is not an NMEA sentence: something
+                // arrived, so the answer is "cannot tell", not "silent". One byte
+                // per call keeps the transport simple while `read_line` still
+                // reaches the `\n` and returns the fragment.
+                const LINE: &[u8] = b"noise-without-dollar\r\n";
+                let Some(slot) = buf.first_mut() else {
+                    return Ok(0);
+                };
+                let Some(byte) = LINE.get(self.sent % LINE.len()) else {
+                    return Ok(0);
+                };
+                *slot = *byte;
+                self.sent += 1;
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                Ok(1)
+            }
+
+            fn write_all(&mut self, _buf: &[u8]) -> Result<()> {
+                panic!("nothing may be written to an unclassifiable line");
+            }
+
+            fn flush(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            fn clear_input(&mut self) -> Result<()> {
+                // Nothing to drop: the noise is produced by `read` so the probe
+                // cannot pass just because a clear emptied the queue.
+                Ok(())
+            }
+
+            fn set_baud(&mut self, _baud: u32) -> Result<()> {
+                Ok(())
+            }
+
+            fn set_control_lines(&mut self, _asserted: bool) -> Result<()> {
+                panic!("the reset lines are never touched");
+            }
+        }
+
+        let mut client = PmtkClient::new(Noise { sent: 0 });
+        let err = client.enter_bootrom().expect_err("unclassifiable line");
+        assert!(format!("{err}").contains("cannot tell"), "got {err}");
+    }
+
+    #[test]
+    fn the_entry_clears_the_line_then_drains_it_before_writing_the_sentence() {
+        // The order is the point: queued sentences are dropped, the line is
+        // drained, dropped again, and only then does `$PMTK180` go out. The
+        // earlier Rust sequence wrote into a busy line and the unit ignored it.
+        let mut client = client();
+        client.transport_mut().queue_nmea(2);
+        let mark = client.transport_mut().call_mark();
+        client.enter_bootrom().expect("the stream is live");
+        let calls = client.transport_mut().calls_since(mark);
+        let write = calls
+            .iter()
+            .position(|call| *call == "write")
+            .unwrap_or_else(|| panic!("no write in {calls:?}"));
+        let before = calls.get(..write).unwrap_or_default();
+        // The exact shape is `clear`, then one or more reads, then `clear`: a
+        // drain that is dropped leaves the two clears adjacent, and a write that
+        // comes before the drain leaves no reads between them.
+        let first_clear = before.iter().position(|call| *call == "clear");
+        let last_clear = before.iter().rposition(|call| *call == "clear");
+        let (Some(first_clear), Some(last_clear)) = (first_clear, last_clear) else {
+            panic!("the line is not cleared before writing: {calls:?}");
+        };
+        assert!(
+            first_clear < last_clear,
+            "two clears are required: {calls:?}"
+        );
+        let drained = before.get(first_clear + 1..last_clear).unwrap_or_default();
+        assert!(
+            drained.contains(&"read"),
+            "reads must fall between the clears (the drain): {calls:?}"
+        );
+        assert!(
+            !before.contains(&"flush"),
+            "nothing may be flushed before the sentence: {calls:?}"
+        );
+        assert!(
+            calls.get(write + 1).copied() == Some("flush"),
+            "the sentence is flushed right after it is written: {calls:?}"
+        );
+        assert!(
+            !calls.contains(&"lines"),
+            "the reset lines are never touched: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn the_entry_observes_the_line_after_writing_the_sentence() {
+        let mut client = client();
+        client.transport_mut().queue_nmea(1);
+        let mark = client.transport_mut().call_mark();
+        client.enter_bootrom().expect("the stream is live");
+        let calls = client.transport_mut().calls_since(mark);
+        let write = calls
+            .iter()
+            .position(|call| *call == "write")
+            .unwrap_or_else(|| panic!("no write in {calls:?}"));
+        assert!(
+            calls.get(write + 1..).unwrap_or_default().contains(&"read"),
+            "the client must listen after the sentence: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn the_entry_switches_to_the_bootrom_baud_and_sends_one_sentence() {
+        let mut client = client();
+        client.transport_mut().queue_nmea(1);
+        assert_eq!(client.transport_mut().baud(), NMEA_BAUD);
+        let mark = client.transport_mut().call_mark();
+        client.enter_bootrom().expect("the stream is live");
+        let device = client.transport_mut();
+        assert_eq!(device.pmtk180_count(), 1, "one sentence, sent once");
+        assert_eq!(device.baud(), DEFAULT_BOOTROM_BAUD);
+        assert!(
+            device.calls_since(mark).contains(&"baud:115200"),
+            "enter_bootrom must call set_baud(115200): {:?}",
+            device.calls_since(mark)
+        );
+        assert!(!device.control_lines(), "the reset lines stay released");
+    }
+
+    #[test]
+    fn the_entry_uses_a_probed_state_without_probing_again() {
+        // The CLI probes once and hands that answer over. Probing a second time
+        // inside `enter_bootrom_after` would read the stream twice and restart
+        // the sequence from a half-consumed line: the fake would drop that second
+        // probe's NMEA in the drain, and the sentence would never be honoured.
+        let mut client = client();
+        client.transport_mut().queue_nmea(1);
+        let probed = client.probe_stream().expect("probe");
+        assert_eq!(probed, crate::protocol::StreamState::Streaming);
+        let mark = client.transport_mut().call_mark();
+        client.enter_bootrom_after(probed).expect("hand over");
+        let calls = client.transport_mut().calls_since(mark);
+        assert_eq!(
+            calls.first().copied(),
+            Some("clear"),
+            "the hand-over starts by clearing, not by reading the stream again: {calls:?}"
+        );
+        assert_eq!(
+            calls.iter().filter(|call| **call == "write").count(),
+            1,
+            "one sentence, written once: {calls:?}"
+        );
+        assert_eq!(client.transport_mut().pmtk180_count(), 1);
+    }
+
+    #[test]
+    fn a_firmware_that_ignores_the_sentence_is_reported_with_the_streams_own_words() {
+        // The unit that produced this bug: NMEA keeps flowing, and the error has
+        // to say so in the log's own words rather than "the sentence was not
+        // honoured" alone. `DeafFirmware` never switches, so every read after the
+        // write returns stream.
+        let device = DeafFirmware::new(FakeDevice::new());
+        let mut client = PmtkClient::new(device)
+            .with_stream_window(std::time::Duration::from_millis(300))
+            .with_entry_timing(EntryTiming::fast());
+        let probe = client.probe_stream().expect("probe");
+        assert_eq!(
+            probe,
+            crate::protocol::StreamState::Streaming,
+            "the deaf firmware must look like a live stream (got {probe:?})"
+        );
+        assert_eq!(client.transport_mut().device.baud(), NMEA_BAUD);
+        let mark = client.transport_mut().device.call_mark();
+        let Err(err) = client.enter_bootrom_after(probe) else {
+            panic!(
+                "a firmware that never stopped streaming was accepted as a switch: the \
+                 post-write watch saw nothing, so it did not run or returned early"
+            )
+        };
+        let text = format!("{err}");
+        assert!(text.contains("kept talking after $PMTK180"), "got {text}");
+        assert!(
+            text.contains("$GPGGA"),
+            "the observed line must be quoted: {text}"
+        );
+        assert!(
+            text.contains("bytes within"),
+            "the count must be given: {text}"
+        );
+        assert_eq!(
+            client.transport_mut().device.baud(),
+            NMEA_BAUD,
+            "a failure must not pretend the chip switched"
+        );
+        assert!(
+            !client
+                .transport_mut()
+                .device
+                .calls_since(mark)
+                .contains(&"baud:115200"),
+            "a failed switch must not call set_baud(115200)"
+        );
+    }
+
+    /// A firmware that honours `$PMTK180` only after it has finished re-entering
+    /// its BootROM listener, which [`EntryTiming::settle`] is there to wait out.
+    ///
+    /// The old mode's last sentence is emitted once, [`Self::EMIT_AT`] after the
+    /// write — the next line of a 1 Hz stream. What happens to it depends on when
+    /// the host looks, and the fake models that rather than a queue: a read that
+    /// starts while the sentence is still in the UART (`emit .. emit +
+    /// TAIL_WINDOW`) gets it, and a read that starts later gets nothing, because
+    /// the hardware only held it for the 1 Hz slot. A 10 ms settle outlasts
+    /// neither; a client that listens at once catches it.
+    #[derive(Debug)]
+    struct SlowSwitchingFirmware {
+        device: FakeDevice,
+        /// When `$PMTK180` was written, if it has been.
+        written: Option<Instant>,
+        /// Whether the sentence has been handed over already.
+        emitted: bool,
+    }
+
+    impl SlowSwitchingFirmware {
+        fn new() -> Self {
+            let mut device = FakeDevice::new();
+            device.queue_nmea(1);
+            Self {
+                device,
+                written: None,
+                emitted: false,
+            }
+        }
+
+        /// When the old mode's next sentence arrives after the write. Outside
+        /// `EntryTiming::fast().settle` (10 ms) so a settle covers it, inside
+        /// `EntryTiming::fast().watch` (100 ms) so a client with no settle sees
+        /// it.
+        const EMIT_AT: Duration = Duration::from_millis(25);
+
+        /// How long the emitted sentence stays readable, i.e. the tail of the
+        /// old mode. Short enough to be over before a settled client's watch
+        /// begins, long enough that a read starting at zero settle catches it.
+        const TAIL_WINDOW: Duration = Duration::from_millis(15);
+    }
+
+    impl Transport for SlowSwitchingFirmware {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+            if let Some(written) = self.written {
+                let elapsed = written.elapsed();
+                let readable = elapsed >= Self::EMIT_AT
+                    && elapsed < Self::EMIT_AT.saturating_add(Self::TAIL_WINDOW);
+                if readable && !self.emitted {
+                    self.emitted = true;
+                    self.device.queue_nmea(1);
+                }
+            }
+            self.device.read(buf)
+        }
+
+        fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+            self.device.write_all(buf)?;
+            if buf.ends_with(b"\n") && self.written.is_none() {
+                self.written = Some(Instant::now());
+            }
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<()> {
+            self.device.flush()
+        }
+
+        fn clear_input(&mut self) -> Result<()> {
+            self.device.clear_input()
+        }
+
+        fn set_baud(&mut self, baud: u32) -> Result<()> {
+            self.device.set_baud(baud)
+        }
+
+        fn set_control_lines(&mut self, asserted: bool) -> Result<()> {
+            self.device.set_control_lines(asserted)
+        }
+    }
+
+    #[test]
+    fn the_settle_window_is_what_keeps_the_old_modes_tail_out_of_the_verdict() {
+        // The hardware fact behind `DEFAULT_ENTRY_SETTLE` (AGENTS.md §4.6): the
+        // firmware needs a moment to stop streaming, so a client that listens at
+        // once reads the old mode's tail and calls a good switch a failure. The
+        // fake emits that tail `SlowSwitchingFirmware::EMIT_AT` after the write;
+        // a settle longer than that must swallow it. Removing the settle has to
+        // fail here, and only here: the ordinary entry tests use a fake that goes
+        // silent on the sentence.
+        let mut client = PmtkClient::new(SlowSwitchingFirmware::new())
+            .with_stream_window(Duration::from_millis(300))
+            .with_entry_timing(EntryTiming {
+                settle: SlowSwitchingFirmware::EMIT_AT.saturating_mul(2),
+                ..EntryTiming::fast()
+            });
+        let probe = client.probe_stream().expect("probe");
+        assert_eq!(probe, crate::protocol::StreamState::Streaming);
+        client
+            .enter_bootrom_after(probe)
+            .expect("the settle outlasts the old mode's tail");
+        assert_eq!(
+            client.transport_mut().device.baud(),
+            crate::protocol::brom::DEFAULT_BOOTROM_BAUD
+        );
+    }
+
+    #[test]
+    fn a_settle_of_zero_reads_the_old_modes_tail_and_refuses_the_switch() {
+        // The other half of the test above: with no settle the watch begins at
+        // the write and reads the tail, and "any byte means it did not switch"
+        // turns that into a refusal. This is the failure a user of the earlier
+        // sequence saw, so it must stay reproducible. `quiet_budget` and `watch`
+        // stay at `fast()` so this one case does not sleep on the real windows.
+        let mut client = PmtkClient::new(SlowSwitchingFirmware::new())
+            .with_stream_window(Duration::from_millis(300))
+            .with_entry_timing(EntryTiming {
+                settle: Duration::ZERO,
+                ..EntryTiming::fast()
+            });
+        let probe = client.probe_stream().expect("probe");
+        let err = client
+            .enter_bootrom_after(probe)
+            .expect_err("the old mode's tail must be seen without a settle");
+        let text = format!("{err}");
+        assert!(text.contains("kept talking after $PMTK180"), "got {text}");
+        assert_eq!(client.transport_mut().device.baud(), NMEA_BAUD);
+        assert!(
+            !client
+                .transport_mut()
+                .device
+                .call_log()
+                .iter()
+                .any(|call| call == "baud:115200")
+        );
+    }
+
+    #[test]
+    fn the_steady_timings_never_settle_to_zero() {
+        // `fast()` is the timing every unit test uses, so a zero settle there
+        // would silently remove the wait from every one of them: the positive
+        // test above sets its own settle and would still pass. Pin it directly.
+        assert!(EntryTiming::fast().settle > Duration::ZERO);
+        assert!(EntryTiming::real().settle > Duration::ZERO);
+        assert!(EntryTiming::fast().settle <= SlowSwitchingFirmware::EMIT_AT);
+        assert_eq!(EntryTiming::real().settle, DEFAULT_ENTRY_SETTLE);
     }
 
     #[test]

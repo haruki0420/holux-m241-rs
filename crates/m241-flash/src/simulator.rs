@@ -217,6 +217,12 @@ pub struct FakeDa {
     bad_jump_counts: usize,
     /// How many times the host sent `0xA5` to ask for a page again.
     retries_sent: usize,
+    /// Bytes the fake puts in front of the next `0xD6` page, once.
+    ///
+    /// Defensive model for leading bytes ahead of the first page (whether a
+    /// unit emits any is ⚠️ 未検証 in `docs/dev/05-verification.md`). A retry
+    /// must be clean, so the prefix is taken on the first send only.
+    page_prefix: Option<Vec<u8>>,
     /// Every opcode the host sent, in order: the BootROM's frames and the DA's.
     opcodes: Vec<u8>,
     /// The two-byte trailer of each packet, as it arrived, parallel to
@@ -300,6 +306,7 @@ impl FakeDa {
             pad_pages: true,
             bad_jump_counts: 0,
             retries_sent: 0,
+            page_prefix: None,
             opcodes: Vec::new(),
             restarted: false,
             refuse_ranges: false,
@@ -423,6 +430,16 @@ impl FakeDa {
         self.output.len()
     }
 
+    /// Put bytes on the line as if stale data arrived before the next command.
+    ///
+    /// Whether a real unit emits trailing bytes after its twenty-byte report
+    /// is ⚠️ 未検証 in `docs/dev/05-verification.md`. A test uses this to put
+    /// stale leftovers ahead of `0xD6` and confirm the pre-read drain drops
+    /// them.
+    pub fn queue_output(&mut self, bytes: &[u8]) {
+        self.queue_bytes(bytes);
+    }
+
     /// The DA's RAM as the loader left it.
     #[must_use]
     pub fn ram(&self) -> &[u8] {
@@ -473,6 +490,17 @@ impl FakeDa {
     #[must_use]
     pub fn retries_sent(&self) -> usize {
         self.retries_sent
+    }
+
+    /// Put bytes in front of the next `0xD6` page, once.
+    ///
+    /// Defensive simulation of stale leading bytes arriving in front of the
+    /// first page (⚠️ 未検証 in `docs/dev/05-verification.md`). The prefix is
+    /// taken on the first send only: a page asked for again with `0xA5` comes
+    /// back clean, which is what lets the client drop the leftover bytes and
+    /// resynchronise.
+    pub fn prefix_next_page(&mut self, bytes: &[u8]) {
+        self.page_prefix = Some(bytes.to_vec());
     }
 
     /// Send every `0xD6` page exactly as long as the range's remaining bytes,
@@ -947,6 +975,9 @@ impl FakeDa {
             self.corrupt_page = None;
         }
         packet.extend_from_slice(&sum.to_be_bytes());
+        if let Some(prefix) = self.page_prefix.take() {
+            self.queue_bytes(&prefix);
+        }
         self.queue_bytes(&packet);
     }
 
