@@ -1470,6 +1470,8 @@ mod tests {
             let links = FakePorts::shared(handle.clone());
             let console = RecordingConsole::default();
             let confirm = PowerCycle::new(handle);
+            // 500 ms, not `fast()`'s 20 ms: the fake answers synchronously but
+            // loses replies when the workspace tests run in parallel.
             let session =
                 Session::new(&links, &console, &confirm).with_timings(Timings::generous());
             let mut options = dump_options(&output);
@@ -2036,6 +2038,8 @@ mod tests {
         let links = fake_da::FakeDaPorts::new(chip.clone());
         let record = links.record();
         let console = RecordingConsole::default();
+        // 500 ms, not `fast()`'s 20 ms: the fake DA answers synchronously but
+        // loses replies when the workspace tests run in parallel.
         let session =
             Session::new(&links, &console, &AutoConfirm).with_timings(Timings::generous());
         let mut options = probe_options(&da);
@@ -2145,6 +2149,8 @@ mod tests {
         let links = fake_da::FakeDaPorts::new(chip);
         let record = links.record();
         let console = RecordingConsole::default();
+        // 500 ms, not `fast()`'s 20 ms: the fake DA answers synchronously but
+        // loses replies when the workspace tests run in parallel.
         let session =
             Session::new(&links, &console, &AutoConfirm).with_timings(Timings::generous());
         let mut options = probe_options(&da);
@@ -2176,6 +2182,8 @@ mod tests {
         let links = fake_da::FakeDaPorts::new(chip);
         let record = links.record();
         let console = RecordingConsole::default();
+        // 500 ms, not `fast()`'s 20 ms: the fake DA answers synchronously but
+        // loses replies when the workspace tests run in parallel.
         let session =
             Session::new(&links, &console, &AutoConfirm).with_timings(Timings::generous());
         let mut options = probe_options(&da);
