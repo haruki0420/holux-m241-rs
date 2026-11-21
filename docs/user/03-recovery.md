@@ -28,12 +28,15 @@ can leave the unit unusable even with the BootROM intact.
 3. Write your own backup back:
 
    ```bash
-   m241 fw flash --da vendor/DA_v3.8.4.bin --fw backup/stock.bin --backup backup/stock.bin
+   m241 fw flash backup/stock.bin --da vendor/DA_v3.8.4.bin --backup backup/stock.bin --yes
    ```
 
-   Passing the same file to `--fw` and `--backup` is deliberate: the difference
-   is zero bytes, and zero differing bytes is accepted. That is how you get a
-   known-good image past the check that normally only allows patch offsets.
+   Passing the same file as the image and to `--backup` is deliberate: the
+   difference is zero bytes, and zero differing bytes is accepted. That is how
+   you get a known-good image past the check that normally only allows patch
+   offsets. The command still reads the range back after `0xD9`; if the
+   re-entry fails, it reports that the read-back was not performed rather than
+   claiming success.
 
 4. If it still will not answer, try assuming the chip is already in BootROM:
 

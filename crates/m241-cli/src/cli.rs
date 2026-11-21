@@ -191,8 +191,7 @@ pub enum FwCommand {
 /// two files, accepts or refuses the image, and prints the plan.
 #[derive(Debug, Args)]
 pub struct FlashOptions {
-    /// The image to write: an official vendor release, or your own backup with
-    /// the WNRO patch applied.
+    /// The image to write: your own backup with the WNRO patch applied.
     #[arg(value_name = "IMAGE")]
     pub image: PathBuf,
 
@@ -212,13 +211,8 @@ pub struct FlashOptions {
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Allow an image whose device type differs from the backup's.
-    ///
-    /// Without it a cross-model write is refused before the port is opened.
-    #[arg(long)]
-    pub allow_cross_model: bool,
-
-    /// Confirm the write without the typed `WRITE` prompt.
+    /// Confirm the write. There is no typed prompt in this build, so this is
+    /// the only confirmation input; `AGENTS.md` §2.5 governs who may pass it.
     #[arg(long)]
     pub yes: bool,
 
@@ -745,7 +739,6 @@ mod tests {
         assert_eq!(flash.backup, PathBuf::from("backup.bin"));
         assert_eq!(flash.da, None, "a dry run needs no DA file");
         assert!(flash.dry_run);
-        assert!(!flash.allow_cross_model);
         assert!(!flash.yes);
         assert!(!flash.assume_brom);
         assert_eq!(flash.port, "auto");
@@ -760,7 +753,6 @@ mod tests {
             "backup.bin",
             "--da",
             "DA_v3.8.4.bin",
-            "--allow-cross-model",
             "--yes",
             "--assume-brom",
             "--port",
@@ -780,7 +772,6 @@ mod tests {
             Some(PathBuf::from("DA_v3.8.4.bin")),
             "a real write needs the vendor DA"
         );
-        assert!(flash.allow_cross_model);
         assert!(flash.yes);
         assert!(flash.assume_brom);
         assert_eq!(flash.port, "COM3");

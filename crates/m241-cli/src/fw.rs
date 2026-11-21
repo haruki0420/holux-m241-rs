@@ -25,7 +25,7 @@ use m241_core::firmware::profiles::{
 };
 use m241_core::firmware::{self, sha256_hex};
 use m241_core::protocol::brom::{BASE_ADDR_FIRMWARE, DEFAULT_BOOTROM_BAUD, DUMP_CHUNK, MtkBootRom};
-use m241_core::protocol::pmtk::{NMEA_BAUD, StreamState};
+use m241_core::protocol::pmtk::{NMEA_BAUD, PmtkClient, StreamState};
 use m241_core::protocol::port::Transport;
 use m241_core::{Error, FirmwareProfile, PatchPlan, Result};
 use m241_flash::da::{
@@ -516,25 +516,26 @@ fn plan_document(report: &PatchReport, written: Option<&std::path::Path>) -> ser
 /// and prints what a write would do. It **opens no port and sends nothing**.
 ///
 /// A real run does everything decidable without a device first, in this order:
-/// the cross-model consent, the `--yes` confirmation, [`check_layout`], the
-/// driver's own acceptance rule against the pinned V1.13 range
-/// ([`check_image`]), and the DA file ([`check_da_image`]). Only then is a port
-/// opened. On the device it:
+/// the `--yes` confirmation, [`check_layout`], the driver's own acceptance rule
+/// against the pinned V1.13 range ([`check_image`]), and the DA file
+/// ([`check_da_image`]). Only then is a port opened. On the device it:
 ///
 /// 1. enters the BootROM ([`enter_bootrom`]) and syncs;
 /// 2. calls [`DownloadAgent::verify_device`], so a unit that does not hold
 ///    `backup` byte for byte is refused **before** anything is erased;
 /// 3. loads the DA into the chip's RAM ([`DaLoader::load`], RAM only);
 /// 4. programs the image ([`DownloadAgent::write`], `0xD3` + `0xD5`);
-/// 5. restarts the chip and reads the range back through the BootROM
-///    ([`PendingWrite::verify_written`], `0xD9`), reporting success only when
-///    every byte matches.
+/// 5. restarts the chip (`0xD9`), re-enters the BootROM through the same NMEA
+///    probe and `$PMTK180*3B` hand-over the initial entry used, and reads the
+///    range back ([`PendingWrite::verify_written`]), reporting success only
+///    when every byte matches.
 ///
-/// The read-back after `0xD9` may fail on a unit that boots its firmware instead
-/// of returning to the BootROM. That is reported as the error the crate
-/// produces, which names the power-cycle and `fw dump` checks; this function
-/// never upgrades a failed read-back to success. ⚠️ 未検証 on hardware: the
-/// write path has run against the fake only.
+/// The read-back after `0xD9` can fail: the unit boots its firmware, and if
+/// that firmware does not stream NMEA the BootROM cannot be re-entered. That is
+/// reported as a read-back that could not be reached, with the power-cycle and
+/// `fw dump` checks; this function never upgrades a failed read-back to success.
+/// ⚠️ 未検証 on hardware: the write path, including the post-`0xD9` re-entry,
+/// has run against the fake only.
 ///
 /// # Errors
 ///
@@ -542,10 +543,10 @@ fn plan_document(report: &PatchReport, written: Option<&std::path::Path>) -> ser
 /// * [`Error::Profile`] when the image or the backup matches no known profile.
 /// * [`Error::Firmware`] when the image is too short to hold a header.
 /// * [`Error::Safety`] when the image is not acceptable ([`write_plan`] /
-///   [`check_image`]), when a cross-model write was not allowed, when `--yes`
-///   was not given, from [`check_layout`], or from [`check_da_image`] / the
-///   device check.
+///   [`check_image`]), when `--yes` was not given, from [`check_layout`], or
+///   from [`check_da_image`] / the device check.
 /// * [`Error::Port`] when no plausible port can be opened.
+/// * [`Error::State`] when the BootROM cannot be re-entered after `0xD9`.
 /// * [`Error::Timeout`] / [`Error::Framing`] / [`Error::Rejected`] from the
 ///   BootROM, the DA, the write or the read-back; each carries the crate's
 ///   recovery paragraph once anything has been sent.
@@ -577,11 +578,8 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
     }
 
     // A real write. Everything that can be decided without a port is decided
-    // first, in the order a person would want to be told: the cross-model
-    // consent, the confirmation, then the layout and the files the write needs.
-    if let Some(err) = cross_model_refusal(&plan, options.allow_cross_model) {
-        return Err(err);
-    }
+    // first, in the order a person would want to be told: the confirmation,
+    // then the layout and the files the write needs.
     let confirmation = Confirmation::of_command_line(options.yes)?;
     check_layout()?;
     writable?;
@@ -595,6 +593,14 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
     };
     let da = fileio::read(da_path)?;
     check_da_image(&da)?;
+    session.console.note(&format!(
+        "DA file {} is {} bytes with SHA-256 {}; `check_da_image` checks only the length and \
+         the first four bytes (W2a adds the digest). AGENTS.md §2.5 requires the full hash to \
+         match the vendor value before --yes is approved",
+        da_path.display(),
+        da.len(),
+        sha256_hex(&da)
+    ));
 
     // The port is opened only after every refusal above, so a dry run, a
     // missing confirmation and a bad file never touch a cable.
@@ -639,16 +645,7 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
     );
 
     let report = match pending.verify_written(da_session, &image, FLASH_WRITE_START, |transport| {
-        // `0xD9` has just been sent. Put the line at the BootROM rate and
-        // give the unit a moment before the first probe; `MtkBootRom::sync`
-        // then clears whatever the DA conversation left queued.
-        if let Err(err) = transport.set_baud(DEFAULT_BOOTROM_BAUD) {
-            session.console.warn(&format!(
-                "could not set the BootROM baud after the restart ({err}); the read-back will \
-                     most likely time out"
-            ));
-        }
-        std::thread::sleep(BOOTROM_REENTRY_SETTLE);
+        reenter_bootrom(transport, session)
     }) {
         Ok(report) => report,
         Err(err) => {
@@ -660,33 +657,64 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
     print_write_report(options, session.console, &port, &plan, &report)
 }
 
-/// The cross-model consent gate, as a value the tests can drive.
+/// Put the transport back where a BootROM read works, after `0xD9`.
 ///
-/// A synthetic backup/image pair cannot reach this branch: [`check_image`]
-/// accepts a device string that differs from the backup's only through the
-/// official-digest rule, and that needs the vendor bytes. Keeping the gate a
-/// function of the plan pins the refusal without weakening the acceptance rule.
-fn cross_model_refusal(plan: &WritePlan, allow: bool) -> Option<Error> {
-    if !plan.needs_cross_model_consent() || allow {
-        return None;
+/// The restart boots the firmware, so this is the same route the initial entry
+/// takes: wait for the firmware to start streaming, probe one NMEA sentence,
+/// then send `$PMTK180*3B`, which leaves the transport at
+/// [`DEFAULT_BOOTROM_BAUD`]. Nothing here touches DTR/RTS: the tri-state probe
+/// in [`enter_bootrom`] exists because pulsing them at a running firmware can
+/// leave the unit unresponsive, and the same rule applies after a restart.
+///
+/// The timeouts are the session's: [`PmtkClient::probe_stream`] uses the stream
+/// window and [`PmtkClient::enter_bootrom_after`] uses the `$PMTK180` timings,
+/// so a unit that never answers fails instead of hanging. The settle before the
+/// probe gives the firmware time to boot; ⚠️ 未検証 on hardware.
+///
+/// # Errors
+///
+/// [`Error::State`] when no complete NMEA sentence arrives (the firmware did not
+/// start, or the line is not usable), or when `$PMTK180` is not honoured.
+/// [`Error::Io`] from the transport.
+fn reenter_bootrom<T: Transport>(transport: T, session: Session<'_>) -> Result<T> {
+    std::thread::sleep(BOOTROM_REENTRY_SETTLE);
+    let mut transport = transport;
+    transport.set_baud(NMEA_BAUD)?;
+    // Drop anything the DA conversation left queued before looking for NMEA;
+    // a stale byte must not be mistaken for the restarted firmware's stream.
+    transport.clear_input()?;
+    let mut client = PmtkClient::new(transport)
+        .with_reply_timeout(session.timings.reply)
+        .with_stream_window(session.timings.stream)
+        .with_entry_timing(session.timings.entry);
+    match client.probe_stream()? {
+        StreamState::Streaming => {
+            session.console.note(
+                "NMEA is streaming again after the restart; sending $PMTK180 to re-enter the \
+                 BootROM for the read-back",
+            );
+            client.enter_bootrom_after(StreamState::Streaming)?;
+            Ok(client.into_transport())
+        }
+        StreamState::Silent => Err(Error::State(String::from(
+            "the unit did not stream NMEA after the restart, so the BootROM could not be \
+             re-entered and the read-back was not performed. The write itself finished; do not \
+             assume it failed. Power-cycle the unit and run `m241 fw dump` to see what it holds, \
+             then write your own backup back if needed",
+        ))),
+        StreamState::Unknown => Err(Error::State(String::from(
+            "the line carried bytes but no complete NMEA sentence after the restart, so the \
+             BootROM could not be re-entered and the read-back was not performed. Power-cycle \
+             the unit and run `m241 fw dump` to see what it holds",
+        ))),
     }
-    Some(Error::Safety {
-        reason: format!(
-            "the image is for device {} but the backup came from {}; pass --allow-cross-model \
-             only if you are sure the two models share this firmware. Nothing was sent",
-            plan.device_type,
-            plan.backup_device_type
-                .as_deref()
-                .unwrap_or("an unreadable image")
-        ),
-    })
 }
 
 /// How long the unit is given after `0xD9` before the first BootROM probe.
 ///
 /// A conservative settle, not a measured value: ⚠️ 未検証 on hardware because the
-/// write path has not run on a unit. The read-back's own timeout is what fails
-/// the command if this is too short.
+/// write path has not run on a unit. The probe's stream window and the
+/// read-back's own timeout are what fail the command if this is too short.
 const BOOTROM_REENTRY_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Say what a failed write left behind, without claiming it wrote nothing.
@@ -722,7 +750,7 @@ fn print_write_report(
             "image": options.image.display().to_string(),
             "backup": options.backup.display().to_string(),
             "profile": plan.profile.name,
-            "acceptance": plan.acceptance.label(),
+            "acceptance": "patched backup",
             "start": format!("0x{:08X}", report.start),
             "length": report.length,
             "packets": report.packets,
@@ -777,14 +805,6 @@ fn print_write_plan(
     plan: &WritePlan,
     write_refusal: Option<&str>,
 ) -> Result<()> {
-    let cross_model_line = match (&plan.device_type, &plan.backup_device_type) {
-        (image, Some(backup)) if plan.cross_model => format!(
-            "yes ({backup} backup -> {image} image); pass --allow-cross-model to permit it, \
-             otherwise a real write is refused"
-        ),
-        (image, Some(backup)) => format!("no (both {backup}, image {image})"),
-        (_image, None) => String::from("unknown: the backup's header could not be read"),
-    };
     let differing_line = match plan.differing_bytes {
         Some(count) => format!(
             "{count} byte(s) differ from the backup{}",
@@ -817,12 +837,9 @@ fn print_write_plan(
             "image": options.image.display().to_string(),
             "backup": options.backup.display().to_string(),
             "profile": plan.profile.name,
-            "acceptance": plan.acceptance.label(),
+            "acceptance": "patched backup",
             "size": plan.size,
             "device_type": plan.device_type,
-            "backup_device_type": plan.backup_device_type,
-            "cross_model": plan.cross_model,
-            "allow_cross_model": options.allow_cross_model,
             "write_length": plan.write_length,
             "start": format!("0x{:08X}", plan.start),
             "packets": plan.packets,
@@ -845,13 +862,8 @@ fn print_write_plan(
         "{:<12}: {} ({}, {} bytes)",
         "profile", plan.profile.name, plan.profile.device_type, plan.size
     ));
-    console.result(&format!(
-        "{:<12}: {}",
-        "accepted as",
-        plan.acceptance.label()
-    ));
+    console.result(&format!("{:<12}: {}", "accepted as", "patched backup"));
     console.result(&format!("{:<12}: {}", "device", plan.device_type));
-    console.result(&format!("{:<12}: {cross_model_line}", "cross model"));
     console.result(&format!(
         "{:<12}: {} bytes ({} packets of {} bytes)",
         "write range",
@@ -1236,7 +1248,7 @@ mod tests {
     use crate::testing::fake_da;
     use crate::testing::{AutoConfirm, DeviceHandle, FakePorts, RecordingConsole, synthetic_image};
     use m241_core::protocol::simulator::FakeDevice;
-    use m241_flash::da::{Acceptance, FLASH_WRITE_END, FLASH_WRITE_LENGTH};
+    use m241_flash::da::{FLASH_WRITE_END, FLASH_WRITE_LENGTH};
     use std::cell::{Cell, RefCell};
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
@@ -2388,7 +2400,6 @@ mod tests {
             backup: case.1.clone(),
             da: None,
             dry_run: true,
-            allow_cross_model: false,
             yes: false,
             assume_brom: false,
             port: String::from("auto"),
@@ -2414,10 +2425,6 @@ mod tests {
             "the V1.13 write length: {stdout}"
         );
         assert!(stdout.contains("1589"), "the packet count: {stdout}");
-        assert!(
-            stdout.contains("cross model : no"),
-            "the backup and image are the same model: {stdout}"
-        );
         assert!(
             stdout.contains("start       : 0x00000000 (settled DA-side base)"),
             "the settled start is shown, not a candidate list: {stdout}"
@@ -2557,56 +2564,34 @@ mod tests {
         assert_eq!(crate::exit::exit_code_for(&err), 4);
     }
 
-    /// A plan whose backup and image are different models.
-    ///
-    /// `write_plan` cannot build this from the synthetic fixtures: the only rule
-    /// that accepts a device string differing from the backup's is the official
-    /// digest, and the fixtures deliberately do not carry vendor bytes. The
-    /// cross-model gate therefore takes the value `flash` acts on, and this is
-    /// that value. A real vendor image reaches the same plan through
-    /// [`Acceptance::OfficialVendor`].
-    fn cross_model_plan() -> WritePlan {
-        WritePlan {
-            profile: &PROFILE_V1_12,
-            acceptance: Acceptance::OfficialVendor,
-            size: PROFILE_V1_12.size,
-            device_type: String::from("01017-00E"),
-            backup_device_type: Some(String::from("01017-00F")),
-            cross_model: true,
-            write_length: PROFILE_V1_12.size,
-            start: FLASH_WRITE_START,
-            packets: PROFILE_V1_12.size.div_ceil(m241_flash::da::PACKET_SIZE),
-            differing_bytes: Some(3),
-            differing_offsets: vec![0x402F6, 0x402F7, 0x59C2C],
-        }
-    }
-
     #[test]
-    fn flash_dry_run_warns_about_a_cross_model_image_but_still_prints_the_plan() {
-        // The dry run shows the plan (that is its job) and says the real write
-        // needs `--allow-cross-model`.
-        let scratch = Scratch::new("flash-dry-cross");
-        let case = (scratch.join("image.bin"), scratch.join("backup.bin"));
+    fn flash_dry_run_refuses_a_vendor_style_image_that_is_not_the_backup() {
+        // A vendor release carries per-unit fields that differ from this unit's
+        // dump. That difference is outside the patch table, and `AGENTS.md`
+        // §2.3 gives no digest route around it.
+        let scratch = crate::testing::Scratch::new("flash-dry-vendor");
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let mut image = flash_image(&PROFILE_V1_13, true);
+        image[0x1000] ^= 0xFF;
+        let case = flash_case(&scratch, &image, &backup);
         let console = RecordingConsole::default();
-        let options = flash_options(&case);
-        print_write_plan(&options, &console, &cross_model_plan(), None).expect("a plan is shown");
-        let stdout = console.stdout();
+        let links = FakePorts::empty();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        let err = flash(&flash_options(&case), session).expect_err("not the backup");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        let text = format!("{err}");
         assert!(
-            stdout.contains("cross model : yes (01017-00F backup -> 01017-00E image)"),
-            "the warning is specific: {stdout}"
+            text.contains("outside the V1.13 patch offsets"),
+            "the only rule is named: {text}"
         );
-        assert!(
-            stdout.contains("--allow-cross-model"),
-            "the plan says how to permit it: {stdout}"
-        );
+        assert!(!text.contains("SHA-256"), "no digest bypass exists: {text}");
     }
 
     #[test]
     fn flash_without_yes_refuses_before_opening_a_port_and_before_the_da_file() {
-        // `--yes` is checked after the cross-model consent and before
-        // `check_layout`, the DA file and the port. The DA path here does not
-        // exist: a handler that read it first would fail with an I/O error
-        // instead of the confirmation refusal.
+        // `--yes` is checked before `check_layout`, the DA file and the port.
+        // The DA path here does not exist: a handler that read it first would
+        // fail with an I/O error instead of the confirmation refusal.
         let scratch = crate::testing::Scratch::new("flash-real-no-yes");
         let backup = flash_image(&PROFILE_V1_13, false);
         let image = flash_image(&PROFILE_V1_13, true);
@@ -2635,24 +2620,6 @@ mod tests {
     }
 
     #[test]
-    fn flash_without_allow_cross_model_refuses_a_cross_model_write() {
-        let err = cross_model_refusal(&cross_model_plan(), false)
-            .expect("cross model without consent must be refused");
-        assert!(matches!(err, Error::Safety { .. }), "got {err}");
-        let text = format!("{err}");
-        assert!(
-            text.contains("--allow-cross-model"),
-            "the refusal names the flag: {text}"
-        );
-        assert!(text.contains("01017-00E"), "got {text}");
-        assert!(text.contains("01017-00F"), "got {text}");
-        assert!(
-            cross_model_refusal(&cross_model_plan(), true).is_none(),
-            "consent is what turns the gate off"
-        );
-    }
-
-    #[test]
     fn flash_with_every_gate_passed_but_no_port_reports_a_port_error() {
         // The image, the confirmation, the layout, the acceptance rule and the
         // DA file all pass; the next step is resolving a port, and there is
@@ -2673,8 +2640,13 @@ mod tests {
         assert!(matches!(err, Error::Port { .. }), "got {err}");
         assert_eq!(crate::exit::exit_code_for(&err), 3, "got {err}");
         assert!(
-            console.stderr().is_empty(),
-            "the port is resolved before anything is announced: {}",
+            !console.stderr().contains("writing "),
+            "the port is resolved before the write is announced: {}",
+            console.stderr()
+        );
+        assert!(
+            console.stderr().contains("SHA-256"),
+            "the DA file's full hash is shown before the port is opened: {}",
             console.stderr()
         );
     }
@@ -2785,7 +2757,11 @@ mod tests {
             assert_eq!(
                 chip.mode(),
                 m241_flash::simulator::Mode::BootRom,
-                "the prepare step moved the chip back to the BootROM"
+                "the NMEA probe and $PMTK180 moved the chip back to the BootROM"
+            );
+            assert!(
+                chip.pmtk180(),
+                "the read-back required the hand-over sentence, not a set_baud shim"
             );
             assert_eq!(
                 &chip.memory()[..FLASH_WRITE_LENGTH],
@@ -2834,6 +2810,63 @@ mod tests {
     }
 
     #[test]
+    fn flash_reports_a_read_back_that_could_not_be_reached() {
+        // The write completes, then the restarted firmware never streams NMEA.
+        // This must be reported as "the read-back could not be reached", not as
+        // a mismatch and not as "the range is only partly programmed".
+        let scratch = crate::testing::Scratch::new("flash-real-no-reentry");
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let image = flash_image(&PROFILE_V1_13, true);
+        let case = flash_case(&scratch, &image, &backup);
+        let chip = m241_flash::FakeDa::with_firmware(&backup).without_nmea_stream();
+        let links = da_write::DaWritePorts::new(chip);
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.yes = true;
+        options.da = Some(da_file(scratch.path()));
+
+        let err = flash(&options, session).expect_err("the re-entry has no NMEA stream");
+        assert!(matches!(err, Error::State(_)), "got {err}");
+        let text = format!("{err}");
+        assert!(
+            text.contains("did not stream NMEA"),
+            "the cause is named: {text}"
+        );
+        assert!(
+            text.contains("read-back could not be reached"),
+            "the write completed but the read-back did not run: {text}"
+        );
+        assert!(
+            !text.contains("read-back disagreed"),
+            "a missing read-back is not a mismatch: {text}"
+        );
+        assert!(
+            !text.contains("only partly erased"),
+            "every packet was accepted, so the range is not partly programmed: {text}"
+        );
+
+        {
+            let chip = chip.borrow();
+            assert!(chip.restarted(), "0xD9 was sent");
+            assert_eq!(chip.accepted_packets(), 1589, "every packet landed");
+            assert_eq!(
+                chip.mode(),
+                m241_flash::simulator::Mode::Firmware,
+                "no re-entry happened"
+            );
+            assert!(!chip.pmtk180(), "no $PMTK180 was sent");
+        }
+        assert!(
+            console.stderr().contains("the write did not complete"),
+            "the CLI still tells the user the backup was not modified: {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
     fn the_write_report_json_names_the_verified_count_and_the_flash_write() {
         let backup = flash_image(&PROFILE_V1_13, false);
         let image = flash_image(&PROFILE_V1_13, true);
@@ -2850,7 +2883,6 @@ mod tests {
             backup: PathBuf::from("backup.bin"),
             da: None,
             dry_run: false,
-            allow_cross_model: false,
             yes: true,
             assume_brom: false,
             port: String::from("auto"),
@@ -2888,7 +2920,6 @@ mod tests {
         assert_eq!(document["acceptance"], "patched backup");
         assert_eq!(document["size"], 406_620);
         assert_eq!(document["device_type"], "01017-00F");
-        assert_eq!(document["cross_model"], false);
         assert_eq!(document["write_length"], 406_620);
         assert_eq!(document["packets"], 1_589);
         assert_eq!(document["opens_port"], false);

@@ -100,23 +100,27 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
 3. **書き込み後に読み戻して照合しているか。** 👁
    書いたバイト列をそのまま信じない。BootROM 経由で同じ範囲を読み、イメージと
    比較する。比較は `m241-core` の読み取り API で行う（書き込みクレートが読み取り
-   側を再実装しない）。*現状:* `PendingWrite::verify_written` が `0xD9` を送ってから
-   `m241_core` の `MtkBootRom` で読み戻し、先頭の不一致オフセットを報告する。
-   読み出しそのものは再実装していない（比較だけがこのクレートにある）。🧪
+   側を再実装しない）。*現状:* `PendingWrite::verify_written` が `0xD9` を送り、
+   呼び出し側の再入ステップ（CLI は NMEA probe → `$PMTK180*3B` → 115200）が
+   transport を返したあと、`m241_core` の `MtkBootRom` で読み戻して先頭の不一致
+   オフセットを報告する。再入が失敗した場合は「読み戻し未実施」として返し、
+   不一致（実行したが違う）と区別する。読み出しそのものは再実装していない
+   （比較だけがこのクレートにある）。🧪
    読み出しアドレスは `BASE_ADDR_FIRMWARE + da_start` で、フェイクが記録した
    最終読み出しアドレスとの一致をテストで固定している。DA ビューと BootROM
    ビューの写像は 2026-11-21 に先頭 64 バイトで確認された（DA `0` と BootROM
    `0x00200000` が同じイメージの先頭を返す。`docs/dev/05-verification.md`
-   §1.2）。テストが固定するのは「クライアントが base を足す」ことであり、
-   書き込み後の全範囲読み戻しは実機で未検証である。
+   §1.2）。テストが固定するのは「クライアントが base を足す」ことと
+   「`0xD9` 後に NMEA → `$PMTK180` で再入する」ことであり、書き込み後の
+   全範囲読み戻しは実機で未検証である。
 4. **失敗時に装置を既知の状態に戻せるか。** 👁
    途中で失敗したとき、どこまで書けたかを報告し、リセット（`0xD9`）後に
    BootROM へ再入する手順が案内されること。`0xD9` は応答を返さないので、
    待ってはいけない（同 §8.4）。*現状:* `0xD5` 送信後の失敗はすべて
    `PartialWrite::recovery` の文面を伴う。書けたバイト数、`0xD9` の送信有無、
    `--assume-brom` での再入、自分のバックアップの書き戻しを名指しする。🧪
-   クライアントが `0xD9` の後に読まないことは
-   `the_restart_does_not_read_a_reply` が、書き込み経路が `0xD9` を送らないことは
+   クライアントが `0xD9` の後に DA 応答を読まないことは
+   `the_restart_does_not_read_a_da_reply` が、書き込み経路が `0xD9` を送らないことは
    `a_write_stops_before_the_restart_so_the_caller_can_decide` が固定する。
 5. **citation のない定数がないか。** 👁
    `m241-flash` の全ての定数は `docs/reference/01-da-protocol.md` の関数と
@@ -184,7 +188,7 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
 | 項目 | 状態 | 固定するテスト |
 |---|---|---|
 | `0xD5` の最初セクタ消去失敗 → `0xA5` | 命令列のみ。実機で失敗を起こしていない。フェイクが模す | `a_failed_first_erase_is_a_rejected_error_with_nothing_written`（今回追加） |
-| `0xD9` が応答を返さないこと | 命令列のみ（`0x00101920`）。実機で測っていない | `the_restart_does_not_read_a_reply`（今回追加） |
+| `0xD9` が応答を返さないこと | 命令列のみ（`0x00101920`）。実機で測っていない | `the_restart_does_not_read_a_da_reply`（今回追加） |
 | 短い最終パケットのゼロ詰め | 書き込み方向は未検証。§4.4 は読み出し側の直列化から読んだ記述 | `the_final_packet_is_the_short_one_and_is_zero_filled`（今回追加、フェイクが受けた payload を見る） |
 | 拒否された `0xD3` が 1 バイト `A5` | 命令列のみ。実機で拒否させていない | `a_refused_range_is_one_byte_and_a_rejected_error` |
 | `0xD5` の 2 つの最終 `0x5A` の間にバイトを送るか | 未確定。送らない形だけ実機で通っている | `a_full_write_consumes_exactly_its_replies` |

@@ -1153,7 +1153,7 @@ pub mod da_write {
 
     use m241_core::Result;
     use m241_core::protocol::port::Transport;
-    use m241_flash::simulator::{FakeDa, Mode, Modelled};
+    use m241_flash::simulator::FakeDa;
 
     use crate::link::{Cable, Links, Opened, PortEntry};
 
@@ -1180,20 +1180,15 @@ pub mod da_write {
             self.0.borrow_mut().clear_input()
         }
 
-        /// Move the chip back to the BootROM where a real unit needs a
-        /// power-cycle.
+        /// Set the baud without changing the modelled mode.
         ///
-        /// [`m241_flash::da::PendingWrite::verify_written`] sends `0xD9` (after
-        /// which the fake models a booted firmware) and calls the CLI's
-        /// `prepare`, which sets the BootROM baud. That is the re-entry step on
-        /// a unit; here it is the signal that the model should be a BootROM
-        /// again. Without it the read-back would be a timeout, not a check.
+        /// Re-entry after `0xD9` is not signalled here: the CLI's
+        /// `reenter_bootrom` probes the firmware's NMEA stream and sends
+        /// `$PMTK180*3B`, which [`m241_flash::FakeDa`] models itself. A shim
+        /// that switched to the BootROM on `set_baud` would hide a missing
+        /// re-entry, so there is none.
         fn set_baud(&mut self, baud: u32) -> Result<()> {
-            let mut device = self.0.borrow_mut();
-            if device.restarted() && device.mode() != Mode::BootRom {
-                device.set_modelled(Modelled::BootRom);
-            }
-            device.set_baud(baud)
+            self.0.borrow_mut().set_baud(baud)
         }
 
         fn set_control_lines(&mut self, asserted: bool) -> Result<()> {

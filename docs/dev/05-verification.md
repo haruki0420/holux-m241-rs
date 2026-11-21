@@ -103,6 +103,8 @@ nothing about which base the DA uses, so it cannot justify emptying
 | 4 MiB units and GR-245 variants | geometry maths is implemented and unit-tested; no device was available |
 | V1.11 and V1.12 on hardware | no V1.11 image to profile, V1.12 was never flashed |
 | Any timing figure | nothing in this repository is a stopwatch measurement |
+| The Rust `fw flash` command on a unit | the 2026-11-15 flash was an earlier manual/v1 run; this Rust client has never opened a port for a write. The write, erase, restart and backup-diff gates are covered only by the simulator |
+| The `0xD9` → NMEA probe → `$PMTK180*3B` re-entry and read-back | implemented in the CLI and exercised against the fake only; no unit has been asked to boot its firmware and hand the BootROM back after a write. The 2026-11-15 row records that the unit booted, not that this read-back ran |
 | The DA's `0xD6` read across multiple pages | one page per address was read on 2026-11-21; the advance between pages, the advance after the **last** page, and any bytes the DA sends between pages are unmeasured (`docs/reference/01-da-protocol.md` §5.5, §7 item 4) |
 | The four bytes after the DA banner | observed once on 2026-11-21; their origin is not established. The client drains them before `0xD6` |
 | `0xD6`'s page length for arguments other than 64 | only a 64-byte page-length argument was measured (64 data bytes + 2-byte trailer) |

@@ -38,16 +38,21 @@
 //!    [`DownloadAgent::verify_device`] compares the whole span, read back by
 //!    `m241_core`'s BootROM reader, with the user's own backup, so a backup from
 //!    a different unit is refused (`AGENTS.md` §2.3). [`check_image`], which
-//!    [`DownloadAgent::write`] always runs, accepts an identical image, an image
-//!    that differs from the backup only at that profile's patch offsets, or —
-//!    the separate gate §2.3 gained for vendor releases — an image whose SHA-256
-//!    is one of the two official digests.
+//!    [`DownloadAgent::write`] always runs, accepts only an identical image or
+//!    an image that differs from the user's own backup at that profile's patch
+//!    offsets. There is no second, digest-based route: a vendor release has
+//!    per-unit fields different from any one unit's dump, and `AGENTS.md` §2.3
+//!    says the backup check must not be weakened. Write your own backup with the
+//!    WNRO patch applied.
 //! 4. **The write is read back and compared.**
-//!    [`PendingWrite::verify_written`] restarts the chip (`0xD9`), re-enters the
-//!    BootROM through `m241_core`'s client, and compares the span with the
-//!    image. The comparison lives in this crate only because the two byte
-//!    vectors are already here; the *read* is `m241_core::protocol::brom`'s and
-//!    is never re-implemented (`docs/dev/11-safety-review.md`, review item 3).
+//!    [`PendingWrite::verify_written`] restarts the chip (`0xD9`), hands the
+//!    transport to the caller's BootROM re-entry step, and compares the span
+//!    with the image. The comparison lives in this crate only because the two
+//!    byte vectors are already here; the *read* is `m241_core::protocol::brom`'s
+//!    and is never re-implemented (`docs/dev/11-safety-review.md`, review item 3).
+//!    The re-entry step can fail (for example when the restarted firmware does
+//!    not stream NMEA), and that failure is reported as a read-back that could
+//!    not be performed, not as a mismatch.
 //!
 //! A fifth, added with the loader, is about which opcodes exist at all: **the
 //! loader speaks only the BootROM's `0xA1` and `0xA8`, and the only DA opcode in
@@ -59,9 +64,9 @@
 //! # The write plan: what `fw flash --dry-run` can say without a port
 //!
 //! [`write_plan`] runs the same acceptance rule [`DownloadAgent::write`] does
-//! ([`check_image`]) and reports what a write would do — the profile, which rule
-//! accepted the image, the device types, the packet count, and how the image
-//! differs from the backup — without sending a byte or opening a port. Its start
+//! ([`check_image`]) and reports what a write would do — the profile, the
+//! device type, the packet count, and how the image differs from the backup —
+//! without sending a byte or opening a port. Its start
 //! is [`FLASH_WRITE_START`], the settled DA-side base: a plan reports the range a
 //! real write would use and cannot unlock a write, which still runs
 //! [`check_layout`] and [`DownloadAgent::verify_device`]. It is what makes
@@ -121,8 +126,11 @@
 //!   let report = pending.verify_written(da, &image, FLASH_WRITE_START, reenter)?;
 //! ```
 //!
-//! `reenter` is the caller's BootROM re-entry step: `--assume-brom` or a
-//! power-cycle on a unit, [`crate::simulator::FakeDa::set_modelled`] in a test.
+//! `reenter` is the caller's BootROM re-entry step: on a unit the CLI probes
+//! for NMEA and sends `$PMTK180*3B` again, a power-cycle followed by
+//! `--assume-brom` also works, and a test names [`crate::simulator::FakeDa`]'s
+//! mode explicitly. It returns the transport so the BootROM client can take it
+//! over.
 //!
 //! # The start address is settled: the image begins at DA address 0
 //!
@@ -202,7 +210,6 @@ use std::time::Duration;
 
 use m241_core::Result;
 use m241_core::error::Error;
-use m241_core::firmware::digest::matches;
 use m241_core::firmware::image::{
     EFFECTIVE_EPOCH_OFFSET, FAMILY, FAMILY_OFFSET, FAMILY_SIZE, FirmwareImage,
 };
@@ -624,6 +631,9 @@ impl Confirmation {
     ///
     /// Only a flag that is actually set produces a token. An absent flag is
     /// [`Error::Safety`], so a caller that forgets to check still cannot write.
+    /// This build has no typed confirmation prompt, so the refusal names
+    /// `--yes` only; [`Self::WORD`] records the word `AGENTS.md` §2.2 allows a
+    /// future prompt to accept, but no code reads it as input here.
     ///
     /// # Errors
     ///
@@ -633,10 +643,9 @@ impl Confirmation {
             return Ok(Self::granted());
         }
         Err(Error::Safety {
-            reason: format!(
-                "refusing to write flash without an explicit confirmation (--yes, or {WORD:?} \
-                 typed at the prompt)",
-                WORD = Self::WORD
+            reason: String::from(
+                "refusing to write flash without an explicit confirmation: pass --yes. There is \
+                 no typed prompt in this build; `AGENTS.md` §2.5 governs who may pass it",
             ),
         })
     }
@@ -1121,8 +1130,10 @@ pub struct PartialWrite {
     pub length: usize,
     /// `true` when `0xD9` has been sent, so the chip has been restarted.
     pub restart_sent: bool,
-    /// `true` when the write reached the end of the range and the read-back is
-    /// what disagreed.
+    /// `true` once the BootROM sync has answered, immediately before the read.
+    ///
+    /// `false` after `0xD9` means the re-entry itself failed, so the read-back
+    /// never ran; the recovery text must not call that "the read-back disagreed".
     pub reached_read_back: bool,
 }
 
@@ -1145,10 +1156,17 @@ impl PartialWrite {
         } else {
             "send 0xD9 to restart (it answers nothing; do not wait), then"
         };
-        let state = if self.reached_read_back {
-            "the whole range was sent but the read-back disagreed"
-        } else {
+        // Three different states, not two: the write may have stopped part-way,
+        // the restart may have happened but the BootROM re-entry failed, or the
+        // read may have run and disagreed. Telling a user whose write completed
+        // that the range is "partly erased" is false and sends them to the
+        // wrong recovery step.
+        let state = if written < total {
             "the range is now only partly erased and programmed"
+        } else if self.reached_read_back {
+            "the whole range was sent, but the read-back did not confirm it"
+        } else {
+            "the whole range was sent, but the BootROM read-back could not be reached"
         };
         format!(
             "{mapped}; {state}. Next: {restart} re-enter the BootROM with --assume-brom (or \
@@ -1204,39 +1222,49 @@ impl PendingWrite {
     /// 2026-11-21: DA address `0` holds the image the BootROM reads at
     /// `0x0020_0000` — see [`FLASH_WRITE_START`].
     ///
-    /// `prepare` puts the chip back where a BootROM read works. On a unit that
-    /// is the re-entry route (`--assume-brom`, or power-cycle); in a test it is
+    /// `prepare` performs the BootROM re-entry and returns the transport. On a
+    /// unit that is the NMEA probe followed by `$PMTK180*3B` (what the CLI
+    /// does), or a power-cycle and `--assume-brom`; in a test it is an explicit
     /// [`crate::simulator::FakeDa::set_modelled`]. Keeping it a parameter makes
-    /// that step explicit instead of hidden in a read helper.
+    /// that step visible instead of hidden in a read helper, and returning a
+    /// `Result` lets a failed re-entry stop the read with its own error rather
+    /// than a bare sync timeout.
     ///
     /// # Errors
     ///
     /// [`Error::Framing`] carrying the first differing offset when the unit does
-    /// not hold `image`, and every error names the recovery step.
+    /// not hold `image`; the error returned by `prepare` when the BootROM cannot
+    /// be re-entered; and every error names the recovery step. A re-entry
+    /// failure is reported as a read-back that could not be reached, not as a
+    /// mismatch.
     pub fn verify_written<T: Transport>(
         self,
         da: DownloadAgent<T>,
         image: &[u8],
         da_start: u32,
-        prepare: impl FnOnce(&mut T),
+        prepare: impl FnOnce(T) -> Result<T>,
     ) -> Result<WriteReport> {
         let unfinished = PartialWrite {
             progress: self.progress,
             start: self.start,
             length: self.length,
             restart_sent: true,
-            reached_read_back: true,
+            reached_read_back: false,
         };
         let mut da = da;
         // §4.5 and §8 item 4: `0xD9` never returns and sends no reply, so any
         // read after it would block until the timeout at best.
         da.restart()?;
-        let mut rom = MtkBootRom::new(da.into_transport());
-        prepare(rom.transport_mut());
+        let transport = prepare(da.into_transport()).map_err(|err| after_write(err, unfinished))?;
+        let mut rom = MtkBootRom::new(transport);
         rom.sync().map_err(|err| after_write(err, unfinished))?;
+        let read_back = PartialWrite {
+            reached_read_back: true,
+            ..unfinished
+        };
         let read = rom
             .read16(BASE_ADDR_FIRMWARE + da_start, self.length)
-            .map_err(|err| after_write(err, unfinished))?;
+            .map_err(|err| after_write(err, read_back))?;
 
         let mismatch = read
             .iter()
@@ -1253,7 +1281,7 @@ impl PendingWrite {
                     ),
                     offset: Some(offset),
                 },
-                unfinished,
+                read_back,
             ));
         }
         if read.len() != image.len() {
@@ -1266,7 +1294,7 @@ impl PendingWrite {
                     ),
                     offset: None,
                 },
-                unfinished,
+                read_back,
             ));
         }
         // `verified` is the length of the comparison above. It equals
@@ -1487,10 +1515,27 @@ impl<T: Transport> DownloadAgent<T> {
     ///
     /// # Errors
     ///
-    /// [`Error::Safety`] when the unit is not a Holux M-241 or its flash is not
-    /// `backup` byte for byte — for example when the backup came from another
-    /// unit. The message names the first differing offset. Nothing is written.
+    /// [`Error::Safety`] when the unit is not a Holux M-241, when `backup` is
+    /// not [`FLASH_WRITE_LENGTH`] bytes, or when its flash is not `backup` byte
+    /// for byte — for example when the backup came from another unit. The
+    /// message names the first differing offset. Nothing is written.
+    ///
+    /// The length guard is deliberate: this method reads the shipped
+    /// [`FLASH_WRITE_START`] span, which [`check_layout`] only allows at
+    /// [`FLASH_WRITE_LENGTH`]. The CLI has already run [`check_image`] against
+    /// the same profile, so a different-length backup is refused twice rather
+    /// than read past the image.
     pub fn verify_device(rom: &mut MtkBootRom<T>, backup: &[u8]) -> Result<()> {
+        if backup.len() != FLASH_WRITE_LENGTH {
+            return Err(Error::Safety {
+                reason: format!(
+                    "the backup is {} bytes; the shipped write range reads {} bytes from \
+                     0x{FLASH_WRITE_START:08X}. Nothing was written",
+                    backup.len(),
+                    FLASH_WRITE_LENGTH
+                ),
+            });
+        }
         Self::verify_device_at(rom, backup, FLASH_WRITE_START)
     }
 
@@ -1555,9 +1600,8 @@ impl<T: Transport> DownloadAgent<T> {
     ///
     /// `backup` is the user's own dump, as [`Self::verify_device`] compared it.
     /// It is used again here for the acceptance rule ([`check_image`]), so a
-    /// caller who skipped the device check still cannot write an image that is
-    /// neither their own dump with only [`PATCH_OFFSETS`] moved nor an official
-    /// vendor release.
+    /// caller who skipped the device check still cannot write an image other
+    /// than their own dump with only [`PATCH_OFFSETS`] moved.
     ///
     /// `confirmation` is required and checked: a token whose flag was never set
     /// is [`Error::Safety`]. Nothing about the type forces a caller to build it
@@ -2040,55 +2084,30 @@ fn check_layout_of(
     Ok(())
 }
 
-/// The two ways an image may be accepted for writing (`AGENTS.md` §2.3).
-///
-/// The rule this type carries is the *original* one plus one addition, never a
-/// replacement:
-///
-/// * [`Self::PatchedBackup`] — the image equals the user's own backup, or
-///   differs from it only at that profile's patch offsets. This is the route
-///   §2.3 always described, and it is checked first.
-/// * [`Self::OfficialVendor`] — the image's SHA-256 is one of the two official
-///   vendor releases in `m241_core::firmware::profiles`. This is the separate
-///   gate §2.3's second paragraph describes: a vendor image has per-unit fields
-///   different from any one unit's dump, so it can never satisfy the backup
-///   diff, and refusing it outright would mean the repaired tool could only
-///   ever write the WNRO patch and never a clean stock image. The backup is
-///   still required — it is the only way back if the write goes wrong.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Acceptance {
-    /// The image is the user's backup, or a WNRO-patched copy of it.
-    PatchedBackup,
-    /// The image hashes to an official vendor release.
-    OfficialVendor,
-}
-
-impl Acceptance {
-    /// The name the CLI and the JSON document show.
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::PatchedBackup => "patched backup",
-            Self::OfficialVendor => "official vendor image",
-        }
-    }
-}
-
-/// What an image was accepted as, plus the profile it belongs to.
+/// An image that passed [`check_image`], plus the profile it belongs to.
 ///
 /// Produced by [`check_image`] and turned into a plan by [`write_plan`]. It is
 /// not a permission to write: [`DownloadAgent::write`] still runs
 /// [`check_layout`], which refuses every start address this crate cannot
 /// establish.
+///
+/// There is exactly one acceptance rule (`AGENTS.md` §2.3): the image is the
+/// user's own backup, or differs from it only at that profile's patch offsets.
+/// No digest, vendor package, or "known profile" route exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AcceptedImage<'a> {
     /// The profile the image was read against.
     pub profile: &'static FirmwareProfile,
-    /// Which of the two rules accepted it.
-    pub acceptance: Acceptance,
     /// The image itself, after checking.
     pub image: &'a [u8],
 }
+
+/// How many differing offsets [`WritePlan`] keeps.
+///
+/// A WNRO patch changes three bytes, so the limit never hides a patched backup;
+/// a large diff (for example a whole vendor image) is refused before a plan is
+/// built, but the limit still keeps a diagnostic short.
+pub const PLAN_DIFF_LIMIT: usize = 16;
 
 /// Everything `fw flash --dry-run` reports that can be decided without a wire.
 ///
@@ -2096,22 +2115,15 @@ pub struct AcceptedImage<'a> {
 /// the same computation a real write would do up to the first byte —
 /// [`DownloadAgent::write`] reaches the client only through [`check_image`] —
 /// plus the numbers a person needs to decide whether to continue: how many
-/// `0xD5` packets, how much would change, and whether the image is for a
-/// different device than the backup.
+/// `0xD5` packets, how much would change, and which profile the image is for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WritePlan {
     /// The profile the image is written as.
     pub profile: &'static FirmwareProfile,
-    /// Which rule accepted the image.
-    pub acceptance: Acceptance,
     /// Bytes the image holds; equals `profile.size`.
     pub size: usize,
     /// The image's device type string (`01017-00F`, …).
     pub device_type: String,
-    /// The backup's device type, or `None` when it cannot be read.
-    pub backup_device_type: Option<String>,
-    /// `true` when the backup's device type differs from the image's.
-    pub cross_model: bool,
     /// The length of the span a real write would program.
     pub write_length: usize,
     /// The DA-side start a real write would use ([`FLASH_WRITE_START`]).
@@ -2125,32 +2137,18 @@ pub struct WritePlan {
     /// Bytes that differ from the backup, when the backup is the same length.
     pub differing_bytes: Option<usize>,
     /// The offsets where the image differs from the backup, truncated to the
-    /// first [`PLAN_DIFF_LIMIT`] so a vendor image cannot print 400,000 lines.
+    /// first [`PLAN_DIFF_LIMIT`] so a large diff cannot print 400,000 lines.
     pub differing_offsets: Vec<usize>,
 }
 
-/// How many differing offsets [`WritePlan`] keeps.
+/// Refuse unless `image` is the user's own backup or a WNRO patch of it.
 ///
-/// A WNRO patch changes three bytes, so the limit never hides a patched backup;
-/// a vendor image differs almost everywhere, and a person needs the count and a
-/// first few, not the list.
-pub const PLAN_DIFF_LIMIT: usize = 16;
-
-impl WritePlan {
-    /// Whether the plan's write would touch a device of another model.
-    #[must_use]
-    pub fn needs_cross_model_consent(&self) -> bool {
-        self.cross_model
-    }
-}
-
-/// Refuse unless `image` is acceptable for `profile`, and say which rule it met.
-///
-/// The check order is [`Acceptance::PatchedBackup`] first, exactly because it is
-/// the stricter one: an image that is the backup with only the patch bytes moved
-/// is accepted as a patched backup and never needs the hash rule. An official
-/// vendor image fails the diff (its per-unit fields differ) and is then checked
-/// against the profile's SHA-256.
+/// `AGENTS.md` §2.3 defines the only rule: an image identical to the backup is
+/// accepted, and an image whose every differing byte falls inside `profile`'s
+/// patch offsets is accepted. Every other difference is refused. There is no
+/// digest, vendor-package, or "known profile" bypass: a vendor release carries
+/// per-unit fields that no one unit's dump has, so accepting it would weaken the
+/// backup check §2.3 tells this code not to weaken.
 ///
 /// The backup's shape is checked too: it must be `profile.size` bytes, or a
 /// backup taken with a different `--length` would be compared against an image
@@ -2159,32 +2157,13 @@ impl WritePlan {
 /// # Errors
 ///
 /// [`Error::Safety`] when either buffer is not `profile.size`, when the image is
-/// not an M-241 image, when the image's device type is not the profile's, when
-/// the image differs from the backup outside the profile's patch offsets **and**
-/// does not hash to the profile's official digest. The message names which of
-/// the two rules was tried and why each failed.
+/// not an M-241 image, when the image's device type is not the profile's, or when
+/// the image differs from the backup outside the profile's patch offsets. The
+/// refusal names the first differing offset and the patch table it checked.
 pub fn check_image<'a>(
     profile: &'static FirmwareProfile,
     backup: &[u8],
     image: &'a [u8],
-) -> Result<AcceptedImage<'a>> {
-    check_image_with(profile, backup, image, |bytes| {
-        matches(bytes, profile.sha256)
-    })
-}
-
-/// [`check_image`] with the official-digest comparison handed in.
-///
-/// The predicate lets the vendor rule be exercised without the vendor binaries: a
-/// test passes the digest the image actually has, and the code under test still
-/// decides between the two rules in the release order. The public [`check_image`]
-/// always passes `matches(image, profile.sha256)`, and this function is private,
-/// so no caller can substitute a looser comparison for it.
-fn check_image_with<'a>(
-    profile: &'static FirmwareProfile,
-    backup: &[u8],
-    image: &'a [u8],
-    is_official: impl Fn(&[u8]) -> bool,
 ) -> Result<AcceptedImage<'a>> {
     let offsets = profile_patch_offsets(profile).ok_or_else(|| Error::Safety {
         reason: format!(
@@ -2226,38 +2205,26 @@ fn check_image_with<'a>(
         });
     }
 
-    let first_miss = backup
-        .iter()
-        .zip(image.iter())
-        .position(|(saved, wanted)| saved != wanted);
-    if all_within(backup, image, offsets) {
-        return Ok(AcceptedImage {
-            profile,
-            acceptance: Acceptance::PatchedBackup,
-            image,
+    if !all_within(backup, image, offsets) {
+        let offset = backup
+            .iter()
+            .zip(image.iter())
+            .position(|(saved, wanted)| saved != wanted)
+            .unwrap_or(0);
+        let saved = backup.get(offset).copied().unwrap_or(0);
+        let wanted = image.get(offset).copied().unwrap_or(0);
+        return Err(Error::Safety {
+            reason: format!(
+                "the image differs from the backup at 0x{offset:X} (0x{saved:02X} -> \
+                 0x{wanted:02X}), which is outside the {} patch offsets {offsets:X?}. Only your \
+                 own backup, or a WNRO-patched copy of it, may be written; write your own dump \
+                 and patch that",
+                profile.name
+            ),
         });
     }
 
-    if is_official(image) {
-        return Ok(AcceptedImage {
-            profile,
-            acceptance: Acceptance::OfficialVendor,
-            image,
-        });
-    }
-
-    let offset = first_miss.unwrap_or(0);
-    let saved = backup.get(offset).copied().unwrap_or(0);
-    let wanted = image.get(offset).copied().unwrap_or(0);
-    Err(Error::Safety {
-        reason: format!(
-            "the image differs from the backup at 0x{offset:X} (0x{saved:02X} -> 0x{wanted:02X}), \
-             which is outside the {} patch offsets {offsets:X?}, and its SHA-256 is not the \
-             official {} digest {}. Only a WNRO patch over your own backup, or the unmodified \
-             vendor release, may be written",
-            profile.name, profile.name, profile.sha256
-        ),
-    })
+    Ok(AcceptedImage { profile, image })
 }
 
 /// Whether every byte where the two buffers differ is in `offsets`.
@@ -2282,17 +2249,14 @@ fn all_within(backup: &[u8], image: &[u8], offsets: &[usize]) -> bool {
 /// to use it, because [`DownloadAgent::write`] still runs [`check_layout`] and
 /// [`DownloadAgent::verify_device`] runs against the unit first.
 ///
-/// # Cross model
+/// # The backup is the image's own dump
 ///
 /// `profile` is the image's, and `backup` must be the same length as the image
-/// (see [`check_image`]). A `01017-00E` image over a `01017-00F` unit is
-/// therefore a plan, not a refusal: the two device strings differ in the header
-/// but the two images are the same length only when the backup was dumped at
-/// that profile's length. When the backup came from a unit of the other model at
-/// the other size, the length check refuses it, because re-flashing a unit with
-/// an image that does not match its own dump's length is exactly the write
-/// nobody can undo. The plan flags the case it *can* see, and
-/// [`WritePlan::needs_cross_model_consent`] is what the CLI gates on.
+/// (see [`check_image`]). Because every differing byte must be in the patch
+/// table, a backup from another unit or another model is refused: its per-unit
+/// fields differ outside those offsets. That is the intended refusal, not a
+/// consent prompt — a cross-model vendor image can neither be produced by
+/// patching this unit's dump nor written by this build.
 ///
 /// # Errors
 ///
@@ -2302,26 +2266,10 @@ pub fn write_plan(
     backup: &[u8],
     image: &[u8],
 ) -> Result<WritePlan> {
-    write_plan_with(profile, backup, image, |bytes| {
-        matches(bytes, profile.sha256)
-    })
-}
-
-/// [`write_plan`] with the official-digest comparison handed in; see
-/// [`check_image_with`] for why the seam exists and why it is private.
-fn write_plan_with(
-    profile: &'static FirmwareProfile,
-    backup: &[u8],
-    image: &[u8],
-    is_official: impl Fn(&[u8]) -> bool,
-) -> Result<WritePlan> {
-    let accepted = check_image_with(profile, backup, image, is_official)?;
+    check_image(profile, backup, image)?;
     let device_type = FirmwareImage::new(image)
         .map(|parsed| parsed.device_type())
         .unwrap_or_default();
-    let backup_device_type = FirmwareImage::new(backup)
-        .map(|parsed| parsed.device_type())
-        .ok();
     let differing_offsets: Vec<usize> = backup
         .iter()
         .zip(image.iter())
@@ -2340,13 +2288,8 @@ fn write_plan_with(
     let write_length = profile_write_length(profile);
     Ok(WritePlan {
         profile,
-        acceptance: accepted.acceptance,
         size: image.len(),
-        cross_model: backup_device_type
-            .as_ref()
-            .is_some_and(|device| *device != device_type),
         device_type,
-        backup_device_type,
         write_length,
         start: FLASH_WRITE_START,
         packets: write_length.div_ceil(PACKET_SIZE),
@@ -2385,10 +2328,9 @@ mod tests {
     /// strings, so the bytes after them are `0x00`, not `0xFF`.
     ///
     /// Note that these fixtures are **not** the vendor packages: they share the
-    /// header and the constant offsets, but every other byte is `0xFF`, so none
-    /// of them hashes to a profile's official digest. That is what lets
-    /// `check_image` accept them only through the diff rule, and the tests that
-    /// need the vendor rule say so and build the case explicitly.
+    /// header and the constant offsets, but every other byte is `0xFF`. The
+    /// tests use them to exercise the one backup-diff rule without any vendor
+    /// bytes.
     fn stock_image_of(profile: &'static FirmwareProfile) -> Vec<u8> {
         let mut data = vec![0xFFu8; profile.size];
         data[..VECTOR.len()].copy_from_slice(&VECTOR);
@@ -2465,8 +2407,10 @@ mod tests {
     }
 
     /// The re-entry step a caller does on hardware, done on the fake.
-    fn reenter(device: &mut FakeDa) {
+    fn reenter(device: FakeDa) -> Result<FakeDa> {
+        let mut device = device;
         device.set_modelled(Modelled::BootRom);
+        Ok(device)
     }
 
     /// Drive the write at the test's own start, so the protocol is exercised
@@ -2741,7 +2685,7 @@ mod tests {
         // `AGENTS.md` §2.3: "An image identical to the backup is accepted."
         let backup = stock_image();
         let accepted = check_image(&PROFILE_V1_13, &backup, &backup).expect("identical");
-        assert_eq!(accepted.acceptance, Acceptance::PatchedBackup);
+        assert_eq!(accepted.image, backup.as_slice());
         let patched = patched_image();
         check_image(&PROFILE_V1_13, &patched, &patched).expect("a patched unit written back");
     }
@@ -2759,7 +2703,7 @@ mod tests {
             .collect();
         assert_eq!(differing, PATCH_OFFSETS.to_vec());
         let accepted = check_image(&PROFILE_V1_13, &backup, &patched).expect("the measured patch");
-        assert_eq!(accepted.acceptance, Acceptance::PatchedBackup);
+        assert_eq!(accepted.image, patched.as_slice());
     }
 
     #[test]
@@ -2779,7 +2723,7 @@ mod tests {
         assert_eq!(differing, PATCH_OFFSETS_V1_12.to_vec());
         let accepted = check_image(&PROFILE_V1_12, &backup, &patched)
             .expect("a V1.12 image patched at V1.12's offsets");
-        assert_eq!(accepted.acceptance, Acceptance::PatchedBackup);
+        assert_eq!(accepted.image, patched.as_slice());
         // And the V1.13 table must not accept it: the two tables differ at the
         // marker byte, so the diff-only route is profile-specific.
         assert!(
@@ -2860,108 +2804,51 @@ mod tests {
         ));
     }
 
-    // -- the official-vendor gate ------------------------------------------
+    // -- no vendor or cross-model bypass -----------------------------------
 
     #[test]
-    fn the_official_digest_of_a_profile_selects_that_profile_and_only_it() {
-        // The two digests are the vendor packages', confirmed by hashing the
-        // files (`profiles.rs` holds the same strings). This test does not read
-        // `holux/`; it checks that the profile→acceptance rule distinguishes the
-        // two and refuses a third image.
-        assert_ne!(PROFILE_V1_12.sha256, PROFILE_V1_13.sha256);
-        assert_eq!(PROFILE_V1_12.sha256.len(), 64);
-        assert_eq!(PROFILE_V1_13.sha256.len(), 64);
-        assert_eq!(PROFILE_V1_12.size, V1_12_WRITE_LENGTH);
-        assert_eq!(PROFILE_V1_13.size, V1_13_WRITE_LENGTH);
-    }
-
-    #[test]
-    fn an_official_vendor_image_is_accepted_as_the_vendor_rule() {
-        // A backup that shares the header but not the body: this is what a dump
-        // from an actual unit looks like, per-unit fields and all, so the diff
-        // rule cannot accept the vendor image. The digest rule is what does.
-        //
-        // The fixture is not the vendor package (it is not committed here), so
-        // "this image is official" is supplied by the test: the seam asks the
-        // *rule order*, which is what a release build and this call share.
-        let vendor = stock_image();
-        let mut backup = vendor.clone();
-        for offset in [0x1000usize, 0x2000, 0x3000] {
-            backup[offset] ^= 0xFF;
-        }
-        let accepted = check_image_with(&PROFILE_V1_13, &backup, &vendor, |_| true)
-            .expect("the official digest");
-        assert_eq!(
-            accepted.acceptance,
-            Acceptance::OfficialVendor,
-            "an image accepted by hash must say so, not claim to be a patched backup"
-        );
-        assert_eq!(accepted.acceptance.label(), "official vendor image");
-    }
-
-    #[test]
-    fn the_patched_backup_rule_is_tried_before_the_vendor_rule() {
-        // An image that is the backup with only the patch bytes moved satisfies
-        // both rules when the digest predicate says "yes". It must still be
-        // reported as a patched backup: the stricter rule wins, so a WNRO patch
-        // of the user's own dump is never described as a vendor release.
+    fn a_vendor_style_image_with_per_unit_fields_different_is_refused() {
+        // A vendor release shares the family and device strings, but its
+        // per-unit runtime fields differ from any one unit's dump. Those bytes
+        // are outside the patch table, and `AGENTS.md` §2.3 says the image must
+        // be refused. There is no digest rule to fall back to.
         let backup = stock_image();
-        let image = patched_image();
-        let accepted = check_image_with(&PROFILE_V1_13, &backup, &image, |_| true)
-            .expect("acceptable by both rules");
-        assert_eq!(accepted.acceptance, Acceptance::PatchedBackup);
-    }
-
-    #[test]
-    fn an_official_image_with_a_wrong_length_is_refused_before_the_digest() {
-        // The digest predicate cannot rescue a wrong-length image: the length
-        // check runs first, so a short file whose hash someone computed is
-        // refused for its size.
-        let short = vec![0xFFu8; 0x1000];
-        let err = check_image_with(&PROFILE_V1_13, &stock_image(), &short, |_| true)
-            .expect_err("wrong length");
-        assert!(format!("{err}").contains("4096"), "got {err}");
-    }
-
-    #[test]
-    fn an_image_with_a_wrong_digest_and_a_wrong_diff_is_refused() {
-        // Neither rule holds: it differs from the backup outside the table and
-        // its digest is not the profile's. This is the refusal that keeps a
-        // hand-edited or truncated image from being written.
-        let vendor = stock_image();
-        let mut backup = vendor.clone();
-        backup[0x1000] ^= 0xFF;
-        let mut image = vendor;
-        image[0x2000] ^= 0xFF;
-        let err =
-            check_image_with(&PROFILE_V1_13, &backup, &image, |_| false).expect_err("neither rule");
+        let mut image = backup.clone();
+        for offset in [0x1000usize, 0x2000, 0x3000] {
+            image[offset] ^= 0xFF;
+        }
+        let err = check_image(&PROFILE_V1_13, &backup, &image).expect_err("not this unit's backup");
         let text = format!("{err}");
-        assert!(text.contains("0x1000"), "the diff is named first: {text}");
         assert!(
-            text.contains(PROFILE_V1_13.sha256),
-            "the refusal says which digest it compared against: {text}"
+            text.contains("0x1000"),
+            "the first difference is named: {text}"
+        );
+        assert!(
+            text.contains("outside the V1.13 patch offsets"),
+            "the refusal names the only rule: {text}"
+        );
+        assert!(
+            !text.contains("SHA-256"),
+            "there is no digest bypass to describe: {text}"
         );
     }
 
     #[test]
-    fn the_real_vendor_digest_is_what_the_public_rule_compares_against() {
-        // `check_image` passes `matches(image, profile.sha256)`. A synthetic
-        // image does not hash to it, so the public function must treat it as a
-        // non-vendor image even when the diff rule also fails. If someone ever
-        // "fixed" the seam by passing a looser predicate, this would accept the
-        // fixture as a vendor image and the assertion below would fail.
-        let vendor = stock_image();
-        let mut backup = vendor.clone();
-        backup[0x1000] ^= 0xFF;
-        let err = check_image(&PROFILE_V1_13, &backup, &vendor).expect_err("not the vendor image");
-        assert!(
-            format!("{err}").contains(PROFILE_V1_13.sha256),
-            "the real digest is named: {err}"
-        );
+    fn a_backup_from_another_model_is_refused_by_the_backup_diff() {
+        // The image is a valid V1.13 WNRO patch, but the backup names another
+        // model. The device field differs outside the patch table, so the only
+        // rule refuses it; no consent flag can make it writable.
+        let image = patched_image();
+        let mut backup = stock_image();
+        backup[DEVICE_TYPE_OFFSET..DEVICE_TYPE_OFFSET + 9].copy_from_slice(b"01017-00E");
+        let err = check_image(&PROFILE_V1_13, &backup, &image)
+            .expect_err("the backup is another model's");
+        let text = format!("{err}");
+        assert!(text.contains("Only your own backup"), "got {text}");
     }
 
     #[test]
-    fn a_vendor_image_of_the_wrong_device_type_is_refused_before_the_digest() {
+    fn an_image_of_the_right_shape_but_a_different_device_is_still_refused() {
         // A V1.12 image checked as V1.13 has the wrong length, which the length
         // check catches. The device-type check is what catches an image of the
         // right length whose header names another model.
@@ -2982,12 +2869,8 @@ mod tests {
         let image = patched_image();
         let plan = write_plan(&PROFILE_V1_13, &backup, &image).expect("acceptable");
         assert_eq!(plan.profile, &PROFILE_V1_13);
-        assert_eq!(plan.acceptance, Acceptance::PatchedBackup);
         assert_eq!(plan.size, PROFILE_V1_13.size);
         assert_eq!(plan.device_type, "01017-00F");
-        assert_eq!(plan.backup_device_type.as_deref(), Some("01017-00F"));
-        assert!(!plan.cross_model);
-        assert!(!plan.needs_cross_model_consent());
         assert_eq!(plan.write_length, V1_13_WRITE_LENGTH);
         assert_eq!(plan.start, FLASH_WRITE_START);
         assert_eq!(plan.packets, V1_13_WRITE_LENGTH.div_ceil(PACKET_SIZE));
@@ -3021,39 +2904,27 @@ mod tests {
         assert_eq!(marker, "V1.14");
         let plan = write_plan(&PROFILE_V1_13, &backup, &image).expect("acceptable");
         assert_eq!(plan.profile.name, "V1.13");
-        assert_eq!(plan.acceptance, Acceptance::PatchedBackup);
     }
 
     #[test]
-    fn a_cross_model_plan_is_flagged_and_the_image_is_still_accepted() {
-        // Two same-length V1.12 images that differ only in the device field:
-        // the image names `01017-00E`, the backup `01017-00F`. Same length is
-        // required — `check_image` refuses a backup of another size, because
-        // that backup cannot be the dump this image was planned from — and the
-        // device strings are what `cross_model` reads.
+    fn a_cross_model_plan_is_refused() {
+        // The image is a valid V1.12 WNRO patch, but the backup names another
+        // model. The device field differs outside the patch table, so
+        // `write_plan` refuses it; there is no consent flag that reopens it.
         let image = patched_image_of(&PROFILE_V1_12);
-        let mut backup = image.clone();
+        let mut backup = stock_image_of(&PROFILE_V1_12);
         backup[DEVICE_TYPE_OFFSET..DEVICE_TYPE_OFFSET + 9].copy_from_slice(b"01017-00F");
-        // The diff is the device field, outside the patch table, so this pair
-        // needs the vendor rule; the test supplies it for the same reason as
-        // `an_official_vendor_image_is_accepted_as_the_vendor_rule`.
-        let plan = write_plan_with(&PROFILE_V1_12, &backup, &image, |_| true)
-            .expect("the image is acceptable");
-        assert!(
-            plan.cross_model,
-            "the backup names 01017-00F, the image 01017-00E"
-        );
-        assert!(plan.needs_cross_model_consent());
-        assert_eq!(plan.device_type, "01017-00E");
-        assert_eq!(plan.backup_device_type.as_deref(), Some("01017-00F"));
+        let err = write_plan(&PROFILE_V1_12, &backup, &image).expect_err("cross model");
+        let text = format!("{err}");
+        assert!(text.contains("Only your own backup"), "got {text}");
     }
 
     #[test]
-    fn a_backup_of_another_length_is_refused_before_cross_model_is_considered() {
+    fn a_backup_of_another_length_is_refused() {
         // A real V1.12 image and a real V1.13 backup are 308 bytes apart. The
-        // length check refuses that pair rather than reporting a cross-model
-        // write nobody could undo: the backup is not the dump this image was
-        // planned against.
+        // length check refuses that pair: the backup is not the dump this image
+        // was planned against, and re-flashing a unit with an image that does
+        // not match its own dump's length is exactly the write nobody can undo.
         let backup = stock_image();
         let image = stock_image_of(&PROFILE_V1_12);
         let err = write_plan(&PROFILE_V1_12, &backup, &image).expect_err("lengths differ");
@@ -3062,20 +2933,6 @@ mod tests {
             text.contains("406620") && text.contains("406312"),
             "got {text}"
         );
-    }
-
-    #[test]
-    fn a_backup_whose_device_field_is_truncated_is_not_a_cross_model() {
-        // The backup and the image both read `01017-00F`, but the backup's field
-        // ends at the NUL after the ninth byte rather than carrying the profile
-        // string's exact byte count. `FirmwareImage::field` stops at the NUL, so
-        // the two strings are equal and the plan must not call it a model change.
-        let image = patched_image();
-        let mut backup = image.clone();
-        backup[DEVICE_TYPE_OFFSET + 9..DEVICE_TYPE_OFFSET + DEVICE_TYPE_SIZE].fill(0);
-        let plan = write_plan(&PROFILE_V1_13, &backup, &image).expect("acceptable");
-        assert_eq!(plan.backup_device_type.as_deref(), Some("01017-00F"));
-        assert!(!plan.cross_model, "the two device strings are equal");
     }
 
     #[test]
@@ -3345,20 +3202,21 @@ mod tests {
     }
 
     #[test]
-    fn the_restart_does_not_read_a_reply() {
-        // §4.5, §8 item 4: `0xD9` never returns and sends nothing. A client that
-        // reads after it waits out the timeout at best. The fake queues nothing
-        // for the restart, so the assertion is "nothing arrived" — a client
-        // that read would block and fail this test on the timeout.
+    fn the_restart_does_not_read_a_da_reply() {
+        // §4.5, §8 item 4: `0xD9` never returns and sends no DA reply. The fake
+        // boots its firmware on the restart, so a read after it returns the
+        // firmware's NMEA stream, not an acknowledgement: a client that waited
+        // for an ACK would consume `$` as one and desynchronise.
         let backup = stock_image();
         let mut da = DownloadAgent::new(fake_in_da(&backup));
         da.restart().expect("0xD9 goes out");
         assert!(da.transport_mut().restarted(), "0xD9 must have been sent");
         let mut byte = [0u8; 1];
         let read = da.transport_mut().read(&mut byte).expect("read");
+        assert_eq!(read, 1, "the booted firmware streams NMEA");
         assert_eq!(
-            read, 0,
-            "0xD9 must not answer; a client may not wait for it"
+            byte[0], b'$',
+            "the first byte after 0xD9 is NMEA, never a DA ACK/NAK"
         );
     }
 
@@ -3573,6 +3431,28 @@ mod tests {
         assert_eq!(
             rom.transport_mut().last_read_address(),
             Some(BASE_ADDR_FIRMWARE + WIRE_START)
+        );
+    }
+
+    #[test]
+    fn the_shipped_device_check_refuses_a_backup_that_is_not_the_pinned_length() {
+        // `verify_device` reads the shipped V1.13 span. A backup of another
+        // length must be refused before the first read rather than compared
+        // against fewer bytes than the write range covers.
+        let backup = stock_image();
+        let short = backup[..FLASH_WRITE_LENGTH - 2].to_vec();
+        let mut rom = MtkBootRom::new(FakeDa::with_firmware(&backup));
+        let err = DownloadAgent::verify_device(&mut rom, &short).expect_err("wrong length");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        let text = format!("{err}");
+        assert!(
+            text.contains("406618") && text.contains("406620"),
+            "the refusal names both lengths: {text}"
+        );
+        assert_eq!(
+            rom.transport_mut().read_bytes(),
+            0,
+            "the length guard runs before any 0xA2 frame"
         );
     }
 
