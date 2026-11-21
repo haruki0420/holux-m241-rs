@@ -1241,9 +1241,10 @@ impl<T: Transport> DownloadAgent<T> {
     /// The line is cleared before the command goes out: a byte that arrived
     /// earlier cannot be this command's answer. On the unit, four bytes follow
     /// the DA banner that [`DaLoader::load`] does not consume (its report is
-    /// exactly [`DA_REPORT_SIZE`]), and reading the first page without the
-    /// drain shifted it by four bytes — every retry repeated the same shift
-    /// (measured 2026-11-21).
+    /// exactly [`DA_REPORT_SIZE`]). They can arrive on either side of the
+    /// command, so a page that fails its checksum also clears the line before
+    /// it is asked for again; without that, the leftover bytes shifted every
+    /// retry by the same four bytes (measured 2026-11-21).
     ///
     /// # Errors
     ///
@@ -1322,6 +1323,10 @@ impl<T: Transport> DownloadAgent<T> {
                     offset: Some(page.saturating_mul(PROBE_PAGE_SIZE)),
                 });
             }
+            // A page that failed may not have been the whole page: if extra
+            // bytes arrived ahead of it, the tail is still queued and asking
+            // again would repeat the same shift. Drop what is left, then ask.
+            self.transport.clear_input()?;
             self.transport.write_all(&[PAGE_RETRY])?;
             self.transport.flush()?;
         }
@@ -3447,6 +3452,32 @@ mod loader_tests {
             device.output_len(),
             0,
             "the drain that starts the read took the leftovers"
+        );
+    }
+
+    #[test]
+    fn a_page_that_arrives_behind_four_bytes_is_asked_for_again_and_read_clean() {
+        let mut window = flash(0x00);
+        let data: Vec<u8> = (0..PROBE_PAGE_SIZE)
+            .map(|index| 0xC0u8.wrapping_add(index as u8))
+            .collect();
+        place(&mut window, 0, &data);
+        let mut device = da_with(&window);
+        // The four bytes arrive after the command, in front of the page: the
+        // clear that starts the read cannot see them (measured 2026-11-21).
+        device.prefix_next_page(&[0x7D, 0x00, 0x00, 0x00]);
+
+        let (page, device) = read(device, 0, PROBE_PAGE_SIZE);
+        assert_eq!(
+            page.expect("0xD6 after a page with a prefix"),
+            data,
+            "the retry must drop the leftovers and start at the page"
+        );
+        assert_eq!(device.retries_sent(), 1, "exactly one re-request");
+        assert_eq!(
+            device.output_len(),
+            0,
+            "nothing is left once the clean page has been read"
         );
     }
 
