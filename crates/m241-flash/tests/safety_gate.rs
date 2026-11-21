@@ -9,9 +9,10 @@
 //! * each forbidden command, escape form, write-shaped identifier, misplaced
 //!   `set_control_lines` reference, and reversed dependency fails and names
 //!   the violated rule;
-//! * `DownloadAgent::write` without its `check_layout()?` call in the body
-//!   fails, including when the call appears only in a comment or another
-//!   function;
+//! * `DownloadAgent::write` without its `check_layout()?` call at the body's
+//!   top level fails, including when the call appears only in a comment,
+//!   another function, or an uncalled nested function;
+//! * the mutation test removes that line from both an LF and a CRLF checkout;
 //! * valid exclusions (comments, trailing inline comments, `erased`, SHA-256
 //!   constants like `0xd5a7_9147`, and `set_control_lines` inside its exact
 //!   allowlisted files) pass;
@@ -196,6 +197,17 @@ impl Drop for FakeRepo {
     }
 }
 
+/// Remove the layout-gate line from `da_rs`, accepting LF or CRLF.
+///
+/// A Windows checkout reads `da.rs` with `\r\n`. The pattern below is written
+/// with `\n`, so normalising first is what keeps the mutation test from
+/// panicking with "the line was not found" on that platform.
+fn without_layout_gate(da_rs: &str) -> String {
+    da_rs
+        .replace("\r\n", "\n")
+        .replacen("        check_layout()?;\n", "", 1)
+}
+
 #[test]
 fn the_safety_gate_is_still_wired_into_check_sh() {
     // The self-tests below exercise the checker, but only `tools/check.sh`
@@ -367,14 +379,55 @@ fn removing_check_layout_from_the_real_write_body_is_reported() {
             .join("da.rs"),
     )
     .expect("crates/m241-flash/src/da.rs is missing");
-    let without = real.replacen("        check_layout()?;\n", "", 1);
+    let normalized = real.replace("\r\n", "\n");
+    let without = without_layout_gate(&real);
     assert_ne!(
-        without, real,
+        without, normalized,
         "the `check_layout()?;` line was not found in the real write body"
     );
 
     let repo = FakeRepo::new("da-real-minus-layout", &[]);
     repo.write_flash_da(&without);
+    repo.assert_reports("does not call `check_layout()?`");
+}
+
+#[test]
+fn a_crlf_checkout_detects_the_removed_layout_gate() {
+    // windows-latest checks the file out with CRLF. The gate itself reads
+    // either ending, but a mutation test that matched only `\n` panicked
+    // before it could exercise the gate on that platform.
+    let real = std::fs::read_to_string(
+        repo_root()
+            .join("crates")
+            .join("m241-flash")
+            .join("src")
+            .join("da.rs"),
+    )
+    .expect("crates/m241-flash/src/da.rs is missing");
+    let crlf = real.replace("\r\n", "\n").replace('\n', "\r\n");
+    assert!(
+        crlf.contains("        check_layout()?;\r\n"),
+        "the CRLF fixture does not contain the layout-gate line:\n{crlf}"
+    );
+
+    // A clean CRLF file passes: CRLF must not become a false positive.
+    let clean = FakeRepo::new("da-crlf-clean", &[]);
+    clean.write_flash_da(&crlf);
+    let (passed, report) = clean.run();
+    assert!(
+        passed,
+        "the safety gate rejected a compliant CRLF da.rs:\n{report}"
+    );
+
+    let without = without_layout_gate(&crlf);
+    assert!(
+        !without.contains("check_layout()?;"),
+        "the CRLF layout-gate line was not removed"
+    );
+    // Feed the gate a CRLF file that is missing the call, not an LF one.
+    let without_crlf = without.replace('\n', "\r\n");
+    let repo = FakeRepo::new("da-crlf-minus-layout", &[]);
+    repo.write_flash_da(&without_crlf);
     repo.assert_reports("does not call `check_layout()?`");
 }
 
@@ -400,6 +453,23 @@ fn a_layout_gate_only_in_another_function_does_not_count() {
          }\n",
     );
     repo.assert_reports("does not call `check_layout()?`");
+}
+
+#[test]
+fn a_nested_function_that_calls_the_layout_gate_does_not_count() {
+    // The nested `prepare` is never called. Its `check_layout()` is at brace
+    // depth 2 inside `write`, so it must not satisfy the top-level gate.
+    let repo = FakeRepo::new("da-layout-nested-function", &[]);
+    repo.write_flash_da(
+        "pub fn write(backup: &[u8], image: &[u8]) -> Result<()> {\n\
+         fn prepare() -> Result<()> {\n\
+         check_layout()?;\n\
+         Ok(())\n\
+         }\n\
+         write_range(backup, image)\n\
+         }\n",
+    );
+    repo.assert_reports("does not call `check_layout()?` at its top level");
 }
 
 #[test]

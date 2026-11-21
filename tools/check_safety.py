@@ -45,11 +45,11 @@ Six checks, each for a different way the split can rot:
    prove it was not pulsed). A second call site is how a "safe because it is
    gated" function stops being gated.
 6. **The write path runs the layout gate.** `crates/m241-flash/src/da.rs`'s
-   `pub fn write` must call `check_layout()?` before it reaches `write_range`.
-   That call is what refuses every start other than the settled `0`; without it
-   the fixed range is a comment. The check looks inside `write`'s body only, so
-   a call in another function, a comment, or a mention elsewhere does not
-   satisfy it.
+   `pub fn write` must call `check_layout()?` at its own brace depth, before it
+   reaches `write_range`. That call is what refuses every start other than the
+   settled `0`; without it the fixed range is a comment. The check looks inside
+   `write`'s body only, so a call in another function, a comment, or an uncalled
+   nested function does not satisfy it.
 
 A rule enforced only by review is a rule that holds until the reviewer is busy.
 These are mechanical so they hold every commit.
@@ -317,8 +317,14 @@ def masked_source(text: str) -> str:
     return "".join(out)
 
 
-def write_body_span(masked: str) -> tuple[int, int] | str:
-    """The byte span of `pub fn write`'s body in masked source, or why it is missing."""
+def write_body_span(masked: str) -> tuple[int, int, int] | str:
+    """The span of `pub fn write` and its body in masked source.
+
+    Returns `(function_start, body_open, body_end)`, where `body_open` is the
+    index of the body's opening `{` and `body_end` is just past its matching
+    `}`. Returning the brace positions lets the caller require a call at the
+    body's own level rather than anywhere inside it.
+    """
     matches = list(WRITE_FUNCTION.finditer(masked))
     if not matches:
         return "no `pub fn write`"
@@ -334,8 +340,31 @@ def write_body_span(masked: str) -> tuple[int, int] | str:
         elif masked[index] == "}":
             depth -= 1
             if depth == 0:
-                return (matches[0].start(), index + 1)
+                return (matches[0].start(), opening, index + 1)
     return "`pub fn write`'s body is not balanced"
+
+
+def top_level_source(body: str) -> str:
+    """Blank everything below the function body's first brace depth.
+
+    `body` starts at the body's opening `{`. Only code directly inside it
+    (depth 1) survives. An uncalled nested function is depth 2 and is blanked,
+    so its `check_layout()` cannot satisfy the gate; neither can a call inside
+    a conditional block, which is the conservative reading of "the gate runs
+    before the write".
+    """
+    out = list(body)
+    depth = 0
+    for index, ch in enumerate(body):
+        if ch == "{":
+            depth += 1
+            out[index] = " "
+        elif ch == "}":
+            out[index] = " "
+            depth -= 1
+        elif depth != 1 and ch != "\n":
+            out[index] = " "
+    return "".join(out)
 
 
 def check_write_layout_gate() -> list[str]:
@@ -352,16 +381,17 @@ def check_write_layout_gate() -> list[str]:
     if isinstance(span, str):
         return [f"{relative(FLASH_DA)}: {span}"]
 
-    number = text.count("\n", 0, span[0]) + 1
-    body = masked[span[0] : span[1]]
-    layout = WRITE_LAYOUT_CALL.search(body)
+    function_start, body_open, body_end = span
+    number = text.count("\n", 0, function_start) + 1
+    top = top_level_source(masked[body_open:body_end])
+    layout = WRITE_LAYOUT_CALL.search(top)
     if layout is None:
         return [
             f"{relative(FLASH_DA)}:{number}: `pub fn write` does not call "
-            "`check_layout()?`; the fixed write range is not gated"
+            "`check_layout()?` at its top level; the fixed write range is not gated"
         ]
 
-    write_at = WRITE_RANGE_CALL.search(body)
+    write_at = WRITE_RANGE_CALL.search(top)
     if write_at is None:
         return [
             f"{relative(FLASH_DA)}:{number}: `pub fn write` does not call "
