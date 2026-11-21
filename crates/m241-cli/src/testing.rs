@@ -11,8 +11,11 @@
 //! does to a real unit, so [`DeviceHandle::power_cycle`] is what the test writes
 //! where the user would remove the battery.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Mutex;
 
 use m241_core::protocol::port::Transport;
 use m241_core::protocol::simulator::FakeDevice;
@@ -83,6 +86,186 @@ impl Console for RecordingConsole {
     }
 }
 
+/// A directory under the system temporary directory, removed on drop.
+///
+/// Every command's tests need scratch files. One type rather than the same
+/// block in each module: the directory is named after the role the test gives it
+/// and the process, so two tests that run in parallel do not share files, and a
+/// test that panics halfway leaves a directory the next run clears first.
+#[derive(Debug)]
+pub struct Scratch(PathBuf);
+
+impl Scratch {
+    /// Create an empty scratch directory for the test called `role`.
+    #[must_use]
+    pub fn new(role: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("m241-cli-{}-{role}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("scratch");
+        Self(path)
+    }
+
+    /// The directory itself.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// A path inside the scratch directory.
+    #[must_use]
+    pub fn join(&self, name: &str) -> PathBuf {
+        self.0.join(name)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A transport that replays queued reply bytes and lets a closure answer a command.
+///
+/// `answer` is called with every complete line written to the port — the
+/// request the command sent — and may push the reply into the same queue. Two
+/// test modules used to carry a private copy of this; they exist to prove a
+/// command sees a *particular* reply (a refusal, a corrupt frame) that the
+/// simulated chip would never send.
+pub struct ScriptedTransport {
+    output: VecDeque<u8>,
+    pending: Vec<u8>,
+    baud: Mutex<u32>,
+    answer: Answer,
+}
+
+/// What a [`ScriptedTransport`] does with one request line: it may push reply
+/// bytes into the queue the transport reads from.
+type Answer = Box<dyn FnMut(&str, &mut VecDeque<u8>)>;
+
+impl ScriptedTransport {
+    /// A transport that answers each command line with `answer`.
+    #[must_use]
+    pub fn new(answer: impl FnMut(&str, &mut VecDeque<u8>) + 'static) -> Self {
+        Self {
+            output: VecDeque::new(),
+            pending: Vec::new(),
+            baud: Mutex::new(0),
+            answer: Box::new(answer),
+        }
+    }
+
+    /// A transport that only replays `lines`, byte for byte, then reports idle.
+    #[must_use]
+    pub fn replaying(lines: &[String]) -> Self {
+        let mut output = VecDeque::new();
+        for line in lines {
+            output.extend(line.as_bytes());
+        }
+        Self {
+            output,
+            pending: Vec::new(),
+            baud: Mutex::new(0),
+            answer: Box::new(|_line, _output| {}),
+        }
+    }
+
+    /// The baud rate the command asked for when it opened the port.
+    #[must_use]
+    pub fn baud(&self) -> u32 {
+        *self.baud.lock().expect("baud cell")
+    }
+}
+
+impl std::fmt::Debug for ScriptedTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScriptedTransport")
+            .field("queued", &self.output.len())
+            .field("baud", &self.baud())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Transport for ScriptedTransport {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let mut count = 0usize;
+        while count < buf.len() {
+            let Some(byte) = self.output.pop_front() else {
+                break;
+            };
+            buf[count] = byte;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        self.pending.extend_from_slice(buf);
+        while let Some(pos) = self.pending.iter().position(|&byte| byte == b'\n') {
+            let raw: Vec<u8> = self.pending.drain(..=pos).collect();
+            let text = String::from_utf8_lossy(&raw);
+            (self.answer)(text.trim(), &mut self.output);
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn clear_input(&mut self) -> Result<()> {
+        self.output.clear();
+        Ok(())
+    }
+
+    fn set_baud(&mut self, baud: u32) -> Result<()> {
+        *self.baud.lock().expect("baud cell") = baud;
+        Ok(())
+    }
+
+    fn set_control_lines(&mut self, _asserted: bool) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A [`Links`] implementation with one plausible port that hands out a fresh
+/// [`ScriptedTransport`] on every `open`.
+pub struct ScriptedLinks {
+    factory: Box<dyn Fn() -> ScriptedTransport>,
+}
+
+impl ScriptedLinks {
+    /// A link whose every `open` returns `factory()`.
+    #[must_use]
+    pub fn new(factory: impl Fn() -> ScriptedTransport + 'static) -> Self {
+        Self {
+            factory: Box::new(factory),
+        }
+    }
+}
+
+impl std::fmt::Debug for ScriptedLinks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScriptedLinks").finish_non_exhaustive()
+    }
+}
+
+impl Links for ScriptedLinks {
+    fn ports(&self) -> Result<Vec<PortEntry>> {
+        Ok(vec![PortEntry {
+            name: String::from(FAKE_PORT),
+            cable: Some(Cable::Cp210x),
+            likely: true,
+            description: None,
+        }])
+    }
+
+    fn open(&self, _name: &str, baud: u32) -> Result<Opened> {
+        let mut transport = (self.factory)();
+        transport.set_baud(baud)?;
+        Ok(Opened::new(Box::new(transport)))
+    }
+}
+
 /// A confirmation prompt that never waits and changes nothing.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AutoConfirm;
@@ -102,6 +285,8 @@ impl crate::Confirm for AutoConfirm {
 pub struct DeviceHandle {
     factory: Rc<dyn Fn() -> FakeDevice>,
     current: Rc<RefCell<FakeDevice>>,
+    stream: Rc<RefCell<Vec<u8>>>,
+    open_baud: Rc<Cell<Option<u32>>>,
 }
 
 impl std::fmt::Debug for DeviceHandle {
@@ -119,7 +304,31 @@ impl DeviceHandle {
         Self {
             current: Rc::new(RefCell::new(factory())),
             factory: Rc::new(factory),
+            stream: Rc::new(RefCell::new(Vec::new())),
+            open_baud: Rc::new(Cell::new(None)),
         }
+    }
+
+    /// Put `lines` on the wire as a raw NMEA stream, independent of `FakeDevice`.
+    ///
+    /// `FakeDevice` models a unit that answers commands; a live `$GPRMC` stream
+    /// is a different thing, and `nmea proxy` only reads it. The lines are
+    /// replayed byte for byte by every transport this handle hands out, after
+    /// any bytes the fake device itself wants to send; once they run out the
+    /// port reports idle (a read of 0), which is what a real port does between
+    /// sentences.
+    pub fn set_stream(&self, lines: &[String]) {
+        let mut stream = self.stream.borrow_mut();
+        stream.clear();
+        for line in lines {
+            stream.extend_from_slice(line.as_bytes());
+        }
+    }
+
+    /// The baud rate the last `open` asked for, or `None` before any open.
+    #[must_use]
+    pub fn open_baud(&self) -> Option<u32> {
+        self.open_baud.get()
     }
 
     /// Replace the chip with a freshly booted one.
@@ -152,6 +361,23 @@ struct SharedFake(DeviceHandle);
 
 impl Transport for SharedFake {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        // The raw stream first (it is the traffic a *live* unit emits), then
+        // whatever the fake device has queued as a command reply.
+        let mut from_stream = 0usize;
+        {
+            let mut stream = self.0.stream.borrow_mut();
+            while from_stream < buf.len() {
+                let Some(byte) = stream.first().copied() else {
+                    break;
+                };
+                stream.remove(0);
+                buf[from_stream] = byte;
+                from_stream += 1;
+            }
+        }
+        if from_stream > 0 {
+            return Ok(from_stream);
+        }
         self.0.current.borrow_mut().read(buf)
     }
 
@@ -239,6 +465,7 @@ impl Links for FakePorts {
         };
         // Record the baud rate the command asked for, so a test can assert that
         // it spoke NMEA at 38400 rather than at the BootROM's rate.
+        device.open_baud.set(Some(baud));
         device.current.borrow_mut().set_baud(baud)?;
         Ok(Opened::new(Box::new(SharedFake(device.clone()))))
     }

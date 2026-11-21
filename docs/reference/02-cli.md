@@ -29,6 +29,17 @@ Machine-readable output goes to **stdout**; progress, warnings and errors go to
 logging on **stderr**. This is not a style preference: a script that pipes
 stdout must not receive a progress bar.
 
+A **finding** is machine-readable output: what a command looked at and what it
+found, including a bad finding such as "the probe did not answer". A **failure**
+is not: the command could not carry out the check at all, so it prints the reason
+on stderr and either stops (exit code 1) or leaves that part out of the report.
+`m241 device doctor` is where the two meet: a unit that does not answer
+`$PMTK605` is a finding — it appears on stdout as `probe : error (...)` and the
+exit code stays 0 — while an OS that will not list serial ports is a failure, and
+the reason appears only on stderr. Findings that are worth a human's attention
+are repeated on stderr as a warning, so `2>&1` and `> report.txt 2> problems.txt`
+each show everything they should.
+
 ## `m241 device ports`
 
 Lists serial ports and flags likely M-241 cables (CP210x, PL2303, FTDI, CH340).
@@ -41,9 +52,23 @@ Accepts `--port <PORT|auto>` (default `auto`) and `--json`.
 
 ## `m241 device doctor`
 
-Diagnoses the environment, the ports, the vendor drop (with `--from-drop`) and the
-device (with `--port`). Reports a missing `pyserial` equivalent as a labelled
-failure, never a traceback.
+Diagnoses the environment, the serial ports, an optional vendor drop
+(`--from-drop`) and an optional device (`--port`). Missing ports or failed
+`$PMTK605` probes are reported as labelled diagnostic findings rather than
+crashing.
+
+Flags: `--port <PORT|auto>` (probe the unit with `$PMTK605` when given),
+`--from-drop <DIR>` (read-only bounded-depth scan computing SHA-256 and
+identifying known firmware profiles and `DA_v3.8.4.bin` by name and 14,896-byte
+size; directories up to four levels below `<DIR>` are read), `--extract-to <DIR>`
+(requires `--from-drop`; copies out only an identified `DA_v3.8.4.bin`, refusing
+to overwrite with exit code 5 unless `--force` is passed), `--force` (accepted on
+its own, where it does nothing), `--json`.
+
+A failed `$PMTK605` probe is a finding on stdout and the exit code stays 0; a
+drop that cannot be read, or an `--extract-to` with no identified
+`DA_v3.8.4.bin` under `--from-drop`, is a failure with exit code 1. See
+[Output](#output) for the finding/failure split.
 
 ## `m241 fw dump`
 
@@ -92,6 +117,10 @@ Converts a dumped log to CSV, GPX, KML, NMEA or JSON (`--format`, default
 `--utc-offset-days` accepts a number or `auto` (default `auto`); `auto` shifts
 only if the newest record looks stale.
 
+The shift, when one was applied, is announced on stderr and — for
+`--format json` — also carried as an `offset_days` field in the exported object.
+The field is absent when nothing was shifted.
+
 ## `m241 log erase`
 
 Erases the track log. **Destructive.** Requires confirmation or `--yes`, and
@@ -103,8 +132,14 @@ only reads cannot link it. See [`11-safety-review.md`](../dev/11-safety-review.m
 
 ## `m241 log geotag`
 
-Matches photos to track points by capture time and writes GPS EXIF data, with a
-configurable maximum gap and a dry-run that lists what would change.
+Matches photos (`<PHOTOS>...`, files or directories whose immediate regular
+files are collected in sorted path order) to track points in `<LOG>` by capture
+time and writes GPS EXIF tags.
+
+Flags: `--max-gap <SECONDS>` (default `300`), `--utc-offset-days <DAYS|auto>`
+(default `auto`), `--tz-offset-minutes <MINUTES>` (default `0`, for cameras
+whose `DateTimeOriginal` is in local time), `--dry-run` (plan without modifying
+any photo), `--json`.
 
 ## `m241 nmea repair`
 
@@ -115,5 +150,17 @@ accepts `--offset-days <DAYS|auto>` (default `auto`).
 
 ## `m241 nmea proxy`
 
-Relays a live NMEA stream with corrected dates, to stdout or a TCP port. Binds to
-loopback only unless explicitly told otherwise.
+Relays a live NMEA stream from the serial port with corrected dates to stdout
+and/or a TCP server. Defaults to stdout when `--bind` is omitted. When `--bind`
+is given, the stream goes to connected clients only, unless `--stdout` is also
+passed, in which case it goes to both. `--bind` refuses any non-loopback address
+with exit code 5 unless `--allow-non-loopback` is passed.
+
+It runs until `--max-lines` lines have been relayed, or until the port fails
+(exit code 1). A quiet port is idle, not closed: it keeps waiting. A fragment
+that grows past 128 bytes without a line terminator is dropped, because it is a
+baud mismatch or noise rather than a sentence.
+
+Flags: `--port <PORT|auto>` (default `auto`), `--baud <BAUD>` (default `38400`),
+`--offset-days <DAYS|auto>` (default `auto`), `--stdout`,
+`--bind <HOST:PORT>`, `--allow-non-loopback`, `--max-lines <N>`.
