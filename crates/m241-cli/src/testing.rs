@@ -541,3 +541,513 @@ pub fn synthetic_dump(points: usize) -> Vec<u8> {
     }
     block
 }
+
+/// A fake chip for the one command that hands the unit to a Download Agent.
+///
+/// `m241-flash`'s `FakeDa` is `#[cfg(test)]` inside that crate, so a test here
+/// cannot reach it. This models only what `fw probe-da` uses: a BootROM that
+/// syncs, a firmware that streams NMEA and honours `$PMTK180`, the `0xA1` /
+/// `0xAF` / `0xA8` frames, the twenty-byte DA banner and the `0xD6` page
+/// conversation.
+///
+/// It is not a protocol test double — `m241-flash` already has one, and this
+/// crate must not become a second opinion on the wire format. Its purpose is to
+/// run the *command's own code path* so a test can watch every opcode that goes
+/// out, because the safety claim under test is "this command sends no write or
+/// erase opcode". Anything else (`0xD3`, `0xD4`, `0xD5`, `0xD9`) is recorded and
+/// answered with silence: enough for the record to fail the test.
+pub mod fake_da {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    use m241_core::Result;
+    use m241_core::protocol::brom::{BASE_ADDR_DA, OPCODE_JUMP, OPCODE_READ32, OPCODE_WRITE16};
+    use m241_core::protocol::frame::swap_pairs;
+    use m241_core::protocol::port::Transport;
+    use m241_flash::da::{ACK, NAK, OPCODE_READ_RANGE, byte_sum};
+
+    use crate::link::{Cable, Links, Opened, PortEntry};
+
+    use super::FAKE_PORT;
+
+    /// The BootROM's four probes and their replies, as `m241-core` sends them.
+    const BOOT_SYNC: [u8; 4] = [0xA0, 0x0A, 0x50, 0x05];
+    const BOOT_REPLY: [u8; 4] = [0x5F, 0xF5, 0xAF, 0xFA];
+
+    /// A live `$GPRMC` line, so the firmware looks like it is streaming.
+    const NMEA_LINE: &[u8] =
+        b"$GPRMC,000000.000,A,3540.8742,N,13946.0275,E,0.00,0.00,010120,,*00\r\n";
+
+    /// Bytes of flash the fake models, in the DA's linear view.
+    ///
+    /// Large enough to hold both probe candidates with a page to spare;
+    /// `PROBE_ADDRESSES[1]` is `0x0020_0000`, which is past the retail part's
+    /// 512 KiB, so a window sized for the real chip would answer the second
+    /// candidate with zeros.
+    const VECTOR_WINDOW: usize = 0x0020_0000 + 0x1000;
+
+    /// Which chip the fake is.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Mode {
+        /// A running firmware: streams NMEA, answers BootROM frames with
+        /// silence, and goes quiet into the BootROM when `$PMTK180` arrives.
+        Firmware,
+        /// The BootROM: nine-byte frames, every byte echoed except `0xA8`.
+        BootRom,
+        /// The download agent: the banner has been sent, `0xD6` is accepted.
+        DownloadAgent,
+    }
+
+    /// Everything the fake saw, kept outside every transport instance so a test
+    /// can read it after the command has closed the port.
+    #[derive(Debug, Default)]
+    pub struct Record {
+        /// Every opcode received, in order. A BootROM frame contributes its
+        /// first byte; a DA command (including the `0x5A` / `0xA5` of the page
+        /// conversation) contributes one byte each.
+        pub opcodes: Vec<u8>,
+        /// Every `0xA1` frame as `(address, payload in memory order)`.
+        pub writes: Vec<(u32, Vec<u8>)>,
+        /// Every `0xA8` frame as `(address, count)`.
+        pub jumps: Vec<(u32, u32)>,
+        /// Every `0xD6` command as `(page length, start, total)`.
+        pub reads: Vec<(u32, u32, u32)>,
+        /// Whether `$PMTK180` arrived while the firmware streamed.
+        pub pmtk180: bool,
+        /// Whether any reset line was asserted (`set_control_lines(true)`).
+        pub control_lines_asserted: bool,
+    }
+
+    impl Record {
+        /// The opcodes as hex, for an assertion message.
+        #[must_use]
+        pub fn opcodes_hex(&self) -> String {
+            self.opcodes
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
+
+    /// The chip. Clones share one [`Record`] and one mode, so a view held by the
+    /// test sees the whole conversation across the port being reopened.
+    #[derive(Debug, Clone)]
+    pub struct FakeChip {
+        record: Rc<RefCell<Record>>,
+        flash: Rc<Vec<u8>>,
+        mode: Rc<RefCell<Mode>>,
+    }
+
+    impl FakeChip {
+        /// A chip in `mode` whose flash window is `flash`, in the DA's linear
+        /// view (the view `0xD6` addresses).
+        #[must_use]
+        pub fn new(mode: Mode, flash: Vec<u8>) -> Self {
+            Self {
+                record: Rc::new(RefCell::new(Record::default())),
+                flash: Rc::new(flash),
+                mode: Rc::new(RefCell::new(mode)),
+            }
+        }
+
+        /// A BootROM chip whose flash holds the M-241 vector at `base` and is
+        /// `0xFF` everywhere else.
+        ///
+        /// Pass [`m241_flash::da::PROBE_ADDRESSES`]`[1]` to put the image at the
+        /// second candidate and `[0]` for the first.
+        #[must_use]
+        pub fn with_vector_at(base: u32) -> Self {
+            Self::with_vector_head_at(base, &m241_flash::da::VECTOR)
+        }
+
+        /// A BootROM chip whose flash starts with `head` at `base` and is `0xFF`
+        /// everywhere else.
+        ///
+        /// A caller passes something that shares only the vector's first byte
+        /// (`[0x18, 0x00, 0x00, 0x00]`) to prove the verdict compares all four.
+        #[must_use]
+        pub fn with_vector_head_at(base: u32, head: &[u8]) -> Self {
+            let mut flash = vec![0xFFu8; VECTOR_WINDOW];
+            let offset = base as usize;
+            if let Some(slot) = flash.get_mut(offset..offset.saturating_add(head.len())) {
+                slot.copy_from_slice(head);
+            }
+            Self::new(Mode::BootRom, flash)
+        }
+
+        /// The record, for assertions.
+        #[must_use]
+        pub fn record(&self) -> Rc<RefCell<Record>> {
+            Rc::clone(&self.record)
+        }
+
+        /// The mode the chip is in now.
+        #[must_use]
+        pub fn mode(&self) -> Mode {
+            *self.mode.borrow()
+        }
+    }
+
+    /// The transport one `open` hands out.
+    #[derive(Debug)]
+    pub struct FakeDaTransport {
+        record: Rc<RefCell<Record>>,
+        flash: Rc<Vec<u8>>,
+        mode: Rc<RefCell<Mode>>,
+        /// Bytes the host can read.
+        output: VecDeque<u8>,
+        /// A BootROM frame or a DA command being assembled.
+        line: Vec<u8>,
+        /// Whether the bytes of the frame being assembled are echoed.
+        echo: bool,
+        /// How many sync probes have been answered since the last complete sync.
+        sync: usize,
+        /// The `0xD6` range being served, when one is running.
+        pages: Option<Pages>,
+    }
+
+    /// A `0xD6` range being served one page at a time.
+    #[derive(Debug)]
+    struct Pages {
+        page_len: usize,
+        start: u32,
+        total: usize,
+        next: usize,
+    }
+
+    impl FakeDaTransport {
+        fn new(chip: &FakeChip) -> Self {
+            let mut transport = Self {
+                record: Rc::clone(&chip.record),
+                flash: Rc::clone(&chip.flash),
+                mode: Rc::clone(&chip.mode),
+                output: VecDeque::new(),
+                line: Vec::new(),
+                echo: true,
+                sync: 0,
+                pages: None,
+            };
+            if transport.mode() == Mode::Firmware {
+                transport.queue(NMEA_LINE);
+            }
+            transport
+        }
+
+        fn mode(&self) -> Mode {
+            *self.mode.borrow()
+        }
+
+        fn queue(&mut self, bytes: &[u8]) {
+            self.output.extend(bytes.iter().copied());
+        }
+
+        fn consume(&mut self, byte: u8) {
+            // A running firmware never runs dry: it emits a sentence a second,
+            // and a probe that eavesdrops for a window must see one. Re-queueing
+            // after every byte is what makes `probe_stream` find a `$` instead
+            // of looping until its deadline and reporting silence.
+            if self.mode() == Mode::Firmware {
+                self.consume_firmware(byte);
+                self.queue(NMEA_LINE);
+                return;
+            }
+            match self.mode() {
+                Mode::Firmware => {}
+                Mode::BootRom => self.consume_bootrom(byte),
+                Mode::DownloadAgent => self.consume_da(byte),
+            }
+        }
+
+        /// A running firmware: nothing answers but the stream, until
+        /// `$PMTK180`.
+        fn consume_firmware(&mut self, byte: u8) {
+            if self.line.is_empty() && byte != b'$' {
+                return;
+            }
+            self.line.push(byte);
+            if byte != b'\n' {
+                return;
+            }
+            let line = std::mem::take(&mut self.line);
+            if line.starts_with(b"$PMTK180") {
+                self.record.borrow_mut().pmtk180 = true;
+                *self.mode.borrow_mut() = Mode::BootRom;
+            }
+        }
+
+        fn consume_bootrom(&mut self, byte: u8) {
+            // The four probes go out unframed and are answered in order.
+            if self.line.is_empty() && byte == BOOT_SYNC[0] {
+                self.sync = 1;
+                self.queue(&BOOT_REPLY[..1]);
+                return;
+            }
+            if self.sync > 0 {
+                if BOOT_SYNC.get(self.sync).copied() == Some(byte) {
+                    if let Some(reply) = BOOT_REPLY.get(self.sync) {
+                        self.queue(&[*reply]);
+                    }
+                    self.sync += 1;
+                }
+                if self.sync >= BOOT_SYNC.len() {
+                    self.sync = 0;
+                }
+                return;
+            }
+            if self.line.is_empty() {
+                self.echo = byte != OPCODE_JUMP;
+                self.record.borrow_mut().opcodes.push(byte);
+            }
+            if self.echo {
+                self.queue(&[byte]);
+            }
+            self.line.push(byte);
+            // `0xA1` is a header and then its payload; the count at 5–8 is in
+            // half-words, so waiting for nine bytes only would swallow it.
+            let needed =
+                if self.line.len() >= 9 && self.line.first().copied() == Some(OPCODE_WRITE16) {
+                    let units = be_u32(&self.line, 5).unwrap_or(0);
+                    9usize.saturating_add(usize::try_from(units).unwrap_or(0).saturating_mul(2))
+                } else {
+                    9
+                };
+            if self.line.len() < needed {
+                return;
+            }
+            let frame = std::mem::take(&mut self.line);
+            self.echo = true;
+            let Some(opcode) = frame.first().copied() else {
+                return;
+            };
+            let address = be_u32(&frame, 1).unwrap_or(0);
+            let count = be_u32(&frame, 5).unwrap_or(0);
+            match opcode {
+                OPCODE_WRITE16 => {
+                    let payload = swap_pairs(frame.get(9..).unwrap_or_default());
+                    self.record.borrow_mut().writes.push((address, payload));
+                }
+                OPCODE_READ32 => {
+                    // `0xAF` counts dwords; each word is reversed on the wire.
+                    let length = usize::try_from(count).unwrap_or(0).saturating_mul(4);
+                    let mut memory = vec![0u8; length];
+                    for (index, slot) in memory.iter_mut().enumerate() {
+                        *slot = self
+                            .ram_byte(address.saturating_add(u32::try_from(index).unwrap_or(0)));
+                    }
+                    let (words, tail) = memory.as_chunks_mut::<4>();
+                    for word in words {
+                        word.reverse();
+                    }
+                    let _ = tail;
+                    self.queue(&memory);
+                }
+                OPCODE_JUMP => {
+                    self.record.borrow_mut().jumps.push((address, count));
+                    if address == BASE_ADDR_DA {
+                        *self.mode.borrow_mut() = Mode::DownloadAgent;
+                        self.queue(&banner());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        /// The byte an `0xAF` read of `address` returns: what a relayed `0xA1`
+        /// wrote, or `0` where nothing did.
+        ///
+        /// Replaying the writes rather than keeping a RAM buffer makes the
+        /// read-back a real check of the loader: a byte a `0xA1` did not carry
+        /// reads back as zero and the loader's compare fails.
+        fn ram_byte(&self, address: u32) -> u8 {
+            let record = self.record.borrow();
+            for (base, bytes) in record.writes.iter().rev() {
+                let offset = address.wrapping_sub(*base) as usize;
+                if let Some(byte) = bytes.get(offset) {
+                    return *byte;
+                }
+            }
+            0
+        }
+
+        fn consume_da(&mut self, byte: u8) {
+            if let Some(page) = self.pages.as_mut() {
+                // The advance (`0x5A`) and the retry (`0xA5`) belong to the page
+                // conversation, not to a new command, but they are wire traffic.
+                self.record.borrow_mut().opcodes.push(byte);
+                if byte != ACK {
+                    return;
+                }
+                page.next += 1;
+                let pages = page.total.div_ceil(page.page_len.max(1));
+                if page.next >= pages {
+                    self.pages = None;
+                    return;
+                }
+                let next = page.next;
+                let (page_len, start) = (page.page_len, page.start);
+                self.send_page(next, page_len, start);
+                return;
+            }
+            if self.line.is_empty() {
+                self.record.borrow_mut().opcodes.push(byte);
+            }
+            self.line.push(byte);
+            if self.line.len() < 13 {
+                return;
+            }
+            let frame = std::mem::take(&mut self.line);
+            if frame.first().copied() != Some(OPCODE_READ_RANGE) {
+                // Any other DA command is recorded above and not answered.
+                return;
+            }
+            let page_len = be_u32(&frame, 1).unwrap_or(0);
+            let start = be_u32(&frame, 5).unwrap_or(0);
+            let total = be_u32(&frame, 9).unwrap_or(0);
+            self.record
+                .borrow_mut()
+                .reads
+                .push((page_len, start, total));
+            let (Ok(page_len), Ok(total)) = (usize::try_from(page_len), usize::try_from(total))
+            else {
+                self.queue(&[NAK]);
+                return;
+            };
+            if page_len == 0 || total == 0 {
+                self.queue(&[NAK]);
+                return;
+            }
+            self.pages = Some(Pages {
+                page_len,
+                start,
+                total,
+                next: 0,
+            });
+            self.send_page(0, page_len, start);
+        }
+
+        /// One page of the range, zero-padded to the page length, then its sum.
+        fn send_page(&mut self, page: usize, page_len: usize, start: u32) {
+            let first = u32::try_from(page.saturating_mul(page_len)).unwrap_or(u32::MAX);
+            let mut payload = Vec::with_capacity(page_len);
+            for index in 0..page_len {
+                let at = start
+                    .saturating_add(first)
+                    .saturating_add(u32::try_from(index).unwrap_or(0));
+                payload.push(self.flash.get(at as usize).copied().unwrap_or(0));
+            }
+            let mut packet = payload.clone();
+            packet.extend_from_slice(&byte_sum(&payload).to_be_bytes());
+            self.queue(&packet);
+        }
+    }
+
+    /// The twenty-byte DA banner, `>BHBLHHHHL`
+    /// (`docs/reference/01-da-protocol.md` §2): marker, version, region, total
+    /// bytes, ids, two zeros, no external SRAM.
+    fn banner() -> Vec<u8> {
+        let mut report = vec![0xC0u8];
+        report.extend_from_slice(&0x0308u16.to_be_bytes());
+        report.push(0x49);
+        report.extend_from_slice(&0x0008_0000u32.to_be_bytes());
+        report.extend_from_slice(&0x00C2u16.to_be_bytes());
+        report.extend_from_slice(&0x22BAu16.to_be_bytes());
+        report.extend_from_slice(&0x0000u16.to_be_bytes());
+        report.extend_from_slice(&0x0000u16.to_be_bytes());
+        report.extend_from_slice(&0x0000_0000u32.to_be_bytes());
+        report
+    }
+
+    fn be_u32(bytes: &[u8], at: usize) -> Option<u32> {
+        bytes
+            .get(at..at.checked_add(4)?)
+            .and_then(|slice| <[u8; 4]>::try_from(slice).ok())
+            .map(u32::from_be_bytes)
+    }
+
+    impl Transport for FakeDaTransport {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+            let mut count = 0usize;
+            while count < buf.len() {
+                if self.output.is_empty() && self.mode() == Mode::Firmware {
+                    // A live unit never stops talking: a read that finds the
+                    // buffer empty is answered with the next sentence, the same
+                    // way the stream arrives once a second on the wire.
+                    self.queue(NMEA_LINE);
+                }
+                let Some(byte) = self.output.pop_front() else {
+                    break;
+                };
+                buf[count] = byte;
+                count += 1;
+            }
+            Ok(count)
+        }
+
+        fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+            for byte in buf {
+                self.consume(*byte);
+            }
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn clear_input(&mut self) -> Result<()> {
+            self.output.clear();
+            Ok(())
+        }
+
+        fn set_baud(&mut self, _baud: u32) -> Result<()> {
+            Ok(())
+        }
+
+        fn set_control_lines(&mut self, asserted: bool) -> Result<()> {
+            // The probe reaches the BootROM through the stream or through
+            // silence, never through the reset lines (`AGENTS.md` §2.1); a test
+            // asserts this stays false.
+            self.record.borrow_mut().control_lines_asserted |= asserted;
+            Ok(())
+        }
+    }
+
+    /// A [`Links`] with one plausible port backed by a [`FakeChip`].
+    #[derive(Debug, Clone)]
+    pub struct FakeDaPorts {
+        chip: FakeChip,
+    }
+
+    impl FakeDaPorts {
+        /// One plausible port backed by `chip`.
+        #[must_use]
+        pub fn new(chip: FakeChip) -> Self {
+            Self { chip }
+        }
+
+        /// The record, for assertions after the command returns.
+        #[must_use]
+        pub fn record(&self) -> Rc<RefCell<Record>> {
+            self.chip.record()
+        }
+    }
+
+    impl Links for FakeDaPorts {
+        fn ports(&self) -> Result<Vec<PortEntry>> {
+            Ok(vec![PortEntry {
+                name: String::from(FAKE_PORT),
+                cable: Some(Cable::Cp210x),
+                likely: true,
+                description: Some(String::from("simulated M-241")),
+            }])
+        }
+
+        fn open(&self, _name: &str, baud: u32) -> Result<Opened> {
+            let mut transport = FakeDaTransport::new(&self.chip);
+            transport.set_baud(baud)?;
+            Ok(Opened::new(Box::new(transport)))
+        }
+    }
+}

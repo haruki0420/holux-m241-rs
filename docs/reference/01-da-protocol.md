@@ -170,6 +170,19 @@ constant while the write path has real error codes to hide.
 `0x00102C5C` is the shared "restart the chip" tail; `0xD9` branches to it
 directly, which is why `0xD9` has no handler of its own.
 
+### 3.2 The BootROM's `0xA8` jump frame
+
+`0xA8` belongs to the BootROM, not to this table: nine bytes, opcode, one
+big-endian `u32` address, one big-endian `u32` count. The address is the DA's
+load address, `0x00100800`. The count's meaning is **not established** — this
+page has no disassembly of the BootROM and nothing in §5 or §9 gives the field a
+job. The only client that ran the jump on a unit sent `0`
+(`python/src/m241/protocol/brom.py`, `BootRom.jump`), and
+`docs/dev/03-hardware-facts.md` "DA jump" records that value. A client that has
+no measurement has no reason to send anything else; `crates/m241-flash` sends
+`0` (`DA_JUMP_COUNT` in `crates/m241-flash/src/da.rs`). ⚠️ 未検証 whether the BootROM
+reads the field.
+
 ## 4. The six questions
 
 ### 4.1 What does the `0xD3` status byte mean?

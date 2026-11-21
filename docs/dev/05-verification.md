@@ -39,6 +39,11 @@ figure on this page.
 | 4 MiB units and GR-245 variants | geometry maths is implemented and unit-tested; no device was available |
 | V1.11 and V1.12 on hardware | no V1.11 image to profile, V1.12 was never flashed |
 | Any timing figure | nothing in this repository is a stopwatch measurement |
+| The DA-side firmware base (`0` or `0x00200000`) | `fw probe-da` reads both and reports; no run has been recorded here, so `FLASH_WRITE_START` stays refused |
+| The DA's `0xD6` read itself | page length it emits for a given page-length argument, whether it sends anything before the first page, and whether the host's advance after the **last** page is sent or omitted (`docs/reference/01-da-protocol.md` §5.5, §7 item 4); the client sends one advance per page including the last |
+| The firmware vector `18 F0 9F E5` through the DA | measured in the BootROM's view only; `fw probe-da`'s test of the first four bytes has never been run against a unit, so its `Settled` verdict is unverified |
+| `fw probe-da` on a stock V1.13 and on a V1.14 unit | neither has been run: the image measured so far is a patched (V1.14-reporting) unit, and the probe's output is what a unit run has to fill in |
+| The `0xA8` jump frame's count word | the protocol page gives it no meaning; the only client that ran the jump on a unit sent `0`, and this crate does too. Whether the BootROM reads the field at all is not established (`docs/dev/03-hardware-facts.md` "DA jump") |
 
 ## 3. The simulator
 

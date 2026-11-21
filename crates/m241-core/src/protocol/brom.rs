@@ -147,6 +147,12 @@ pub const OPCODE_JUMP: u8 = 0xA8;
 pub const OPCODE_READ32: u8 = 0xAF;
 
 /// A nine-byte BootROM command frame.
+///
+/// The fields are public, so a literal can carry any `count` the protocol does
+/// not define — `0xA8`'s count is written as `0` in `m241-flash`'s
+/// `DA_JUMP_COUNT` and the type cannot enforce it. That value is pinned by a
+/// test instead: the fake DA counts any jump whose count is not `DA_JUMP_COUNT`
+/// (`the_jump_frame_carries_count_zero_and_the_fake_refuses_any_other`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Frame {
     pub opcode: u8,
@@ -219,6 +225,17 @@ impl<T: Transport> MtkBootRom<T> {
     /// Borrow the transport (tests use this to inspect what was written).
     pub fn transport_mut(&mut self) -> &mut T {
         &mut self.transport
+    }
+
+    /// Take the transport back, for the client that follows this one.
+    ///
+    /// A BootROM client owns its transport for the duration of one conversation;
+    /// a command that reads first and then hands the chip to the Download Agent
+    /// needs the same port back. `m241-flash`'s driver takes one by this method
+    /// (`DownloadAgent::new`), so the write path's own test harness depends on it.
+    #[must_use]
+    pub fn into_transport(self) -> T {
+        self.transport
     }
 
     /// Send the four sync probes and verify each reply.

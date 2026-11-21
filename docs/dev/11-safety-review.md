@@ -123,6 +123,48 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
    バイト数のように、このクライアントが正当化できる値が 0 しかないものは定数にせず、
    `expect_final_acks` の doc に未検証として書いた。
 
+### DA ロードと `fw probe-da`（今回追加）
+
+開始アドレスを確定するための経路を足した。この経路そのものの安全上の位置づけを
+ここに固定する。
+
+1. **DA ロードは RAM への書き込みであり、フラッシュ書き込みではない。** 👁
+   `DaLoader::load` が送るのは BootROM の `0xA1`（RAM に半ワードを書く）と 1 回の
+   `0xA8`（`0x00100800` へジャンプ）だけ。書き込み先は
+   `0x00100800`–`0x0010422F` のチップ内 SRAM で（`docs/reference/01-da-protocol.md`
+   §2, §9）、電源を切れば消える。`0xD3` / `0xD4` / `0xD5` / `0xD9` は 1 度も送らない。
+   ただしロード後の DA は次のコマンドでフラッシュを操作できるため、確認
+   （`--yes` だけ。`fw probe-da` にタイプ入力のプロンプトは無い）は必須のままにした。
+   *固定するテスト:* `the_loader_writes_the_whole_image_to_the_da_base_and_starts_it`
+   が偽 DA の受けた opcode を `0xA1` / `0xAF` / `0xA8` に限り、
+   `the_read_path_never_sends_a_write_opcode` が読み出し経路の opcode を `0xD6` に限る。
+   ロード範囲が BootROM のスタック `0x00100000`–`0x001007FF` と重ならないことは
+   `the_load_range_does_not_touch_the_bootrom_stack` が区間として固定する。🧪
+2. **probe は `0xD3` / `0xD4` / `0xD5` / `0xD9` を呼ばない。** 👁
+   読み出しは `DownloadAgent::read_range` の `0xD6` だけで、CLI がアドレスを決める場所は
+   2 つに限られる: 読み出しの一覧は `m241_flash::da::read_candidates` の
+   `PROBE_ADDRESSES`（= `UNRESOLVED_STARTS`）に固定され、`fw probe-da` はアドレスを
+   持たない。CLI の判定 `base_verdict`（`crates/m241-cli/src/fw.rs`）は、その 2 つ以外の一覧を受け取ると
+   `Error::State` で拒否する（`the_probe_verdict_refuses_anything_but_the_two_candidate_slots`）。
+   `read_range(address, length)` 自体は `pub` の読み出し API で任意の `u32` を受けるが、
+   範囲を記録・消去・書き込みはしない（範囲を受け取る書き込み関数は private の
+   `write_range` だけ）。`0xD3` に相当するコマンドも送らないので、後続の `0xD5` が
+   書き込みに使える範囲は更新されない（`the_read_path_never_sends_a_write_opcode` が
+   偽 DA の `recorded_range() == (0, 0)` を確認）。🧪
+   この不変条件は **`fw probe-da` の本体についても**、
+   `probe_da_reads_both_candidates_through_the_fake_and_sends_no_write_opcode` が
+   `m241-cli` の偽 DA（`crates/m241-cli/src/testing.rs` の `fake_da`）で `probe_da` を最後まで
+   駆動して固定する: 受けた opcode が `0xA1` / `0xAF` / `0xA8` / `0xD6`（と `0xD6` の
+   `0x5A` / `0xA5`）だけであること、`0xD3` / `0xD4` / `0xD5` / `0xD9` が無いこと、`0xA1` の
+   アドレスが DA の RAM 範囲に収まること、`0xA8` が `0x00100800` に count `0` で 1 回だけ
+   であること、リセット線を脈打たないこと。🧪
+3. **開始アドレスが確定するまで `FLASH_WRITE_START` は拒否のまま。** 👁
+   `fw probe-da` は判定（`BaseVerdict`）を表示するだけで、`da.rs` の定数・
+   `UNRESOLVED_STARTS`・`check_layout` を一切書き換えない。確定は次の 2 段階で行う:
+   `docs/dev/05-verification.md` §1 に実機の読み出し結果を記録し、その行を根拠に
+   `UNRESOLVED_STARTS` を空にし `FLASH_WRITE_START` を確定値にする。probe が
+   `Settled(0x0020_0000)` を返しても、それだけで書き込みは開かない。
+
 ### この経路で担保していないこと（マージ時に「担保済み」と読まない）
 
 以下はコードにあるが、**実機でもフェイクでもテストで固定していない**か、

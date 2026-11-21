@@ -175,6 +175,12 @@ pub enum FwCommand {
     Patch(PatchOptions),
     /// Write a firmware image back (destructive).
     Flash,
+    /// Load the DA and read the two candidate firmware bases through it.
+    ///
+    /// **Writes no flash.** The DA is loaded into the chip's RAM and reads the
+    /// two addresses the DA-side firmware base could be, so the start address
+    /// `fw flash` refuses on can be settled by measurement.
+    ProbeDa(ProbeDaOptions),
 }
 
 #[derive(Debug, Args)]
@@ -200,6 +206,36 @@ pub struct DumpOptions {
     /// Overwrite an existing output file.
     #[arg(long)]
     pub force: bool,
+
+    /// Print one JSON object instead of labelled lines.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// `m241 fw probe-da`: load the DA and read the two candidate bases.
+#[derive(Debug, Args)]
+pub struct ProbeDaOptions {
+    /// The vendor download agent (`DA_v3.8.4.bin`, 14,896 bytes).
+    ///
+    /// Never committed here: it is a copy of MediaTek's binary that the user
+    /// obtains from the vendor package.
+    #[arg(long, value_name = "FILE")]
+    pub da: PathBuf,
+
+    /// Serial port, or `auto` to pick the only likely cable.
+    #[arg(long, default_value = "auto")]
+    pub port: String,
+
+    /// Confirm loading the DA; without it the command stops before opening a port.
+    ///
+    /// The load only writes the chip's RAM, but the DA it starts can drive the
+    /// flash, so the hand-over is still an action that was asked for.
+    #[arg(long)]
+    pub yes: bool,
+
+    /// The chip is already in the BootROM; send the sync without `$PMTK180`.
+    #[arg(long)]
+    pub assume_brom: bool,
 
     /// Print one JSON object instead of labelled lines.
     #[arg(long)]
