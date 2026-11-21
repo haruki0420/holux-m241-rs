@@ -147,6 +147,12 @@ pub const OPCODE_JUMP: u8 = 0xA8;
 pub const OPCODE_READ32: u8 = 0xAF;
 
 /// A nine-byte BootROM command frame.
+///
+/// The fields are public, so a literal can carry any `count` the protocol does
+/// not define — `0xA8`'s count is written as `0` in `m241-flash`'s
+/// `DA_JUMP_COUNT` and the type cannot enforce it. That value is pinned by a
+/// test instead: the fake DA counts any jump whose count is not `DA_JUMP_COUNT`
+/// (`the_jump_frame_carries_count_zero_and_the_fake_refuses_any_other`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Frame {
     pub opcode: u8,

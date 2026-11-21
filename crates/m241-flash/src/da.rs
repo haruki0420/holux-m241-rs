@@ -1722,7 +1722,15 @@ fn packet_length() -> u32 {
 /// received bytes (`0x0010199C`–`0x001019A4`, bits 16–17 cleared at
 /// `0x001019A4`) and the trailer goes high byte first (`0x001019DC`,
 /// `0x001019EC`), so it is a big-endian `u16`.
-fn byte_sum(data: &[u8]) -> u16 {
+///
+/// Public because the `m241-cli` test double has to build the same trailer the
+/// reader checks: the fake in `crates/m241-cli/src/testing.rs` frames a `0xD6`
+/// page with this function, so an "ok" page is one the crate's own reader
+/// accepts. Using the function under test is taken deliberately — that fake
+/// exists to watch *which opcodes the command sends*, and a checksum bug on
+/// the reader's side belongs in `crate::da`'s tests, which compute the sum
+/// independently.
+pub fn byte_sum(data: &[u8]) -> u16 {
     data.iter()
         .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)))
 }
@@ -3050,6 +3058,31 @@ mod loader_tests {
     }
 
     #[test]
+    fn a_drain_that_fails_is_reported_instead_of_a_successful_load() {
+        // `write_image` ends by draining the chip's last echo byte. The port can
+        // be gone by then, and a loader that discarded that error would report
+        // "the DA started" for a port that had already failed. The error has to
+        // reach the caller, and nothing that looks like a successful load may
+        // have gone out: no `0xAF` read-back, no `0xA8` jump.
+        let image = da_image();
+        let mut device = bootrom();
+        device.failing_clear_input();
+        let err =
+            load(&mut device, &image).expect_err("the drain failed, so the load did not happen");
+        assert!(matches!(err, Error::Io { .. }), "got {err}");
+        assert!(
+            format!("{err}").contains("went away"),
+            "the port's own error is carried: {err}"
+        );
+        assert!(!device.started(), "a failed load must not start the DA");
+        assert!(
+            device.opcodes().iter().all(|byte| *byte == OPCODE_WRITE16),
+            "the failure happened before the read-back: {:02X?}",
+            device.opcodes()
+        );
+    }
+
+    #[test]
     fn the_loader_refuses_an_image_that_is_not_exactly_the_da_size() {
         let full = da_image();
         let mut long = da_image();
@@ -3213,10 +3246,12 @@ mod loader_tests {
     }
 
     #[test]
-    fn a_da_that_did_not_start_is_a_framing_error_rather_than_a_wait() {
+    fn a_silent_port_after_the_jump_is_a_timeout_not_a_framing_error() {
         // A chip that never answers `0xA8` leaves the loader waiting for a
-        // banner that is not coming. The scan is bounded, and the bound is short
-        // in a test.
+        // banner that is not coming. A port that stays silent is a timeout: no
+        // bytes arrived, so nothing says the image was wrong. `Framing` is the
+        // other case, handled by
+        // `bytes_that_are_not_a_report_end_the_scan_as_a_framing_error`.
         let mut device = bootrom();
         // No jump, so the fake stays in the BootROM and offers nothing: the
         // report read has to give up rather than spin.
@@ -3225,6 +3260,70 @@ mod loader_tests {
             .read_report()
             .expect_err("nothing is queued before the jump");
         assert!(matches!(err, Error::Timeout { .. }), "got {err}");
+        assert!(
+            format!("{err}").contains("first report byte"),
+            "the timeout names what it waited for: {err}"
+        );
+    }
+
+    #[test]
+    fn bytes_that_are_not_a_report_end_the_scan_as_a_framing_error() {
+        // The other ending: the chip sends something and none of it starts a
+        // `0xC0` report within the scan's bound. That is `Framing` — the chip is
+        // talking, just not the DA this crate drives. The bytes come from a thin
+        // transport rather than the fake because the fake would parse them as a
+        // BootROM frame; the scan is what is under test here.
+        #[derive(Debug)]
+        struct Noise {
+            left: usize,
+        }
+
+        impl Transport for Noise {
+            fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+                // A chip that keeps printing: every read is answered with the
+                // same byte, so the scan reaches its own bound instead of
+                // timing out first.
+                let take = self.left.min(buf.len());
+                buf[..take].fill(0x7D);
+                self.left -= take;
+                Ok(take)
+            }
+
+            fn write_all(&mut self, _buf: &[u8]) -> Result<()> {
+                Ok(())
+            }
+
+            fn flush(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            fn clear_input(&mut self) -> Result<()> {
+                Ok(())
+            }
+
+            fn set_baud(&mut self, _baud: u32) -> Result<()> {
+                Ok(())
+            }
+
+            fn set_control_lines(&mut self, _asserted: bool) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        // `0x7D` is the one byte the DA sends while it waits; a long run of it
+        // never starts a report.
+        let mut noise = Noise {
+            left: REPORT_SCAN_LIMIT,
+        };
+        let mut loader = DaLoader::new(&mut noise).with_reply_timeout(Duration::from_millis(20));
+        let err = loader
+            .read_report()
+            .expect_err("no C0 report in the stream");
+        assert!(matches!(err, Error::Framing { .. }), "got {err}");
+        assert!(
+            format!("{err}").contains("0xC0 report"),
+            "the refusal says what was missing: {err}"
+        );
     }
 
     // -- 0xD6 --------------------------------------------------------------
@@ -3459,36 +3558,92 @@ mod loader_tests {
     }
 
     #[test]
-    fn a_two_page_read_is_the_same_bytes_however_the_da_pads_the_range() {
-        // §5.5: a read page goes through the same serialiser as `0xD5`. Each
-        // page here is the full 64 bytes, so neither is short; what varies is
-        // whether the fake pads the range up to a whole page (which the client
-        // never asks for) or stops at the range length. The client's bytes must
-        // not depend on that.
-        //
-        // The read is at `0x100`, and the window is `0x11` with one `0x3C` at
-        // `0x180`: the page served by the second advance is the window's
-        // `0x180`–`0x1BF`, so a fake that ignored the start address — or
-        // shifted it by the BootROM base — returns the wrong bytes here.
+    fn the_fake_pads_a_partial_page_by_default_and_can_send_it_short() {
+        // §5.5: a read page goes through the same serialiser as `0xD5`, which
+        // pads it to the page length. Whether a DA really pads a **partial**
+        // page is unmeasured (§7 item 4), so the fake can do either. Note what
+        // `read_range` guarantees: it refuses a length that is not a whole page
+        // (`0xD6 reads whole 64-byte pages`), so a partial page can only arise
+        // from a DA whose page size differs from the one asked for. What is
+        // pinned here is the fake's own model, so a later test knows which bytes
+        // it is comparing.
         let mut window: Vec<u8> = Vec::new();
         window.resize(0x400, 0x11);
-        if let Some(slot) = window.get_mut(0x180) {
-            *slot = 0x3C;
-        }
-        let padded = {
-            let (page, _device) = read(da_with(&window), 0x0100, 2 * PROBE_PAGE_SIZE);
-            page.expect("two pages, the fake pads the range")
+        place(&mut window, 0x180, &[0x3C]);
+        let total = 40;
+        let mut frame = vec![OPCODE_READ_RANGE];
+        frame.extend_from_slice(&u32::try_from(PROBE_PAGE_SIZE).unwrap().to_be_bytes());
+        frame.extend_from_slice(&0x0100u32.to_be_bytes());
+        frame.extend_from_slice(&u32::try_from(total).unwrap().to_be_bytes());
+
+        let first_reply = |device: &mut FakeDa| -> Vec<u8> {
+            device.write_all(&frame).expect("0xD6");
+            let mut reply = vec![0u8; PROBE_PAGE_SIZE + 2];
+            let mut filled = 0usize;
+            while filled < reply.len() {
+                let read = device.read(&mut reply[filled..]).expect("a page");
+                if read == 0 {
+                    break;
+                }
+                filled += read;
+            }
+            reply.truncate(filled);
+            reply
         };
-        let unpadded = {
+
+        let mut padded = da_with(&window);
+        let whole = first_reply(&mut padded);
+        assert_eq!(
+            whole.len(),
+            PROBE_PAGE_SIZE + 2,
+            "the padded fake sends a whole page plus its trailer"
+        );
+        assert_eq!(
+            whole.get(..4),
+            Some(&[0x11u8, 0x11, 0x11, 0x11][..]),
+            "the page starts at the address the range asked for"
+        );
+        assert_eq!(
+            whole.get(PROBE_PAGE_SIZE - 4..PROBE_PAGE_SIZE),
+            Some(&[0u8; 4][..]),
+            "the bytes past the range are zero, not the window's filler"
+        );
+
+        let mut short = da_with(&window);
+        short.without_page_padding();
+        let tail = first_reply(&mut short);
+        assert_eq!(
+            tail.len(),
+            total + 2,
+            "the unpadded fake sends only the bytes in the range"
+        );
+        assert_eq!(
+            whole.get(..total),
+            tail.get(..total),
+            "the two modes differ only in the padding that follows"
+        );
+
+        // A range that is a whole number of pages is served identically, which
+        // is why `read_range`'s refusal of a partial page costs no coverage.
+        let aligned = {
+            let (page, _device) = read(da_with(&window), 0x0100, 3 * PROBE_PAGE_SIZE);
+            page.expect("three whole pages, padded")
+        };
+        let aligned_short = {
             let mut device = da_with(&window);
             device.without_page_padding();
-            let (page, _device) = read(device, 0x0100, 2 * PROBE_PAGE_SIZE);
-            page.expect("two pages, the fake stops at the range length")
+            let (page, _device) = read(device, 0x0100, 3 * PROBE_PAGE_SIZE);
+            page.expect("three whole pages, unpadded")
         };
-        assert_eq!(padded.len(), 2 * PROBE_PAGE_SIZE);
+        assert_eq!(aligned.len(), 3 * PROBE_PAGE_SIZE);
         assert_eq!(
-            padded, unpadded,
-            "the client's bytes must not depend on how the DA pads the range"
+            aligned, aligned_short,
+            "a whole-page read must not depend on the fake's padding mode"
+        );
+        assert_eq!(
+            aligned.get(0x80..0x84),
+            Some(&[0x3Cu8, 0x11, 0x11, 0x11][..]),
+            "the third page starts at the address the range asked for"
         );
     }
 }

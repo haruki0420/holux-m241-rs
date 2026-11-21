@@ -262,6 +262,8 @@ pub struct FakeDa {
     /// The other half of the pair: an extra read that finds nothing moves
     /// `read_bytes` by zero but still shows up here.
     read_polls: usize,
+    /// Whether every `clear_input` fails, as a port that went away does.
+    clear_input_fails: bool,
 }
 
 impl FakeDa {
@@ -309,6 +311,7 @@ impl FakeDa {
             bootrom_sync: 0,
             read_bytes: 0,
             read_polls: 0,
+            clear_input_fails: false,
         }
     }
 
@@ -479,6 +482,17 @@ impl FakeDa {
     /// the other reading a test needs: a DA that sends the last page short.
     pub fn without_page_padding(&mut self) {
         self.pad_pages = false;
+    }
+
+    /// Make every `clear_input` fail with [`Error::Io`], as a vanished USB
+    /// device does.
+    ///
+    /// The loader drains the chip's last echo byte at the end of the image
+    /// write. A caller that discards that error would report a successful load
+    /// for a port that had already gone away, so a test needs a port that can
+    /// be made to fail exactly there.
+    pub fn failing_clear_input(&mut self) {
+        self.clear_input_fails = true;
     }
 
     /// The last `0xD6` range as `(start, bytes the fake prepared)`.
@@ -1258,6 +1272,12 @@ impl Transport for FakeDa {
     }
 
     fn clear_input(&mut self) -> Result<()> {
+        if self.clear_input_fails {
+            return Err(m241_core::Error::Io {
+                path: Some(String::from("SIM0")),
+                source: std::io::Error::other("simulated port went away during the drain"),
+            });
+        }
         self.output.clear();
         Ok(())
     }

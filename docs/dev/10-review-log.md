@@ -589,11 +589,11 @@ C2（ベクタ比較を 1 バイトに）は未検出**。
 
 | # | 処置 | 固定するテスト |
 |---|---|---|
-| M1 | `BaseVerdict` を `Settled` / `Inconclusive(Inconclusive)` に分け、`Inconclusive` を `Unread` / `NoMatch` / `Ambiguous` に分ける。`Unread` は読めた候補を列挙する。CLI と `--json` は候補ごとに「読めた/読めない」「先頭 4 バイト」「一致/不一致」を出す。doc と `02-cli.md` に「DA ビューでは未検証」を明記 | `a_candidate_that_was_not_read_blocks_settling_even_when_the_other_matches`, `probe_da_json_document_names_both_candidates_and_says_no_flash_write`, `probe_da_text_result_shows_read_state_first_bytes_and_the_match_for_both` |
+| M1 | `BaseVerdict` を `Settled` / `Inconclusive(Inconclusive)` に分け、`Inconclusive` を `Unread` / `NoMatch` / `Ambiguous` に分ける。`Unread` は読めた候補を列挙する。CLI と `--json` は候補ごとに「読めた/読めない」「先頭 4 バイト」「一致/不一致」を出す。doc と `02-cli.md` に「DA ビューでは未検証」を明記 | 判定の純関数: `a_candidate_that_was_not_read_blocks_settling_even_when_the_other_matches`。表示（`print_probe_result` を直接呼ぶ。`probe_da` は通らない）: `probe_da_json_document_names_both_candidates_and_says_no_flash_write`, `probe_da_text_result_shows_read_state_first_bytes_and_the_match_for_both`。`probe_da` 本体を通すのは `probe_da_reads_both_candidates_through_the_fake_and_sends_no_write_opcode` |
 | M2 | `Settled` は「2 候補とも読めて、ちょうど片方が一致」のときだけ | 同上 + `the_probe_verdict_settles_only_on_exactly_one_vector_match` |
 | M3 | `0xA8` を `Frame { count: DA_JUMP_COUNT = 0 }` で構築（旧実装と同じ zero）。偽 DA が `count != 0` を数え、テストで固定。`03-hardware-facts.md` と `01-da-protocol.md` §3.2 に根拠と未検証を記載。ロード範囲と BootROM スタックの非重複を区間で固定 | `the_jump_frame_carries_count_zero_and_the_fake_refuses_any_other`, `the_load_range_does_not_touch_the_bootrom_stack` |
 | M4 | 選択肢 (a): `DA_IMAGE_HEAD = [00, 00, A0, E1]`（ベンダー `DA_v3.8.4.bin` の先頭 4 バイト = `mov r0, r0`）を追加し、`check_da_image` がサイズの次に比較。DA バイナリはコミットしない | `the_loader_refuses_an_image_whose_first_bytes_are_not_the_da`, `the_loader_constants_are_pinned_to_the_documents_and_the_read_crate` |
-| M5 | 失敗を捨てず `Result` を返す。理由（ずれた echo は次の `read_back` の 9 バイト echo 比較で `Framing` になる）をコメントに書く。ポーリング抽象は持たないので、1 回の drain 失敗はそのままエラーになる | `the_loader_writes_the_whole_image_to_the_da_base_and_starts_it`（drain が失敗しないことの経路） |
+| M5 | 失敗を捨てず `Result` を返す。理由（ずれた echo は次の `read_back` の 9 バイト echo 比較で `Framing` になる）をコメントに書く。ポーリング抽象は持たないので、1 回の drain 失敗はそのままエラーになる | `a_drain_that_fails_is_reported_instead_of_a_successful_load`（Stage 3 の Should-2 で追加。drain の `Io` が `load` のエラーになり、`0xAF` の読み戻しと `0xA8` に到達しないことを固定）。成功経路は `the_loader_writes_the_whole_image_to_the_da_base_and_starts_it` |
 | M6 | `02-cli.md` を「判定は先頭 4 バイトだけ、残りは表示用」に書き直し、実機ログとして貼れる出力例も追記 | — |
 | M7 | `PROBE_PAGE_SIZE` の doc を「偶数は `0xD6` の要件ではなく、ページ長は DA が受け付けるか未検証」に修正 | — |
 | M8 | `PROBE_WORD` を削除し、`of_probe_command_line` のエラーを `--yes` のみに。`11-safety-review.md` の記述も追随 | `the_loader_refuses_without_a_confirmation_and_sends_nothing`, `probe_da_refuses_without_yes_before_opening_a_port_or_reading_a_file` |
@@ -609,7 +609,11 @@ C2（ベクタ比較を 1 バイトに）は未検出**。
 （`0x100` を読むと `0x00` の内容）。`read_returns_the_window_at_the_address_asked_for` はデータを窓の
 `0x100` に置いていたので、偽 DA 側のずれとテストの前提が同じだけずれて一致していた。範囲全体を
 `start` からコピーし、ページをその中の位置で切り出し、ページ数を §5.5 の `udiv(total+page-1, page)` に
-合わせた。固定するテストは `a_two_page_read_is_the_same_bytes_however_the_da_pads_the_range`。
+合わせた。固定するテストは `the_fake_pads_a_partial_page_by_default_and_can_send_it_short`
+（Stage 3 の Should-3 で `a_two_page_read_is_the_same_bytes_however_the_da_pads_the_range` から
+改名・強化した。旧テストは範囲長がページ長の倍数で、名前に反して短いページを作っていなかった。
+`read_range` 自体がページ長の倍数以外を `Error::State` で拒否するため、短いページはクライアントからは
+到達しない。テストが固定するのは偽 DA のページ詰めのモデルのほうで、それをテスト名と本文で明示した）。
 併せて `05-verification.md` に `0xD6` / DA ビューのベクタ / V1.14 個体で probe を走らせていないことを追記した。
 
 **見送った Should と理由**
@@ -624,12 +628,41 @@ C2（ベクタ比較を 1 バイトに）は未検出**。
   同じバイト列が返ることは固定した。
 - Could-2（`0x7D` 待ちの境界）・Could-3（`PROBE_PAGE_SIZE` を可変にする）は実機の値が要る。片付けず、
   `05-verification.md` に未検証として残した。
-- Could-5（偽 DA の `0xA1` アドレス未検査）と Could-6（`03-hardware-facts.md` の追記）は解消済み。Could-4
-  （テスト名）は `the_loader_refuses_an_image_whose_first_bytes_are_not_the_da` 等の改名で解消。
+- Could-5（偽 DA の `0xA1` アドレス未検査）と Could-6（`03-hardware-facts.md` の追記）は解消済み。
+  Could-4（テスト名）は **当時の記録が誤り**。Stage 2 では改名されておらず、
+  `a_da_that_did_not_start_is_a_framing_error_rather_than_a_wait` が `Error::Timeout` を期待したまま
+  残っていた（Stage 3 が指摘）。Stage 3 の Should-6 で
+  `a_silent_port_after_the_jump_is_a_timeout_not_a_framing_error` に改名し、`Framing` 側は
+  `bytes_that_are_not_a_report_end_the_scan_as_a_framing_error` として別に固定した。
+
+**訂正（Stage 3 の Should-1）**
+
+- Stage 2 の報告には「`&[u8]` の `get(24..26)` が `None` を返すので `Vec<u8>` でも同じはず」という
+  主張が混ざっていたが、これは誤り。`Vec<u8>` も `&[u8]` も範囲内なら `get(24..26)` は `Some` を返す。
+  HEAD のコードに `get(24..26)` は無く（`first_bytes` は `page.get(..VECTOR.len()).unwrap_or(page)`）、
+  この誤った前提に基づくコードは残っていない。以下の記述は環境依存の主張なので取り下げる。
 
 ### ゲート
 
 `./tools/check.sh` 6/6、`cargo test -p m241-flash -p m241-cli`。Gate の詳細は Stage 3 の節（未検証）。
+
+### Stage 2 v2（Stage 3 の Must / Should への対応）
+
+Stage 3（`/tmp/opencode/verify-da-loader-probe.md`）の **V-Must-1** と Should 1〜6 に対応した。
+
+| # | 処置 | 固定するテスト |
+|---|---|---|
+| V-Must-1 | `m241-cli` のテスト用の偽 DA（`crates/m241-cli/src/testing.rs` の `fake_da` モジュール）を追加し、`probe_da` を**最後まで**駆動する。偽 DA は BootROM の sync、NMEA ストリームと `$PMTK180`、`0xA1` / `0xAF` / `0xA8`、DA のバナー、`0xD6` のページ会話を最小限に模し、受けた opcode・`0xA1` のアドレス・`0xA8` の count・`0xD6` の範囲を記録する | `probe_da_reads_both_candidates_through_the_fake_and_sends_no_write_opcode`, `probe_da_with_the_vector_at_the_first_candidate_settles_on_it`, `probe_da_uses_silence_and_assume_brom_without_touching_the_reset_lines` |
+| Should-1 | 上記「訂正」のとおり、`get(24..26)` の誤った主張を取り下げた | — |
+| Should-2 | 偽 DA に `failing_clear_input()` を足し、drain 失敗が `load` の `Error::Io` になり、読み戻しと jump に到達しないことを固定 | `a_drain_that_fails_is_reported_instead_of_a_successful_load` |
+| Should-3 | 旧テストを改名・強化。短いページは `read_range` からは到達しない（ページ長の倍数以外は `Error::State`）ため、「偽 DA のページ詰めのモデル」を固定するテストだと名前に明記 | `the_fake_pads_a_partial_page_by_default_and_can_send_it_short` |
+| Should-4 | 上の M1 / M2 / M5 の「固定するテスト」列を、実際に通る関数とテスト名に直した | — |
+| Should-5 | `Frame` の doc に「count は型では守れず、`DA_JUMP_COUNT` との一致はテストで固定する」と書いた | `the_jump_frame_carries_count_zero_and_the_fake_refuses_any_other` |
+| Should-6 | テスト名を期待値に合わせて改名し、`Framing` 側は別テストにした | `a_silent_port_after_the_jump_is_a_timeout_not_a_framing_error`, `bytes_that_are_not_a_report_end_the_scan_as_a_framing_error` |
+
+**変異（実測、各変異のあと元に戻して `git status --porcelain` 空を確認）**: M9（`probe_da` に `0xD5`）は
+`probe_da*` の 3 本で検出。M2c（2 候補目を捨てる）は 2 本で検出。`DA_JUMP_COUNT = 1`、ベクタ比較 1 バイト、
+未読 → `Settled`、先頭 4 バイト検査の除去もすべて検出。
 
 ### Stage 3 検証
 

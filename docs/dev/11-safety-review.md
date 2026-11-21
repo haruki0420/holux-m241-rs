@@ -151,6 +151,13 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
    `write_range` だけ）。`0xD3` に相当するコマンドも送らないので、後続の `0xD5` が
    書き込みに使える範囲は更新されない（`the_read_path_never_sends_a_write_opcode` が
    偽 DA の `recorded_range() == (0, 0)` を確認）。🧪
+   この不変条件は **`fw probe-da` の本体についても**、
+   `probe_da_reads_both_candidates_through_the_fake_and_sends_no_write_opcode` が
+   `m241-cli` の偽 DA（`crates/m241-cli/src/testing.rs` の `fake_da`）で `probe_da` を最後まで
+   駆動して固定する: 受けた opcode が `0xA1` / `0xAF` / `0xA8` / `0xD6`（と `0xD6` の
+   `0x5A` / `0xA5`）だけであること、`0xD3` / `0xD4` / `0xD5` / `0xD9` が無いこと、`0xA1` の
+   アドレスが DA の RAM 範囲に収まること、`0xA8` が `0x00100800` に count `0` で 1 回だけ
+   であること、リセット線を脈打たないこと。🧪
 3. **開始アドレスが確定するまで `FLASH_WRITE_START` は拒否のまま。** 👁
    `fw probe-da` は判定（`BaseVerdict`）を表示するだけで、`da.rs` の定数・
    `UNRESOLVED_STARTS`・`check_layout` を一切書き換えない。確定は次の 2 段階で行う:

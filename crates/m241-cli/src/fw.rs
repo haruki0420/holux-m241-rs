@@ -681,7 +681,9 @@ pub fn base_verdict(pages: &[ProbeCandidate]) -> Result<BaseVerdict> {
 /// Writes **no** flash. The only writes in the whole path are the BootROM's
 /// `0xA1` frames that put the DA into the chip's RAM, and the DA is gone at the
 /// next power-on. `0xD3` / `0xD4` / `0xD5` / `0xD9` are never sent; a test drives
-/// the same path against the fake and asserts the fake saw none of them.
+/// the same path against the fake and asserts the fake saw none of them
+/// (`probe_da_reads_both_candidates_through_the_fake_and_sends_no_write_opcode`
+/// in this module's tests, over the fake in [`crate::testing::fake_da`]).
 ///
 /// The candidate addresses come from [`m241_flash::da::read_candidates`]; this
 /// function has no address of its own.
@@ -858,6 +860,7 @@ fn hex_bytes(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::Timings;
+    use crate::testing::fake_da;
     use crate::testing::{AutoConfirm, DeviceHandle, FakePorts, RecordingConsole, synthetic_image};
     use m241_core::protocol::simulator::FakeDevice;
     use std::cell::{Cell, RefCell};
@@ -1946,6 +1949,225 @@ mod tests {
         assert!(
             stdout.contains("flash write: no") || stdout.contains("flash write : no"),
             "got {stdout}"
+        );
+    }
+
+    // -- fw probe-da, end to end against a fake DA -------------------------
+
+    /// The DA file `probe_da` reads: the vendor length and first bytes, with
+    /// every other byte distinct so a wrong relay shows up in the read-back.
+    fn da_file(scratch: &Scratch) -> PathBuf {
+        let path = scratch.join("DA_v3.8.4.bin");
+        let mut image: Vec<u8> = (0..m241_flash::da::DA_IMAGE_SIZE)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        if let Some(head) = image.get_mut(..m241_flash::da::DA_IMAGE_HEAD.len()) {
+            head.copy_from_slice(&m241_flash::da::DA_IMAGE_HEAD);
+        }
+        fileio::write(&path, &image).expect("write the DA");
+        path
+    }
+
+    /// The opcodes the probe is allowed to send, once the BootROM frame bytes
+    /// and the `0xD6` page conversation are separated from the rest.
+    ///
+    /// A BootROM frame contributes one recorded byte (`0xA1`, `0xAF`, `0xA8`);
+    /// a DA command contributes its opcode, and the page conversation
+    /// contributes its `0x5A` advances. Anything else — `0xD3`, `0xD4`,
+    /// `0xD5`, `0xD9`, `0xA2`, or a stray byte — is not in this set.
+    const ALLOWED: [u8; 6] = [
+        m241_core::protocol::brom::OPCODE_WRITE16,
+        m241_core::protocol::brom::OPCODE_READ32,
+        m241_core::protocol::brom::OPCODE_JUMP,
+        m241_flash::da::OPCODE_READ_RANGE,
+        m241_flash::da::ACK,
+        m241_flash::da::NAK,
+    ];
+
+    fn assert_no_destructive_opcode(record: &fake_da::Record) {
+        for opcode in &record.opcodes {
+            assert!(
+                ALLOWED.contains(opcode),
+                "0x{opcode:02X} is not part of loading the DA or reading through it; \
+                 everything on the wire was {}",
+                record.opcodes_hex()
+            );
+        }
+        for destructive in [
+            m241_flash::da::OPCODE_MEM_CMD, // 0xD3
+            0xD4,                           // erase a range, never sent by this crate
+            m241_flash::da::OPCODE_WRITE,   // 0xD5
+            m241_flash::da::OPCODE_RESTART, // 0xD9
+        ] {
+            assert!(
+                !record.opcodes.contains(&destructive),
+                "fw probe-da must never send 0x{destructive:02X}: {}",
+                record.opcodes_hex()
+            );
+        }
+    }
+
+    #[test]
+    fn probe_da_reads_both_candidates_through_the_fake_and_sends_no_write_opcode() {
+        // The safety claim for this command, checked on the code the command
+        // actually runs: DA load, jump, two `0xD6` reads, verdict. A `0xD5`
+        // slipped in beside `DownloadAgent::new` used to leave every gate green
+        // because nothing drove `probe_da` past its port step.
+        let scratch = Scratch::new("probe-fake");
+        let da = da_file(&scratch);
+        // A running firmware, so the documented `$PMTK180` route is the one the
+        // command takes. The first candidate carries only the vector's first
+        // byte: a verdict that compared one byte would settle on `0x0020_0000`
+        // at best (both match) or on the wrong address, and either fails below.
+        let mut flash = vec![0xFFu8; 0x0020_0000 + 0x1000];
+        if let Some(slot) = flash.get_mut(..4) {
+            slot.copy_from_slice(&[VECTOR[0], 0x00, 0x00, 0x00]);
+        }
+        let at = PROBE_ADDRESSES[1] as usize;
+        if let Some(slot) = flash.get_mut(at..at + VECTOR.len()) {
+            slot.copy_from_slice(&VECTOR);
+        }
+        let chip = fake_da::FakeChip::new(fake_da::Mode::Firmware, flash);
+        let links = fake_da::FakeDaPorts::new(chip.clone());
+        let record = links.record();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = probe_options(&da);
+        options.yes = true;
+        options.json = true;
+
+        probe_da(&options, session).expect("the fake DA answers");
+
+        let record = record.borrow();
+        assert_no_destructive_opcode(&record);
+
+        // Both candidates were read, in order, at the page size the probe asks
+        // for — dropping the second one must fail here.
+        assert_eq!(
+            record.reads,
+            vec![
+                (
+                    u32::try_from(PROBE_PAGE_SIZE).unwrap(),
+                    PROBE_ADDRESSES[0],
+                    u32::try_from(PROBE_PAGE_SIZE).unwrap()
+                ),
+                (
+                    u32::try_from(PROBE_PAGE_SIZE).unwrap(),
+                    PROBE_ADDRESSES[1],
+                    u32::try_from(PROBE_PAGE_SIZE).unwrap()
+                ),
+            ],
+            "one 0xD6 per candidate, in PROBE_ADDRESSES order"
+        );
+
+        // The load itself: `0xA1` into RAM at the DA base, one `0xA8` back to
+        // it with count zero, and nothing written outside the DA's span.
+        let span = m241_flash::da::DA_LOAD_ADDRESS
+            ..m241_flash::da::DA_LOAD_ADDRESS + m241_flash::da::DA_IMAGE_SIZE as u32;
+        assert!(!record.writes.is_empty(), "the DA was streamed into RAM");
+        for (address, payload) in &record.writes {
+            assert!(
+                span.contains(address),
+                "0xA1 to 0x{address:08X} is outside the DA's RAM span"
+            );
+            let end = address.saturating_add(u32::try_from(payload.len()).unwrap());
+            assert!(
+                span.contains(&end.saturating_sub(1)),
+                "the chunk ending at 0x{end:08X} runs past the DA's RAM span"
+            );
+        }
+        assert_eq!(
+            record.jumps,
+            vec![(m241_flash::da::DA_LOAD_ADDRESS, 0)],
+            "exactly one jump, to the DA base, with the documented count"
+        );
+
+        // The firmware streams and `$PMTK180` is what moved the chip to the
+        // BootROM; no reset line was touched.
+        assert!(record.pmtk180, "the documented entry route was used");
+        assert!(
+            !record.control_lines_asserted,
+            "DTR/RTS must never be pulsed at a unit (AGENTS.md §2.1)"
+        );
+
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(document["conclusion"], "settled");
+        assert_eq!(
+            document["firmware_base"],
+            format!("0x{:08X}", PROBE_ADDRESSES[1]),
+            "the vector was at the second candidate, so that is the base"
+        );
+        assert_eq!(document["probe"][0]["read"], true);
+        assert_eq!(
+            document["probe"][0]["first_bytes"], "18 00 00 00",
+            "the first candidate shares only the vector's first byte"
+        );
+        assert_eq!(document["probe"][0]["vector_match"], false);
+        assert_eq!(document["probe"][1]["vector_match"], true);
+        assert_eq!(document["wrote_flash"], false);
+        assert_eq!(document["vector_verified_through_da"], false);
+        assert_eq!(document["da"]["version"], "0x0308");
+    }
+
+    #[test]
+    fn probe_da_with_the_vector_at_the_first_candidate_settles_on_it() {
+        // The other direction: the verdict follows the bytes, not a preference
+        // for either address.
+        let scratch = Scratch::new("probe-fake-first");
+        let da = da_file(&scratch);
+        let chip = fake_da::FakeChip::with_vector_at(PROBE_ADDRESSES[0]);
+        let links = fake_da::FakeDaPorts::new(chip);
+        let record = links.record();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = probe_options(&da);
+        options.yes = true;
+        options.json = true;
+
+        probe_da(&options, session).expect("the fake DA answers");
+
+        let record = record.borrow();
+        assert_no_destructive_opcode(&record);
+        assert_eq!(record.reads.len(), 2, "both candidates are still read");
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(
+            document["firmware_base"],
+            format!("0x{:08X}", PROBE_ADDRESSES[0])
+        );
+        assert_eq!(document["probe"][0]["vector_match"], true);
+        assert_eq!(document["probe"][1]["vector_match"], false);
+    }
+
+    #[test]
+    fn probe_da_uses_silence_and_assume_brom_without_touching_the_reset_lines() {
+        // A chip already parked in the BootROM: the stream probe finds nothing,
+        // the silence route is taken, and still nothing is pulsed.
+        let scratch = Scratch::new("probe-fake-silent");
+        let da = da_file(&scratch);
+        let chip = fake_da::FakeChip::with_vector_at(PROBE_ADDRESSES[1]);
+        let links = fake_da::FakeDaPorts::new(chip);
+        let record = links.record();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = probe_options(&da);
+        options.yes = true;
+
+        probe_da(&options, session).expect("the fake BootROM answers the sync");
+
+        let record = record.borrow();
+        assert!(!record.pmtk180, "no stream, so no sentence");
+        assert!(
+            !record.control_lines_asserted,
+            "silence must not be read as 'pulse the reset lines'"
+        );
+        assert_eq!(record.reads.len(), 2);
+        assert_no_destructive_opcode(&record);
+        assert!(
+            console.stderr().contains("no NMEA stream"),
+            "the silence route is reported: {}",
+            console.stderr()
         );
     }
 }
