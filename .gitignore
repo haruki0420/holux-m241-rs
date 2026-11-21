@@ -32,6 +32,6 @@
 # Rendered screen captures are build output; regenerate with `m241-gui --screenshot`.
 /.design/
 
-# Python bytecode from the tools/ scripts.
+# Python bytecode (the `__pycache__/` and `*.pyc` patterns are repository-wide).
 __pycache__/
 *.pyc

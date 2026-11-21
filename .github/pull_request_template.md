@@ -7,15 +7,16 @@
 <!-- The gate is machine-enforced by the `review-gate` status on the head SHA.
      Fill this in before asking for merge. -->
 
-- Tier: <!-- 1 (diff/tests), 2 (two reviews), 3 (safety-critical) -->
-- Non-test lines changed: <!-- >300 needs a split rationale -->
+- Tier: <!-- 1 (1–100 non-test lines, docs/tests only), 2 (101–300, one module), 3 (safety-critical, 301+, or several modules) -->
+- Non-test lines changed: <!-- added+deleted from `git diff --numstat`, excluding tests/ and *_test.rs; inline tests count. >300 needs a split rationale -->
 - If >300, why not split: <!-- ... -->
-- Stage 1 specification review: <!-- link -->
+- Stage 1 specification review: <!-- link; required in every tier -->
 - Stage 1 readability review: <!-- link, or "n/a" for Tier 1 -->
 - Stage 2 fix: <!-- commit -->
-- Stage 3 independent verification: <!-- link + 合格/不合格 -->
-- Reviewed head SHA: <!-- the SHA the reviewer read -->
-- `review-gate` status: <!-- link to the status or the review comment -->
+- Stage 3 independent verification: <!-- link + 合格/不合格 (the verdict vocabulary of docs/dev/09-review-protocol.md), or "n/a" for Tier 1 unless behaviour changed -->
+- Mutation tests: <!-- Tier 2: 3–5, Tier 3: 10+; "n/a" for Tier 1 -->
+- Reviewed head SHA: <!-- the full 40-character SHA the reviewer read -->
+- `review-gate` status: <!-- link to the status or the review comment; required in every tier -->
 
 ## Checks
 

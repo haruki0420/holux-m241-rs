@@ -11,6 +11,10 @@ cargo clippy --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+`./tools/check.sh` runs all six gates together (`fmt`, `clippy`, `test`, `docs`,
+`design`, `safety`) and is the gate this repository actually requires at 6/6. Use
+the individual commands above when you need to iterate on one of them.
+
 All three must be clean. The workspace denies `unsafe`, `unwrap`, `expect` and
 `panic`, so a serial failure becomes an error value rather than a process abort.
 That is not style: the device may be mid-write when a cable is pulled, and the
@@ -72,18 +76,29 @@ The merge gate is more than CI. Read
 [`docs/dev/09-review-protocol.md`](docs/dev/09-review-protocol.md) for the full
 three-stage process. In short:
 
-- **Tier 1** — docs/tests only, or under 100 non-test lines: one independent
-  reviewer reads the diff and the tests.
-- **Tier 2** — 100–300 non-test lines, one module: specification and
-  readability reviews by two agents, then a third agent verifies the fix.
-- **Tier 3** — safety-critical (`m241-flash`, the protocol, geotag/destructive
-  paths) or over 300 non-test lines: full-file reviews, at least ten mutation
-  tests, and a deep third-agent verification. Split the pull request first if
-  you can.
+- **Tier 1** — docs/tests only, or 1–100 non-test lines: one independent
+  reviewer does the specification review of the diff and the tests (readability
+  is n/a). The `review-gate` status is still required.
+- **Tier 2** — 101–300 non-test lines, one module: specification and
+  readability reviews by two agents, a third agent verifies the fix, and 3–5
+  mutation tests.
+- **Tier 3** — safety-critical (`m241-flash`, the protocol, geotag (EXIF
+  rewrite), destructive paths) regardless of size, or 301+ non-test lines, or
+  more than one module: two reviewers over every changed file, a deep
+  third-agent verification, and 10+ mutation tests. Split the pull request first
+  if you can.
+
+Count non-test lines as the added plus deleted lines in `git diff --numstat`
+with `tests/` and `*_test.rs` excluded; inline `#[cfg(test)]` tests count. If
+unsure, count more and take the higher tier.
+
+`docs/dev/09-review-protocol.md` is authoritative; this list and the pull
+request template are summaries of its tier table.
 
 After the independent review, the reviewer posts the `review-gate` status on
-the exact head SHA. Branch protection requires it, and a new push needs a new
-review. `./tools/check.sh` must be 6/6 and every required CI check must pass.
+the exact head SHA. Branch protection requires it in every tier, and a new push
+needs a new review. `./tools/check.sh` must be 6/6 and every required CI check
+must pass.
 
 ## Commits
 
