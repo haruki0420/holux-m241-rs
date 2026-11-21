@@ -115,18 +115,18 @@ Flags: `--da <FILE>` (the vendor `DA_v3.8.4.bin`, exactly 14,896 bytes starting
 no typed prompt for this command), `--assume-brom` (the same route
 `fw dump --assume-brom` takes when the chip is already in BootROM), `--json`.
 
-It reads one 64-byte page at each of `0` and `0x00200000` — the two addresses the
-DA-side base is documented to be — and **judges only the first four bytes** of
-each page against `18 F0 9F E5`. The other 60 bytes are printed for a person
-(`first 16:`), not judged.
+It reads one 64-byte page at each of `0` and `0x00200000` — the DA-side base and
+the BootROM-side base — and **judges only the first four bytes** of each page
+against `18 F0 9F E5`. The other 60 bytes are printed for a person (`first 16:`),
+not judged.
 
 For every candidate the report states, as a line a user can paste into
 `docs/dev/05-verification.md`:
 
 ```text
-0x00000000  : not read — 0xD6 page 0 (0 of 66 bytes): timed out
-0x00200000  : read, first bytes 18 F0 9F E5 (matches the vector 18 F0 9F E5)  first 16: 18 F0 9F E5 00 …
-verdict     : the image is at 0x00200000
+0x00000000  : read, first bytes 18 F0 9F E5 (matches the vector 18 F0 9F E5)  first 16: 18 F0 9F E5 18 F0 9F E5 18 F0 9F E5 18 F0 9F E5
+0x00200000  : read, first bytes 02 02 20 42 (does not match the vector)  first 16: 02 02 20 42 00 00 AA 55 AA 55 AA 55 AA 55
+verdict     : the image is at 0x00000000
 ```
 
 The verdict is one of:
@@ -140,18 +140,17 @@ The verdict is one of:
 * **inconclusive: … both start with the vector** — both were read and matched,
   which is not a tie the tool breaks.
 
-⚠️ The first-four-bytes test is **unverified through the DA**. `18 F0 9F E5` is
-measured in the BootROM's view only (`docs/dev/03-hardware-facts.md` "Firmware
-base, BootROM view"); `0xD6` itself — the page length the DA emits, whether it
-sends anything before the first page — has no hardware run either
-(`docs/reference/01-da-protocol.md` §5.5, §7 item 4). If `0xD6` does not answer,
-the result is "not read", and that means the DA-side question is still open, not
-that the image is absent or that the address is wrong. The V1.13 unit measured
-so far carries the WNRO patch (it reports `V1.14`); no probe has been run on
-it, and none on an unpatched V1.13.
+✅ A run on 2026-11-21 (`/dev/ttyUSB0`, after `--assume-brom`) returned the
+output above: the DA's view has the image at `0`, while `0x00200000` reads the
+unmapped-bus pattern `02 02 20 42`. The same session measured one `0xD6` page as
+64 data bytes + a 2-byte checksum, and observed four bytes after the banner
+before the first page. Multi-page reads and the advance after the final page are
+still unmeasured (`docs/reference/01-da-protocol.md` §5.5, §7 item 4). See
+`docs/dev/05-verification.md` §1.2 for the full transcript.
 
-`fw probe-da` exists so the address `fw flash` refuses on can be settled by
-measurement; it does not change `fw flash` by itself.
+`fw probe-da` was how the DA-side base was settled; it remains a **read-only**
+diagnostic and does not write flash. `fw flash` now uses the settled `0`, but the
+write path itself has not run against a unit.
 
 ## `m241 log download`
 

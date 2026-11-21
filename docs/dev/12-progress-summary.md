@@ -65,8 +65,8 @@
 
 | 項目 | 状態 | ブロッカー / 注意点 |
 |---|---|---|
-| **DA 書き込み実装**（`crates/m241-flash/src/da.rs`） | 実装済みだが**書き込みは拒否**（PR #6） | `FLASH_WRITE_START = 0` は `UNRESOLVED_STARTS` に含まれ、`check_layout` がバスアクセス前に拒否する。`write_range` は private、読み戻し・消去失敗 `0xA5`・ゼロ詰め・`0xD9` 無応答はテスト済み（82 テスト）。開始アドレス（`0` か `0x00200000`）の確定と実機セッションがブロッカー。実機の書き込み・消去・再起動は**未検証** |
-| **CLI 残り 2 コマンド** | 未実装スタブ | `fw flash`（DA の開始アドレス確定後）と `log erase`。`device doctor` / `log geotag` / `nmea proxy` はマージ済み |
+| **DA 書き込み実装**（`crates/m241-flash/src/da.rs`） | 実装済み。開始アドレスは確定済み（PR #6 以降） | DA 側の開始アドレスは 2026-11-21 の `fw probe-da` で `0` に確定（`docs/dev/05-verification.md` §1.2）。`UNRESOLVED_STARTS` は空、`check_layout` は確定値 `0` を通す。`write_range` は private、読み戻し・消去失敗 `0xA5`・ゼロ詰め・`0xD9` 無応答はテスト済み。**実機の書き込み・消去・再起動は未検証** |
+| **CLI 残り 2 コマンド** | 未実装スタブ | `fw flash`（開始アドレスは確定。実機セッションが残る）と `log erase`。`device doctor` / `log geotag` / `nmea proxy` はマージ済み |
 
 ### 3.2 ezTour 代替機能の再実装（[`07-eztour-spec.ja.md`](07-eztour-spec.ja.md) §8）
 

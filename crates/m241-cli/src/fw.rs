@@ -553,16 +553,18 @@ impl ProbeCandidate {
     }
 }
 
-/// Which of the two candidate DA-side bases holds the firmware image.
+/// Which of the two probed addresses holds the firmware image.
 ///
 /// The assumption behind the probe is that the provisioning image starts with
 /// the vector table `18 F0 9F E5`. That is **measured in the BootROM's view**
-/// only (`docs/dev/03-hardware-facts.md` "Firmware base, BootROM view"); no run
-/// has recorded it through the DA. `0xD6` itself — the page length the DA emits,
-/// whether it sends anything before the first page — is unmeasured too
-/// (`docs/reference/01-da-protocol.md` §5.5, §7 item 4). A run whose cause is
-/// unknown therefore produces *unread*, not *no image here*, and the two are
-/// never folded together.
+/// (`docs/dev/03-hardware-facts.md` "Firmware base, BootROM view") and, on
+/// 2026-11-21, through the DA (`docs/dev/05-verification.md` §1): DA address
+/// `0` returned the vector and DA address `0x00200000` returned the
+/// unmapped-bus pattern. A 64-byte page emits 64 data bytes plus the two-byte
+/// trailer; multi-page reads and the advance after the last page remain
+/// unmeasured (`docs/reference/01-da-protocol.md` §5.5, §7 item 4). A run whose
+/// cause is unknown therefore produces *unread*, not *no image here*, and the
+/// two are never folded together.
 ///
 /// Two variants carry five outcomes:
 ///
@@ -679,7 +681,7 @@ pub fn base_verdict(pages: &[ProbeCandidate]) -> Result<BaseVerdict> {
     }
 }
 
-/// `m241 fw probe-da`: load the DA, read the two candidate bases, say which one
+/// `m241 fw probe-da`: load the DA, read the two candidate addresses, say which one
 /// holds the image.
 ///
 /// Writes **no** flash. The only writes in the whole path are the BootROM's

@@ -6,7 +6,9 @@ document points here.
 `✅` measured on a retail M-241 · `⚠️` not measured on hardware · `🧪` covered by
 the simulator and tests only — see §3 for what that is and is not worth.
 
-## 1. The hardware session (2026-11-15)
+## 1. The hardware sessions
+
+### 1.1 The write and dump (2026-11-15)
 
 Device: `B-core_1.20`, build `0043`, model `01017-00F` (V1.13), MT3318.
 Host: Windows 11, CP210x bridge (VID 10C4 / PID EA60) as a COM port.
@@ -27,6 +29,49 @@ The measured dump's SHA-256 differs per unit because the image contains
 per-unit runtime fields; compare against your own backup, never against a
 figure on this page.
 
+### 1.2 The DA-side base read (2026-11-21)
+
+Device: the same retail M-241. Host: Linux, `/dev/ttyUSB0` (USB serial).
+
+Command, after re-entering the BootROM with `--assume-brom`:
+
+```text
+m241 fw probe-da --da <DA_v3.8.4.bin> --port /dev/ttyUSB0 --yes --assume-brom
+```
+
+Output:
+
+```text
+loading the DA into RAM on /dev/ttyUSB0 (this writes no flash), then reading 64 bytes at 0x00000000 and 0x00200000
+BootROM sync answered; writing the DA into the chip's RAM
+DA v3.8 answered (region 0x49, flash 00C2:22BA, 524288 bytes); reading
+0x00000000  : read, first bytes 18 F0 9F E5 (matches the vector 18 F0 9F E5)  first 16: 18 F0 9F E5 18 F0 9F E5 18 F0 9F E5 18 F0 9F E5
+0x00200000  : read, first bytes 02 02 20 42 (does not match the vector)  first 16: 02 02 20 42 00 00 AA 55 AA 55 AA 55 AA 55
+verdict     : the image is at 0x00000000
+flash write : no
+```
+
+* **DA-side base: `0x00000000`.** The first four bytes are the firmware vector
+  `18 F0 9F E5`, and the first 64 bytes match the vendor V1.13 image's first 64
+  bytes exactly.
+* **`0x00200000` in the DA's view is not firmware.** It reads `02 02 20 42`,
+  the unmapped-bus pattern `42 20 02 02` byte-reversed. This is a different
+  address view from the BootROM's: the BootROM reads the firmware vector at
+  `0x00200000`, while the DA reads it at `0`. The same number means different
+  things in the two views.
+* **No flash was written.** The only writes were the BootROM's `0xA1` frames
+  into the DA's RAM at `0x00100800`–`0x0010422F`, and the `0xA8` jump. No
+  `0xD3`, `0xD4`, `0xD5` or `0xD9` was sent.
+* **Manual check in the same session:** one `0xD6` page with a 64-byte
+  page-length argument is **64 data bytes + a 2-byte big-endian checksum** (66
+  bytes total). The trailer of the page read at address `0` was `0x17FF`, equal
+  to the sum of its 64 bytes.
+* The first attempt read four bytes off (trailer `0x7035`, sum `0x1870`); after
+  the drain fix the read succeeded. **Four bytes remained after the banner**;
+  their origin is not established.
+* Only **one page** was read at each address. Multi-page reads, the advance
+  after the final page, and bytes between pages were not exercised.
+
 ## 2. What was never measured
 
 | Claim | Why it is still open |
@@ -39,10 +84,10 @@ figure on this page.
 | 4 MiB units and GR-245 variants | geometry maths is implemented and unit-tested; no device was available |
 | V1.11 and V1.12 on hardware | no V1.11 image to profile, V1.12 was never flashed |
 | Any timing figure | nothing in this repository is a stopwatch measurement |
-| The DA-side firmware base (`0` or `0x00200000`) | `fw probe-da` reads both and reports; no run has been recorded here, so `FLASH_WRITE_START` stays refused |
-| The DA's `0xD6` read itself | page length it emits for a given page-length argument, whether it sends anything before the first page, and whether the host's advance after the **last** page is sent or omitted (`docs/reference/01-da-protocol.md` §5.5, §7 item 4); the client sends one advance per page including the last |
-| The firmware vector `18 F0 9F E5` through the DA | measured in the BootROM's view only; `fw probe-da`'s test of the first four bytes has never been run against a unit, so its `Settled` verdict is unverified |
-| `fw probe-da` on a stock V1.13 and on a V1.14 unit | neither has been run: the image measured so far is a patched (V1.14-reporting) unit, and the probe's output is what a unit run has to fill in |
+| The DA's `0xD6` read across multiple pages | one page per address was read on 2026-11-21; the advance between pages, the advance after the **last** page, and any bytes the DA sends between pages are unmeasured (`docs/reference/01-da-protocol.md` §5.5, §7 item 4) |
+| The four bytes after the DA banner | observed once on 2026-11-21; their origin is not established. The client drains them before `0xD6` |
+| `0xD6`'s page length for arguments other than 64 | only a 64-byte page-length argument was measured (64 data bytes + 2-byte trailer) |
+| `fw probe-da` on stock V1.13 and on a second unit | the 2026-11-21 run read one unit; no stock V1.13 or V1.14 comparison was recorded |
 | The `0xA8` jump frame's count word | the protocol page gives it no meaning; the only client that ran the jump on a unit sent `0`, and this crate does too. Whether the BootROM reads the field at all is not established (`docs/dev/03-hardware-facts.md` "DA jump") |
 
 ## 3. The simulator
