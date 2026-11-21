@@ -80,20 +80,23 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
    ユニットテストで固定し、書き込み経路が 1 本だけであることをレビューで確認する。
    *現状:* `crates/m241-flash/src/da.rs` に書き込み経路を実装した。範囲は
    `FLASH_WRITE_START` / `FLASH_WRITE_LENGTH` のリテラルのみで、`check_layout`
-   が期待値と照合する。開始アドレスの DA 側表現が未確定
-   （`docs/reference/01-da-protocol.md` §4.2 は `0x00200000`、`m241_core` の
-   `BASE_ADDR_FIRMWARE_M3318` は `0` と書き、実機の読み出しで決着していない）ため、
-   出荷定数は `0` であり、したがって**この経路は現在どの実機にも書き込めない**。
-   `check_layout` は定数 `UNRESOLVED_STARTS` に**両方の候補**（`0` と `0x00200000`）
-   が載っている間、開始がそのどちらでも `Error::Safety` を返す。定数を片方に
-   取り替えるだけでは解禁されず、候補リスト自体を空にすることが、
-   `docs/dev/05-verification.md` の行で決着を記録する編集になる。
-   テストは非公開の `write_range` にテスト専用の開始アドレスを渡してプロトコルだけを
-   検証している（🧪）。
+   が期待値と照合する。DA 側の開始アドレスは 2026-11-21 の実機読み出しで
+   **`0x00000000` に確定**した（`docs/dev/05-verification.md` §1.2: DA アドレス
+   `0` がベクタ `18 F0 9F E5` とベンダー V1.13 イメージの先頭 64 バイトを返し、
+   DA アドレス `0x00200000` は未実装バスの `02 02 20 42` を返した）。
+   `FLASH_WRITE_START = 0`、`UNRESOLVED_STARTS` は空である。`check_layout` は
+   「候補リストが空」「期待開始が確定値 `0`」「開始が期待値と一致」
+   「長さが `FLASH_WRITE_LENGTH`」のすべてを満たすときだけ通し、それ以外の
+   開始は拒否する。範囲はリセットベクタを含むが、それはイメージ自身の先頭
+   バイトであり、`check_image` がバックアップとの差分をパッチ表の外に許さず、
+   `verify_device` が範囲全体の一致を要求するため、消去後は同じバイト列が
+   書き戻される。テストは非公開の `write_range` にテスト専用の開始アドレスを
+   渡してプロトコルだけを検証する（🧪）。
    `crates/m241-flash/src/da.rs` の
-   `the_shipped_start_is_zero_and_the_layout_check_refuses_it` と
-   `the_layout_check_refuses_both_unresolved_starts` が固定する。
-   開始アドレスが実機で確定した時点で、定数・候補リスト・テスト・この段落を同時に更新する。
+   `the_shipped_start_is_zero_and_the_layout_check_accepts_it`、
+   `the_layout_check_refuses_an_unsettled_start`、
+   `a_pinned_range_that_disagrees_is_refused_on_its_own` が固定する。
+   実機への書き込み・消去・再起動は引き続き**未検証**である。
 3. **書き込み後に読み戻して照合しているか。** 👁
    書いたバイト列をそのまま信じない。BootROM 経由で同じ範囲を読み、イメージと
    比較する。比較は `m241-core` の読み取り API で行う（書き込みクレートが読み取り
@@ -101,10 +104,11 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
    `m241_core` の `MtkBootRom` で読み戻し、先頭の不一致オフセットを報告する。
    読み出しそのものは再実装していない（比較だけがこのクレートにある）。🧪
    読み出しアドレスは `BASE_ADDR_FIRMWARE + da_start` で、フェイクが記録した
-   最終読み出しアドレスとの一致をテストで固定している。ただし
-   **DA ビューと BootROM ビューの写像そのものが未検証**（`FLASH_WRITE_START` の項）。
-   テストが固定するのは「クライアントが base を足す」ことであって、
-   「base を足すのが実機で正しい」ことではない。
+   最終読み出しアドレスとの一致をテストで固定している。DA ビューと BootROM
+   ビューの写像は 2026-11-21 に先頭 64 バイトで確認された（DA `0` と BootROM
+   `0x00200000` が同じイメージの先頭を返す。`docs/dev/05-verification.md`
+   §1.2）。テストが固定するのは「クライアントが base を足す」ことであり、
+   書き込み後の全範囲読み戻しは実機で未検証である。
 4. **失敗時に装置を既知の状態に戻せるか。** 👁
    途中で失敗したとき、どこまで書けたかを報告し、リセット（`0xD9`）後に
    BootROM へ再入する手順が案内されること。`0xD9` は応答を返さないので、
@@ -113,12 +117,14 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
    `--assume-brom` での再入、自分のバックアップの書き戻しを名指しする。🧪
    クライアントが `0xD9` の後に読まないことは
    `the_restart_does_not_read_a_reply` が、書き込み経路が `0xD9` を送らないことは
-   `the_shipped_write_path_never_reaches_the_wire` が固定する。
+   `a_write_stops_before_the_restart_so_the_caller_can_decide` が固定する。
 5. **citation のない定数がないか。** 👁
    `m241-flash` の全ての定数は `docs/reference/01-da-protocol.md` の関数と
    命令範囲を指すこと。指せないなら、その定数は書けない（`CONTRIBUTING.md`）。
    *現状:* `da.rs` の全定数が同ページの節か `03-hardware-facts.md` の行を指す。
-   指せない値（`REPLY_TIMEOUT`、DA 側の開始アドレス）は
+   DA 側の開始アドレスは 2026-11-21 の実機読み出し
+   （`05-verification.md` §1.2）によって `03-hardware-facts.md` の行を持つ。
+   指せない値（`REPLY_TIMEOUT`）は
    プロトコル定数ではない／未検証であると本文に明記した。2 つの最終 `0x5A` の間の
    バイト数のように、このクライアントが正当化できる値が 0 しかないものは定数にせず、
    `expect_final_acks` の doc に未検証として書いた。
@@ -143,8 +149,8 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
 2. **probe は `0xD3` / `0xD4` / `0xD5` / `0xD9` を呼ばない。** 👁
    読み出しは `DownloadAgent::read_range` の `0xD6` だけで、CLI がアドレスを決める場所は
    2 つに限られる: 読み出しの一覧は `m241_flash::da::read_candidates` の
-   `PROBE_ADDRESSES`（= `UNRESOLVED_STARTS`）に固定され、`fw probe-da` はアドレスを
-   持たない。CLI の判定 `base_verdict`（`crates/m241-cli/src/fw.rs`）は、その 2 つ以外の一覧を受け取ると
+   `PROBE_ADDRESSES`（独立定数 `0` と `0x00200000`）に固定され、`fw probe-da` は
+   アドレスを持たない。CLI の判定 `base_verdict`（`crates/m241-cli/src/fw.rs`）は、その 2 つ以外の一覧を受け取ると
    `Error::State` で拒否する（`the_probe_verdict_refuses_anything_but_the_two_candidate_slots`）。
    `read_range(address, length)` 自体は `pub` の読み出し API で任意の `u32` を受けるが、
    範囲を記録・消去・書き込みはしない（範囲を受け取る書き込み関数は private の
@@ -158,12 +164,14 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
    `0x5A` / `0xA5`）だけであること、`0xD3` / `0xD4` / `0xD5` / `0xD9` が無いこと、`0xA1` の
    アドレスが DA の RAM 範囲に収まること、`0xA8` が `0x00100800` に count `0` で 1 回だけ
    であること、リセット線を脈打たないこと。🧪
-3. **開始アドレスが確定するまで `FLASH_WRITE_START` は拒否のまま。** 👁
-   `fw probe-da` は判定（`BaseVerdict`）を表示するだけで、`da.rs` の定数・
-   `UNRESOLVED_STARTS`・`check_layout` を一切書き換えない。確定は次の 2 段階で行う:
-   `docs/dev/05-verification.md` §1 に実機の読み出し結果を記録し、その行を根拠に
-   `UNRESOLVED_STARTS` を空にし `FLASH_WRITE_START` を確定値にする。probe が
-   `Settled(0x0020_0000)` を返しても、それだけで書き込みは開かない。
+3. **開始アドレスは確定し、ゲートは開いた。** 👁
+   2026-11-21 の実機読み出し（`docs/dev/05-verification.md` §1.2）を根拠に、
+   `UNRESOLVED_STARTS` を空にし、`FLASH_WRITE_START = 0` を確定値とした。
+   `check_layout` は候補リストが空で、期待開始が確定値 `0` と一致し、開始が
+   その期待値と一致し、長さが `FLASH_WRITE_LENGTH` のときだけ通す。候補
+   リストが再び非空になれば、開始が何であれ拒否する。`fw probe-da` は今後も
+   判定を表示するだけで、`da.rs` の定数を書き換えない。**実機への書き込みは
+   まだ一度も行っていない**ので、書き込み経路そのものは未検証のままである。
 
 ### この経路で担保していないこと（マージ時に「担保済み」と読まない）
 
@@ -177,7 +185,7 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
 | 短い最終パケットのゼロ詰め | 書き込み方向は未検証。§4.4 は読み出し側の直列化から読んだ記述 | `the_final_packet_is_the_short_one_and_is_zero_filled`（今回追加、フェイクが受けた payload を見る） |
 | 拒否された `0xD3` が 1 バイト `A5` | 命令列のみ。実機で拒否させていない | `a_refused_range_is_one_byte_and_a_rejected_error` |
 | `0xD5` の 2 つの最終 `0x5A` の間にバイトを送るか | 未確定。送らない形だけ実機で通っている | `a_full_write_consumes_exactly_its_replies` |
-| DA ビュー ↔ BootROM ビューの写像 | 未検証。開始アドレスの決着待ち | `the_read_back_address_is_the_bootrom_view_of_the_da_start`（クライアントの式だけ） |
+| DA ビュー ↔ BootROM ビューの写像 | 先頭 64 バイトで確認（2026-11-21、DA `0` = BootROM `0x00200000`）。書き込み後の全範囲読み戻しは未検証 | `the_read_back_address_is_the_bootrom_view_of_the_da_start`（クライアントの式だけ） |
 | 最終バックアップ照合（`0xD5` 後の DA 側通しチェック） | §4.4 の 2 番目のチェック。フェイクは模さない | なし |
 | 実機での書き込み経路 | 一度も動いていない。`05-verification.md` §1 の手動フラッシュは本コードではない | なし |
 
@@ -244,6 +252,7 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
   ような実行時文字列組み立て、間接参照によるバイト構築、あるいは公開されている
   `Port::open` / `Transport::write_all` / `pmtk::line` / `Frame` を使った意図的な生
   フレーム送信は、正規表現ベースの静的検査では完全に防げない。
-- **書き込み手順そのものの正しさ:** 範囲定数の妥当性、`start > 0` の保証、読み戻し
-  照合の有無、失敗時のリカバリ案内は `tools/check_safety.py` の対象外であり、上の
-  2 つのレビュー節とテストで担保する。
+- **書き込み手順そのものの正しさ:** 範囲定数の妥当性、`start = 0` が正しい
+  ことの根拠（`docs/dev/05-verification.md` §1.2）、読み戻し照合の有無、失敗時の
+  リカバリ案内は `tools/check_safety.py` の対象外であり、上の 2 つのレビュー節と
+  テストで担保する。
