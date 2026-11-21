@@ -814,10 +814,11 @@ impl FakeDa {
     ///
     /// `m241_core` maps the same flash at [`BASE_ADDR_FIRMWARE`], the DA at
     /// zero; this window is the DA's, so a BootROM address is shifted back to
-    /// its offset. ⚠️ That shift is the unresolved half of the mapping (see
-    /// [`crate::da::FLASH_WRITE_START`]): the fake subtracts exactly as the
+    /// its offset. The 2026-11-21 read settled that mapping: DA address `0`
+    /// holds the image the BootROM reads at `0x0020_0000` (see
+    /// [`crate::da::FLASH_WRITE_START`]). The fake subtracts exactly as the
     /// client adds, so a test that only checks "the read matched" agrees with
-    /// either convention. [`FakeDa::last_read_address`] is what a test compares
+    /// either convention; [`FakeDa::last_read_address`] is what a test compares
     /// with [`BASE_ADDR_FIRMWARE`] instead. Reads past the window are
     /// zero-filled: the chip answers with whatever the bus returns and the
     /// client's length checks catch a request that was too long.
@@ -890,8 +891,8 @@ impl FakeDa {
         // without the BootROM's `BASE_ADDR_FIRMWARE` shift: `0xD6` carries the
         // DA's own view, the same one `0xD3`/`0xD5` take, so a read at `0x100`
         // returns flash offset `0x100` and not zero. `read_flash` would shift
-        // both candidates down by 2 MiB, and the probe's whole question is
-        // which view holds the image.
+        // both candidates down by 2 MiB, and the probe exists to compare the
+        // two views.
         // Copied byte by byte from the DA's own address: `start` is a flash
         // offset, so `memory[start]` is the range's first byte. A flat `map`
         // over `memory[start..start + total]` would need a slice whose bounds

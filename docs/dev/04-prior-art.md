@@ -49,7 +49,7 @@ code implements them.
 |---|---|---|---|
 | `0xD3` replies with two bytes: ACK plus a status byte | reads two bytes, checks only `r[0] == 0x5A` and ignores the status (`scripts/mtk_proto.py`, `_set_mem_block`) | documented as measured in `docs/dev/03-hardware-facts.md`; the disassembly shows the reply is two bytes only on acceptance (section 4.1 of `docs/reference/01-da-protocol.md`) | both prior implementations read two bytes; the measurement is v1's, and it is a success-path measurement. The second byte is always `0x00` — it is not a result code |
 | A non-zero `0xD3` status means failure | never inspects it: reads two bytes and only checks the ACK (`scripts/mtk_proto.py`, `_set_mem_block`) | **v1 implements the claim** — the second byte is read and anything other than `0x00` (or a second `0x5A`) is raised as an error (`src/m241/protocol/da.py`, `_begin_write`) | **refuted by the disassembly**: the status cell is written only with zero, and a refusal sends no second byte at all — it is a single `0xA5`. v1's check can never fire on a successful command; after a refusal it reads the first byte of the next reply as the status |
-| WRITE16's echo trails by one byte | hit the same phenomenon: the last chunk's echo is read with a short timeout and a mismatch is printed as a warning and ignored (`scripts/mtk_proto.py`, `write16`) | documented in `AGENTS.md` §4.2; no write path exists here yet to implement it in | two independent implementations meeting the same asymmetry is strong corroboration; the exact N−1 rule is **measured by v1** |
+| WRITE16's echo trails by one byte | hit the same phenomenon: the last chunk's echo is read with a short timeout and a mismatch is printed as a warning and ignored (`scripts/mtk_proto.py`, `write16`) | documented in `AGENTS.md` §4.2; implemented in `DaLoader::write_image` (`crates/m241-flash/src/da.rs`), which compares against `sent[..len-1]` and drains the final echo | two independent implementations meeting the same asymmetry is strong corroboration; the exact N−1 rule is **measured by v1**, implemented here and tested against the simulator (🧪) |
 | Reads carry no checksum trailer; `0xA4` is separate | every read is followed by a separate `0xA4` round trip (`read16`, `read32`); no trailer is ever consumed | documented in `AGENTS.md` §4.3; `0xA4` is a distinct opcode with a word count (`OPCODE_CHECKSUM` and `Frame::for_bytes` in `crates/m241-core/src/protocol/brom.rs`), though no method issues it yet | **measured by v1**, corroborated by a second implementation that would have desynchronised if a trailer existed |
 | `0xD3` is one ten-byte frame, not split header/begin/end | one `struct.pack(">BBLL", 0xD3, 1, start, end)` in a single write (`_set_mem_block`) | documented in `docs/reference/01-da-protocol.md` | **measured by v1**, corroborated by Nekoba |
 | The DA accepts a short final packet | the write loop would send one, but its expected image length (458,752 = `0x70000`) is a whole multiple of `0x100`, so it never does | not recorded here; the 92-byte tail of a 406,620-byte image is a v1 measurement (v1's `AGENTS.md` §5 during its one hardware flash) | **measured by v1** with a real short tail; Nekoba neither confirms nor contradicts it, and this project has not flashed |
@@ -109,17 +109,19 @@ the docstring, about dumping twice.
 known profile **or** every byte that differs from `--backup` falls inside the
 patch offsets; the image fits the flash size the DA reports; the user typed
 `WRITE` (`docs/reference/02-cli.md` §`m241 fw flash`, `AGENTS.md` §2.3,
-`CONTRIBUTING.md` safety-gate table) — plus a read-back after the write. **It is
-not implemented.** `crates/m241-flash/src/da.rs` refuses to operate and
-`crates/m241-cli/src/lib.rs` returns "not implemented" for `fw flash`; the
-offline gates that *are* code are the profile and epoch checks in
-`crates/m241-core/src/firmware/patch.rs`.
+`CONTRIBUTING.md` safety-gate table) — plus a read-back after the write.
+**The write path is implemented in `m241-flash` but not wired into the CLI.**
+`crates/m241-flash/src/da.rs` accepts only the settled DA-side range
+(`FLASH_WRITE_START = 0`, `check_layout`), while `crates/m241-cli/src/lib.rs`
+returns "not implemented" for `fw flash`; the offline gates that *are* code are
+the profile and epoch checks in `crates/m241-core/src/firmware/patch.rs`.
 
 **Verdict: the largest difference, and the one where this project is currently
 the weakest of the three.** Nekoba and v1 both have a working write path with a
-typed confirmation; this project has a specification, a refusal and no write path.
-The backup diff check and the read-back are the two gates that do not exist
-upstream in any form, and they stay unproven until the flash path lands.
+typed confirmation; this project has an implemented write path and a read-back,
+neither of which has run against a unit, and no CLI wiring yet. The backup diff
+check and the read-back are the two gates that do not exist upstream in any
+form, and they stay unproven until the flash path runs on hardware.
 
 ### 3. Which firmware images the patch tool will accept
 

@@ -33,12 +33,18 @@ A fourth offset means the image is not the version this tool expects. Stop.
 
 ## Step 4 is the only dangerous step
 
-> **Status: 未検証 / 未実装.** `m241 fw flash` is not implemented in this build
-> yet; `crates/m241-flash/src/da.rs` still refuses to operate while the write
-> path is reviewed against `docs/reference/01-da-protocol.md` and
+> **Status: 未検証 / 未実装.** `m241 fw flash` is still a stub in this build, and
+> the write path in `crates/m241-flash/src/da.rs` has not been run against a
+> unit. Its range gate is open at the settled DA-side start `0`; the protocol
+> and safety reviews are in `docs/reference/01-da-protocol.md` and
 > `docs/dev/11-safety-review.md`.
 
-When implemented, the tool refuses unless all three of these hold:
+When implemented, the command first compares the unit's whole firmware span
+with `--backup` (`DownloadAgent::verify_device`). The library's
+`DownloadAgent::write` does not call that check itself: it compares the image
+with `backup`, not with the unit. The device check belongs to the CLI route,
+not to the library `write`. After that it refuses unless all three of these
+hold:
 
 1. the image matches a known firmware profile, or every byte that differs from
    `--backup` falls inside the patch offsets;

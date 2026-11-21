@@ -25,7 +25,8 @@
 //! 1. **The range is a constant.** [`FLASH_WRITE_START`] and
 //!    [`FLASH_WRITE_LENGTH`] are literals checked against their expected values
 //!    by [`check_layout`] before any byte goes out, and [`check_layout`] refuses
-//!    a start of `0` outright. No public function in this crate takes a range.
+//!    every start other than the settled `0`. No public function in this crate
+//!    takes a range.
 //! 2. **A confirmation token must be passed** ([`Confirmation`]). It has one
 //!    public constructor, [`Confirmation::granted`], and [`DownloadAgent::write`]
 //!    takes one as its first argument and refuses a token that is not given.
@@ -83,8 +84,8 @@
 //! §5.5): three big-endian `u32` — page length, start, total length — then one
 //! zero-padded, checksummed page at a time, each answered by the host with `0x5A`
 //! to advance or `0xA5` to ask again. It is the only way to read flash through
-//! the DA's own address view, and that view is the question
-//! [`FLASH_WRITE_START`] is waiting on.
+//! the DA's own address view, and that view is what settled
+//! [`FLASH_WRITE_START`].
 //!
 //! # Shape: load, then read; or write, then read
 //!
@@ -109,33 +110,44 @@
 //! `reenter` is the caller's BootROM re-entry step: `--assume-brom` or a
 //! power-cycle on a unit, [`crate::simulator::FakeDa::set_modelled`] in a test.
 //!
-//! # The start address is unresolved, so the gate refuses to write
+//! # The start address is settled: the image begins at DA address 0
 //!
-//! Two documents disagree about where the image begins in the DA's address
-//! space and no hardware read settles it:
+//! Two sources described the base in different views:
 //!
-//! * `docs/reference/01-da-protocol.md` §4.2 speaks of a "firmware base
-//!   `0x00200000`" as a DA-side address;
-//! * `m241_core::protocol::brom::BASE_ADDR_FIRMWARE_M3318` says the DA addresses
-//!   the same flash from `0`, so the image's first byte is DA address `0`.
+//! * `docs/reference/01-da-protocol.md` §6 records the driver vtable's `+0x38`
+//!   firmware base as `0x00200000` — the BootROM's view of the image;
+//! * `m241_core::protocol::brom::BASE_ADDR_FIRMWARE_M3318` said the DA addresses
+//!   the same flash from `0`.
 //!
-//! The difference decides everything: a range starting at `0` covers the reset
-//! vector. [`FLASH_WRITE_START`] carries the value the `m241_core` citation
-//! supports, `0`, and [`check_layout`] refuses it. The wire protocol is written
-//! and tested against [`crate::simulator::FakeDa`]; **this crate cannot write
-//! flash on a real unit** until `docs/dev/05-verification.md` §1 gains a row
-//! that fixes the address. [`check_layout`] refuses to run unless a single
-//! constant, [`UNRESOLVED_STARTS`], still lists **both** candidate addresses and
-//! [`FLASH_WRITE_START`] is one of them: whichever of the two is put in the
-//! constant, the gate keeps refusing until the list itself is emptied, which is
-//! the edit the hardware row has to justify.
+//! A `0xD6` read through the DA's own view settled it on 2026-11-21: DA address
+//! `0` returns the vector `18 F0 9F E5` and the first 64 bytes are the vendor
+//! V1.13 image's first 64, while DA address `0x0020_0000` returns
+//! `02 02 20 42` — consistent with the unmapped-bus pattern `42 20 02 02`
+//! byte-reversed, and not the firmware vector. The run, its command and its
+//! manual checks are recorded in `docs/dev/05-verification.md` §1.
+//!
+//! The two views therefore address the same image differently: `0` in the DA's
+//! view is `0x0020_0000` in the BootROM's. The same number is not the same
+//! thing, and `0x00200000` in the DA's view does not return the image even
+//! though the BootROM reads firmware there.
+//!
+//! [`FLASH_WRITE_START`] is `0` and [`UNRESOLVED_STARTS`] is empty. The range
+//! includes the reset vector; that is intended, because the image's own first
+//! bytes are what gets erased and reprogrammed. What keeps that safe is the
+//! image rule: [`check_image`] refuses any difference from the user's backup
+//! outside [`PATCH_OFFSETS`], and [`DownloadAgent::verify_device`] refuses a
+//! unit whose span does not equal that backup. [`check_layout`] passes only
+//! while the list is empty and the start is the settled `0`; a non-empty list,
+//! or any other start, refuses every write.
 //!
 //! # What is verified and what is not
 //!
-//! 🧪 Nothing in this module has run against a unit. The whole path is exercised
-//! by the fake and unit tests only; the hardware session in
-//! `docs/dev/05-verification.md` §1 flashed a unit by hand, outside this code.
-//! Nothing here may be reported as measured until that page gains a row.
+//! 🧪 The **write** path (`0xD3`, `0xD5`, the read-back) has not run against a
+//! unit. It is exercised by the fake and unit tests only; the write recorded in
+//! `docs/dev/05-verification.md` §1 was a manual session outside this code. The
+//! DA load and one `0xD6` page per candidate have run: 2026-11-21,
+//! `/dev/ttyUSB0`, `fw probe-da --assume-brom` (same section). That run wrote no
+//! flash, only the DA's RAM.
 //!
 //! Points the disassembly leaves open are marked 未検証 where they are used:
 //!
@@ -163,12 +175,14 @@
 //! * whether the chip emits anything between a `0xA1` write and the next frame
 //!   (the echo lags one byte, `AGENTS.md` §4.2) — the client requires the echo of
 //!   everything but the last byte of each chunk and drains the rest;
-//! * whether the DA emits anything before its first page on `0xD6` — the client
-//!   reads the page directly and stops on a framing error rather than resync;
-//! * the exact page size the DA emits for a given page-length argument (§7
-//!   item 4) — the client asks for [`PROBE_PAGE_SIZE`] and requires exactly that
-//!   many bytes plus the two-byte trailer per page, which is the one reading
-//!   §5.5's "same serialiser as the write path" supports.
+//! * what the four bytes after the DA's twenty-byte banner are — the 2026-11-21
+//!   run left four bytes on the line before the first page; the client drains
+//!   the line before `0xD6`, so the page starts where the reader expects it, but
+//!   the bytes' origin is not established;
+//! * the page size the DA emits for a page-length argument other than
+//!   [`PROBE_PAGE_SIZE`], and the advance after the final page of a multi-page
+//!   read — one page was measured (64 data bytes plus the two-byte trailer) and
+//!   only one page was read.
 
 use std::time::Duration;
 
@@ -260,34 +274,35 @@ pub const PACKET_SIZE: usize = 0x100;
 
 /// Start of the span this driver writes, in the **DA's** linear flash view.
 ///
-/// **Settled:** the flash answers the BootROM at `BASE_ADDR_FIRMWARE`
-/// (`0x0020_0000`) and the image begins with the vector `18 F0 9F E5` there
-/// (`measured elsewhere:` `docs/dev/03-hardware-facts.md` "Firmware base,
-/// BootROM view").
+/// **Settled: `0x0000_0000`.** The DA answers a `0xD6` read at address `0` with
+/// the firmware vector `18 F0 9F E5`, and its first 64 bytes are the vendor
+/// V1.13 image's first 64. The same read at DA address `0x0020_0000` returns
+/// `02 02 20 42`, consistent with the unmapped-bus pattern (`42 20 02 02`
+/// byte-reversed). Measured 2026-11-21 on `/dev/ttyUSB0` with
+/// `fw probe-da --assume-brom`; the output is recorded in
+/// `docs/dev/05-verification.md` §1.
 ///
-/// **Not settled:** where the same bytes sit in the DA's view.
-/// `m241_core::protocol::brom::BASE_ADDR_FIRMWARE_M3318` is `0x0000_0000` —
-/// both prior clients wrote at DA address `0` — while
-/// `docs/reference/01-da-protocol.md` §4.2 writes the base as `0x00200000`.
-/// No read through the DA's own view has settled it, so this constant carries
-/// the `m241_core` citation, `0`, and the ambiguity is left visible instead of
-/// resolved by preference.
+/// The BootROM reads the same image at `BASE_ADDR_FIRMWARE` (`0x0020_0000`).
+/// That is a different view, not a different image: the same number means the
+/// firmware to the BootROM and does not return the image to the DA.
 ///
-/// ➡️ **This value is refused.** [`check_layout`] refuses every write while
-/// [`UNRESOLVED_STARTS`] lists it, and it lists both candidates, so swapping
-/// this constant for the other one still refuses. See the module
-/// documentation, "The start address is unresolved".
+/// ➡️ The range starts at zero and therefore includes the reset vector. That is
+/// intended: those are the image's own first instructions, erased and
+/// reprogrammed together with the rest. What keeps it safe is the image rule —
+/// [`check_image`] refuses any difference from the user's backup outside
+/// [`PATCH_OFFSETS`], and [`DownloadAgent::verify_device`] refuses a unit whose
+/// span does not equal that backup. [`check_layout`] passes only while
+/// [`UNRESOLVED_STARTS`] is empty and this constant is the settled `0`.
 pub const FLASH_WRITE_START: u32 = 0x0000_0000;
 
-/// The DA-side start addresses this crate refuses to write at.
+/// The DA-side start addresses this crate refuses to write at: none.
 ///
-/// The two candidates of the paragraph above, `0` and `0x0020_0000`. While both
-/// are listed, [`check_layout`] refuses a write at either: the constant cannot
-/// be "fixed" by swapping in one of them, only by a change to this list, and
-/// that change has to cite the hardware row that settled which one is right.
-/// Emptying the list is the act the documentation calls for, so it is one
-/// visible edit rather than a silently different constant.
-pub const UNRESOLVED_STARTS: [u32; 2] = [0x0000_0000, 0x0020_0000];
+/// This held the two candidates while the address was unresolved. The 2026-11-21
+/// read settled it at `0` (see [`FLASH_WRITE_START`] and
+/// `docs/dev/05-verification.md` §1), so the list is empty. It stays in the
+/// gate: [`check_layout`] refuses every write when the list is non-empty, so
+/// re-adding a candidate closes the gate again instead of being a comment.
+pub const UNRESOLVED_STARTS: [u32; 0] = [];
 
 /// Bytes this driver writes: the V1.13 image size.
 ///
@@ -355,8 +370,9 @@ pub const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// `measured elsewhere:` `docs/dev/03-hardware-facts.md` "Firmware base, BootROM
 /// view": `0x00200000` returns the vector table `18 f0 9f e5 …`. This is the
 /// known-intact marker [`DownloadAgent::verify_device`] reads before anything
-/// is recorded or erased, and the marker [`DownloadAgent::read_range`] uses to
-/// decide which of the two DA-side bases holds the image.
+/// is recorded or erased, and the marker `fw probe-da` compares at each of its
+/// candidates. On 2026-11-21 it matched at DA address `0` and did not match at
+/// DA address `0x0020_0000` (see [`FLASH_WRITE_START`]).
 pub const VECTOR: [u8; 4] = [0x18, 0xF0, 0x9F, 0xE5];
 
 /// Bytes in `DA_v3.8.4.bin`.
@@ -432,11 +448,20 @@ pub const DA_LOAD_CHUNK: usize = m241_core::protocol::brom::WRITE_CHUNK;
 
 /// The two addresses a `0xD6` probe reads, and the only two.
 ///
-/// The two candidates [`UNRESOLVED_STARTS`] lists — the DA-side base of the
-/// firmware image, as the two documents of the module header name it. `0` is
-/// where `m241_core::protocol::brom::BASE_ADDR_FIRMWARE_M3318` says the DA sees
-/// the flash; `0x0020_0000` is `docs/reference/01-da-protocol.md` §4.2's base.
-pub const PROBE_ADDRESSES: [u32; 2] = UNRESOLVED_STARTS;
+/// The probe is a read-only diagnostic, so it still reads both former
+/// candidates after the start was settled: `0` is the DA-side base
+/// ([`FLASH_WRITE_START`]) and `0x0020_0000` is the BootROM-side base, which
+/// does not return the image in the DA's view. The 2026-11-21 run is what
+/// established that difference. Keeping both means a later unit can be compared
+/// with this one, and no caller chooses the address. `0` is where
+/// `m241_core::protocol::brom::BASE_ADDR_FIRMWARE_M3318` says the DA sees the
+/// flash; `0x0020_0000` is the BootROM-side base recorded in
+/// `docs/reference/01-da-protocol.md` §6 (driver vtable `+0x38`), which does not
+/// return the image through the DA.
+///
+/// Deliberately **not** derived from [`UNRESOLVED_STARTS`]: that list is empty
+/// now, while the probe must keep reading both addresses.
+pub const PROBE_ADDRESSES: [u32; 2] = [0x0000_0000, 0x0020_0000];
 
 /// The whole of `fw probe-da`'s read path: one `0xD6` page at each candidate.
 ///
@@ -461,9 +486,9 @@ pub fn read_candidates<T: Transport>(
 ///
 /// A host-chosen value, not a protocol one — `docs/reference/01-da-protocol.md`
 /// §4.3 records that even `0xD5`'s length has no maximum in the DA, and §7 item 4
-/// leaves `0xD6`'s emitted page size unmeasured. 64 is small enough that a page
-/// that goes wrong costs one retry and large enough to carry a vector table and
-/// its neighbours.
+/// leaves `0xD6`'s emitted page size unmeasured for any other argument. 64 is
+/// small enough that a page that goes wrong costs one retry and large enough to
+/// carry a vector table and its neighbours.
 ///
 /// The value being even is **not** a `0xD6` requirement. The read page's
 /// checksum is a byte sum (§4.4, [`byte_sum`]) and the serialiser pads the page
@@ -471,7 +496,10 @@ pub fn read_candidates<T: Transport>(
 /// write path's payload (`0xD5`, `0xA1`), not to this page. §5.5 does not even
 /// say whether the DA accepts an odd page length, so the number of choice that
 /// a caller may raise to 128 is "who chooses it", not "which values are legal".
-/// 未検証: the page size the DA actually emits for this argument.
+///
+/// Measured on 2026-11-21: with this argument the DA emitted 64 data bytes plus
+/// the two-byte big-endian trailer. The size for other arguments, and the
+/// advance after the final page of a multi-page read, are 未検証.
 pub const PROBE_PAGE_SIZE: usize = 64;
 
 /// How many times one `0xD6` page with a bad checksum is asked for again.
@@ -1089,8 +1117,9 @@ impl PendingWrite {
     /// and the read that needs it cannot happen on different ports.
     ///
     /// `da_start` is the address the write used ([`Self::start`]); the BootROM
-    /// read is at `BASE_ADDR_FIRMWARE + da_start`. ⚠️ 未検証 that mapping — see
-    /// [`FLASH_WRITE_START`].
+    /// read is at `BASE_ADDR_FIRMWARE + da_start`. The mapping was settled on
+    /// 2026-11-21: DA address `0` holds the image the BootROM reads at
+    /// `0x0020_0000` — see [`FLASH_WRITE_START`].
     ///
     /// `prepare` puts the chip back where a BootROM read works. On a unit that
     /// is the re-entry route (`--assume-brom`, or power-cycle); in a test it is
@@ -1249,13 +1278,12 @@ impl<T: Transport> DownloadAgent<T> {
     /// rather than a protocol one.
     ///
     /// The line is cleared before the command goes out: a byte that arrived
-    /// earlier cannot be this command's answer. Whether the DA emits any
-    /// trailing bytes after its [`DA_REPORT_SIZE`] report or leading bytes
-    /// before the first page is ⚠️ 未検証 (not yet recorded in
-    /// `docs/dev/05-verification.md`), so stale bytes are treated defensively
-    /// on either side of the command: when a page fails its checksum,
-    /// [`Self::read_page`] also clears the line before asking for it again,
-    /// so leftover prefix bytes cannot shift every retry.
+    /// earlier cannot be this command's answer. The 2026-11-21 run left four
+    /// bytes on the line after the twenty-byte report and before the first page;
+    /// their origin is not established (`docs/dev/05-verification.md` §1), so
+    /// stale bytes are treated defensively on either side of the command: when a
+    /// page fails its checksum, [`Self::read_page`] also clears the line before
+    /// asking for it again, so leftover prefix bytes cannot shift every retry.
     ///
     /// # Errors
     ///
@@ -1279,11 +1307,10 @@ impl<T: Transport> DownloadAgent<T> {
                 ))
             })?;
         let pages = length / PROBE_PAGE_SIZE;
-        // Anything already on the line belongs to an earlier exchange. Whether
-        // the DA emits trailing bytes after its twenty-byte report is
-        // ⚠️ 未検証 (not yet recorded in `docs/dev/05-verification.md`), so
-        // drain defensively before sending 0xD6 in case stale bytes sit ahead
-        // of the first page.
+        // Anything already on the line belongs to an earlier exchange. The
+        // 2026-11-21 run left four bytes after the twenty-byte report, ahead of
+        // the first page, so drain defensively before sending 0xD6 in case
+        // stale bytes sit there.
         self.transport.clear_input()?;
         let mut frame = Vec::with_capacity(13);
         frame.push(OPCODE_READ_RANGE);
@@ -1387,7 +1414,9 @@ impl<T: Transport> DownloadAgent<T> {
     ///
     /// The BootROM addresses flash at [`BASE_ADDR_FIRMWARE`]; a DA address is
     /// the same flash as seen from zero, so the read adds the BootROM base back.
-    /// ⚠️ 未検証 that mapping: see [`FLASH_WRITE_START`].
+    /// The 2026-11-21 read settled that mapping: DA address `0` returned the
+    /// vector `18 F0 9F E5` and the vendor image's first 64 bytes, which is the
+    /// image the BootROM reads at `0x0020_0000` (see [`FLASH_WRITE_START`]).
     ///
     /// # Errors
     ///
@@ -1441,6 +1470,11 @@ impl<T: Transport> DownloadAgent<T> {
     /// the device check still cannot write an image that changes anything
     /// outside [`PATCH_OFFSETS`].
     ///
+    /// The device check is the caller's: `write` does not call
+    /// [`Self::verify_device`]. The CLI design runs it against `--backup` before
+    /// opening the DA; a library caller that skips it has only [`check_image`],
+    /// which compares the image with the backup file, not with the unit.
+    ///
     /// `confirmation` is required and checked: a token whose flag was never set
     /// is [`Error::Safety`]. Nothing about the type forces a caller to build it
     /// from a prompt, but every route into this function names the step.
@@ -1474,9 +1508,9 @@ impl<T: Transport> DownloadAgent<T> {
     /// The write with an explicit start, used by [`Self::write`] and the tests.
     ///
     /// Private. [`Self::write`] is the only non-test caller and it runs
-    /// [`check_layout`] first, which refuses the start address this crate cannot
-    /// establish, so a release build has no reachable way to write at a range a
-    /// caller chooses. **Every** write goes through the checks in this function:
+    /// [`check_layout`] first, which accepts only the settled `0`, so a release
+    /// build has no reachable way to write at a range a caller chooses.
+    /// **Every** write goes through the checks in this function:
     /// [`check_image`] against `backup`, which is `AGENTS.md` §2.3's rule, so
     /// `0xD3` cannot go out for a buffer that was never compared with the user's
     /// own dump.
@@ -1767,24 +1801,27 @@ pub fn byte_sum(data: &[u8]) -> u16 {
 /// Refuse unless the range constants are the values the safety rules pin.
 ///
 /// `AGENTS.md` §2.2 and `docs/dev/11-safety-review.md` review items 1 and 2:
-/// the range must be a hard-coded constant, it must be refused when it is
-/// anything else, and it must not include address zero — `0xD5` erases every
-/// sector the range touches (`0x0010251C`–`0x00102560`), so a range starting at
-/// zero destroys the reset vector.
+/// the range must be a hard-coded constant, and it must be refused when it is
+/// anything else. The start was settled at `0` by the 2026-11-21 read through
+/// the DA's own view (`docs/dev/05-verification.md` §1), and
+/// [`UNRESOLVED_STARTS`] is empty. This function is the gate: it passes only
+/// while that list is empty, the pinned start is the settled `0`, and the length
+/// is [`FLASH_WRITE_LENGTH`]. A non-empty list closes the gate again, and so
+/// does any other start — `0x0020_0000` is the BootROM's view and does not
+/// return the image through the DA (consistent with an unmapped bus).
 ///
-/// The start address is unresolved (see the module documentation). This
-/// function is where that is enforced, and it refuses **both** candidates in
-/// [`UNRESOLVED_STARTS`]: `0` covers the reset vector outright, and
-/// `0x0020_0000` is the address the protocol document names but no read through
-/// the DA's view has confirmed. A write starts only when the constant is not in
-/// that list, which means the list has to be changed on purpose, with the
-/// hardware row that settled it.
+/// The range does include address zero, which is where the DA sees the image
+/// begin. `0xD5` erases every sector the range touches
+/// (`0x0010251C`–`0x00102560`), so the reset vector is erased and reprogrammed
+/// with the rest; [`check_image`] and [`DownloadAgent::verify_device`] are what
+/// require those bytes to be the unit's own backup.
 ///
 /// # Errors
 ///
-/// [`Error::Safety`] when the start is one of [`UNRESOLVED_STARTS`], when any
-/// pinned value has moved, or when the patch table and the readers that define
-/// it disagree.
+/// [`Error::Safety`] when [`UNRESOLVED_STARTS`] is non-empty, when the pinned
+/// start is not the settled `0`, when the write start is not that pin, when any
+/// other pinned value has moved, or when the patch table and the readers that
+/// define it disagree.
 pub fn check_layout() -> Result<()> {
     check_layout_of(
         FLASH_WRITE_START,
@@ -1794,14 +1831,21 @@ pub fn check_layout() -> Result<()> {
     )
 }
 
+/// The DA-side base the 2026-11-21 hardware read settled: `0x0000_0000`.
+///
+/// `docs/dev/05-verification.md` §1 records the run: a `0xD6` read at this
+/// address returned the vector `18 F0 9F E5` and the vendor image's first 64
+/// bytes, while `0x0020_0000` returned `02 02 20 42`, consistent with an
+/// unmapped bus. A change to this constant needs a new row in that section.
+const SETTLED_WRITE_START: u32 = 0x0000_0000;
+
 /// The pinned start, in one place so a test can compare it with the constant.
 ///
-/// `check_layout` used to keep this as a local, which meant "the pin and the
-/// shipped constant agree" was only observable through the refusal message —
-/// and the unresolved-address stage refuses the shipped start first, so moving
-/// this value to the other candidate changed nothing a test could see. Naming
-/// it is what makes the pin checkable; the refusal logic is unchanged.
-const EXPECTED_WRITE_START: u32 = 0x0000_0000;
+/// It is the settled `0`, not a candidate. [`check_layout_of`] refuses a pin
+/// that moves away from [`SETTLED_WRITE_START`] before it compares the shipped
+/// constant, so editing this value alone cannot turn the BootROM's view into
+/// "the pinned range".
+const EXPECTED_WRITE_START: u32 = SETTLED_WRITE_START;
 
 /// The pinned image length, for the same reason.
 const EXPECTED_WRITE_LENGTH: usize = 0x0006_345C;
@@ -1810,47 +1854,57 @@ const EXPECTED_WRITE_LENGTH: usize = 0x0006_345C;
 ///
 /// Test-only, so a test can vary *one* of the four numbers and see which rule
 /// refuses it. The public entry point hard-codes both pairs, so no caller can
-/// choose a range: this exists because the stages overlap on the shipped
-/// values — the shipped start is in [`UNRESOLVED_STARTS`], so the second stage
-/// refuses it before the "is it the expected value" stage is ever asked.
+/// choose a range.
 fn check_layout_of(
     write_start: u32,
     write_length: usize,
     expected_start: u32,
     expected_length: usize,
 ) -> Result<()> {
-    // The expected start is a candidate, not a decision: if someone edits it to
-    // the other candidate alone, the write is still refused here rather than
-    // becoming "the pinned range". Only emptying `UNRESOLVED_STARTS` unlocks a
-    // write, and that is the edit the hardware row has to justify.
-    if !UNRESOLVED_STARTS.contains(&expected_start) {
+    // A non-empty list means an address is unresolved again. Refusing whichever
+    // value the list holds keeps the gate shut without choosing a candidate.
+    if !UNRESOLVED_STARTS.is_empty() {
         return Err(Error::Safety {
             reason: format!(
-                "the expected write start 0x{expected_start:08X} is not one of the unresolved \
-                 candidates 0x{UNRESOLVED_STARTS:08X?}; the expected start may only be a candidate \
-                 until docs/dev/05-verification.md settles it"
+                "the DA-side write start is unresolved again: UNRESOLVED_STARTS is \
+                 0x{UNRESOLVED_STARTS:08X?}. The 2026-11-21 read settled it at \
+                 0x{SETTLED_WRITE_START:08X} (docs/dev/05-verification.md §1); refusing every \
+                 write until a new hardware row settles the list"
             ),
         });
     }
 
-    if UNRESOLVED_STARTS.contains(&write_start) {
+    // The pin is the settled value, not a candidate. Moving it is refused here,
+    // so editing it to the BootROM's 0x0020_0000 cannot turn into a shipped
+    // range.
+    if expected_start != SETTLED_WRITE_START {
         return Err(Error::Safety {
             reason: format!(
-                "the write range starts at 0x{write_start:08X}, which is one of the DA-side \
-                 addresses 0x{UNRESOLVED_STARTS:08X?} nobody has established by reading the DA's \
-                 own view. If the image begins at DA address 0, a 0xD5 over this range erases the \
-                 reset vector and the unit stops booting. This driver refuses every write until \
-                 docs/dev/05-verification.md settles which address the DA uses — see the module \
-                 documentation, \"The start address is unresolved\"",
+                "the expected write start 0x{expected_start:08X} is not the settled DA-side base \
+                 0x{SETTLED_WRITE_START:08X} (docs/dev/05-verification.md §1); the pin may not \
+                 move without a new hardware row"
             ),
         });
     }
-    if write_start != expected_start || write_length != expected_length {
+
+    // Every other start is refused, including the BootROM's 0x0020_0000: the
+    // DA does not return the image at that address.
+    if write_start != expected_start {
         return Err(Error::Safety {
             reason: format!(
-                "the write range is 0x{write_start:08X}+0x{write_length:X}, not the \
-                 expected 0x{expected_start:08X}+0x{expected_length:X}; refusing to write an \
-                 unpinned range"
+                "the write range starts at 0x{write_start:08X}, not the settled DA-side base \
+                 0x{expected_start:08X}. The image begins at DA address 0; 0x0020_0000 is the \
+                 BootROM's view and reads 02 02 20 42 through the DA, consistent with an \
+                 unmapped bus (docs/dev/05-verification.md §1). Refusing to write an unpinned \
+                 range"
+            ),
+        });
+    }
+    if write_length != expected_length {
+        return Err(Error::Safety {
+            reason: format!(
+                "the write range is 0x{write_start:08X}+0x{write_length:X}, not the settled \
+                 0x{expected_start:08X}+0x{expected_length:X}; refusing to write an unpinned range"
             ),
         });
     }
@@ -1976,19 +2030,14 @@ mod tests {
 
     use crate::simulator::{FakeDa, Modelled, enter_download_agent};
 
-    /// The start address the tests drive the wire with.
+    /// The start address the protocol tests drive the wire with.
     ///
-    /// ⚠️ **Not established on hardware, and deliberately not the shipped
-    /// constant.** Whether the image begins at DA address `0` or at
-    /// `0x0020_0000` decides whether `0xD5` erases the reset vector, and no read
-    /// through the DA's linear view has been made. The shipped constant is
-    /// therefore refused by [`check_layout`]; these bytes only exercise the
-    /// protocol on the fake.
-    ///
-    /// `0x4000` is also chosen so the fake's "nothing recorded" pair `(0, 0)`
-    /// can never be mistaken for this range: if it were `0`, a test asserting
-    /// `recorded_range() == (0, 0)` after a refusal would pass whether or not
-    /// the refusal was recorded.
+    /// Deliberately not the shipped constant. `0x4000` keeps the fake's
+    /// "nothing recorded" pair `(0, 0)` distinguishable from a recorded range,
+    /// so a test asserting `recorded_range() == (0, 0)` after a refusal cannot
+    /// pass because the range itself started at zero. The public `write` path is
+    /// covered with the settled `0` in
+    /// `the_shipped_write_path_opens_the_settled_range_and_verifies`.
     const WIRE_START: u32 = 0x0000_4000;
     /// The inclusive end of the test range.
     const WIRE_END: u32 = WIRE_START + (FLASH_WRITE_LENGTH as u32 - 1);
@@ -2098,128 +2147,137 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_start_is_zero_and_the_layout_check_refuses_it() {
-        // The safety rule has no exception: this range includes address zero,
-        // so the gate refuses it. A comment promising not to use it would not.
+    fn the_shipped_start_is_zero_and_the_layout_check_accepts_it() {
+        // The 2026-11-21 DA read settled the base at 0 (05-verification §1):
+        // a `0xD6` at 0 returns the vector and the vendor image's first 64
+        // bytes, and 0x00200000 returns `02 02 20 42`, consistent with an
+        // unmapped bus.
         assert_eq!(FLASH_WRITE_START, 0x0000_0000);
+        assert_eq!(FLASH_WRITE_START, SETTLED_WRITE_START);
         assert_eq!(FLASH_WRITE_LENGTH, 0x0006_345C);
         assert_eq!(FLASH_WRITE_LENGTH, 406_620);
         assert_eq!(FLASH_WRITE_LENGTH, PROFILE_V1_13.size);
         assert_eq!(FLASH_WRITE_END, 0x0006_345B);
-        let err = check_layout().expect_err("start 0 must be refused");
-        assert!(matches!(err, Error::Safety { .. }), "got {err}");
-        assert!(format!("{err}").contains("reset vector"), "got {err}");
-    }
-
-    #[test]
-    fn the_layout_check_refuses_both_unresolved_starts() {
-        // The start address is not established. `0` covers the reset vector;
-        // `0x0020_0000` is the address `01-da-protocol.md` §4.2 names but no
-        // read through the DA's view confirms. Whichever one the constant
-        // carried, a write must be refused — swapping the constant is exactly
-        // the edit that would otherwise turn "refused" into "shipped".
-        assert_eq!(
-            UNRESOLVED_STARTS,
-            [0x0000_0000, 0x0020_0000],
-            "both candidates must stay listed; removing one is the act the hardware row has to justify"
-        );
-        for start in UNRESOLVED_STARTS {
-            assert!(
-                check_layout().is_err() || start != FLASH_WRITE_START,
-                "start 0x{start:08X} must not pass check_layout"
-            );
-        }
-        // The shipped constant is in the list, which is what makes the gate
-        // refuse. If someone sets FLASH_WRITE_START to the other candidate,
-        // this assertion still holds because the other candidate is listed too.
-        assert!(UNRESOLVED_STARTS.contains(&FLASH_WRITE_START));
-        // A start that is not in the list and not the pinned value is refused
-        // by the second gate, so there is no third address that slips through.
-        assert_ne!(WIRE_START, FLASH_WRITE_START);
         assert!(
-            !UNRESOLVED_STARTS.contains(&WIRE_START),
-            "the test's own start is deliberately outside the candidates"
+            UNRESOLVED_STARTS.is_empty(),
+            "the list is empty only because 05-verification.md §1 records the read"
         );
+        check_layout().expect("the settled range must pass the layout gate");
     }
 
     #[test]
-    fn the_pinned_start_is_the_shipped_start_and_not_the_other_candidate() {
-        // The pin and the shipped constant are two numbers that must agree. Only
-        // the unresolved-address stage refuses the shipped start, and it accepts
-        // *both* candidates, so moving the pin to the other one changes no
-        // refusal anywhere — which is why this has to be stated, not deduced
-        // from an error message.
-        assert_eq!(
-            EXPECTED_WRITE_START, FLASH_WRITE_START,
-            "the pin must be the shipped start, not the other candidate"
-        );
-        assert_eq!(EXPECTED_WRITE_LENGTH, FLASH_WRITE_LENGTH);
-        assert_eq!(EXPECTED_WRITE_LENGTH, PROFILE_V1_13.size);
+    fn the_layout_check_refuses_an_unsettled_start() {
+        // `0x0020_0000` is the BootROM's view of the image, and the DA does
+        // not return the image there (consistent with an unmapped bus). A
+        // write at that address would erase and program the wrong sectors.
+        // The probe still reads it, but the write gate does not accept it.
+        assert_eq!(PROBE_ADDRESSES[0], FLASH_WRITE_START);
+        assert_eq!(PROBE_ADDRESSES[1], 0x0020_0000);
 
-        // And the same disagreement, seen through the function: a write start
-        // that is not the pin is refused by the pinned-value stage.
+        let err = check_layout_of(
+            0x0020_0000,
+            FLASH_WRITE_LENGTH,
+            EXPECTED_WRITE_START,
+            EXPECTED_WRITE_LENGTH,
+        )
+        .expect_err("the BootROM view is not the DA-side base");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        assert!(format!("{err}").contains("unpinned range"), "got {err}");
+        assert!(format!("{err}").contains("0x00000000"), "got {err}");
+        assert!(format!("{err}").contains("0x00200000"), "got {err}");
+
+        // A start that is neither the settled value nor the other view is
+        // refused by the same rule, so there is no third address that slips
+        // through.
         let err = check_layout_of(
             WIRE_START,
             FLASH_WRITE_LENGTH,
             EXPECTED_WRITE_START,
             EXPECTED_WRITE_LENGTH,
         )
-        .expect_err("a write start that is not the pin must be refused");
+        .expect_err("a third start");
+        assert!(format!("{err}").contains("unpinned range"), "got {err}");
+    }
+
+    #[test]
+    fn the_pinned_start_is_the_shipped_start_and_the_settled_zero() {
+        // The pin and the shipped constant are two numbers that must agree, and
+        // both must be the value the hardware row settled.
+        assert_eq!(SETTLED_WRITE_START, 0x0000_0000);
+        assert_eq!(EXPECTED_WRITE_START, SETTLED_WRITE_START);
+        assert_eq!(
+            EXPECTED_WRITE_START, FLASH_WRITE_START,
+            "the pin must be the shipped start, not the BootROM's view"
+        );
+        assert_eq!(EXPECTED_WRITE_LENGTH, FLASH_WRITE_LENGTH);
+        assert_eq!(EXPECTED_WRITE_LENGTH, PROFILE_V1_13.size);
+
+        // The pin drifting to the BootROM view is refused before the shipped
+        // constant is compared.
+        let err = check_layout_of(
+            FLASH_WRITE_START,
+            FLASH_WRITE_LENGTH,
+            0x0020_0000,
+            FLASH_WRITE_LENGTH,
+        )
+        .expect_err("a pin at the other view");
         assert!(
-            format!("{err}").contains("unpinned range"),
-            "the pinned-value rule must refuse it: {err}"
+            format!("{err}").contains("settled DA-side base"),
+            "the pin rule must name the settled base: {err}"
         );
     }
 
     #[test]
     fn a_pinned_range_that_disagrees_is_refused_on_its_own() {
-        // The shipped start is in `UNRESOLVED_STARTS`, so `check_layout` refuses
-        // it at that stage and never reaches "is it the expected value". A test
-        // that only calls `check_layout` therefore cannot see a wrong
-        // `expected_start`: moving it to the other candidate changes the *first*
-        // stage's message, which still looks like a refusal.
-        //
-        // `check_layout_of` is asked directly, with the shipped start as the
-        // expected value — the one case where stage three would agree — and then
-        // with a candidate as the expected value and the shipped start as the
-        // write. The first call must be refused (the shipped start is still on
-        // the list); the second must be refused by the *pinned-value* stage. If
-        // `expected_start` inside `check_layout` ever drifts, the shipped
-        // constant and the pin stop matching. This test covers the refusal
-        // path; the pin itself is compared with the shipped value in
-        // `the_pinned_start_is_the_shipped_start_and_not_the_other_candidate`.
+        // The gate opens for exactly one range: the settled start and the
+        // pinned length. Vary each number in turn and check the stage that owns
+        // it refuses, so a drift in any one cannot hide behind another.
         let length = FLASH_WRITE_LENGTH;
-        let shipped = FLASH_WRITE_START;
+        let start = FLASH_WRITE_START;
+        check_layout_of(start, length, EXPECTED_WRITE_START, EXPECTED_WRITE_LENGTH)
+            .expect("the settled range passes");
 
-        let err = check_layout_of(shipped, length, shipped, length)
-            .expect_err("the shipped start is a candidate");
+        let err = check_layout_of(
+            start,
+            length + 2,
+            EXPECTED_WRITE_START,
+            EXPECTED_WRITE_LENGTH,
+        )
+        .expect_err("a longer range");
+        assert!(format!("{err}").contains("unpinned range"), "got {err}");
+
+        let err = check_layout_of(start, length, 0x0020_0000, length).expect_err("a moved pin");
         assert!(
-            format!("{err}").contains("DA-side"),
-            "the shipped start must be refused by the unresolved-address rule: {err}"
+            format!("{err}").contains("settled DA-side base"),
+            "got {err}"
         );
 
-        // The pin, cross-checked: whichever candidate `check_layout` uses as its
-        // expected start, the shipped constant is the other one and the refusal
-        // must name the shipped address.
-        for expected in UNRESOLVED_STARTS {
-            let err = check_layout_of(WIRE_START, length, expected, length)
-                .expect_err("a write start that is not the expected one must be refused");
-            assert!(
-                format!("{err}").contains("unpinned range"),
-                "a mismatched pair must be refused by the pinned-value rule: {err}"
-            );
-        }
+        let err = check_layout_of(
+            0x0020_0000,
+            length,
+            EXPECTED_WRITE_START,
+            EXPECTED_WRITE_LENGTH,
+        )
+        .expect_err("the BootROM view");
+        assert!(format!("{err}").contains("unpinned range"), "got {err}");
     }
 
     #[test]
-    fn the_layout_check_names_the_unresolved_address_in_its_refusal() {
-        // The message has to say *why* the shipped constant is refused, so a
-        // reader does not "fix" it by pointing at the wrong value. It must not
+    fn the_layout_check_names_the_settled_base_in_its_refusal() {
+        // The message has to say *why* another start is refused, so a reader
+        // does not "fix" it by pointing at the BootROM's view. It must not
         // depend on the item number in `11-safety-review.md`, which can be
         // renumbered.
-        let err = check_layout().expect_err("the shipped constant is a candidate");
+        let err = check_layout_of(
+            0x0020_0000,
+            FLASH_WRITE_LENGTH,
+            EXPECTED_WRITE_START,
+            EXPECTED_WRITE_LENGTH,
+        )
+        .expect_err("the BootROM view is refused");
         let text = format!("{err}");
-        assert!(text.contains("DA-side"), "got {text}");
+        assert!(text.contains("0x00000000"), "got {text}");
+        assert!(text.contains("0x00200000"), "got {text}");
         assert!(text.contains("05-verification.md"), "got {text}");
         assert!(
             !text.contains("review item"),
@@ -2228,21 +2286,31 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_write_path_never_reaches_the_wire() {
-        // `write` runs `check_layout` first, so with the shipped constant it
-        // must fail before the fake sees a byte.
+    fn the_shipped_write_path_opens_the_settled_range_and_verifies() {
+        // The gate passes only because 05-verification §1 settled the start at
+        // 0. Drive the public `write` (not the test-only `write_range`) so the
+        // range on the wire is the shipped one, and verify it through the
+        // BootROM view.
         let backup = stock_image();
-        let mut da = DownloadAgent::new(fake_in_da(&backup));
-        let err = da
-            .write(Confirmation::granted(), &backup, &patched_image())
-            .expect_err("the shipped start is refused");
-        assert!(matches!(err, Error::Safety { .. }), "got {err}");
-        let device = da.transport_mut();
-        assert_eq!(device.accepted_packets(), 0);
-        assert!(
-            !device.wrote_an_empty_range(),
-            "no 0xD5 may arrive without a 0xD3"
+        let image = patched_image();
+        let mut device = FakeDa::with_firmware(&backup);
+        let report = enter_download_agent(&mut device);
+        assert_eq!(report.first().copied(), Some(0xC0), "the DA banner");
+        let mut da = DownloadAgent::new(device);
+        let pending = da
+            .write(Confirmation::granted(), &backup, &image)
+            .expect("the settled range passes check_layout");
+        assert_eq!(pending.start, 0);
+        assert_eq!(
+            da.transport_mut().recorded_range(),
+            (0, FLASH_WRITE_END),
+            "0xD3 records the settled range"
         );
+        let report = pending
+            .verify_written(da, &image, FLASH_WRITE_START, reenter)
+            .expect("read back through the BootROM view");
+        assert_eq!(report.start, 0);
+        assert_eq!(report.verified, FLASH_WRITE_LENGTH);
     }
 
     #[test]
@@ -2855,7 +2923,7 @@ mod tests {
         let mut rom = MtkBootRom::new(in_bootrom(fake_in_da(&not_an_m241)));
         rom.sync().expect("sync");
         let err = DownloadAgent::verify_device_at(&mut rom, &not_an_m241, WIRE_START)
-            .expect_err("unmapped bus");
+            .expect_err("a vector table that is not an M-241 image");
         assert!(matches!(err, Error::Safety { .. }), "got {err}");
         assert!(format!("{err}").contains("vector table"), "got {err}");
     }
@@ -2976,9 +3044,13 @@ mod loader_tests {
             (0x49, 0x00C2, 0x22BA)
         );
         assert_eq!(PROBE_ADDRESSES, [0x0000_0000, 0x0020_0000]);
+        assert!(
+            UNRESOLVED_STARTS.is_empty(),
+            "the start was settled at 0 by the 2026-11-21 run"
+        );
         assert_eq!(
-            PROBE_ADDRESSES, UNRESOLVED_STARTS,
-            "the probe reads the two candidates and no third address"
+            PROBE_ADDRESSES[0], FLASH_WRITE_START,
+            "the probe's first candidate is the settled DA-side base"
         );
         assert_eq!(PROBE_PAGE_SIZE, 64);
         assert_eq!((DA_REPORT_SIZE, DA_REPORT_MARKER), (20, 0xC0));

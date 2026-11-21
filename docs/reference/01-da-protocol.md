@@ -510,6 +510,16 @@ trailer** described in 4.4. After each page the host must send one byte: `0x5A`
 to advance, `0xA5` to retry the same page. Any other byte is ignored and the DA
 keeps waiting. Nothing is sent when the range is complete.
 
+**Measured through the DA (2026-11-21, one page):** with a 64-byte page-length
+argument the DA emitted 64 data bytes followed by the two-byte big-endian
+checksum, 66 bytes in total. The trailer of the page read at DA address `0` was
+`0x17FF`, equal to the sum of its 64 bytes. Four bytes remained on the line
+after the 20-byte banner and before that first page; their origin was not
+established. The client drains the line before sending `0xD6`, so the page
+starts where the frame expects it. Multi-page ranges were not read: the advance
+between pages, the advance after the **last** page, and anything the DA sends
+between pages remain unmeasured. See `docs/dev/05-verification.md` §1.2.
+
 ### 5.6 `0xD5` — write
 
 `FUN_001024B8`, `0x001024B8`–`0x001028E4`. Argument: one big-endian `u32`
@@ -645,8 +655,11 @@ Recorded honestly rather than guessed.
 3. **`0xDA`'s half-word.** The value sent is a stale register. No caller was
    found that sets it deliberately.
 4. **`0xD6`'s page length on hardware.** The argument is passed to an unsigned
-   division that mixes it with the total length; the page size the DA actually
-   emits for a given argument triple has not been measured.
+   division that mixes it with the total length. One measurement exists: a
+   64-byte page-length argument emitted 64 data bytes plus the two-byte
+   checksum (66 bytes) on 2026-11-21. The size emitted for any other argument,
+   the advance between pages, and the advance after the final page of a
+   multi-page read are still unmeasured (`docs/dev/05-verification.md` §1.2).
 5. **Whether any command computes a per-range checksum for the host to compare.**
    The only checksums found are the packet trailer and the DA's own read-back
    verification in 4.4. `0xD4`, which earlier notes called a checksum, is an
