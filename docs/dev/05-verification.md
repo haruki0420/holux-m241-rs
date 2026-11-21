@@ -29,6 +29,23 @@ The measured dump's SHA-256 differs per unit because the image contains
 per-unit runtime fields; compare against your own backup, never against a
 figure on this page.
 
+A **settlement row** for the DA-side firmware base is the only row that may
+justify emptying `UNRESOLVED_STARTS`. It must contain at least:
+
+* the exact `fw probe-da` command line that ran, including the resolved
+  `--port` and the `--da` path;
+* what `0xD6` returned at **both** candidates, `0` and `0x00200000` — a failed
+  read is recorded as "not read", never as a mismatch;
+* whether the first four bytes at the adopted base are `18 F0 9F E5`;
+* the base adopted, and why the other candidate was excluded;
+* the date;
+* an explicit statement that the run wrote no flash (DA load into RAM only).
+
+The `Flash write through the DA … ✅` row above is the earlier manual flash.
+It is **not** a settlement row: it records no `fw probe-da` run and says
+nothing about which base the DA uses, so it cannot justify emptying
+`UNRESOLVED_STARTS`.
+
 ### 1.2 The DA-side base read (2026-11-21)
 
 Device: the same retail M-241. Host: Linux, `/dev/ttyUSB0` (USB serial).

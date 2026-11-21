@@ -28,7 +28,7 @@ use m241_core::firmware::profiles::{PROFILE_V1_13, identify};
 use m241_core::firmware::{FirmwareImage, patch};
 use m241_core::log::{block, export, parse_dump};
 use m241_core::protocol::brom::{BASE_ADDR_FIRMWARE, MtkBootRom};
-use m241_core::protocol::pmtk::{PmtkClient, StreamState};
+use m241_core::protocol::pmtk::{EntryTiming, PmtkClient, StreamState};
 use m241_core::protocol::simulator::{FakeDevice, Mode};
 use m241_core::{ExportFormat, Track};
 
@@ -126,10 +126,17 @@ fn pmtk180_then_the_bootrom_sync_then_a_firmware_dump() {
     // The shape of `m241 fw dump`, with the PMTK client handing the transport to
     // the BootROM client exactly as the CLI will.
     let image = stock_image();
+    // Two sentences: the probe consumes one, the drain before `$PMTK180` gets
+    // the other, and the fake's switch then silences the line for the watch.
     let device = FakeDevice::new().with_firmware(&image).with_nmea(2);
+    // `EntryTiming::fast()` for the same reason the unit tests use it: the real
+    // 350/200/500 ms windows are exercised on hardware, not in the test suite,
+    // and a real window here would make this one test cost a second. The values
+    // are not zero; `EntryTiming::fast` says why.
     let mut client = PmtkClient::new(device)
         .with_stream_window(Duration::from_millis(50))
-        .with_reply_timeout(Duration::from_millis(500));
+        .with_reply_timeout(Duration::from_millis(500))
+        .with_entry_timing(EntryTiming::fast());
 
     client.enter_bootrom().expect("the stream is live");
     let mut brom = MtkBootRom::new(client.into_transport());
@@ -271,7 +278,8 @@ fn the_simulator_does_not_pulse_the_control_lines_for_the_pmtk_route() {
     let device = FakeDevice::new().with_nmea(2);
     let mut client = PmtkClient::new(device)
         .with_stream_window(Duration::from_millis(50))
-        .with_reply_timeout(Duration::from_millis(500));
+        .with_reply_timeout(Duration::from_millis(500))
+        .with_entry_timing(EntryTiming::fast());
     client.enter_bootrom().expect("entry");
     assert!(
         !client.transport_mut().control_lines(),

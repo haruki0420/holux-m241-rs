@@ -245,12 +245,16 @@ fn enter_bootrom(assume_brom: bool, session: Session<'_>, port: &str) -> Result<
     }
 
     let mut client = link::open_pmtk(session.links, port, session.timings)?;
-    match client.probe_stream()? {
+    // One probe only. `enter_bootrom_after` takes the answer rather than probing
+    // again: a second probe reads a line the first one has already started to
+    // drain, and the hand-over is timing-sensitive enough that it matters.
+    let state = client.probe_stream()?;
+    match state {
         StreamState::Streaming => {
             session
                 .console
                 .note("NMEA is streaming; sending $PMTK180 to hand over to the BootROM");
-            client.enter_bootrom()?;
+            client.enter_bootrom_after(state)?;
             Ok(client.into_transport())
         }
         StreamState::Silent => {
@@ -2042,6 +2046,25 @@ mod tests {
 
         let record = record.borrow();
         assert_no_destructive_opcode(&record);
+        assert!(
+            record.pmtk180,
+            "the stream was live, so the sentence went out"
+        );
+        assert_eq!(
+            record.nmea_after, 0,
+            "the fake switches on the sentence, so nothing may stream after it"
+        );
+        // One probe, not two. The fake gives each `clear_input`-delimited segment
+        // one sentence and no segment more than one, and `probe_stream` returns
+        // on the first sentence it sees. So a second probe — what
+        // `enter_bootrom()` does internally where `enter_bootrom_after(state)`
+        // does not — finds its segment already spent and the command refuses
+        // instead of getting this far.
+        assert_eq!(
+            record.nmea_before, 1,
+            "one sentence, one probe: {} before $PMTK180",
+            record.nmea_before
+        );
 
         // Both candidates were read, in order, at the page size the probe asks
         // for — dropping the second one must fail here.

@@ -108,7 +108,16 @@ Rules:
 * the range must be a hard-coded constant, not a value derived from user input;
 * refuse to run if that constant is anything unexpected;
 * verify a known-intact marker before erasing;
-* require an explicit confirmation: type `WRITE` at the prompt, or pass `--yes`.
+* require an explicit confirmation: type `WRITE` at the prompt, or pass `--yes`;
+* the prompt is for the user. An agent must not answer it — not even by driving
+  a PTY — because typing `WRITE` is the user's own acknowledgement, not an
+  approval an agent can supply. The only route an agent may take is `--yes`,
+  and only once the approval §2.5 requires has been obtained (by default the
+  user; when delegated, the independent reviewer);
+* an agent may pass `--yes` to `fw flash` **or `fw probe-da`** only when the
+  approval §2.5 requires has been obtained. `fw probe-da` loads the DA into RAM
+  and jumps to it, so the loaded DA can erase or program flash itself; it is
+  inside §2.5, not outside it.
 
 ### 2.3 Take a dump before writing anything
 
@@ -119,6 +128,89 @@ that check.
 ### 2.4 Never commit personal data
 
 See §6.
+
+### 2.5 Who may approve a write-capable run (`fw flash --yes`, `fw probe-da --yes`)
+
+By default, passing `--yes` to `fw flash` **or `fw probe-da`** requires the
+user's own approval. Subagent approval under this section applies **only** when
+the user has explicitly delegated approval for these write-capable runs in that
+session or instruction; any explicit user requirement for prior human approval
+on destructive changes **always** takes precedence and overrides this section.
+
+`fw probe-da` is covered even though this client never sends `0xD3` / `0xD4` /
+`0xD5` / `0xD9`: it loads the DA into RAM and jumps to it with `0xA8`, and the
+loaded DA can erase or program flash itself. `da.rs::check_da_image` checks only
+the length (14,896 bytes) and the first four bytes (`00 00 A0 E1`), so any
+14,896-byte file with that head would run. For `fw probe-da`, approval therefore
+requires the `--da` file's **full** SHA-256 to equal
+`190d7064cf2320752d8eb65681142730b21cddc90e0d1491d4e8379c3f2e89aa`
+(the V1.12 and V1.13 vendor packages ship the same 14,896-byte DA). Any other
+value is not approvable. The code does not compute that hash yet — adding it to
+`check_da_image` is follow-up **W2a** — so until W2a lands, the approver compares
+it manually and records the result.
+
+When delegated, the agent preparing the run asks an **independent**
+reviewer session — not the preparing session and **not forked** from the
+preparing session's history — whether the exact run may proceed, and passes
+`--yes` only after that reviewer records `"approved"`. The preparer must pass
+raw artifacts and command paths only, **never** its own summary, narrative, or
+conclusions (`docs/dev/09-review-protocol.md`). If a reviewer refuses, the
+preparer must fix the underlying cause and restart the request from fresh
+artifacts; shopping for a different approver without fixing the cause and
+re-gathering fresh artifacts is forbidden.
+
+For `fw probe-da --yes`, the request supplies the current-session `device info`
+log, the resolved `--port`, the `--da` path and its full SHA-256, and the exact
+command line. The image, backup, write-range and read-back items below apply
+only to `fw flash`, for which the request must also supply raw artifacts that
+the reviewer independently verifies:
+
+* current-session raw command logs for `device info`, `fw dump`, and
+  `fw probe-da`, confirming the unit's identity (`B-core_1.20`, model
+  `01017-00F`, flash `00C2:22BA`) and the exact resolved serial port (never
+  `--port auto`);
+* the backup path and its SHA-256 recomputed independently by the reviewer from
+  the current session's `fw dump` artifact;
+* the write image path, its independently recomputed SHA-256, and its
+  provenance per §2.3 and `da.rs::check_image`: it must be either identical to
+  the user's own backup from this session or differ from that backup **only**
+  at the recorded patch offsets for the unit's supported profile (currently
+  V1.13 `01017-00F`, length `0x6345C`, `PATCH_OFFSETS` `[0x402F6, 0x402F7, 0x59C2C]`),
+  verified independently to have zero differing bytes outside those offsets
+  (never an unrelated image or unverified vendor package);
+* the `--da` binary (`DA_v3.8.4.bin`, 14,896 bytes) path and its independently
+  recomputed SHA-256, which must equal the full value recorded above (a
+  mismatch is a refusal);
+* the write range: `FLASH_WRITE_START` and `FLASH_WRITE_LENGTH` (`0x6345C`),
+  covering the firmware and nothing else, with `FLASH_WRITE_START` **already
+  settled** by a hardware run recorded in `docs/dev/05-verification.md` §1 and
+  `UNRESOLVED_STARTS` emptied in `crates/m241-flash/src/da.rs` (if
+  `UNRESOLVED_STARTS` is non-empty or §1 lacks that settlement row, approval
+  must be refused; §1 defines what the row must contain);
+* the read-back plan (whole-image BootROM compare) and the recovery step
+  matching `crates/m241-flash/src/da.rs` (`0xD9` restart without waiting for a
+  reply, or power-cycle, then re-enter BootROM with `--assume-brom` or retry the
+  four-probe sync and write the user's own backup image back; do not download
+  the log from a partly written unit);
+* the exact full command line to run, including `--yes`, the resolved `--port`,
+  `--da`, the image path, and the backup path. `fw flash`'s flags are still a
+  stub (`crates/m241-cli/src/lib.rs`), so this is the intended shape; re-check
+  it against the real flags when they are implemented.
+
+A missing item, a hash or byte-diff mismatch, an unsettled
+`FLASH_WRITE_START`, `--port auto`, or a non-independent/forked reviewer is a
+refusal. The independent reviewer does not open the port and does not edit the
+preparing branch, and **authors its own durable verdict record directly** — a
+PR comment, or a review record the reviewer commits on a branch or PR; a chat
+or session log alone is not a record — citing the verified SHA-256s, command
+line, and reviewer session ID, **before** `--yes` is passed. The preparer must
+never author or edit the approval record on the reviewer's behalf, and pre-write
+approvals must **never** be written into `docs/dev/05-verification.md` §1 (which
+records actual post-run hardware measurements only).
+
+`log erase` is not covered: it destroys the user's track data, which a reviewer
+cannot consent to on the user's behalf. It still needs the user's own
+instruction.
 
 ## 3. Verified hardware facts — do not re-derive
 
@@ -199,7 +291,27 @@ If the stream has already stopped the sentence is ignored, so the client checks
 for the stream first and reports a precise error instead of a bare sync timeout.
 Send at the NMEA baud, then switch to 115200.
 
-### 4.7 The three sync probes must be back to back
+A live stream is necessary but not sufficient: the timing around the sentence
+is part of the sequence. **`PmtkClient::enter_bootrom_after` in
+`crates/m241-core/src/protocol/pmtk.rs` is the authoritative description** of
+that sequence; the numbers are the `DEFAULT_ENTRY_*` constants and
+`EntryTiming` beside them. In outline: clear the input, drain the line, clear
+again, write `$PMTK180*3B`, flush, stay quiet, then listen. **Any** byte in
+that last window means the sentence was not honoured, and the error quotes it so
+"still NMEA" can be told from "answered, but did not switch".
+
+The timing constants are the previous Python client's values, from its
+`_send_pmtk180` function (a private v1 repository, not this tree); that is the
+only `$PMTK180` route measured on this unit. Three details deliberately differ
+and are listed on `EntryTiming`: no baud switch before the sequence, the
+pre-write drain is not a verdict, and a failure does not move the baud.
+
+Probing the stream twice is a bug, not a harmless extra check: the caller probes
+once and passes its `StreamState` to `enter_bootrom_after`, because a second
+probe consumes the line the hand-over depends on. ⚠️ 未検証 in the Rust client:
+the same sequence has not yet been re-run on hardware from `m241` itself.
+
+### 4.7 The four sync probes must be back to back
 
 `0xA0` → `0x5F`, then `0x0A`→`0xF5`, `0x50`→`0xAF`, `0x05`→`0xFA` with no pause.
 Inserting delays drops the chip out of the handshake.

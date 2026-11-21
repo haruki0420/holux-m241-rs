@@ -61,7 +61,7 @@ mod testing;
 use std::time::Duration;
 
 use m241_core::Result;
-use m241_core::protocol::pmtk::{DEFAULT_REPLY_TIMEOUT, DEFAULT_STREAM_WINDOW};
+use m241_core::protocol::pmtk::{DEFAULT_REPLY_TIMEOUT, DEFAULT_STREAM_WINDOW, EntryTiming};
 
 pub use cli::{Cli, Command};
 pub use exit::CliError;
@@ -70,9 +70,10 @@ pub(crate) use output::Console;
 
 /// How long the wire commands wait.
 ///
-/// Two numbers, not one: a reply may take seconds because the device has to
-/// parse and answer, while the stream probe watches for one sentence per second.
-/// Both are exposed so a test can run the same code paths without spending five
+/// Three numbers, not one: a reply may take seconds because the device has to
+/// parse and answer, the stream probe watches for one sentence per second, and
+/// the `$PMTK180` hand-over has its own quiet/settle/watch sequence.
+/// All are exposed so a test can run the same code paths without spending
 /// seconds proving a timeout.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Timings {
@@ -80,6 +81,8 @@ pub(crate) struct Timings {
     pub reply: Duration,
     /// How long the "is NMEA streaming?" probe watches the wire.
     pub stream: Duration,
+    /// The `$PMTK180` hand-over timings.
+    pub entry: EntryTiming,
 }
 
 impl Timings {
@@ -89,6 +92,7 @@ impl Timings {
         Self {
             reply: DEFAULT_REPLY_TIMEOUT,
             stream: DEFAULT_STREAM_WINDOW,
+            entry: EntryTiming::real(),
         }
     }
 
@@ -99,6 +103,7 @@ impl Timings {
         Self {
             reply: Duration::from_millis(20),
             stream: Duration::from_millis(1),
+            entry: EntryTiming::fast(),
         }
     }
 }
@@ -295,6 +300,9 @@ pub fn init_tracing(verbose: bool) {
 mod tests {
     use super::testing::{AutoConfirm, FakePorts, RecordingConsole};
     use super::*;
+    use m241_core::protocol::pmtk::{
+        DEFAULT_ENTRY_QUIET_BUDGET, DEFAULT_ENTRY_SETTLE, DEFAULT_ENTRY_WATCH,
+    };
 
     /// Parse a command line, so the stub list is built the way a user builds it.
     fn parsed(args: &[&str]) -> Command {
@@ -363,6 +371,9 @@ mod tests {
         let timings = Timings::real();
         assert_eq!(timings.reply, DEFAULT_REPLY_TIMEOUT);
         assert_eq!(timings.stream, DEFAULT_STREAM_WINDOW);
+        assert_eq!(timings.entry.quiet_budget, DEFAULT_ENTRY_QUIET_BUDGET);
+        assert_eq!(timings.entry.settle, DEFAULT_ENTRY_SETTLE);
+        assert_eq!(timings.entry.watch, DEFAULT_ENTRY_WATCH);
         assert_eq!(Timings::default().reply, timings.reply);
     }
 
