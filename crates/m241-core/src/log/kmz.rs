@@ -864,6 +864,23 @@ mod tests {
     }
 
     #[test]
+    fn the_long_edge_is_the_height_when_the_photo_is_portrait() {
+        // A portrait photo breaches the limit through its height; measuring
+        // only the width would let it through.
+        let mut portrait = photo("portrait.jpg");
+        portrait.jpeg_bytes = jpeg_with_size(1080, 1920);
+        portrait.max_edge_pixels = Some(1600);
+        let err = export_kmz(&sample_track(), &[portrait])
+            .expect_err("a 1920-pixel long edge exceeds 1600");
+        let message = err.to_string();
+        assert!(
+            message.contains("1080 pixels wide and 1920 high")
+                && message.contains("long edge 1920"),
+            "the long edge is the larger of the two: {message}"
+        );
+    }
+
+    #[test]
     fn a_long_edge_exactly_at_the_limit_is_accepted() {
         // The limit is a maximum, not an exclusive bound: 1024 is allowed.
         let mut exact = photo("exact.jpg");
