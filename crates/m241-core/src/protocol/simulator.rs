@@ -1345,6 +1345,74 @@ mod tests {
     }
 
     #[test]
+    fn logging_is_resumed_even_when_the_stop_ack_is_lost() {
+        // The stop sentence can reach the unit while its acknowledgement is
+        // lost. The unit is then recording nothing, so the resume must be sent
+        // even though the transfer is abandoned. The fake itself answers stop,
+        // so this wrapper swallows exactly the first stop reply.
+        #[derive(Debug)]
+        struct LostStopAck {
+            device: FakeDevice,
+            swallow: bool,
+        }
+        impl Transport for LostStopAck {
+            fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+                if std::mem::take(&mut self.swallow) {
+                    let mut dropped = [0u8; 64];
+                    self.device.read(&mut dropped)?;
+                    return Ok(0);
+                }
+                self.device.read(buf)
+            }
+            fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+                let stop = b"$PMTK182,5";
+                if buf.windows(stop.len()).any(|window| window == stop) {
+                    self.swallow = true;
+                }
+                self.device.write_all(buf)
+            }
+            fn flush(&mut self) -> Result<()> {
+                self.device.flush()
+            }
+            fn clear_input(&mut self) -> Result<()> {
+                self.device.clear_input()
+            }
+            fn set_baud(&mut self, baud: u32) -> Result<()> {
+                self.device.set_baud(baud)
+            }
+            fn set_control_lines(&mut self, asserted: bool) -> Result<()> {
+                self.device.set_control_lines(asserted)
+            }
+        }
+
+        let log = vec![0x42u8; 0x900];
+        let mut client = PmtkClient::new(LostStopAck {
+            device: FakeDevice::new().with_log(&log),
+            swallow: false,
+        })
+        .with_reply_timeout(std::time::Duration::from_millis(60));
+        let mut callback = |_done: usize, _total: usize| {};
+        let err = client
+            .download_log(&mut callback)
+            .expect_err("stop ACK lost");
+        assert!(matches!(err, Error::Timeout { .. }), "got {err}");
+        let device = &mut client.transport_mut().device;
+        assert!(
+            device.logging_enabled(),
+            "the resume must be sent even when the stop's ACK was lost"
+        );
+        assert_eq!(device.log_commands().last().copied(), Some("PMTK182,4"));
+        assert!(
+            !device
+                .log_commands()
+                .iter()
+                .any(|command| command.starts_with("PMTK182,7")),
+            "a failed stop must abandon the transfer: {:?}",
+            device.log_commands()
+        );
+    }
+
+    #[test]
     fn a_jump_frame_is_echoed_part_way_and_changes_no_state() {
         // The fake stops at the BootROM: the Download Agent is the write crate's
         // subject, and modelling it here would put the erase/program state

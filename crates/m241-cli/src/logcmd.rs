@@ -169,20 +169,25 @@ pub fn erase(options: &EraseOptions, session: Session<'_>) -> Result<()> {
 
     let proof = BackupProof::of_bytes(&bytes);
     // Logging must be stopped (`$PMTK182,5`) before `$PMTK182,6,1` and always
-    // resumed (`$PMTK182,4`) afterwards, even when the erase fails — otherwise
-    // a failed erase would leave the unit silently not recording.
-    client.log_stop()?;
-    let mut eraser =
-        LogEraser::new(client.into_transport()).with_reply_timeout(session.timings.erase);
-    let outcome = eraser.erase(proof);
-    let mut client = PmtkClient::new(eraser.into_transport())
-        .with_reply_timeout(session.timings.reply)
-        .with_stream_window(session.timings.stream);
-    let resumed = client.log_resume();
-    match outcome {
-        Err(err) => return Err(err),
-        Ok(()) => resumed?,
-    }
+    // resumed (`$PMTK182,4`) afterwards, even when the stop's acknowledgement is
+    // lost or the erase fails — otherwise a failed command leaves the unit
+    // silently not recording. A failed stop also skips the erase: the unit's
+    // state is unknown, and the erase sentence must not be sent blind. The stop
+    // error is kept as the primary failure; if the resume fails too, both are
+    // reported.
+    let (mut client, outcome) = match client.log_stop() {
+        Ok(()) => {
+            let mut eraser =
+                LogEraser::new(client.into_transport()).with_reply_timeout(session.timings.erase);
+            let outcome = eraser.erase(proof);
+            let client = PmtkClient::new(eraser.into_transport())
+                .with_reply_timeout(session.timings.reply)
+                .with_stream_window(session.timings.stream);
+            (client, outcome)
+        }
+        Err(err) => (client, Err(err)),
+    };
+    m241_core::protocol::pmtk::resume_after(&mut client, outcome)?;
 
     if options.json {
         return session.console.json(&serde_json::json!({
@@ -1423,6 +1428,10 @@ mod tests {
         let console = RecordingConsole::default();
         let confirm = AutoConfirm;
         let mut options = erase_options(&output);
+        // Set before the erase: assigning it afterwards would make the
+        // "no success object on failure" assertion pass without exercising the
+        // JSON branch at all.
+        options.json = true;
         let timings = Timings {
             reply: std::time::Duration::from_millis(50),
             stream: std::time::Duration::from_millis(1),
@@ -1446,11 +1455,129 @@ mod tests {
             handle.logging_enabled(),
             "logging must be on again after a timed-out erase"
         );
-        options.json = true;
         assert!(
             console.stdout().is_empty(),
             "a failed erase must not print a success object: {}",
             console.stdout()
+        );
+    }
+
+    #[test]
+    fn erase_resumes_logging_when_the_stop_ack_is_lost() {
+        use m241_core::protocol::pmtk::line as pmtk_line;
+
+        // The `$PMTK182,5` sent immediately before the erase reaches the unit,
+        // but its acknowledgement is lost. The unit is now not recording, so the
+        // resume must still be sent — and the erase must not be, because the
+        // client cannot tell whether the stop took effect.
+        let stops = Rc::new(Cell::new(0u32));
+        let resumed_after_lost_stop = Rc::new(Cell::new(false));
+        let erased = Rc::new(Cell::new(false));
+        let links = ScriptedLinks::new({
+            let stops = Rc::clone(&stops);
+            let resumed_after_lost_stop = Rc::clone(&resumed_after_lost_stop);
+            let erased = Rc::clone(&erased);
+            move || {
+                let stops = Rc::clone(&stops);
+                let resumed_after_lost_stop = Rc::clone(&resumed_after_lost_stop);
+                let erased = Rc::clone(&erased);
+                ScriptedTransport::new(move |request, output| {
+                    if request.contains("PMTK182,2,8") {
+                        output.extend(pmtk_line("PMTK182,3,8,10").as_bytes());
+                    } else if request.contains("PMTK182,5") {
+                        let count = stops.get() + 1;
+                        stops.set(count);
+                        // The first stop (the transfer's) is answered; the one
+                        // before the erase is seen by the unit but its reply is
+                        // lost.
+                        if count == 1 {
+                            output.extend(pmtk_line("PMTK001,182,5,3").as_bytes());
+                        }
+                    } else if request.contains("PMTK182,7,") {
+                        let reply = format!("PMTK182,8,0,{}", "00".repeat(0x10));
+                        output.extend(pmtk_line(&reply).as_bytes());
+                    } else if request.contains("PMTK182,6,1") {
+                        erased.set(true);
+                        output.extend(pmtk_line("PMTK001,182,6,3").as_bytes());
+                    } else if request.contains("PMTK182,4") {
+                        if stops.get() == 2 {
+                            resumed_after_lost_stop.set(true);
+                        }
+                        output.extend(pmtk_line("PMTK001,182,4,3").as_bytes());
+                    }
+                })
+            }
+        });
+
+        let scratch = Scratch::new("erase-lost-stop");
+        let output = scratch.join("track.bin");
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        let err = erase(
+            &erase_options(&output),
+            Session::new(&links, &console, &confirm).with_timings(Timings::fast()),
+        )
+        .expect_err("the stop acknowledgement was lost");
+
+        assert!(matches!(err, Error::Timeout { .. }), "got {err}");
+        assert!(
+            format!("{err}").contains("PMTK182,5"),
+            "the error must name the stop: {err}"
+        );
+        assert!(
+            resumed_after_lost_stop.get(),
+            "log_resume() must still be sent after a lost stop acknowledgement"
+        );
+        assert!(
+            !erased.get(),
+            "the erase must not be sent when the stop was not confirmed"
+        );
+        assert_eq!(
+            fileio::read(&output)
+                .expect("the backup is still saved")
+                .len(),
+            0x10,
+            "the backup is written before the stop"
+        );
+    }
+
+    #[test]
+    fn a_failed_backup_write_sends_no_erase_or_stop() {
+        // The output path is the scratch directory itself, so the write fails
+        // with EISDIR after a successful download. Nothing destructive may be
+        // sent: the erase would destroy the only copy the user has.
+        let scratch = Scratch::new("erase-write-fails");
+        let handle = DeviceHandle::new(|| FakeDevice::new().with_log(&synthetic_dump(3)))
+            .with_erase_reply("PMTK001,182,6,3");
+        let links = FakePorts::shared(handle.clone());
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        let mut options = erase_options(scratch.path());
+        options.force = true;
+
+        let err = erase(&options, fast(&links, &console, &confirm))
+            .expect_err("writing over a directory must fail");
+
+        assert!(matches!(err, Error::Io { .. }), "got {err}");
+        let commands = handle.commands();
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.starts_with("PMTK182,6")),
+            "no erase may follow a failed backup write: {commands:?}"
+        );
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| *command == "PMTK182,5")
+                .count(),
+            1,
+            "only the download's own stop may have been sent: {commands:?}"
+        );
+        assert!(
+            handle.logging_enabled(),
+            "the download's resume must still leave the unit recording"
         );
     }
 
@@ -1646,6 +1773,11 @@ mod tests {
         assert!(
             format!("{err}").contains("PMTK182,6"),
             "returned error must describe the erase refusal: got {err}"
+        );
+        assert!(
+            format!("{err}").contains("could not be resumed")
+                && format!("{err}").contains("PMTK182,4"),
+            "a failed resume must be reported beside the erase error: got {err}"
         );
     }
 
