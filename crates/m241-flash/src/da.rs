@@ -389,7 +389,8 @@ pub const DA_JUMP_COUNT: u32 = 0;
 /// The first four bytes of `DA_v3.8.4.bin`.
 ///
 /// Read from the vendor image (`holux/M-241 Firmware V1.13 update package/
-/// DA_v3.8.4.bin`, 14,896 bytes, SHA-256 `190d7064…9aa`). The four ARM
+/// DA_v3.8.4.bin`, 14,896 bytes, SHA-256 `190d7064…9aa`; the full value is
+/// recorded in `AGENTS.md` §2.5). The four ARM
 /// instructions are `mov r0, r0` (`00 00 A0 E1`, NOP), `mrs r0, CPSR`
 /// (`00 00 0F E1`), `mov r0, #C0_32` (`C0 10 A0 E3`) and
 /// `orr r0, r0, r1` (`01 00 80 E1`) — `docs/reference/01-da-protocol.md` §2
@@ -858,11 +859,13 @@ pub const REPORT_SCAN_LIMIT: usize = 256;
 ///    instruction (`mov r0, r0`), so a 14,896-byte file that is not the DA is
 ///    refused before anything is written to RAM.
 ///
-/// Content is not hashed, and deliberately so: the DA is a user's own copy of a
-/// vendor binary, never committed here, so no hash could be checked in
-/// (`docs/reference/01-da-protocol.md` §9 records where the bytes came from, not
-/// what they hash to). A four-byte head narrows "the right size" to "the right
-/// image"; what makes the load safe is still the steps after it
+/// Content is not hashed **yet**. The DA is a user's own copy of a vendor
+/// binary, never committed here, but its SHA-256 is known (the full value is in
+/// `AGENTS.md` §2.5), so the hash can be checked without committing the image.
+/// A four-byte head still narrows "the right size" to "the right image"; adding
+/// the full SHA-256 comparison here is follow-up W2a, and until then the
+/// approval rule requires the approver to compare it manually. What makes the
+/// load safe in the meantime is still the steps after it
 /// ([`parse_report`] refusing any other version, flash part or region, and
 /// [`DaLoader::read_back`] refusing to jump at RAM that did not take the write).
 ///
