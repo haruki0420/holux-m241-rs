@@ -111,6 +111,19 @@ impl Timings {
             erase: Duration::from_millis(20),
         }
     }
+
+    /// Generous enough that a synchronous fake-device exchange never times out
+    /// under parallel CPU load.
+    #[cfg(test)]
+    #[must_use]
+    pub fn generous() -> Self {
+        Self {
+            reply: Duration::from_millis(500),
+            stream: Duration::from_millis(1),
+            entry: EntryTiming::fast(),
+            erase: Duration::from_millis(500),
+        }
+    }
 }
 
 impl Default for Timings {
@@ -377,7 +390,10 @@ mod tests {
         assert_eq!(timings.entry.settle, DEFAULT_ENTRY_SETTLE);
         assert_eq!(timings.entry.watch, DEFAULT_ENTRY_WATCH);
         assert_eq!(timings.erase, m241_flash::erase::DEFAULT_REPLY_TIMEOUT);
+        assert_eq!(timings.erase, Duration::from_secs(30));
         assert_eq!(Timings::default().reply, timings.reply);
+        assert_eq!(Timings::default().stream, timings.stream);
+        assert_eq!(Timings::default().erase, timings.erase);
     }
 
     #[test]

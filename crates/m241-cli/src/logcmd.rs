@@ -112,15 +112,18 @@ fn read_log<T: Transport>(client: &mut PmtkClient<T>, console: &dyn Console) -> 
 ///
 /// The copy is written **before** the erase is considered, and the
 /// [`BackupProof`] handed to [`LogEraser::erase`] is made from the bytes that
-/// were just written. A failed write returns before the erase sentence is
-/// built, so there is no path from "the backup could not be saved" to a
-/// destructive command. Without `--yes` the download still runs and is saved:
-/// the refusal says where the copy is, and the next invocation can erase.
+/// were just written. If the device reports an empty log (`0` bytes), nothing
+/// is written or erased and an [`Error::Safety`] is returned. A failed write
+/// also returns before the erase sentence is built, so there is no path from
+/// "the backup could not be saved" to a destructive command. Without `--yes`
+/// the download still runs and is saved: the refusal says where the copy is,
+/// and the next invocation can erase.
 ///
 /// # Errors
 ///
-/// * [`Error::Safety`] when the output exists and `--force` was not given, or
-///   when `--yes` is absent (exit code 5);
+/// * [`Error::Safety`] when the output exists and `--force` was not given, when
+///   the device reports an empty log (`0` bytes), or when `--yes` is absent
+///   (exit code 5);
 /// * [`Error::Port`] when no plausible port can be opened;
 /// * [`Error::Timeout`] / [`Error::Nmea`] / [`Error::Rejected`] when the
 ///   transfer or the erase fails;
@@ -134,6 +137,14 @@ pub fn erase(options: &EraseOptions, session: Session<'_>) -> Result<()> {
         .console
         .note(&format!("reading the track log from {port}"));
     let bytes = read_log(&mut client, session.console)?;
+
+    if bytes.is_empty() {
+        return Err(Error::Safety {
+            reason: String::from(
+                "the device reported an empty log (0 bytes); nothing was written or erased",
+            ),
+        });
+    }
 
     // The file is the only copy this tool can offer once `$PMTK182,6` has run.
     // Writing it first, and returning here if the write fails, is what makes
@@ -665,7 +676,7 @@ mod tests {
         console: &'a RecordingConsole,
         confirm: &'a AutoConfirm,
     ) -> Session<'a> {
-        Session::new(links, console, confirm).with_timings(Timings::fast())
+        Session::new(links, console, confirm).with_timings(Timings::generous())
     }
 
     #[test]
@@ -784,7 +795,7 @@ mod tests {
                 force: false,
                 json: false,
             },
-            fast(&links, &console, &confirm),
+            Session::new(&links, &console, &confirm).with_timings(Timings::fast()),
         )
         .expect_err("the transfer fails");
         assert!(matches!(err, Error::Timeout { .. }), "got {err}");
@@ -1434,9 +1445,134 @@ mod tests {
 
         let document: serde_json::Value =
             serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(document["port"], crate::testing::FAKE_PORT);
         assert_eq!(document["output"], output.display().to_string());
         assert_eq!(document["bytes"], synthetic_dump(3).len());
         assert_eq!(document["erased"], true);
+    }
+
+    #[test]
+    fn erase_refuses_an_empty_log_without_writing_or_sending_erase() {
+        let scratch = Scratch::new("erase-empty");
+        let output = scratch.join("track.bin");
+        let handle = DeviceHandle::new(|| FakeDevice::new().with_log(&[]))
+            .with_erase_reply("PMTK001,182,6,3");
+        let links = FakePorts::shared(handle.clone());
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        let err = erase(&erase_options(&output), fast(&links, &console, &confirm))
+            .expect_err("an empty log has nothing to back up or erase");
+
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        assert_eq!(crate::exit::exit_code_for(&err), 5, "got {err}");
+        assert!(format!("{err}").contains("0 bytes"), "got {err}");
+        assert!(!output.exists(), "no zero-byte file may be written");
+        let commands = handle.commands();
+        assert!(
+            !commands.iter().any(|command| matches!(
+                command.as_str(),
+                "PMTK182,5" | "PMTK182,6,1" | "PMTK182,4"
+            )),
+            "no stop/erase/resume may be sent for an empty log: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn erase_uses_timings_erase_not_timings_reply_for_erase_timeout() {
+        let scratch = Scratch::new("erase-timeout-budget");
+        let output = scratch.join("track.bin");
+        // No `with_erase_reply`: the erase sentence is left silent while the
+        // surrounding PMTK182 transfer/stop/resume steps answer immediately.
+        let handle = DeviceHandle::new(|| FakeDevice::new().with_log(&synthetic_dump(1)));
+        let links = FakePorts::shared(handle.clone());
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        let timings = Timings {
+            reply: std::time::Duration::from_secs(1),
+            stream: std::time::Duration::from_millis(1),
+            entry: m241_core::protocol::pmtk::EntryTiming::fast(),
+            erase: std::time::Duration::from_millis(1),
+        };
+
+        let err = erase(
+            &erase_options(&output),
+            Session::new(&links, &console, &confirm).with_timings(timings),
+        )
+        .expect_err("silent erase must time out");
+
+        match err {
+            Error::Timeout { timeout, .. } => {
+                assert_eq!(timeout.as_std(), timings.erase);
+                assert_ne!(timeout.as_std(), timings.reply);
+            }
+            other => panic!("expected Error::Timeout, got {other}"),
+        }
+        assert!(
+            handle.logging_enabled(),
+            "logging must be resumed after an erase timeout"
+        );
+    }
+
+    #[test]
+    fn erase_preserves_its_error_when_log_resume_also_fails() {
+        use m241_core::protocol::pmtk::line as pmtk_line;
+
+        let saw_erase = Rc::new(Cell::new(false));
+        let resumed_after_erase = Rc::new(Cell::new(false));
+        let links = ScriptedLinks::new({
+            let saw_erase = Rc::clone(&saw_erase);
+            let resumed_after_erase = Rc::clone(&resumed_after_erase);
+            move || {
+                let saw_erase = Rc::clone(&saw_erase);
+                let resumed_after_erase = Rc::clone(&resumed_after_erase);
+                ScriptedTransport::new(move |request, output| {
+                    if request.contains("PMTK182,2,8") {
+                        output.extend(pmtk_line("PMTK182,3,8,10").as_bytes());
+                    } else if request.contains("PMTK182,5") {
+                        output.extend(pmtk_line("PMTK001,182,5,3").as_bytes());
+                    } else if request.contains("PMTK182,7,") {
+                        let reply = format!("PMTK182,8,0,{}", "00".repeat(0x10));
+                        output.extend(pmtk_line(&reply).as_bytes());
+                    } else if request.contains("PMTK182,6,1") {
+                        saw_erase.set(true);
+                        // Status 0 = refusal from the device.
+                        output.extend(pmtk_line("PMTK001,182,6,0").as_bytes());
+                    } else if request.contains("PMTK182,4") {
+                        if saw_erase.get() {
+                            // Leave the post-erase resume silent so `log_resume()` times out.
+                            resumed_after_erase.set(true);
+                        } else {
+                            output.extend(pmtk_line("PMTK001,182,4,3").as_bytes());
+                        }
+                    }
+                })
+            }
+        });
+
+        let scratch = Scratch::new("erase-resume-also-fails");
+        let output = scratch.join("track.bin");
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        let err = erase(
+            &erase_options(&output),
+            Session::new(&links, &console, &confirm).with_timings(Timings::fast()),
+        )
+        .expect_err("erase was refused");
+
+        assert!(
+            resumed_after_erase.get(),
+            "log_resume() must still be attempted after a failed erase"
+        );
+        assert!(
+            matches!(err, Error::Rejected { .. }),
+            "erase error must not be masked by resume timeout: got {err}"
+        );
+        assert!(
+            format!("{err}").contains("PMTK182,6"),
+            "returned error must describe the erase refusal: got {err}"
+        );
     }
 
     #[test]

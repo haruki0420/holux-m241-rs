@@ -733,6 +733,8 @@ impl<T: Transport> PmtkClient<T> {
             &format!("$PMTK001,182,{subcommand} acknowledgement"),
         )?;
         let ack = parse_ack(&parse_sentence(&reply)?)?;
+        // `await_reply` already matched `$PMTK001,182,<subcommand>,`, so this
+        // guard is purely defensive against future changes to `parse_ack`.
         if ack.command != 182 {
             return Err(Error::Framing {
                 what: format!("acknowledgement was for command {}, not 182", ack.command),
