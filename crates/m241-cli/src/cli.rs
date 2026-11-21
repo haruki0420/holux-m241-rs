@@ -19,8 +19,13 @@
 //! handler, because clap can produce the documented exit code 2 for them:
 //!
 //! * `fw patch --dry-run` needs no `-o`, but a real run does;
-//! * `--format` and `--utc-offset-days` are validated while parsing, so a typo
-//!   is a usage error rather than a runtime failure halfway through a file.
+//! * the value of a flag is validated while parsing, so a typo is a usage error
+//!   (exit 2) rather than a runtime failure halfway through a file. Concretely:
+//!   `--format` must be one of the five `ExportFormat` names; `--utc-offset-days`
+//!   and `--offset-days` must be `auto` or a signed number of days that fits an
+//!   `i32` (negative values need `allow_hyphen_values` to be seen as values at
+//!   all); and `fw dump --length` must be a positive, even count that does not
+//!   run off the end of the 32-bit BootROM address space from `BASE_ADDR_FIRMWARE`.
 
 use std::path::PathBuf;
 
@@ -93,7 +98,7 @@ pub enum DeviceCommand {
     Doctor(DoctorOptions),
 }
 
-#[derive(Debug, Default, Args)]
+#[derive(Debug, Args)]
 pub struct DoctorOptions {
     /// Probe the logger at this serial port (or `auto` for the only likely cable).
     #[arg(long, value_name = "PORT|auto")]
@@ -108,12 +113,30 @@ pub struct DoctorOptions {
     pub extract_to: Option<PathBuf>,
 
     /// Allow overwriting an existing `DA_v3.8.4.bin` under `--extract-to`.
+    ///
+    /// No `requires`: `--force` on its own is an accepted no-op, because it is
+    /// also the documented flag for the other writing commands and a script that
+    /// passes it to every command must not fail on the one that happens to have
+    /// nothing to overwrite.
     #[arg(long)]
     pub force: bool,
 
     /// Print one JSON object instead of labelled diagnostic lines.
     #[arg(long)]
     pub json: bool,
+}
+
+impl Default for DoctorOptions {
+    /// The defaults clap uses, so a test builds the same command the parser does.
+    fn default() -> Self {
+        Self {
+            port: None,
+            from_drop: None,
+            extract_to: None,
+            force: false,
+            json: false,
+        }
+    }
 }
 
 #[derive(Debug, Default, Args)]
@@ -472,6 +495,40 @@ mod tests {
         let err = Cli::try_parse_from(["m241", "device", "doctor", "--extract-to", "vendor"])
             .expect_err("--extract-to requires --from-drop");
         assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
+
+        // S8: the documented combinations, pinned both ways. `--force` might look
+        // as if it belonged to `--extract-to` alone, but the reference does not
+        // say so; giving it `requires = "extract_to"` would break a script that
+        // passes `--force` to every command, and giving `--from-drop` a
+        // `requires = "extract_to"` would break a plain read-only inventory.
+        Cli::try_parse_from(["m241", "device", "doctor", "--force"])
+            .expect("--force on its own is an accepted no-op");
+        Cli::try_parse_from(["m241", "device", "doctor", "--from-drop", "drop"])
+            .expect("--from-drop alone is the read-only inventory");
+        Cli::try_parse_from(["m241", "device", "doctor", "--from-drop", "drop", "--force"])
+            .expect("--force with --from-drop but no extraction is still valid");
+        Cli::try_parse_from([
+            "m241",
+            "device",
+            "doctor",
+            "--from-drop",
+            "drop",
+            "--extract-to",
+            "vendor",
+            "--force",
+            "--json",
+        ])
+        .expect("the documented extraction command line");
+
+        let cli = Cli::try_parse_from(["m241", "device", "doctor", "--force"])
+            .expect("--force alone parses");
+        let Command::Device {
+            command: DeviceCommand::Doctor(doctor),
+        } = cli.command
+        else {
+            panic!("expected device doctor");
+        };
+        assert!(doctor.force, "the flag reaches the handler");
 
         let cli =
             Cli::try_parse_from(["m241", "log", "geotag", "track.bin", "a.jpg", "photos_dir"])

@@ -6,11 +6,11 @@
 //! optionally shifting WNRO-stale timestamps; `geotag` matches photos by capture
 //! time and writes GPS EXIF tags.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use m241_core::log::geotag::{self, CaptureTime, GeotagOptions, GeotagPlan};
 use m241_core::log::{ParseReport, export, parse_dump};
-use m241_core::{Error, LogSummary, Result, Track};
+use m241_core::{Error, ExportFormat, LogSummary, Result, Track};
 
 use crate::Session;
 use crate::cal::OffsetSpec;
@@ -80,24 +80,33 @@ pub fn download(options: &DownloadOptions, session: Session<'_>) -> Result<()> {
             "summary": summary_document(summary),
         }));
     }
-    session.console.result(&format!("{:<12}: {port}", "port"));
-    session
-        .console
-        .result(&format!("{:<12}: {}", "output", options.output.display()));
-    session
-        .console
-        .result(&format!("{:<12}: {}", "bytes", bytes.len()));
-    session
-        .console
-        .result(&format!("{:<12}: {}", "records", summary.records));
-    session
-        .console
-        .result(&format!("{:<12}: {}", "fixes", summary.fixes));
+    print_download(
+        session.console,
+        &port,
+        &options.output,
+        bytes.len(),
+        summary,
+    );
     session.console.note(&format!(
         "next: m241 log read {} --format gpx -o track.gpx",
         options.output.display()
     ));
     Ok(())
+}
+
+/// The labelled lines `log download` prints on stdout.
+fn print_download(
+    console: &dyn Console,
+    port: &str,
+    output: &Path,
+    bytes: usize,
+    summary: LogSummary,
+) {
+    console.result(&format!("{:<12}: {port}", "port"));
+    console.result(&format!("{:<12}: {}", "output", output.display()));
+    console.result(&format!("{:<12}: {bytes}", "bytes"));
+    console.result(&format!("{:<12}: {}", "records", summary.records));
+    console.result(&format!("{:<12}: {}", "fixes", summary.fixes));
 }
 
 /// Convert a dumped log to GPX, KML, CSV, NMEA or JSON.
@@ -116,25 +125,42 @@ pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
     let summary = report.summary(&track);
     warn_about_damage(session.console, &summary, &report);
 
-    let _shift = apply_utc_offset(&mut track, options.utc_offset_days, session.console);
+    let shift = apply_utc_offset(&mut track, options.utc_offset_days, session.console);
+
+    // The shift is already announced on stderr by `apply_utc_offset`. A JSON
+    // reader gets it as a field too, so `--format json` carries the same fact as
+    // `geotag --json` rather than leaving the number in a human message.
+    let exported = export(&track, options.format);
+    let exported = if options.format == ExportFormat::Json && shift != 0 {
+        match serde_json::from_str::<serde_json::Value>(&exported) {
+            Ok(serde_json::Value::Object(mut object)) => {
+                object.insert(String::from("offset_days"), serde_json::Value::from(shift));
+                format!("{}\n", serde_json::Value::Object(object))
+            }
+            // Not an object: leave the exporter's text exactly as it wrote it.
+            _ => exported,
+        }
+    } else {
+        exported
+    };
 
     match &options.output {
         Some(path) => {
-            fileio::write_text(path, &export(&track, options.format))?;
+            fileio::write_text(path, &exported)?;
             session.console.note(&format!(
-                "wrote {} {} to {}",
-                track.points.len(),
-                if track.points.len() == 1 {
-                    "point"
-                } else {
-                    "points"
-                },
+                "wrote {} to {}",
+                points_label(track.points.len()),
                 path.display()
             ));
         }
-        None => session.console.text(&export(&track, options.format)),
+        None => session.console.text(&exported),
     }
     Ok(())
+}
+
+/// `1 point`, `2 points` — the count as it reads in a sentence.
+fn points_label(count: usize) -> String {
+    format!("{count} {}", if count == 1 { "point" } else { "points" })
 }
 
 /// Which day, in days since the Unix epoch, the log's newest record falls on.
@@ -151,8 +177,14 @@ fn track_days(track: &Track) -> Option<i64> {
         .map(|utc| i64::from(utc / 86_400))
 }
 
-/// Add `days` to every timestamp the track carries.
-fn shift_track(track: &mut Track, days: i32) {
+/// Add whole `days` to every timestamp the track carries.
+///
+/// `cal::shift_seconds` takes its second argument in *days* despite the name
+/// (it is the one place the epoch-to-seconds conversion happens); this wrapper
+/// keeps the unit in its own name so a caller cannot pass a day count where a
+/// second count was meant. `shift_track_seconds` below is the second-counting
+/// sibling.
+fn shift_track_days(track: &mut Track, days: i32) {
     for point in &mut track.points {
         point.utc = point.utc.map(|utc| crate::cal::shift_seconds(utc, days));
     }
@@ -162,7 +194,7 @@ fn shift_track(track: &mut Track, days: i32) {
 fn apply_utc_offset(track: &mut Track, spec: OffsetSpec, console: &dyn Console) -> i32 {
     let shift = track_days(track).map_or(0, |days| spec.shift_for(days));
     if shift != 0 {
-        shift_track(track, shift);
+        shift_track_days(track, shift);
         let reason = if matches!(spec, OffsetSpec::Auto) {
             "the log was written by a unit whose clock is still on the old GPS epoch"
         } else {
@@ -195,42 +227,39 @@ pub fn info(options: &LogInfoOptions, session: Session<'_>) -> Result<()> {
             "parse": parse_document(&report),
         }));
     }
-    session
-        .console
-        .result(&format!("{:<18}: {}", "file", options.file.display()));
-    session
-        .console
-        .result(&format!("{:<18}: {}", "size", bytes.len()));
-    session
-        .console
-        .result(&format!("{:<18}: {}", "records", summary.records));
-    session
-        .console
-        .result(&format!("{:<18}: {}", "fixes", summary.fixes));
-    session
-        .console
-        .result(&format!("{:<18}: {}", "blocks", report.blocks));
-    session.console.result(&format!(
-        "{:<18}: {}",
-        "damaged blocks", summary.damaged_block_count
-    ));
-    session.console.result(&format!(
-        "{:<18}: {}",
-        "bad checksums", report.bad_checksums
-    ));
-    session.console.result(&format!(
-        "{:<18}: {}",
-        "truncated records", report.truncated_records
-    ));
-    session.console.result(&format!(
-        "{:<18}: {}",
-        "start",
-        timestamp(summary.started_at)
-    ));
-    session
-        .console
-        .result(&format!("{:<18}: {}", "end", timestamp(summary.ended_at)));
+    print_info(
+        session.console,
+        &options.file,
+        bytes.len(),
+        summary,
+        &report,
+    );
     Ok(())
+}
+
+/// The labelled lines `log info` prints on stdout.
+fn print_info(
+    console: &dyn Console,
+    file: &Path,
+    size: usize,
+    summary: LogSummary,
+    report: &ParseReport,
+) {
+    let lines = [
+        ("file", file.display().to_string()),
+        ("size", size.to_string()),
+        ("records", summary.records.to_string()),
+        ("fixes", summary.fixes.to_string()),
+        ("blocks", report.blocks.to_string()),
+        ("damaged blocks", summary.damaged_block_count.to_string()),
+        ("bad checksums", report.bad_checksums.to_string()),
+        ("truncated records", report.truncated_records.to_string()),
+        ("start", timestamp(summary.started_at)),
+        ("end", timestamp(summary.ended_at)),
+    ];
+    for (label, value) in lines {
+        console.result(&format!("{label:<18}: {value}"));
+    }
 }
 
 /// One summary as JSON, with the timestamps rendered as ISO-8601 as well.
@@ -274,6 +303,15 @@ pub fn geotag(options: &LogGeotagOptions, session: Session<'_>) -> Result<()> {
     let offset_days = apply_utc_offset(&mut track, options.utc_offset_days, session.console);
     let photo_paths = expand_photo_inputs(&options.photos)?;
 
+    // The camera's clock, not the log's. `DateTimeOriginal` is written from the
+    // camera's local time, so a camera set to UTC+9 records a capture nine hours
+    // later than the moment it happened. Matching against the UTC track therefore
+    // moves the *track* forward by the same amount — both sides are now on the
+    // camera's clock and the nearest point is the right one — and then moves the
+    // chosen point's `utc` back, because the coordinate that gets written is a
+    // real UTC instant and must not carry the camera's error. Doing it the other
+    // way (moving only the photo, or only the match) would tag the right place
+    // with the wrong time, which is harder to notice than a miss.
     let tz_delta_seconds = i64::from(options.tz_offset_minutes) * 60;
     let mut matching_track = track;
     if tz_delta_seconds != 0 {
@@ -400,9 +438,16 @@ fn shift_track_seconds(track: &mut Track, delta_seconds: i64) {
 
 /// Shift one Unix timestamp by `delta_seconds`, clamped to `0..=u32::MAX`.
 fn shift_timestamp_seconds(utc: u32, delta_seconds: i64) -> u32 {
-    let shifted = i64::from(utc) + delta_seconds;
-    let clamped = shifted.clamp(0, i64::from(u32::MAX));
-    u32::try_from(clamped).unwrap_or(utc)
+    let clamped = (i64::from(utc) + delta_seconds).clamp(0, i64::from(u32::MAX));
+    // The conversion cannot fail — `clamped` is inside `0..=u32::MAX` by
+    // construction — so `unwrap_or(utc)` used to stand here as a silent
+    // fallback that nothing could reach. The bit-cast says the same thing
+    // without an unreachable branch: the clamp above is the only guard, and
+    // `shifting_seconds_clamps_at_the_ends_of_the_range` in `cal` pins it.
+    u32::try_from(clamped).unwrap_or_else(|_| {
+        debug_assert!(false, "the clamp above keeps the value in the u32 range");
+        utc
+    })
 }
 
 /// Render `m241 log geotag --json` as a single JSON object.
@@ -498,32 +543,13 @@ mod tests {
     use super::*;
     use crate::Timings;
     use crate::link::PortEntry;
-    use crate::testing::{AutoConfirm, DeviceHandle, FakePorts, RecordingConsole, synthetic_dump};
+    use crate::testing::{
+        AutoConfirm, DeviceHandle, FakePorts, RecordingConsole, Scratch, ScriptedLinks,
+        ScriptedTransport, synthetic_dump,
+    };
     use m241_core::Error;
     use m241_core::protocol::simulator::FakeDevice;
     use std::path::PathBuf;
-
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new(name: &str) -> Self {
-            let path =
-                std::env::temp_dir().join(format!("m241-cli-log-{}-{name}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).expect("scratch");
-            Self(path)
-        }
-
-        fn join(&self, name: &str) -> PathBuf {
-            self.0.join(name)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
 
     fn write_dump(scratch: &Scratch, name: &str, points: usize) -> PathBuf {
         let path = scratch.join(name);
@@ -792,16 +818,44 @@ mod tests {
         .expect("read");
         let document: serde_json::Value =
             serde_json::from_str(&console.stdout()).expect("one JSON object");
+        // One day, expressed through the same conversion the shift uses rather
+        // than a bare 86,400 whose unit a reader has to work out.
+        let one_day_later = crate::cal::shift_seconds(1_700_000_000, 1);
+        assert_eq!(one_day_later, 1_700_000_000 + 86_400, "one day is 86,400 s");
         assert_eq!(
-            document["points"][0]["utc"],
-            1_700_000_000u32 + 86_400,
+            document["points"][0]["utc"], one_day_later,
             "one day was added"
         );
+        assert_eq!(document["offset_days"], 1, "the JSON names the shift");
         assert!(
             console.stderr().contains("+1 days"),
             "got {}",
             console.stderr()
         );
+    }
+
+    #[test]
+    fn read_json_without_a_shift_carries_no_offset_field() {
+        // The field is added only when something was shifted, so a reader can
+        // tell "no shift asked for" from "shifted by zero".
+        let scratch = Scratch::new("read-json-no-offset");
+        let path = write_dump(&scratch, "track.bin", 1);
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        read(
+            &LogReadOptions {
+                file: path,
+                format: m241_core::ExportFormat::Json,
+                output: None,
+                utc_offset_days: OffsetSpec::Days(0),
+            },
+            fast(&links, &console, &confirm),
+        )
+        .expect("read");
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert!(document.get("offset_days").is_none(), "got {document}");
     }
 
     #[test]
@@ -1044,86 +1098,22 @@ mod tests {
 
     #[test]
     fn download_exits_code_one_when_the_device_rejects_pmtk182() {
-        use std::collections::VecDeque;
-
         use m241_core::protocol::pmtk::line as pmtk_line;
-        use m241_core::protocol::port::Transport;
 
-        #[derive(Debug)]
-        struct RejectingStopTransport {
-            pending: Vec<u8>,
-            output: VecDeque<u8>,
-        }
-
-        impl Transport for RejectingStopTransport {
-            fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-                let mut count = 0;
-                while count < buf.len() {
-                    let Some(byte) = self.output.pop_front() else {
-                        break;
-                    };
-                    buf[count] = byte;
-                    count += 1;
+        // A unit that reports a log length and then refuses to stop logging.
+        let links = ScriptedLinks::new(|| {
+            ScriptedTransport::new(|request, output| {
+                if request.contains("PMTK182,2,8") {
+                    output.extend(pmtk_line("PMTK182,3,8,100").as_bytes());
+                } else if request.contains("PMTK182,5") {
+                    // Status 2 = action failed / rejected by the device.
+                    output.extend(pmtk_line("PMTK001,182,5,2").as_bytes());
                 }
-                Ok(count)
-            }
-
-            fn write_all(&mut self, buf: &[u8]) -> Result<()> {
-                self.pending.extend_from_slice(buf);
-                while let Some(pos) = self.pending.iter().position(|&b| b == b'\n') {
-                    let raw: Vec<u8> = self.pending.drain(..=pos).collect();
-                    let text = String::from_utf8_lossy(&raw);
-                    if text.contains("PMTK182,2,8") {
-                        self.output.extend(pmtk_line("PMTK182,3,8,100").as_bytes());
-                    } else if text.contains("PMTK182,5") {
-                        // Status 2 = action failed / rejected by the device.
-                        self.output.extend(pmtk_line("PMTK001,182,5,2").as_bytes());
-                    }
-                }
-                Ok(())
-            }
-
-            fn flush(&mut self) -> Result<()> {
-                Ok(())
-            }
-
-            fn clear_input(&mut self) -> Result<()> {
-                self.output.clear();
-                Ok(())
-            }
-
-            fn set_baud(&mut self, _baud: u32) -> Result<()> {
-                Ok(())
-            }
-
-            fn set_control_lines(&mut self, _asserted: bool) -> Result<()> {
-                Ok(())
-            }
-        }
-
-        struct RejectingLinks;
-
-        impl crate::Links for RejectingLinks {
-            fn ports(&self) -> Result<Vec<PortEntry>> {
-                Ok(vec![PortEntry {
-                    name: String::from("SIM0"),
-                    cable: Some(crate::link::Cable::Cp210x),
-                    likely: true,
-                    description: None,
-                }])
-            }
-
-            fn open(&self, _name: &str, _baud: u32) -> Result<crate::link::Opened> {
-                Ok(crate::link::Opened::new(Box::new(RejectingStopTransport {
-                    pending: Vec::new(),
-                    output: VecDeque::new(),
-                })))
-            }
-        }
+            })
+        });
 
         let scratch = Scratch::new("download-rejected");
         let output = scratch.join("track.bin");
-        let links = RejectingLinks;
         let console = RecordingConsole::default();
         let confirm = AutoConfirm;
         let err = download(

@@ -31,10 +31,27 @@ use crate::link::{self, Cable, PortEntry};
 /// Expected filename of the proprietary MediaTek Download Agent.
 const DA_FILENAME: &str = "DA_v3.8.4.bin";
 
-/// Expected byte length of `DA_v3.8.4.bin` (`docs/reference/01-da-protocol.md`).
+/// Expected byte length of `DA_v3.8.4.bin`.
+///
+/// `docs/reference/01-da-protocol.md` §9: "The image this page describes is
+/// `DA_v3.8.4.bin`, 14,896 bytes, covering `0x00100800`–`0x0010422F`" — the
+/// same page's §2 uses the figure again ("outside the 14,896-byte image").
+/// `0x0010422F - 0x00100800 + 1` is 14,896, so the size and the address range
+/// agree. The size is the check this command makes; the contents are
+/// deliberately not hashed, because the drop is a user's copy and not a pinned
+/// upstream artefact.
 const DA_SIZE_BYTES: usize = 14_896;
 
 /// Maximum directory recursion depth when scanning `--from-drop`.
+///
+/// `docs/reference/02-cli.md` §`m241 device doctor` promises a "read-only
+/// bounded-depth scan". The bound counts directory levels *below* the directory
+/// given to `--from-drop`: a file `DROP/a/b/c/d/name` is four levels deep and is
+/// read; `DROP/a/b/c/d/e/name` is five and the scan stops at `e`, reporting on
+/// stderr that it did. `the_drop_scan_stops_one_level_past_max_drop_depth` pins
+/// both sides of that line. Four is enough for Holux's own drop (`firmware/`,
+/// `tool/`) plus an unpacked archive, and small enough that pointing
+/// `--from-drop` at a home directory cannot walk the whole tree.
 const MAX_DROP_DEPTH: usize = 4;
 
 /// List the serial ports, flagging the ones that look like an M-241 cable.
@@ -47,7 +64,7 @@ const MAX_DROP_DEPTH: usize = 4;
 pub fn ports(options: &PortsOptions, session: Session<'_>) -> Result<()> {
     let entries = session.links.ports()?;
     if options.json {
-        return session.console.json(&document(&entries));
+        return session.console.json(&ports_document(&entries));
     }
     if entries.is_empty() {
         session.console.result(
@@ -86,7 +103,7 @@ pub fn ports(options: &PortsOptions, session: Session<'_>) -> Result<()> {
 
 /// The ports a bare `--port auto` would consider.
 #[must_use]
-pub fn candidates(entries: &[PortEntry]) -> Vec<&str> {
+pub(crate) fn candidates(entries: &[PortEntry]) -> Vec<&str> {
     entries
         .iter()
         .filter(|entry| entry.likely)
@@ -110,7 +127,7 @@ fn port_entry_documents(entries: &[PortEntry]) -> Vec<serde_json::Value> {
 
 /// The ports as the one JSON object `--json` promises.
 #[must_use]
-pub fn document(entries: &[PortEntry]) -> serde_json::Value {
+pub(crate) fn ports_document(entries: &[PortEntry]) -> serde_json::Value {
     serde_json::json!({
         "ports": port_entry_documents(entries),
         "candidates": candidates(entries),
@@ -128,14 +145,7 @@ pub fn info(options: &InfoOptions, session: Session<'_>) -> Result<()> {
     let port = link::resolve(session.links, &options.port)?;
     let mut client = link::open_pmtk(session.links, &port, session.timings)?;
     let identity = client.request_identity()?;
-
-    if !is_known_release(&identity.release) {
-        session.console.warn(&format!(
-            "the release {:?} is not one this build knows; the patch path decides on the \
-             image's bytes rather than on this string",
-            identity.release
-        ));
-    }
+    warn_about_unknown_release(session.console, &identity.release);
 
     if options.json {
         return session.console.json(&serde_json::json!({
@@ -171,8 +181,23 @@ pub fn info(options: &InfoOptions, session: Session<'_>) -> Result<()> {
 /// be repairable, and the patch path decides on the image rather than on the
 /// string.
 #[must_use]
-pub fn is_known_release(release: &str) -> bool {
+pub(crate) fn is_known_release(release: &str) -> bool {
     release.starts_with("B-core_1.")
+}
+
+/// Warn about a release string this build does not recognise.
+///
+/// One helper rather than the same sentence in `info` and `doctor`: the two
+/// places must not drift into saying different things about the same unit, and a
+/// wording change is meant to happen once.
+fn warn_about_unknown_release(console: &dyn crate::Console, release: &str) {
+    if is_known_release(release) {
+        return;
+    }
+    console.warn(&format!(
+        "the release {release:?} is not one this build knows; the patch path decides on the \
+         image's bytes rather than on this string"
+    ));
 }
 
 /// Outcome of the optional `$PMTK605` device probe in `device doctor`.
@@ -294,13 +319,7 @@ fn probe_device(port_spec: &str, session: Session<'_>) -> ProbeReport {
     };
     match client.request_identity() {
         Ok(identity) => {
-            if !is_known_release(&identity.release) {
-                session.console.warn(&format!(
-                    "the release {:?} is not one this build knows; the patch path decides on the \
-                     image's bytes rather than on this string",
-                    identity.release
-                ));
-            }
+            warn_about_unknown_release(session.console, &identity.release);
             ProbeReport {
                 requested_port: port_spec.to_owned(),
                 resolved_port: Some(resolved_port),
@@ -564,6 +583,20 @@ fn doctor_document(
     })
 }
 
+/// Print the text form of `device doctor`.
+///
+/// The split follows `docs/reference/02-cli.md` §Output literally: stdout
+/// carries the machine-readable findings, stderr carries the problems.
+///
+/// * A complete report always writes every line to stdout, `=` lines included,
+///   so a script can parse `probe : error (...)`. A `--port` that does not answer
+///   is a change in the unit's state, not a failed report, and the exit code
+///   stays 0 — that is the difference between `doctor` and `device info`, which
+///   fails and exits 3.
+/// * Anything that went wrong is repeated as a `m241: warning:` line on stderr,
+///   so a human reading stderr sees it without reading stdout, and a run **whose
+///   report could not even be started** (the OS would not list ports) puts that
+///   failure only on stderr.
 fn print_doctor_text(
     console: &dyn crate::Console,
     ports_result: &Result<Vec<PortEntry>>,
@@ -588,10 +621,12 @@ fn print_doctor_text(
                 candidate_list.len()
             ));
             if candidate_list.is_empty() {
-                console.result(&format!(
+                let line = format!(
                     "{:<18}: none found (check USB cable, power switch, and OS serial permissions)",
                     "candidates"
-                ));
+                );
+                console.result(&line);
+                console.warn(&line);
             } else {
                 console.result(&format!(
                     "{:<18}: {}",
@@ -601,7 +636,11 @@ fn print_doctor_text(
             }
         }
         Err(err) => {
-            console.result(&format!("{:<18}: error: {err}", "ports"));
+            // There is nothing to count, so this run is a failed check rather
+            // than a report with a finding: the reason goes to stderr alone and
+            // stdout stops here instead of claiming a port count it does not have.
+            console.warn(&format!("could not list serial ports: {err}"));
+            return;
         }
     }
 
@@ -619,7 +658,9 @@ fn print_doctor_text(
             }
             None => {
                 let err = report.error.as_deref().unwrap_or("probe failed");
-                console.result(&format!("{:<18}: error ({port_label}: {err})", "probe"));
+                let detail = format!("{port_label}: {err}");
+                console.result(&format!("{:<18}: error ({detail})", "probe"));
+                console.warn(&format!("the $PMTK605 probe failed ({detail})"));
             }
         }
     }
@@ -660,7 +701,7 @@ fn print_doctor_text(
 mod tests {
     use super::*;
     use crate::Timings;
-    use crate::testing::{AutoConfirm, FAKE_PORT, FakePorts, RecordingConsole};
+    use crate::testing::{AutoConfirm, FAKE_PORT, FakePorts, RecordingConsole, Scratch};
     use m241_core::protocol::simulator::FakeDevice;
 
     fn run_ports(
@@ -870,29 +911,7 @@ mod tests {
             },
         ];
         assert_eq!(candidates(&entries), vec!["b"]);
-        assert_eq!(document(&entries)["candidates"][0], "b");
-    }
-
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new(name: &str) -> Self {
-            let path =
-                std::env::temp_dir().join(format!("m241-cli-doctor-{}-{name}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).expect("scratch");
-            Self(path)
-        }
-
-        fn join(&self, name: &str) -> PathBuf {
-            self.0.join(name)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+        assert_eq!(ports_document(&entries)["candidates"][0], "b");
     }
 
     fn run_doctor(
@@ -929,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn doctor_probes_device_and_records_probe_failure_without_crashing() {
+    fn doctor_reports_the_simulated_probe_identity_on_its_ok_line() {
         let links = FakePorts::single(FakeDevice::new);
         let console = RecordingConsole::default();
         run_doctor(
@@ -942,10 +961,41 @@ mod tests {
         )
         .expect("probe ok");
         let text = console.stdout();
-        assert!(text.contains("ok (SIM0: B-core_1.20"), "got {text}");
+        // The identity is the simulator's own, not a measurement: SIM0 is the
+        // fake port in `crate::testing`, and the strings are what `FakeDevice`
+        // answers with.
+        assert!(
+            text.contains(&format!("ok ({FAKE_PORT}: B-core_1.20")),
+            "got {text}"
+        );
+        assert_eq!(console.stderr(), "", "a clean probe warns about nothing");
+    }
 
-        // A unit in BootROM does not answer $PMTK605: doctor reports error cleanly.
+    #[test]
+    fn a_failed_probe_is_a_finding_on_stdout_and_a_diagnostic_on_stderr() {
+        // A unit in the BootROM answers no $PMTK605. Unlike `device info`, which
+        // exits 3, `doctor` reports the finding and still exits 0.
         let silent_links = FakePorts::single(|| FakeDevice::new().in_bootrom());
+
+        let console = RecordingConsole::default();
+        run_doctor(
+            &DoctorOptions {
+                port: Some(String::from("auto")),
+                ..DoctorOptions::default()
+            },
+            &silent_links,
+            &console,
+        )
+        .expect("probe failure must not crash doctor");
+        let text = console.stdout();
+        assert!(text.contains("probe             : error ("), "got {text}");
+        let stderr = console.stderr();
+        assert!(
+            stderr.contains(&format!("$PMTK605 probe failed ({FAKE_PORT}: ")),
+            "the finding is repeated on stderr: {stderr}"
+        );
+
+        // The same finding in `--json`, and still nothing but the object on stdout.
         let console = RecordingConsole::default();
         run_doctor(
             &DoctorOptions {
@@ -961,6 +1011,69 @@ mod tests {
             serde_json::from_str(&console.stdout()).expect("one JSON object");
         assert_eq!(doc["probe"]["status"], "error");
         assert!(doc["probe"]["error"].is_string(), "got {doc}");
+    }
+
+    #[test]
+    fn a_port_listing_failure_goes_to_stderr_and_stops_the_report() {
+        // `Links` refuses to list at all: the report cannot count ports, so
+        // stdout stops before the `ports` line rather than printing a count that
+        // was never taken.
+        struct FailingPorts;
+        impl crate::Links for FailingPorts {
+            fn ports(&self) -> Result<Vec<PortEntry>> {
+                Err(Error::State(String::from("serial subsystem unavailable")))
+            }
+            fn open(&self, _name: &str, _baud: u32) -> Result<crate::link::Opened> {
+                Err(Error::State(String::from("not reached")))
+            }
+        }
+        let console = RecordingConsole::default();
+        doctor(
+            &DoctorOptions::default(),
+            Session::new(&FailingPorts, &console, &AutoConfirm),
+        )
+        .expect("a failed check is still a doctor report");
+        assert!(
+            !console.stdout().contains("ports"),
+            "stdout must not carry a port count: {}",
+            console.stdout()
+        );
+        let stderr = console.stderr();
+        assert!(
+            stderr.contains("could not list serial ports"),
+            "got {stderr}"
+        );
+        assert!(
+            stderr.contains("serial subsystem unavailable"),
+            "got {stderr}"
+        );
+    }
+
+    #[test]
+    fn doctor_warns_about_an_unknown_release_once_on_stderr() {
+        let links =
+            FakePorts::single(|| FakeDevice::with_identity("X-core_9.99", "0001", "99999-00Z", ""));
+        let console = RecordingConsole::default();
+        run_doctor(
+            &DoctorOptions {
+                port: Some(String::from("auto")),
+                ..DoctorOptions::default()
+            },
+            &links,
+            &console,
+        )
+        .expect("doctor");
+        let stderr = console.stderr();
+        assert_eq!(
+            stderr.matches("not one this build knows").count(),
+            1,
+            "the warning is emitted once, by the shared helper: {stderr}"
+        );
+        assert!(
+            console.stdout().contains("X-core_9.99"),
+            "got {}",
+            console.stdout()
+        );
     }
 
     #[test]
@@ -1005,17 +1118,34 @@ mod tests {
         assert_eq!(doc["drop"]["file_count"], 3);
 
         let files = doc["drop"]["files"].as_array().expect("files array");
-        assert!(files.iter().any(|item| {
-            item["kind"] == "firmware"
-                && item["profile"] == "V1.13"
-                && item["evidence"] == "structure"
-        }));
-        assert!(
-            files
-                .iter()
-                .any(|item| { item["kind"] == "download_agent" && item["size"] == DA_SIZE_BYTES })
+        let firmware = files
+            .iter()
+            .find(|item| item["kind"] == "firmware")
+            .unwrap_or_else(|| panic!("no firmware entry in {doc}"));
+        assert_eq!(firmware["profile"], "V1.13");
+        assert_eq!(firmware["evidence"], "structure");
+        // Pinned digest, so a scan that stopped hashing (or hashed the wrong
+        // bytes) cannot pass on the other fields alone.
+        assert_eq!(
+            firmware["sha256"],
+            sha256_hex(&crate::testing::synthetic_image()),
+            "the digest is the SHA-256 of the bytes on disk"
         );
-        assert!(files.iter().any(|item| item["kind"] == "unknown"));
+        let da = files
+            .iter()
+            .find(|item| item["kind"] == "download_agent")
+            .unwrap_or_else(|| panic!("no download-agent entry in {doc}"));
+        assert_eq!(da["size"], DA_SIZE_BYTES);
+        assert_eq!(da["sha256"], sha256_hex(&da_bytes));
+        let unknown = files
+            .iter()
+            .find(|item| item["kind"] == "unknown")
+            .unwrap_or_else(|| panic!("no unknown entry in {doc}"));
+        assert_eq!(
+            unknown["sha256"],
+            sha256_hex(b"unrelated text"),
+            "an unclassified file is still hashed"
+        );
 
         // Only DA_v3.8.4.bin was copied to extract_dir.
         let extracted_da = extract_dir.join(DA_FILENAME);
@@ -1054,5 +1184,287 @@ mod tests {
             &console,
         )
         .expect("--force allows overwrite");
+    }
+
+    /// What a directory tree holds, for "nothing changed" checks.
+    fn tree_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut files = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    files.push((path.clone(), fileio::read(&path).expect("read file")));
+                }
+            }
+        }
+        files.sort_by(|(left, _), (right, _)| left.cmp(right));
+        files
+    }
+
+    #[test]
+    fn a_wrong_sized_download_agent_is_unknown_and_extraction_is_refused() {
+        // M1: the 14,896-byte identification is the only thing separating a DA
+        // from a file that merely has its name. One byte over must not be
+        // extracted; it must be reported as an unknown file with the reason.
+        let scratch = Scratch::new("da-wrong-size");
+        let drop_dir = scratch.join("holux_drop");
+        let extract_dir = scratch.join("vendor");
+        std::fs::create_dir_all(&drop_dir).expect("create drop dir");
+
+        let wrong_bytes = vec![0xA5u8; DA_SIZE_BYTES + 1];
+        fileio::write(&drop_dir.join(DA_FILENAME), &wrong_bytes).expect("write wrong-sized da");
+
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let err = run_doctor(
+            &DoctorOptions {
+                from_drop: Some(drop_dir.clone()),
+                extract_to: Some(extract_dir.clone()),
+                ..DoctorOptions::default()
+            },
+            &links,
+            &console,
+        )
+        .expect_err("a DA of the wrong size must not be extracted");
+        assert!(matches!(err, Error::State(_)), "got {err}");
+        assert_eq!(crate::exit::exit_code_for(&err), 1);
+        assert!(
+            format!("{err}").contains(&DA_SIZE_BYTES.to_string()),
+            "the refusal names the size it expected: {err}"
+        );
+        assert!(!extract_dir.exists(), "nothing was written");
+
+        // The inventory itself says why the file was not accepted.
+        let console = RecordingConsole::default();
+        run_doctor(
+            &DoctorOptions {
+                from_drop: Some(drop_dir),
+                json: true,
+                ..DoctorOptions::default()
+            },
+            &links,
+            &console,
+        )
+        .expect("the inventory still runs");
+        let doc: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert!(doc["drop"]["download_agent"].is_null(), "got {doc}");
+        assert_eq!(doc["drop"]["files"][0]["kind"], "unknown", "got {doc}");
+        let note = doc["drop"]["files"][0]["note"].as_str().unwrap_or("");
+        assert!(note.contains(&DA_SIZE_BYTES.to_string()), "got {note}");
+    }
+
+    #[test]
+    fn extract_to_without_a_download_agent_in_the_drop_is_refused() {
+        // S1: the failure `docs/reference/02-cli.md` documents — `--extract-to`
+        // with a drop that holds no identified DA is `Error::State`, not an
+        // empty directory quietly created.
+        let scratch = Scratch::new("no-da");
+        let drop_dir = scratch.join("holux_drop");
+        let extract_dir = scratch.join("vendor");
+        std::fs::create_dir_all(&drop_dir).expect("create drop dir");
+        fileio::write_text(&drop_dir.join("readme.txt"), "nothing to extract").expect("write");
+
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let err = run_doctor(
+            &DoctorOptions {
+                from_drop: Some(drop_dir),
+                extract_to: Some(extract_dir.clone()),
+                ..DoctorOptions::default()
+            },
+            &links,
+            &console,
+        )
+        .expect_err("no DA means nothing to copy");
+        assert!(matches!(err, Error::State(_)), "got {err}");
+        assert!(format!("{err}").contains(DA_FILENAME), "got {err}");
+        assert_eq!(crate::exit::exit_code_for(&err), 1);
+        assert!(!extract_dir.exists());
+    }
+
+    #[test]
+    fn the_drop_scan_stops_one_level_past_max_drop_depth() {
+        // S3 / R18: the scan reads files up to four directory levels below
+        // `--from-drop` (`holux_drop/d1/d2/d3/d4/` is the deepest that is read)
+        // and stops at the fifth. Keying a file to a specific depth is what makes
+        // the test catch a bound that is off by one in either direction: a
+        // marker proving the bound was met, and a file proving it was not passed.
+        let scratch = Scratch::new("drop-depth");
+        let drop_dir = scratch.join("holux_drop");
+        let mut level = drop_dir.clone();
+        for depth in 1..=6 {
+            level = level.join(format!("d{depth}"));
+            std::fs::create_dir_all(&level).expect("create level");
+            if depth == 5 {
+                fileio::write_text(&level.join("beyond.txt"), "x").expect("write file");
+            }
+        }
+        fileio::write_text(&level.join("deepest_file.txt"), "x").expect("write");
+        let at_the_bound = drop_dir.join("d1").join("d2").join("d3").join("d4");
+        fileio::write_text(&at_the_bound.join("bound.txt"), "x").expect("write bound marker");
+
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        run_doctor(
+            &DoctorOptions {
+                from_drop: Some(drop_dir),
+                json: true,
+                ..DoctorOptions::default()
+            },
+            &links,
+            &console,
+        )
+        .expect("depth-limited scan");
+        let doc: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        let listed: Vec<String> = doc["drop"]["files"]
+            .as_array()
+            .expect("files array")
+            .iter()
+            .map(|item| item["path"].as_str().unwrap_or("").to_owned())
+            .collect();
+        assert!(
+            listed.iter().any(|path| path.ends_with("d4/bound.txt")),
+            "four levels below the root is read: {listed:?}"
+        );
+        assert!(
+            !listed.iter().any(|path| path.ends_with("beyond.txt")),
+            "five levels below the root is not read: {listed:?}"
+        );
+        assert!(
+            !listed.iter().any(|path| path.ends_with("deepest_file.txt")),
+            "six levels below the root is not read: {listed:?}"
+        );
+        assert_eq!(listed.len(), 1, "got {listed:?}");
+        assert!(
+            console.stderr().contains("deeper than 4 levels"),
+            "the truncation is reported: {}",
+            console.stderr()
+        );
+
+        // A tree exactly MAX_DROP_DEPTH deep is read in full and silent.
+        let shallow = scratch.join("shallow");
+        let mut level = shallow.clone();
+        for depth in 1..=MAX_DROP_DEPTH {
+            level = level.join(format!("d{depth}"));
+        }
+        std::fs::create_dir_all(&level).expect("create deep level");
+        fileio::write_text(&level.join("deep.txt"), "x").expect("write file");
+        let console = RecordingConsole::default();
+        run_doctor(
+            &DoctorOptions {
+                from_drop: Some(shallow),
+                json: true,
+                ..DoctorOptions::default()
+            },
+            &links,
+            &console,
+        )
+        .expect("scan at the limit");
+        let doc: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(doc["drop"]["file_count"], 1, "got {doc}");
+        assert_eq!(console.stderr(), "", "no truncation to report");
+    }
+
+    #[test]
+    fn a_drop_scan_leaves_the_drop_directory_untouched() {
+        // S4: `--from-drop` is documented as a read-only scan, so the input tree
+        // must be byte-identical afterwards, with and without `--extract-to`.
+        let scratch = Scratch::new("drop-readonly");
+        let drop_dir = scratch.join("holux_drop");
+        let nested = drop_dir.join("tool").join("da");
+        std::fs::create_dir_all(&nested).expect("create drop dirs");
+        fileio::write(
+            &drop_dir.join("m241_v1_13.bin"),
+            &crate::testing::synthetic_image(),
+        )
+        .expect("write firmware");
+        let da_bytes = vec![0x5Au8; DA_SIZE_BYTES];
+        fileio::write(&nested.join(DA_FILENAME), &da_bytes).expect("write da");
+        fileio::write_text(&drop_dir.join("readme.txt"), "drop notes").expect("write notes");
+        let before = tree_snapshot(&drop_dir);
+
+        let links = FakePorts::empty();
+        for extract_to in [None, Some(scratch.join("vendor"))] {
+            let console = RecordingConsole::default();
+            run_doctor(
+                &DoctorOptions {
+                    from_drop: Some(drop_dir.clone()),
+                    extract_to,
+                    ..DoctorOptions::default()
+                },
+                &links,
+                &console,
+            )
+            .expect("doctor --from-drop");
+        }
+
+        assert_eq!(tree_snapshot(&drop_dir), before, "the drop was modified");
+    }
+
+    #[test]
+    fn a_drop_scan_does_not_create_the_extract_directory_it_only_copies_one_file() {
+        // S4 / S1, from the outside: the destination is created only when there
+        // is something to copy into it, and then it holds the DA and nothing else.
+        let scratch = Scratch::new("extract-creates");
+        let drop_dir = scratch.join("holux_drop");
+        std::fs::create_dir_all(&drop_dir).expect("create drop dir");
+        fileio::write(&drop_dir.join(DA_FILENAME), &vec![0x11u8; DA_SIZE_BYTES]).expect("write da");
+
+        // Read-only pass: no destination is created.
+        let only_report = scratch.join("never_created");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        run_doctor(
+            &DoctorOptions {
+                from_drop: Some(drop_dir.clone()),
+                ..DoctorOptions::default()
+            },
+            &links,
+            &console,
+        )
+        .expect("read-only scan");
+        assert!(!only_report.exists(), "no --extract-to, no directory");
+        assert!(
+            !scratch.join("vendor").exists(),
+            "no --extract-to, no directory"
+        );
+
+        // Extraction pass: the destination appears, holding only the DA.
+        let extract_dir = scratch.join("vendor");
+        let console = RecordingConsole::default();
+        run_doctor(
+            &DoctorOptions {
+                from_drop: Some(drop_dir),
+                extract_to: Some(extract_dir.clone()),
+                ..DoctorOptions::default()
+            },
+            &links,
+            &console,
+        )
+        .expect("extract");
+        let written: Vec<String> = std::fs::read_dir(&extract_dir)
+            .expect("destination created")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(written, vec![String::from(DA_FILENAME)], "got {written:?}");
+        // The bytes crossed, not just the name: `drop(fileio::write(..))`
+        // leaves an empty file that a name-only assertion would accept.
+        assert_eq!(
+            fileio::read(&extract_dir.join(DA_FILENAME)).expect("read extracted"),
+            vec![0x11u8; DA_SIZE_BYTES],
+            "the extracted DA is the drop's bytes"
+        );
     }
 }
