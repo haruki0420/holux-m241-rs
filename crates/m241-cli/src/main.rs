@@ -19,13 +19,9 @@ use std::process::ExitCode;
 use clap::Parser;
 use m241_cli::{Cli, exit, run};
 
-// `m241-flash` is a dependency of this binary because two of its subcommands
-// write to the device: `fw flash` (the Download Agent) and `log erase`
-// (`$PMTK182,6`). Neither is implemented yet, so nothing from the crate is
-// called; the import keeps the dependency honest instead of declared-and-unused,
-// and marks where those two subcommands will enter the write path.
-#[allow(unused_imports)]
-use m241_flash as _;
+// `m241-flash` is a dependency of this package because `fw flash` (the Download
+// Agent) and `log erase` (`$PMTK182,6`) write to the device. The library wires
+// `fw flash`; `log erase` is still a stub in `m241-cli/src/lib.rs`.
 
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {

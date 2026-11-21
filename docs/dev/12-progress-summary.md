@@ -51,7 +51,7 @@
 | **ezTour 仕様化** | 完了（`docs/dev/07-eztour-spec.ja.md` 615 行、クリーンルーム仕様） |
 | **読み書き分離 + safety ゲート** | 完了（`m241-core` / `m241-flash` 分離、`tools/check_safety.py` + 配線・検出力テスト 12 件） |
 | **コア読み取り・変換・EXIF/ジオタグ基盤** | 完了（PMTK / BootROM / ログ解析 / GPX・KML・CSV・NMEA・JSON 出力 / パッチ計画 / 自前 EXIF・geotag） |
-| **CLI 11 コマンド + 2 スタブ** | 完了（`device ports` / `info` / `doctor`、`fw dump` / `patch`、`log info` / `download` / `read` / `geotag`、`nmea repair` / `proxy`。131 + 1 テスト。`fw flash` / `log erase` はスタブ） |
+| **CLI 12 コマンド + 1 スタブ** | 完了（`device ports` / `info` / `doctor`、`fw dump` / `patch` / `flash`、`log info` / `download` / `read` / `geotag`、`nmea repair` / `proxy`。`fw flash` は DA 書き込みと読み戻しまで配線済み・**実機未検証**。`log erase` はスタブ） |
 | **GUI 4 画面（実データ接続・再生・写真同期）** | 完了（接続 / ログ / ファーム / 設定。実ポート probe・実ログ読込・再生・写真同期・POI・始点終点・設定反映。132 テスト。実機未検証） |
 
 - **2026-11-21 のマージ**: review-gate (#2)、CLI 非破壊 3 コマンド (#3)、GUI 実データ接続 (#4)、
@@ -66,7 +66,7 @@
 | 項目 | 状態 | ブロッカー / 注意点 |
 |---|---|---|
 | **DA 書き込み実装**（`crates/m241-flash/src/da.rs`） | 実装済み。開始アドレスは確定済み（PR #6 以降） | DA 側の開始アドレスは 2026-11-21 の `fw probe-da` で `0` に確定（`docs/dev/05-verification.md` §1.2）。`UNRESOLVED_STARTS` は空、`check_layout` は確定値 `0` を通す。`write_range` は private、読み戻し・消去失敗 `0xA5`・ゼロ詰め・`0xD9` 無応答はテスト済み。**実機の書き込み・消去・再起動は未検証** |
-| **CLI 残り 2 コマンド** | 未実装スタブ | `fw flash`（開始アドレスは確定。実機セッションが残る）と `log erase`。`device doctor` / `log geotag` / `nmea proxy` はマージ済み |
+| **CLI 残り 1 コマンド** | 未実装スタブ | `log erase` のみ。`fw flash` は開始アドレス確定後、`verify_device` → DA RAM ロード → `0xD3`/`0xD5` → `0xD9` → BootROM 読み戻しまで配線済み。**実機の書き込み・消去・再起動は未検証** |
 
 ### 3.2 ezTour 代替機能の再実装（[`07-eztour-spec.ja.md`](07-eztour-spec.ja.md) §8）
 

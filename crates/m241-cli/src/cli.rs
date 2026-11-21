@@ -201,6 +201,13 @@ pub struct FlashOptions {
     #[arg(long, value_name = "FILE")]
     pub backup: PathBuf,
 
+    /// The vendor download agent (`DA_v3.8.4.bin`, 14,896 bytes).
+    ///
+    /// Required for a real write because the DA has to be loaded into the
+    /// chip's RAM before it can program flash. Not used by `--dry-run`.
+    #[arg(long, value_name = "FILE", required_unless_present = "dry_run")]
+    pub da: Option<PathBuf>,
+
     /// Check the image and print the write plan; open no port and send nothing.
     #[arg(long)]
     pub dry_run: bool,
@@ -214,6 +221,10 @@ pub struct FlashOptions {
     /// Confirm the write without the typed `WRITE` prompt.
     #[arg(long)]
     pub yes: bool,
+
+    /// The chip is already in the BootROM; send the sync without `$PMTK180`.
+    #[arg(long)]
+    pub assume_brom: bool,
 
     /// Serial port for a real write, or `auto` for the only likely cable.
     ///
@@ -732,9 +743,11 @@ mod tests {
         };
         assert_eq!(flash.image, PathBuf::from("image.bin"));
         assert_eq!(flash.backup, PathBuf::from("backup.bin"));
+        assert_eq!(flash.da, None, "a dry run needs no DA file");
         assert!(flash.dry_run);
         assert!(!flash.allow_cross_model);
         assert!(!flash.yes);
+        assert!(!flash.assume_brom);
         assert_eq!(flash.port, "auto");
         assert!(!flash.json);
 
@@ -745,8 +758,11 @@ mod tests {
             "image.bin",
             "--backup",
             "backup.bin",
+            "--da",
+            "DA_v3.8.4.bin",
             "--allow-cross-model",
             "--yes",
+            "--assume-brom",
             "--port",
             "COM3",
             "--json",
@@ -759,10 +775,47 @@ mod tests {
             panic!("expected fw flash");
         };
         assert!(!flash.dry_run);
+        assert_eq!(
+            flash.da,
+            Some(PathBuf::from("DA_v3.8.4.bin")),
+            "a real write needs the vendor DA"
+        );
         assert!(flash.allow_cross_model);
         assert!(flash.yes);
+        assert!(flash.assume_brom);
         assert_eq!(flash.port, "COM3");
         assert!(flash.json);
+    }
+
+    #[test]
+    fn fw_flash_without_a_da_is_a_usage_error_unless_dry_run() {
+        // The DA is loaded into the chip's RAM before a real write, so the
+        // grammar asks for it up front rather than opening a port and then
+        // failing with "no DA". A dry run touches no device and needs none.
+        let err = Cli::try_parse_from([
+            "m241",
+            "fw",
+            "flash",
+            "image.bin",
+            "--backup",
+            "backup.bin",
+            "--yes",
+        ])
+        .expect_err("no --da");
+        assert!(err.use_stderr(), "got {err}");
+        assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
+        assert!(err.to_string().contains("--da"), "got {err}");
+
+        Cli::try_parse_from([
+            "m241",
+            "fw",
+            "flash",
+            "image.bin",
+            "--backup",
+            "backup.bin",
+            "--dry-run",
+        ])
+        .expect("a dry run needs no --da");
     }
 
     #[test]

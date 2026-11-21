@@ -95,12 +95,33 @@ and an image that is already patched.
 
 Writes an image through the Download Agent. **Destructive.**
 
-Before writing it checks, and refuses on any failure:
+Before opening a port it checks, and refuses on any failure:
 
 1. the image matches a known profile, **or** every differing byte against
    `--backup` falls inside the allowed patch offsets;
-2. the image fits the flash size the DA reports;
-3. the user typed `WRITE` (or passed `--yes`).
+2. the image is acceptable to the driver's pinned V1.13 range (a V1.12 plan is
+   shown by `--dry-run` but is not writable by this build);
+3. a cross-model image (the backup names another device type) has
+   `--allow-cross-model`;
+4. the user passed `--yes`;
+5. the layout gate accepts the pinned start `0x00000000` and length `406620`;
+6. `--da` names a 14,896-byte vendor `DA_v3.8.4.bin` starting `00 00 A0 E1`.
+
+A real run then enters the BootROM, compares the whole backup span with the
+unit's flash (**before any erase**), loads the DA into the chip's RAM, sends
+`0xD3` + `0xD5`, sends `0xD9`, re-enters the BootROM and reads the range back.
+Success is reported only when the read-back equals the image; `WriteReport`
+prints the start, length, packet count and verified byte count. A failed
+read-back keeps its error and names the power-cycle and `fw dump` checks — it is
+never reported as a success. The backup file is never modified.
+
+Flags: `--backup <FILE>` (required), `--da <FILE>` (required unless
+`--dry-run`), `--port <PORT|auto>`, `--yes`, `--assume-brom` (the chip is
+already in the BootROM), `--allow-cross-model`, `--dry-run` (plan only; opens no
+port and sends nothing), `--json`.
+
+🧪 The whole write path has been exercised only against the fake Download Agent.
+No unit has been flashed by this build; see `docs/dev/05-verification.md`.
 
 ## `m241 fw probe-da`
 

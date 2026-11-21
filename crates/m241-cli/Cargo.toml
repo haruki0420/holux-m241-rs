@@ -32,5 +32,11 @@ serialport.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+# The CLI's `fw flash` test runs the whole write against the same fake DA the
+# write crate's protocol tests use. The feature is off for the shipped binary,
+# so the model is not linked into `m241` itself.
+m241-flash = { workspace = true, features = ["simulator"] }
+
 [lints]
 workspace = true

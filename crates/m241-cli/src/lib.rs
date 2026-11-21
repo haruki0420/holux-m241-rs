@@ -13,16 +13,20 @@
 //!   fileio   reading and writing the files a command works on
 //!   cal      civil dates, so the offset flags need no date library
 //!   device   ports, info, doctor
-//!   fw       dump and patch (flash is a stub, see below)
+//!   fw       dump, patch and flash
 //!   logcmd   download, info, read, geotag (erase is a stub, see below)
 //!   nmea     repair and proxy
 //! ```
 //!
-//! Two verbs are deliberately not wired: `fw flash` and `log erase`, the two
-//! commands that change the device. They parse, so the help is complete, and they
-//! fail with a message naming themselves and pointing at `m241 --help`. Adding a
-//! handler for either would put a destructive command behind this binary; the
-//! reference says why that is the write crate's job, not this one's.
+//! `fw flash` is the one destructive verb wired here, and it is a thin front end
+//! to `m241-flash`: the erase, the program and the restart live in that crate,
+//! and the handler only decides the order of the refusals and what to print.
+//! `log erase` is still not wired; it parses, so the help is complete, and fails
+//! with a message naming itself and pointing at `m241 --help`.
+//!
+//! 🧪 The firmware write has not run against a unit. It is exercised end to end
+//! against `m241-flash`'s fake DA; `docs/dev/05-verification.md` records what
+//! hardware sessions exist.
 //!
 //! Machine output goes to stdout; progress and warnings go to stderr. Exit codes
 //! are documented in `docs/reference/02-cli.md` and map one-to-one onto

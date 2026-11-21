@@ -53,17 +53,18 @@ pub mod da;
 pub mod erase;
 /// The fake Download Agent the write path's tests run against.
 ///
-/// Test-only: no crate outside this one uses it (`m241-cli` only names the crate
-/// for its side effects), and a shipped binary has no reason to carry a
-/// destructive command set's model.
-#[cfg(test)]
+/// Off by default: a shipped binary has no reason to carry a destructive
+/// command set's model. This crate's own tests see it through `cfg(test)`; a
+/// dependent crate's tests enable the `simulator` feature so the end-to-end
+/// test drives the same model the protocol tests do rather than a second one.
+#[cfg(any(test, feature = "simulator"))]
 pub mod simulator;
 
 pub use da::DownloadAgent;
 pub use da::{Acceptance, AcceptedImage, WritePlan, check_image, write_plan};
 pub use da::{DaLoadId, DaLoader};
 pub use erase::{BackupProof, ERASE_SUBCOMMAND, LogEraser};
-#[cfg(test)]
+#[cfg(any(test, feature = "simulator"))]
 pub use simulator::FakeDa;
 
 /// Version of the crate, taken from `Cargo.toml` at build time.

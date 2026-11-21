@@ -110,16 +110,18 @@ known profile **or** every byte that differs from `--backup` falls inside the
 patch offsets; the image fits the flash size the DA reports; the user typed
 `WRITE` (`docs/reference/02-cli.md` §`m241 fw flash`, `AGENTS.md` §2.3,
 `CONTRIBUTING.md` safety-gate table) — plus a read-back after the write. **It is
-not implemented.** `crates/m241-flash/src/da.rs` refuses to operate and
-`crates/m241-cli/src/lib.rs` returns "not implemented" for `fw flash`; the
-offline gates that *are* code are the profile and epoch checks in
-`crates/m241-core/src/firmware/patch.rs`.
+implemented but has not run against a unit.** `crates/m241-flash/src/da.rs`
+drives `verify_device`, the DA load, `0xD3`/`0xD5` and the `0xD9` read-back;
+`crates/m241-cli/src/lib.rs` calls it from `fw flash` after the consent,
+confirmation, layout and DA-file checks. The offline gates are the profile and
+epoch checks in `crates/m241-core/src/firmware/patch.rs`.
 
-**Verdict: the largest difference, and the one where this project is currently
-the weakest of the three.** Nekoba and v1 both have a working write path with a
-typed confirmation; this project has a specification, a refusal and no write path.
-The backup diff check and the read-back are the two gates that do not exist
-upstream in any form, and they stay unproven until the flash path lands.
+**Verdict: the write path now exists, and the next step is the hardware
+session.** Nekoba and v1 both have a working write path with a typed
+confirmation; this project has the same sequence plus the backup diff check and
+the read-back, which do not exist upstream in any form. Those two gates are
+proven against the simulator only until `docs/dev/05-verification.md` records a
+run on a unit.
 
 ### 3. Which firmware images the patch tool will accept
 

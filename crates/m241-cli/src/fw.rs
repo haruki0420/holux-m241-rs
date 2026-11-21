@@ -29,8 +29,9 @@ use m241_core::protocol::pmtk::{NMEA_BAUD, StreamState};
 use m241_core::protocol::port::Transport;
 use m241_core::{Error, FirmwareProfile, PatchPlan, Result};
 use m241_flash::da::{
-    Confirmation, DaLoadId, DaLoader, DownloadAgent, PROBE_ADDRESSES, PROBE_PAGE_SIZE, VECTOR,
-    WritePlan, check_da_image, check_layout, read_candidates, write_plan,
+    Confirmation, DaLoadId, DaLoader, DownloadAgent, FLASH_WRITE_START, PROBE_ADDRESSES,
+    PROBE_PAGE_SIZE, VECTOR, WritePlan, WriteReport, check_da_image, check_image, check_layout,
+    read_candidates, write_plan,
 };
 
 use crate::Session;
@@ -508,29 +509,46 @@ fn plan_document(report: &PatchReport, written: Option<&std::path::Path>) -> ser
     })
 }
 
-/// `m241 fw flash`: check an image against a backup, or refuse to write it.
+/// `m241 fw flash`: check an image against a backup, then write and verify it.
 ///
-/// `--dry-run` is the whole command for now. It reads the two files, identifies
-/// the image against a known profile, runs [`write_plan`] — the same acceptance
-/// rule [`DownloadAgent::write`] runs — and prints what a write would do. It
-/// **opens no port and sends nothing**: the plan function in `m241-flash` has no
-/// transport, and this handler returns before [`link::resolve`] is ever called.
+/// `--dry-run` reads the two files, identifies the image against a known profile,
+/// runs [`write_plan`] — the same acceptance rule [`DownloadAgent::write`] runs —
+/// and prints what a write would do. It **opens no port and sends nothing**.
 ///
-/// Without `--dry-run` the command stops at [`check_layout`]'s refusal. The DA's
-/// flash view of the image's first byte is either `0` or `0x0020_0000` and no
-/// read has settled which (`docs/reference/01-da-protocol.md` §4.2 versus
-/// `m241_core::protocol::brom`), and a wrong one erases the reset vector. The
-/// refusal is the one `m241-flash` already gives, reused rather than restated
-/// here, so the CLI cannot drift from the crate that would do the write.
+/// A real run does everything decidable without a device first, in this order:
+/// the cross-model consent, the `--yes` confirmation, [`check_layout`], the
+/// driver's own acceptance rule against the pinned V1.13 range
+/// ([`check_image`]), and the DA file ([`check_da_image`]). Only then is a port
+/// opened. On the device it:
+///
+/// 1. enters the BootROM ([`enter_bootrom`]) and syncs;
+/// 2. calls [`DownloadAgent::verify_device`], so a unit that does not hold
+///    `backup` byte for byte is refused **before** anything is erased;
+/// 3. loads the DA into the chip's RAM ([`DaLoader::load`], RAM only);
+/// 4. programs the image ([`DownloadAgent::write`], `0xD3` + `0xD5`);
+/// 5. restarts the chip and reads the range back through the BootROM
+///    ([`PendingWrite::verify_written`], `0xD9`), reporting success only when
+///    every byte matches.
+///
+/// The read-back after `0xD9` may fail on a unit that boots its firmware instead
+/// of returning to the BootROM. That is reported as the error the crate
+/// produces, which names the power-cycle and `fw dump` checks; this function
+/// never upgrades a failed read-back to success. ⚠️ 未検証 on hardware: the
+/// write path has run against the fake only.
 ///
 /// # Errors
 ///
-/// * [`Error::Io`] when either file cannot be read.
+/// * [`Error::Io`] when a file cannot be read.
 /// * [`Error::Profile`] when the image or the backup matches no known profile.
 /// * [`Error::Firmware`] when the image is too short to hold a header.
-/// * [`Error::Safety`] when the image is not acceptable ([`write_plan`]), when a
-///   cross-model write was not allowed, when `--yes` was not given, or — always,
-///   for now — from [`check_layout`].
+/// * [`Error::Safety`] when the image is not acceptable ([`write_plan`] /
+///   [`check_image`]), when a cross-model write was not allowed, when `--yes`
+///   was not given, from [`check_layout`], or from [`check_da_image`] / the
+///   device check.
+/// * [`Error::Port`] when no plausible port can be opened.
+/// * [`Error::Timeout`] / [`Error::Framing`] / [`Error::Rejected`] from the
+///   BootROM, the DA, the write or the read-back; each carries the crate's
+///   recovery paragraph once anything has been sent.
 pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
     let backup = fileio::read(&options.backup)?;
     let image = fileio::read(&options.image)?;
@@ -542,60 +560,223 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
     let profile = identify(&image_view)?.profile;
     let plan = write_plan(profile, &backup, &image)?;
 
+    // The plan may describe a V1.12 or V1.14 image, but the driver programs the
+    // pinned V1.13 range. Run its own acceptance rule now so a dry run can say a
+    // write would be refused, and a real run stops before opening a port.
+    let writable = check_image(&PROFILE_V1_13, &backup, &image);
+
     if options.dry_run {
-        print_write_plan(options, session.console, &plan)?;
+        print_write_plan(
+            options,
+            session.console,
+            &plan,
+            writable.as_ref().err().map(ToString::to_string).as_deref(),
+        )?;
         session.console.note(&dry_run_note());
         return Ok(());
     }
 
     // A real write. Everything that can be decided without a port is decided
     // first, in the order a person would want to be told: the cross-model
-    // consent, the confirmation, then the layout the crate refuses on.
-    if plan.needs_cross_model_consent() && !options.allow_cross_model {
-        return Err(Error::Safety {
-            reason: format!(
-                "the image is for device {} but the backup came from {}; pass --allow-cross-model \
-                 only if you are sure the two models share this firmware. Nothing was sent",
-                plan.device_type,
-                plan.backup_device_type
-                    .as_deref()
-                    .unwrap_or("an unreadable image")
-            ),
-        });
+    // consent, the confirmation, then the layout and the files the write needs.
+    if let Some(err) = cross_model_refusal(&plan, options.allow_cross_model) {
+        return Err(err);
     }
-    let _confirmation = Confirmation::of_command_line(options.yes)?;
-    // The refusal that stands between this command and a unit. It is
-    // `m241-flash`'s own, with its own message naming `05-verification.md`.
+    let confirmation = Confirmation::of_command_line(options.yes)?;
     check_layout()?;
-    // Reached only if `check_layout` ever stops refusing, which is the edit the
-    // hardware row has to justify. The port is opened after the confirmation so
-    // a dry run and a refusal never touch a cable.
-    let _port = link::resolve(session.links, &options.port)?;
-    Err(Error::State(String::from(
-        "the write path past check_layout is not wired in this build; open an issue with the \
-         output of `m241 fw flash --dry-run` and `m241 fw probe-da`",
-    )))
+    writable?;
+
+    // clap requires `--da` unless `--dry-run`, but the handler does not lean on
+    // the grammar: a missing file must not fall through to "load nothing".
+    let Some(da_path) = options.da.as_deref() else {
+        return Err(Error::State(String::from(
+            "no DA image: pass --da FILE (the vendor DA_v3.8.4.bin; not needed with --dry-run)",
+        )));
+    };
+    let da = fileio::read(da_path)?;
+    check_da_image(&da)?;
+
+    // The port is opened only after every refusal above, so a dry run, a
+    // missing confirmation and a bad file never touch a cable.
+    let port = link::resolve(session.links, &options.port)?;
+    session.console.note(&format!(
+        "writing {} bytes to {port}; the backup at {} is not modified",
+        plan.write_length,
+        options.backup.display()
+    ));
+
+    let transport = enter_bootrom(options.assume_brom, session, &port)?;
+    let mut rom = MtkBootRom::new(transport);
+    rom.sync()?;
+    session
+        .console
+        .note("BootROM sync answered; comparing the whole unit with the backup before any erase");
+    DownloadAgent::verify_device(&mut rom, &backup)?;
+
+    session.console.note(
+        "the unit matches the backup; loading the DA into the chip's RAM (no flash write yet)",
+    );
+    let mut loader = DaLoader::new(rom.transport_mut());
+    let id = loader.load(confirmation, &da)?;
+    session.console.note(&format!(
+        "DA v{}.{} answered; programming {} bytes in {} packets",
+        id.version >> 8,
+        id.version & 0xFF,
+        plan.write_length,
+        plan.packets
+    ));
+
+    let mut da_session = DownloadAgent::new(rom.into_transport());
+    let pending = match da_session.write(confirmation, &backup, &image) {
+        Ok(pending) => pending,
+        Err(err) => {
+            note_write_failure(session.console, &options.backup);
+            return Err(err);
+        }
+    };
+    session.console.note(
+        "every packet was acknowledged; restarting the unit and reading the written range back",
+    );
+
+    let report = match pending.verify_written(da_session, &image, FLASH_WRITE_START, |transport| {
+        // `0xD9` has just been sent. Put the line at the BootROM rate and
+        // give the unit a moment before the first probe; `MtkBootRom::sync`
+        // then clears whatever the DA conversation left queued.
+        if let Err(err) = transport.set_baud(DEFAULT_BOOTROM_BAUD) {
+            session.console.warn(&format!(
+                "could not set the BootROM baud after the restart ({err}); the read-back will \
+                     most likely time out"
+            ));
+        }
+        std::thread::sleep(BOOTROM_REENTRY_SETTLE);
+    }) {
+        Ok(report) => report,
+        Err(err) => {
+            note_write_failure(session.console, &options.backup);
+            return Err(err);
+        }
+    };
+
+    print_write_report(options, session.console, &port, &plan, &report)
 }
 
-/// The sentence a dry run ends with, naming the refusal and how to settle it.
+/// The cross-model consent gate, as a value the tests can drive.
 ///
-/// One string rather than a literal at the call site so the test that asserts
-/// both halves — "a real write is refused" and "run `fw probe-da`" — reads the
-/// same text a user does.
+/// A synthetic backup/image pair cannot reach this branch: [`check_image`]
+/// accepts a device string that differs from the backup's only through the
+/// official-digest rule, and that needs the vendor bytes. Keeping the gate a
+/// function of the plan pins the refusal without weakening the acceptance rule.
+fn cross_model_refusal(plan: &WritePlan, allow: bool) -> Option<Error> {
+    if !plan.needs_cross_model_consent() || allow {
+        return None;
+    }
+    Some(Error::Safety {
+        reason: format!(
+            "the image is for device {} but the backup came from {}; pass --allow-cross-model \
+             only if you are sure the two models share this firmware. Nothing was sent",
+            plan.device_type,
+            plan.backup_device_type
+                .as_deref()
+                .unwrap_or("an unreadable image")
+        ),
+    })
+}
+
+/// How long the unit is given after `0xD9` before the first BootROM probe.
+///
+/// A conservative settle, not a measured value: ⚠️ 未検証 on hardware because the
+/// write path has not run on a unit. The read-back's own timeout is what fails
+/// the command if this is too short.
+const BOOTROM_REENTRY_SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Say what a failed write left behind, without claiming it wrote nothing.
+///
+/// The error above carries the crate's own recovery paragraph, which differs
+/// before and after `0xD9`. This note adds the one fact the error cannot know:
+/// the backup is a local file and this command never touched it.
+fn note_write_failure(console: &dyn Console, backup: &std::path::Path) {
+    console.note(&format!(
+        "the write did not complete. The backup at {} was not modified by this command; follow \
+         the recovery steps in the error above. A power-cycle followed by `m241 fw dump` shows \
+         what the unit actually holds — do not treat the write as successful without that check.",
+        backup.display()
+    ));
+}
+
+/// Show the completed write: the range, the packets and the read-back count.
+///
+/// # Errors
+///
+/// Whatever [`Console::json`] returns when the document cannot be written.
+fn print_write_report(
+    options: &FlashOptions,
+    console: &dyn Console,
+    port: &str,
+    plan: &WritePlan,
+    report: &WriteReport,
+) -> Result<()> {
+    if options.json {
+        return console.json(&serde_json::json!({
+            "dry_run": false,
+            "port": port,
+            "image": options.image.display().to_string(),
+            "backup": options.backup.display().to_string(),
+            "profile": plan.profile.name,
+            "acceptance": plan.acceptance.label(),
+            "start": format!("0x{:08X}", report.start),
+            "length": report.length,
+            "packets": report.packets,
+            "verified": report.verified,
+            "verified_matches_image": true,
+            "flash_write": true,
+        }));
+    }
+    console.result(&format!("{:<12}: {port}", "port"));
+    console.result(&format!("{:<12}: {}", "image", options.image.display()));
+    console.result(&format!("{:<12}: {}", "backup", options.backup.display()));
+    console.result(&format!(
+        "{:<12}: {} ({}, {} bytes)",
+        "profile", plan.profile.name, plan.profile.device_type, plan.size
+    ));
+    console.result(&format!("{:<12}: 0x{:08X}", "start", report.start));
+    console.result(&format!("{:<12}: {}", "length", report.length));
+    console.result(&format!("{:<12}: {}", "packets", report.packets));
+    console.result(&format!(
+        "{:<12}: {} bytes read back and identical",
+        "verified", report.verified
+    ));
+    console.result(&format!("{:<12}: yes", "flash write"));
+    Ok(())
+}
+
+/// The sentence a dry run ends with.
+///
+/// One string rather than a literal at the call site, so the test that asserts
+/// the dry run opened nothing reads the same text a user does.
 fn dry_run_note() -> String {
     String::from(
-        "actual write is refused until the start address is resolved; run `fw probe-da` on the \
-         unit and record its verdict in docs/dev/05-verification.md. This dry run opened no port \
-         and sent no command",
+        "dry run: no port was opened and no command was sent. A real run asks for --yes, loads \
+         the DA, compares the unit with the backup, writes, and reads the range back before it \
+         reports success",
     )
 }
 
 /// Format the plan as labelled lines or one JSON object.
 ///
+/// `write_refusal` is the driver's own acceptance error for this image against
+/// the pinned V1.13 range, when there is one. A dry run still prints the plan —
+/// that is what it is for — but it must not say a real write would proceed when
+/// [`DownloadAgent::write`] would refuse it.
+///
 /// # Errors
 ///
 /// Whatever [`Console::json`] returns when the document cannot be written.
-fn print_write_plan(options: &FlashOptions, console: &dyn Console, plan: &WritePlan) -> Result<()> {
+fn print_write_plan(
+    options: &FlashOptions,
+    console: &dyn Console,
+    plan: &WritePlan,
+    write_refusal: Option<&str>,
+) -> Result<()> {
     let cross_model_line = match (&plan.device_type, &plan.backup_device_type) {
         (image, Some(backup)) if plan.cross_model => format!(
             "yes ({backup} backup -> {image} image); pass --allow-cross-model to permit it, \
@@ -620,13 +801,15 @@ fn print_write_plan(options: &FlashOptions, console: &dyn Console, plan: &WriteP
         ),
         None => String::from("the backup is a different length"),
     };
-    let refused_line = format!(
-        "yes: {}. Run `fw probe-da` and record the result in docs/dev/05-verification.md",
-        check_layout().err().map_or_else(
-            || String::from("check_layout does not refuse"),
-            |err| { format!("{err}") }
-        )
-    );
+    let write_line = match (check_layout(), write_refusal) {
+        (Err(err), _) => format!("refused: {err}"),
+        (Ok(()), Some(reason)) => format!("refused: {reason}"),
+        (Ok(()), None) => String::from(
+            "permitted; a real run still needs --yes, compares the unit with the backup, and \
+             reads the range back before reporting success",
+        ),
+    };
+    let write_refused = check_layout().is_err() || write_refusal.is_some();
 
     if options.json {
         return console.json(&serde_json::json!({
@@ -641,11 +824,7 @@ fn print_write_plan(options: &FlashOptions, console: &dyn Console, plan: &WriteP
             "cross_model": plan.cross_model,
             "allow_cross_model": options.allow_cross_model,
             "write_length": plan.write_length,
-            "start_candidates": plan
-                .start_candidates
-                .iter()
-                .map(|address| format!("0x{address:08X}"))
-                .collect::<Vec<_>>(),
+            "start": format!("0x{:08X}", plan.start),
             "packets": plan.packets,
             "differing_bytes": plan.differing_bytes,
             "differing_offsets": plan
@@ -655,7 +834,8 @@ fn print_write_plan(options: &FlashOptions, console: &dyn Console, plan: &WriteP
                 .collect::<Vec<_>>(),
             "opens_port": false,
             "wrote_flash": false,
-            "actual_write_refused": true,
+            "actual_write_refused": write_refused,
+            "actual_write": write_line,
         }));
     }
 
@@ -680,11 +860,11 @@ fn print_write_plan(options: &FlashOptions, console: &dyn Console, plan: &WriteP
         m241_flash::da::PACKET_SIZE
     ));
     console.result(&format!(
-        "{:<12}: 0x{:08X} and 0x{:08X} (unresolved)",
-        "start", plan.start_candidates[0], plan.start_candidates[1]
+        "{:<12}: 0x{:08X} (settled DA-side base)",
+        "start", plan.start
     ));
     console.result(&format!("{:<12}: {differing_line}", "diff"));
-    console.result(&format!("{:<12}: {refused_line}", "actual write"));
+    console.result(&format!("{:<12}: {write_line}", "actual write"));
     console.result(&format!("{:<12}: no (this was --dry-run)", "port opened"));
     console.result(&format!(
         "{:<12}: no (0xD3/0xD4/0xD5/0xD9 were not sent)",
@@ -1052,10 +1232,11 @@ fn hex_bytes(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::Timings;
+    use crate::testing::da_write;
     use crate::testing::fake_da;
     use crate::testing::{AutoConfirm, DeviceHandle, FakePorts, RecordingConsole, synthetic_image};
-    use m241_core::firmware::image::DEVICE_TYPE_OFFSET;
     use m241_core::protocol::simulator::FakeDevice;
+    use m241_flash::da::{Acceptance, FLASH_WRITE_END, FLASH_WRITE_LENGTH};
     use std::cell::{Cell, RefCell};
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
@@ -1069,6 +1250,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).expect("scratch");
             Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
         }
 
         fn join(&self, name: &str) -> PathBuf {
@@ -2201,9 +2386,11 @@ mod tests {
         FlashOptions {
             image: case.0.clone(),
             backup: case.1.clone(),
+            da: None,
             dry_run: true,
             allow_cross_model: false,
             yes: false,
+            assume_brom: false,
             port: String::from("auto"),
             json: false,
         }
@@ -2228,29 +2415,29 @@ mod tests {
         );
         assert!(stdout.contains("1589"), "the packet count: {stdout}");
         assert!(
-            stdout.contains("cross model: no"),
+            stdout.contains("cross model : no"),
             "the backup and image are the same model: {stdout}"
         );
         assert!(
-            stdout.contains("actual write: yes: refused"),
-            "the refusal is shown in the plan: {stdout}"
+            stdout.contains("start       : 0x00000000 (settled DA-side base)"),
+            "the settled start is shown, not a candidate list: {stdout}"
         );
         assert!(
-            stdout.contains("flash write: no"),
+            stdout.contains("actual write: permitted"),
+            "the plan says the write would proceed: {stdout}"
+        );
+        assert!(
+            stdout.contains("flash write : no"),
             "a dry run claims no write: {stdout}"
         );
         let stderr = console.stderr();
         assert!(
-            stderr.contains("actual write is refused until the start address is resolved"),
-            "the note names the refusal and how to settle it: {stderr}"
-        );
-        assert!(
-            stderr.contains("fw probe-da"),
-            "the note names the measurement command: {stderr}"
-        );
-        assert!(
-            stderr.contains("opened no port") && stderr.contains("sent no command"),
+            stderr.contains("dry run: no port was opened and no command was sent"),
             "the note says nothing reached the wire: {stderr}"
+        );
+        assert!(
+            stderr.contains("reads the range back before it reports success"),
+            "the note says a real run verifies: {stderr}"
         );
     }
 
@@ -2271,8 +2458,13 @@ mod tests {
             "the V1.12 write length, not V1.13's: {stdout}"
         );
         assert!(
-            !stdout.contains("406620"),
-            "a V1.12 plan must not print V1.13's length: {stdout}"
+            stdout.contains("write range : 406312"),
+            "a V1.12 plan must print V1.12's length: {stdout}"
+        );
+        assert!(
+            stdout.contains("actual write: refused"),
+            "the driver writes only the pinned V1.13 range, so the plan must not promise a V1.12 \
+             write: {stdout}"
         );
     }
 
@@ -2365,23 +2557,42 @@ mod tests {
         assert_eq!(crate::exit::exit_code_for(&err), 4);
     }
 
+    /// A plan whose backup and image are different models.
+    ///
+    /// `write_plan` cannot build this from the synthetic fixtures: the only rule
+    /// that accepts a device string differing from the backup's is the official
+    /// digest, and the fixtures deliberately do not carry vendor bytes. The
+    /// cross-model gate therefore takes the value `flash` acts on, and this is
+    /// that value. A real vendor image reaches the same plan through
+    /// [`Acceptance::OfficialVendor`].
+    fn cross_model_plan() -> WritePlan {
+        WritePlan {
+            profile: &PROFILE_V1_12,
+            acceptance: Acceptance::OfficialVendor,
+            size: PROFILE_V1_12.size,
+            device_type: String::from("01017-00E"),
+            backup_device_type: Some(String::from("01017-00F")),
+            cross_model: true,
+            write_length: PROFILE_V1_12.size,
+            start: FLASH_WRITE_START,
+            packets: PROFILE_V1_12.size.div_ceil(m241_flash::da::PACKET_SIZE),
+            differing_bytes: Some(3),
+            differing_offsets: vec![0x402F6, 0x402F7, 0x59C2C],
+        }
+    }
+
     #[test]
     fn flash_dry_run_warns_about_a_cross_model_image_but_still_prints_the_plan() {
-        // A V1.12 image over a V1.12-length backup whose device string is the
-        // V1.13 one. The dry run shows the plan (that is its job) and says the
-        // real write needs `--allow-cross-model`.
-        let scratch = crate::testing::Scratch::new("flash-dry-cross");
-        let image = flash_image(&PROFILE_V1_12, true);
-        let mut backup = flash_image(&PROFILE_V1_12, true);
-        backup[DEVICE_TYPE_OFFSET..DEVICE_TYPE_OFFSET + 9].copy_from_slice(b"01017-00F");
-        let case = flash_case(&scratch, &image, &backup);
+        // The dry run shows the plan (that is its job) and says the real write
+        // needs `--allow-cross-model`.
+        let scratch = Scratch::new("flash-dry-cross");
+        let case = (scratch.join("image.bin"), scratch.join("backup.bin"));
         let console = RecordingConsole::default();
-        let links = FakePorts::empty();
-        let session = Session::new(&links, &console, &AutoConfirm);
-        flash(&flash_options(&case), session).expect("a cross-model plan is shown");
+        let options = flash_options(&case);
+        print_write_plan(&options, &console, &cross_model_plan(), None).expect("a plan is shown");
         let stdout = console.stdout();
         assert!(
-            stdout.contains("cross model: yes (01017-00F backup -> 01017-00E image)"),
+            stdout.contains("cross model : yes (01017-00F backup -> 01017-00E image)"),
             "the warning is specific: {stdout}"
         );
         assert!(
@@ -2391,46 +2602,23 @@ mod tests {
     }
 
     #[test]
-    fn flash_without_dry_run_refuses_at_check_layout_before_opening_a_port() {
-        let scratch = crate::testing::Scratch::new("flash-real-layout");
-        let backup = flash_image(&PROFILE_V1_13, false);
-        let image = flash_image(&PROFILE_V1_13, true);
-        let case = flash_case(&scratch, &image, &backup);
-        let chip = fake_da::FakeChip::with_vector_at(PROBE_ADDRESSES[1]);
-        let links = fake_da::FakeDaPorts::new(chip);
-        let record = links.record();
-        let console = RecordingConsole::default();
-        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
-        let mut options = flash_options(&case);
-        options.dry_run = false;
-        options.yes = true;
-        let err = flash(&options, session).expect_err("the start address is unresolved");
-        assert!(matches!(err, Error::Safety { .. }), "got {err}");
-        assert_eq!(crate::exit::exit_code_for(&err), 5);
-        let text = format!("{err}");
-        assert!(
-            text.contains("05-verification.md"),
-            "the refusal is check_layout's, which says how to settle it: {text}"
-        );
-        let record = record.borrow();
-        assert_eq!(record.opens, 0, "no port may be opened before the refusal");
-        assert_eq!(record.bytes_moved, 0, "nothing reached the wire");
-    }
-
-    #[test]
-    fn flash_without_yes_refuses_before_the_layout_check() {
+    fn flash_without_yes_refuses_before_opening_a_port_and_before_the_da_file() {
         // `--yes` is checked after the cross-model consent and before
-        // `check_layout`, so a user who forgot it is told that, not told to go
-        // measure an address.
+        // `check_layout`, the DA file and the port. The DA path here does not
+        // exist: a handler that read it first would fail with an I/O error
+        // instead of the confirmation refusal.
         let scratch = crate::testing::Scratch::new("flash-real-no-yes");
         let backup = flash_image(&PROFILE_V1_13, false);
         let image = flash_image(&PROFILE_V1_13, true);
         let case = flash_case(&scratch, &image, &backup);
-        let links = FakePorts::empty();
+        let chip = m241_flash::FakeDa::with_firmware(&backup);
+        let links = da_write::DaWritePorts::new(chip);
+        let chip = links.chip();
         let console = RecordingConsole::default();
-        let session = Session::new(&links, &console, &AutoConfirm);
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
         let mut options = flash_options(&case);
         options.dry_run = false;
+        options.da = Some(scratch.join("absent.bin"));
         let err = flash(&options, session).expect_err("no --yes");
         assert!(matches!(err, Error::Safety { .. }), "got {err}");
         let text = format!("{err}");
@@ -2439,22 +2627,17 @@ mod tests {
             !text.contains("05-verification.md"),
             "the confirmation is asked for first: {text}"
         );
+        assert_eq!(
+            chip.borrow().read_bytes(),
+            0,
+            "no port may be opened before the confirmation"
+        );
     }
 
     #[test]
     fn flash_without_allow_cross_model_refuses_a_cross_model_write() {
-        let scratch = crate::testing::Scratch::new("flash-real-cross");
-        let image = flash_image(&PROFILE_V1_12, true);
-        let mut backup = flash_image(&PROFILE_V1_12, true);
-        backup[DEVICE_TYPE_OFFSET..DEVICE_TYPE_OFFSET + 9].copy_from_slice(b"01017-00F");
-        let case = flash_case(&scratch, &image, &backup);
-        let links = FakePorts::empty();
-        let console = RecordingConsole::default();
-        let session = Session::new(&links, &console, &AutoConfirm);
-        let mut options = flash_options(&case);
-        options.dry_run = false;
-        options.yes = true;
-        let err = flash(&options, session).expect_err("cross model without consent");
+        let err = cross_model_refusal(&cross_model_plan(), false)
+            .expect("cross model without consent must be refused");
         assert!(matches!(err, Error::Safety { .. }), "got {err}");
         let text = format!("{err}");
         assert!(
@@ -2463,34 +2646,227 @@ mod tests {
         );
         assert!(text.contains("01017-00E"), "got {text}");
         assert!(text.contains("01017-00F"), "got {text}");
+        assert!(
+            cross_model_refusal(&cross_model_plan(), true).is_none(),
+            "consent is what turns the gate off"
+        );
     }
 
     #[test]
-    fn flash_with_allow_cross_model_reaches_the_layout_refusal() {
-        // With consent and confirmation given, the cross-model write gets as far
-        // as the start address — which is still refused. The two gates are
-        // stacked, not alternatives.
-        let scratch = crate::testing::Scratch::new("flash-real-cross-allowed");
-        let image = flash_image(&PROFILE_V1_12, true);
-        let mut backup = flash_image(&PROFILE_V1_12, true);
-        backup[DEVICE_TYPE_OFFSET..DEVICE_TYPE_OFFSET + 9].copy_from_slice(b"01017-00F");
+    fn flash_with_every_gate_passed_but_no_port_reports_a_port_error() {
+        // The image, the confirmation, the layout, the acceptance rule and the
+        // DA file all pass; the next step is resolving a port, and there is
+        // none. This is what proves the dry-run-only refusal is gone without
+        // touching a device.
+        let scratch = crate::testing::Scratch::new("flash-real-noport");
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let image = flash_image(&PROFILE_V1_13, true);
         let case = flash_case(&scratch, &image, &backup);
-        let chip = fake_da::FakeChip::with_vector_at(PROBE_ADDRESSES[1]);
-        let links = fake_da::FakeDaPorts::new(chip);
-        let record = links.record();
+        let console = RecordingConsole::default();
+        let links = FakePorts::empty();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.yes = true;
+        options.da = Some(da_file(scratch.path()));
+        let err = flash(&options, session).expect_err("no port is available");
+        assert!(matches!(err, Error::Port { .. }), "got {err}");
+        assert_eq!(crate::exit::exit_code_for(&err), 3, "got {err}");
+        assert!(
+            console.stderr().is_empty(),
+            "the port is resolved before anything is announced: {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
+    fn flash_refuses_a_da_that_is_not_the_vendor_image_before_opening_a_port() {
+        let scratch = crate::testing::Scratch::new("flash-real-bad-da");
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let image = flash_image(&PROFILE_V1_13, true);
+        let case = flash_case(&scratch, &image, &backup);
+        let da = scratch.join("DA_v3.8.4.bin");
+        fileio::write(&da, &vec![0u8; m241_flash::da::DA_IMAGE_SIZE])
+            .expect("write a same-length file that is not the DA");
+        let chip = m241_flash::FakeDa::with_firmware(&backup);
+        let links = da_write::DaWritePorts::new(chip);
+        let chip = links.chip();
         let console = RecordingConsole::default();
         let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
         let mut options = flash_options(&case);
         options.dry_run = false;
         options.yes = true;
-        options.allow_cross_model = true;
-        let err = flash(&options, session).expect_err("the start address is unresolved");
+        options.da = Some(da);
+        let err = flash(&options, session).expect_err("not the vendor DA");
         assert!(matches!(err, Error::Safety { .. }), "got {err}");
         assert!(
-            format!("{err}").contains("05-verification.md"),
-            "the refusal is the layout one: {err}"
+            format!("{err}").contains("A0 E1"),
+            "the refusal names the first bytes it wanted: {err}"
         );
-        assert_eq!(record.borrow().opens, 0, "still no port");
+        assert_eq!(
+            chip.borrow().read_bytes(),
+            0,
+            "the DA file is checked before the port is opened"
+        );
+    }
+
+    #[test]
+    fn flash_refuses_a_unit_that_does_not_hold_the_backup_before_any_write_opcode() {
+        // The whole point of `verify_device`: one byte different on the unit is
+        // refused before the DA is loaded, so no `0xA1` frame, jump, `0xD3`,
+        // `0xD5` or `0xD9` reaches the wire.
+        let scratch = crate::testing::Scratch::new("flash-real-wrong-unit");
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let image = flash_image(&PROFILE_V1_13, true);
+        let case = flash_case(&scratch, &image, &backup);
+        let mut unit = backup.clone();
+        unit[0x1000] ^= 0xFF;
+        let chip = m241_flash::FakeDa::with_firmware(&unit);
+        let links = da_write::DaWritePorts::new(chip);
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.yes = true;
+        options.da = Some(da_file(scratch.path()));
+        let err = flash(&options, session).expect_err("the unit is not the backup");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        let text = format!("{err}");
+        assert!(
+            text.contains("differs from the backup at image offset 0x1000"),
+            "the refusal names the offset: {text}"
+        );
+        assert!(text.contains("Nothing was written"), "got {text}");
+        let chip = chip.borrow();
+        assert!(!chip.started(), "the DA was never started");
+        assert_eq!(chip.bootrom_writes(), 0, "no 0xA1 frame was sent");
+        for destructive in [0xD3u8, 0xD5, 0xD9] {
+            assert!(
+                !chip.opcodes().contains(&destructive),
+                "0x{destructive:02X} must not go out before the device check passes: {:02X?}",
+                chip.opcodes()
+            );
+        }
+    }
+
+    #[test]
+    fn flash_writes_through_the_da_and_reports_the_verified_read_back() {
+        // The end-to-end path against the write crate's own fake DA: entry,
+        // `verify_device`, the RAM load, `0xD3` + `0xD5`, `0xD9`, the BootROM
+        // re-entry and the read-back. A CLI that skipped `verify_written` would
+        // have no report to print, and one that skipped `verify_device` would
+        // get to `0xD3` instead of the mismatch test above.
+        let scratch = crate::testing::Scratch::new("flash-real-e2e");
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let image = flash_image(&PROFILE_V1_13, true);
+        let case = flash_case(&scratch, &image, &backup);
+        let chip = m241_flash::FakeDa::with_firmware(&backup);
+        let links = da_write::DaWritePorts::new(chip);
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.yes = true;
+        options.da = Some(da_file(scratch.path()));
+
+        flash(&options, session).expect("the fake completes the write and the read-back");
+
+        {
+            let chip = chip.borrow();
+            assert_eq!(
+                chip.recorded_range(),
+                (FLASH_WRITE_START, FLASH_WRITE_END),
+                "0xD3 recorded the settled range"
+            );
+            assert_eq!(chip.accepted_packets(), 1589, "every 0xD5 packet landed");
+            assert!(chip.restarted(), "the read-back sent 0xD9");
+            assert_eq!(
+                chip.mode(),
+                m241_flash::simulator::Mode::BootRom,
+                "the prepare step moved the chip back to the BootROM"
+            );
+            assert_eq!(
+                &chip.memory()[..FLASH_WRITE_LENGTH],
+                &image[..],
+                "the flash window now holds the image"
+            );
+            assert!(
+                !chip.wrote_an_empty_range(),
+                "no 0xD5 ever ran without a recorded range"
+            );
+        }
+        assert_eq!(
+            fileio::read(&case.1).expect("the backup is still there"),
+            backup,
+            "a read-only input is never modified"
+        );
+
+        let stdout = console.stdout();
+        assert!(stdout.contains("port        : SIM0"), "got {stdout}");
+        assert!(
+            stdout.contains("start       : 0x00000000"),
+            "the report names the range: {stdout}"
+        );
+        assert!(
+            stdout.contains("length      : 406620"),
+            "the report names the length: {stdout}"
+        );
+        assert!(
+            stdout.contains("packets     : 1589"),
+            "the report names the accepted packets: {stdout}"
+        );
+        assert!(
+            stdout.contains("verified    : 406620 bytes read back and identical"),
+            "success is the read-back, not the write: {stdout}"
+        );
+        assert!(stdout.contains("flash write : yes"), "got {stdout}");
+        let stderr = console.stderr();
+        assert!(
+            stderr.contains("the unit matches the backup"),
+            "the pre-write device check is reported: {stderr}"
+        );
+        assert!(
+            stderr.contains("reading the written range back"),
+            "the read-back step is reported: {stderr}"
+        );
+    }
+
+    #[test]
+    fn the_write_report_json_names_the_verified_count_and_the_flash_write() {
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let image = flash_image(&PROFILE_V1_13, true);
+        let plan = write_plan(&PROFILE_V1_13, &backup, &image).expect("plan");
+        let report = WriteReport {
+            start: FLASH_WRITE_START,
+            length: FLASH_WRITE_LENGTH,
+            packets: plan.packets,
+            verified: FLASH_WRITE_LENGTH,
+        };
+        let console = RecordingConsole::default();
+        let options = FlashOptions {
+            image: PathBuf::from("image.bin"),
+            backup: PathBuf::from("backup.bin"),
+            da: None,
+            dry_run: false,
+            allow_cross_model: false,
+            yes: true,
+            assume_brom: false,
+            port: String::from("auto"),
+            json: true,
+        };
+        print_write_report(&options, &console, "SIM0", &plan, &report).expect("json");
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(document["dry_run"], false);
+        assert_eq!(document["start"], "0x00000000");
+        assert_eq!(document["length"], 406_620);
+        assert_eq!(document["packets"], 1_589);
+        assert_eq!(document["verified"], 406_620);
+        assert_eq!(document["verified_matches_image"], true);
+        assert_eq!(document["flash_write"], true);
+        assert_eq!(document["port"], "SIM0");
     }
 
     #[test]
@@ -2517,11 +2893,14 @@ mod tests {
         assert_eq!(document["packets"], 1_589);
         assert_eq!(document["opens_port"], false);
         assert_eq!(document["wrote_flash"], false);
-        assert_eq!(document["actual_write_refused"], true);
-        assert_eq!(
-            document["start_candidates"],
-            serde_json::json!(["0x00000000", "0x00200000"]),
-            "both candidates are shown, neither chosen"
+        assert_eq!(document["actual_write_refused"], false);
+        assert_eq!(document["start"], "0x00000000");
+        assert!(
+            document["actual_write"]
+                .as_str()
+                .is_some_and(|line| line.starts_with("permitted")),
+            "a V1.13 patched backup would be written: {}",
+            document["actual_write"]
         );
         assert_eq!(document["differing_bytes"], 3);
     }
@@ -2530,8 +2909,8 @@ mod tests {
 
     /// The DA file `probe_da` reads: the vendor length and first bytes, with
     /// every other byte distinct so a wrong relay shows up in the read-back.
-    fn da_file(scratch: &Scratch) -> PathBuf {
-        let path = scratch.join("DA_v3.8.4.bin");
+    fn da_file(dir: &Path) -> PathBuf {
+        let path = dir.join("DA_v3.8.4.bin");
         let mut image: Vec<u8> = (0..m241_flash::da::DA_IMAGE_SIZE)
             .map(|index| (index % 251) as u8)
             .collect();
@@ -2588,7 +2967,7 @@ mod tests {
         // slipped in beside `DownloadAgent::new` used to leave every gate green
         // because nothing drove `probe_da` past its port step.
         let scratch = Scratch::new("probe-fake");
-        let da = da_file(&scratch);
+        let da = da_file(scratch.path());
         // A running firmware, so the documented `$PMTK180` route is the one the
         // command takes. The first candidate carries only the vector's first
         // byte: a verdict that compared one byte would settle on `0x0020_0000`
@@ -2708,7 +3087,7 @@ mod tests {
         // The other direction: the verdict follows the bytes, not a preference
         // for either address.
         let scratch = Scratch::new("probe-fake-first");
-        let da = da_file(&scratch);
+        let da = da_file(scratch.path());
         let chip = fake_da::FakeChip::with_vector_at(PROBE_ADDRESSES[0]);
         let links = fake_da::FakeDaPorts::new(chip);
         let record = links.record();
@@ -2738,7 +3117,7 @@ mod tests {
         // A chip already parked in the BootROM: the stream probe finds nothing,
         // the silence route is taken, and still nothing is pulsed.
         let scratch = Scratch::new("probe-fake-silent");
-        let da = da_file(&scratch);
+        let da = da_file(scratch.path());
         let chip = fake_da::FakeChip::with_vector_at(PROBE_ADDRESSES[1]);
         let links = fake_da::FakeDaPorts::new(chip);
         let record = links.record();

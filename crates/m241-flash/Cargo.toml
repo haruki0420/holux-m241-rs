@@ -14,5 +14,12 @@ repository.workspace = true
 [dependencies]
 m241-core.workspace = true
 
+[features]
+# The fake Download Agent, for this crate's tests and for a dependent crate's
+# end-to-end test of a command that drives the write path. Off by default: a
+# shipped binary has no reason to carry a destructive command set's model. This
+# crate's own unit tests use it through `cfg(test)` either way.
+simulator = []
+
 [lints]
 workspace = true

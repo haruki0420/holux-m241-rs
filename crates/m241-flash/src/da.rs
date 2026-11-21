@@ -60,8 +60,9 @@
 //! ([`check_image`]) and reports what a write would do — the profile, which rule
 //! accepted the image, the device types, the packet count, and how the image
 //! differs from the backup — without sending a byte or opening a port. Its start
-//! addresses are [`UNRESOLVED_STARTS`], the two candidates, not a choice: a plan
-//! cannot unlock a write, and this one does not try to. It is what makes
+//! is [`FLASH_WRITE_START`], the settled DA-side base: a plan reports the range a
+//! real write would use and cannot unlock a write, which still runs
+//! [`check_layout`] and [`DownloadAgent::verify_device`]. It is what makes
 //! "would this image be accepted" answerable before a unit is in front of you,
 //! and V1.12 / V1.13 / V1.14 are all expressible (see [`profile_patch_offsets`]).
 //!
@@ -1142,7 +1143,9 @@ impl PartialWrite {
         format!(
             "{mapped}; {state}. Next: {restart} re-enter the BootROM with --assume-brom (or \
              power-cycle the unit and retry the four-probe sync) and write your own backup image \
-             back. Do not download the log from a partly written unit"
+             back. After a power-cycle, `m241 fw dump` shows what the unit actually holds; use \
+             it to confirm the read-back before retrying. Do not download the log from a partly \
+             written unit"
         )
     }
 }
@@ -1599,9 +1602,12 @@ impl<T: Transport> DownloadAgent<T> {
         let mut packets = 0usize;
         let mut progress = Progress::NothingWritten;
         let end = range_end(start);
-        let outcome = self
-            .record_range(start, end)
-            .and_then(|()| self.program(image, start, &mut packets, &mut progress));
+        // A refused `0xD3` records nothing and no packet was sent, so its error
+        // stands on its own. Wrapping it in the partial-write paragraph would
+        // tell the user the range is "now only partly erased and programmed"
+        // when this run did not erase or program a byte.
+        self.record_range(start, end)?;
+        let outcome = self.program(image, start, &mut packets, &mut progress);
         if let Err(err) = outcome {
             let unfinished = PartialWrite {
                 progress,
@@ -2098,8 +2104,12 @@ pub struct WritePlan {
     pub cross_model: bool,
     /// The length of the span a real write would program.
     pub write_length: usize,
-    /// The two DA-side start candidates a real write must choose from.
-    pub start_candidates: [u32; 2],
+    /// The DA-side start a real write would use ([`FLASH_WRITE_START`]).
+    ///
+    /// This is the settled base, not a candidate: the 2026-11-21 read placed the
+    /// image at DA address `0` (`docs/dev/05-verification.md` §1), and
+    /// [`UNRESOLVED_STARTS`] is empty.
+    pub start: u32,
     /// `0xD5` packets a write of `write_length` would take.
     pub packets: usize,
     /// Bytes that differ from the backup, when the backup is the same length.
@@ -2257,9 +2267,10 @@ fn all_within(backup: &[u8], image: &[u8], offsets: &[usize]) -> bool {
 /// that says "acceptable" cannot be followed by a write that refuses for a
 /// reason the plan did not name.
 ///
-/// The start addresses in the result are [`UNRESOLVED_STARTS`], not a choice:
-/// no plan selects one, because which one is right is the question
-/// `docs/dev/05-verification.md` §1 has to answer.
+/// The result's start is [`FLASH_WRITE_START`], the settled DA-side base. The
+/// plan reports the range a real write would use; it does not grant permission
+/// to use it, because [`DownloadAgent::write`] still runs [`check_layout`] and
+/// [`DownloadAgent::verify_device`] runs against the unit first.
 ///
 /// # Cross model
 ///
@@ -2327,7 +2338,7 @@ fn write_plan_with(
         device_type,
         backup_device_type,
         write_length,
-        start_candidates: UNRESOLVED_STARTS,
+        start: FLASH_WRITE_START,
         packets: write_length.div_ceil(PACKET_SIZE),
         differing_bytes,
         differing_offsets,
@@ -2968,7 +2979,7 @@ mod tests {
         assert!(!plan.cross_model);
         assert!(!plan.needs_cross_model_consent());
         assert_eq!(plan.write_length, V1_13_WRITE_LENGTH);
-        assert_eq!(plan.start_candidates, UNRESOLVED_STARTS);
+        assert_eq!(plan.start, FLASH_WRITE_START);
         assert_eq!(plan.packets, V1_13_WRITE_LENGTH.div_ceil(PACKET_SIZE));
         assert_eq!(plan.packets, 1_589);
         assert_eq!(plan.differing_bytes, Some(3));
@@ -3058,14 +3069,16 @@ mod tests {
     }
 
     #[test]
-    fn a_plan_does_not_select_a_start_address() {
-        // The plan reports the candidates; choosing one is the edit the
-        // hardware row has to justify. If this ever returned a single address,
-        // `--dry-run` would be deciding the thing the write refuses on.
+    fn a_plan_reports_the_settled_start_and_does_not_reopen_the_question() {
+        // The 2026-11-21 read settled the DA-side base at 0, so the plan names
+        // it. The gate that still has to pass is `check_layout`, and the list
+        // the gate refuses on must stay empty: putting a candidate back here
+        // would make `check_layout` refuse every write again.
         let plan = write_plan(&PROFILE_V1_13, &stock_image(), &patched_image()).expect("plan");
-        assert_eq!(plan.start_candidates, UNRESOLVED_STARTS);
-        assert_eq!(plan.start_candidates.len(), 2);
-        assert!(UNRESOLVED_STARTS.contains(&FLASH_WRITE_START));
+        assert_eq!(plan.start, FLASH_WRITE_START);
+        assert_eq!(plan.start, 0);
+        assert!(UNRESOLVED_STARTS.is_empty());
+        check_layout().expect("the plan's start is the one the gate accepts");
     }
 
     // -- the confirmation token --------------------------------------------

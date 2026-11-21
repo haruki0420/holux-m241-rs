@@ -1139,3 +1139,104 @@ pub mod fake_da {
         }
     }
 }
+
+/// The write crate's own fake DA behind the CLI's [`Links`] seam.
+///
+/// `fw flash` drives the whole write sequence (`verify_device`, the DA load,
+/// `0xD3` / `0xD5`, `0xD9`, the read-back), so its end-to-end test uses the same
+/// model the protocol tests do rather than a second description of the wire.
+/// The feature is enabled in this crate's dev-dependencies only; the shipped
+/// binary does not link the model.
+pub mod da_write {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use m241_core::Result;
+    use m241_core::protocol::port::Transport;
+    use m241_flash::simulator::{FakeDa, Mode, Modelled};
+
+    use crate::link::{Cable, Links, Opened, PortEntry};
+
+    use super::FAKE_PORT;
+
+    /// The transport one `open` hands out; clones share the chip.
+    #[derive(Debug)]
+    struct SharedFakeDa(Rc<RefCell<FakeDa>>);
+
+    impl Transport for SharedFakeDa {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+            self.0.borrow_mut().read(buf)
+        }
+
+        fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+            self.0.borrow_mut().write_all(buf)
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            self.0.borrow_mut().flush()
+        }
+
+        fn clear_input(&mut self) -> Result<()> {
+            self.0.borrow_mut().clear_input()
+        }
+
+        /// Move the chip back to the BootROM where a real unit needs a
+        /// power-cycle.
+        ///
+        /// [`m241_flash::da::PendingWrite::verify_written`] sends `0xD9` (after
+        /// which the fake models a booted firmware) and calls the CLI's
+        /// `prepare`, which sets the BootROM baud. That is the re-entry step on
+        /// a unit; here it is the signal that the model should be a BootROM
+        /// again. Without it the read-back would be a timeout, not a check.
+        fn set_baud(&mut self, baud: u32) -> Result<()> {
+            let mut device = self.0.borrow_mut();
+            if device.restarted() && device.mode() != Mode::BootRom {
+                device.set_modelled(Modelled::BootRom);
+            }
+            device.set_baud(baud)
+        }
+
+        fn set_control_lines(&mut self, asserted: bool) -> Result<()> {
+            self.0.borrow_mut().set_control_lines(asserted)
+        }
+    }
+
+    /// A [`Links`] with one plausible port backed by a shared [`FakeDa`].
+    #[derive(Debug, Clone)]
+    pub struct DaWritePorts {
+        chip: Rc<RefCell<FakeDa>>,
+    }
+
+    impl DaWritePorts {
+        /// One plausible port backed by `device`.
+        #[must_use]
+        pub fn new(device: FakeDa) -> Self {
+            Self {
+                chip: Rc::new(RefCell::new(device)),
+            }
+        }
+
+        /// The chip, for assertions after the command returns.
+        #[must_use]
+        pub fn chip(&self) -> Rc<RefCell<FakeDa>> {
+            Rc::clone(&self.chip)
+        }
+    }
+
+    impl Links for DaWritePorts {
+        fn ports(&self) -> Result<Vec<PortEntry>> {
+            Ok(vec![PortEntry {
+                name: String::from(FAKE_PORT),
+                cable: Some(Cable::Cp210x),
+                likely: true,
+                description: Some(String::from("simulated M-241")),
+            }])
+        }
+
+        fn open(&self, _name: &str, baud: u32) -> Result<Opened> {
+            let mut transport = SharedFakeDa(Rc::clone(&self.chip));
+            transport.set_baud(baud)?;
+            Ok(Opened::new(Box::new(transport)))
+        }
+    }
+}
