@@ -1,20 +1,25 @@
-//! `m241 log download`, `m241 log info`, `m241 log read`, and `m241 log geotag`.
+//! `m241 log download`, `m241 log info`, `m241 log read`, `m241 log erase` and
+//! `m241 log geotag`.
 //!
 //! Downloading talks PMTK182 to the logger and saves the raw flash blocks;
 //! `info` summarises a dump without converting it so the user can check damage
 //! before exporting; `read` converts a dump to GPX, KML, CSV, NMEA or JSON,
-//! optionally shifting WNRO-stale timestamps; `geotag` matches photos by capture
-//! time and writes GPS EXIF tags.
+//! optionally shifting WNRO-stale timestamps; `erase` saves the log and then
+//! destroys it on the device through `m241-flash`; `geotag` matches photos by
+//! capture time and writes GPS EXIF tags.
 
 use std::path::{Path, PathBuf};
 
 use m241_core::log::geotag::{self, CaptureTime, GeotagOptions, GeotagPlan};
 use m241_core::log::{ParseReport, export, parse_dump};
+use m241_core::protocol::PmtkClient;
+use m241_core::protocol::port::Transport;
 use m241_core::{Error, ExportFormat, LogSummary, Result, Track};
+use m241_flash::erase::{BackupProof, LogEraser};
 
 use crate::Session;
 use crate::cal::OffsetSpec;
-use crate::cli::{DownloadOptions, LogGeotagOptions, LogInfoOptions, LogReadOptions};
+use crate::cli::{DownloadOptions, EraseOptions, LogGeotagOptions, LogInfoOptions, LogReadOptions};
 use crate::fileio;
 use crate::link;
 use crate::output::Console;
@@ -41,17 +46,7 @@ pub fn download(options: &DownloadOptions, session: Session<'_>) -> Result<()> {
     session
         .console
         .note(&format!("reading the track log from {port}"));
-    let mut last_reported = 0usize;
-    let bytes = client.download_log(&mut |done, total| {
-        // One line per 5% rather than per chunk: a 200 KB log is about 100 round
-        // trips, and a line apiece would be a wall of text.
-        let step = (total / 20).max(1);
-        if done == total || done.saturating_sub(last_reported) >= step {
-            last_reported = done;
-            session.console.progress(done, total);
-        }
-    })?;
-    session.console.progress_done();
+    let bytes = read_log(&mut client, session.console)?;
 
     // Written only after the transfer returned: a failed download must not leave
     // a partial dump where a complete one is expected. If parsing then fails,
@@ -92,6 +87,98 @@ pub fn download(options: &DownloadOptions, session: Session<'_>) -> Result<()> {
         options.output.display()
     ));
     Ok(())
+}
+
+/// Read the whole log into memory, reporting progress on stderr.
+///
+/// Shared by `log download` and `log erase` so the erase path shows the same
+/// five-percent steps rather than growing a second progress loop.
+fn read_log<T: Transport>(client: &mut PmtkClient<T>, console: &dyn Console) -> Result<Vec<u8>> {
+    let mut last_reported = 0usize;
+    let bytes = client.download_log(&mut |done, total| {
+        // One line per 5% rather than per chunk: a 200 KB log is about 100 round
+        // trips, and a line apiece would be a wall of text.
+        let step = (total / 20).max(1);
+        if done == total || done.saturating_sub(last_reported) >= step {
+            last_reported = done;
+            console.progress(done, total);
+        }
+    })?;
+    console.progress_done();
+    Ok(bytes)
+}
+
+/// Save the track log, then erase it on the device.
+///
+/// The copy is written **before** the erase is considered, and the
+/// [`BackupProof`] handed to [`LogEraser::erase`] is made from the bytes that
+/// were just written. A failed write returns before the erase sentence is
+/// built, so there is no path from "the backup could not be saved" to a
+/// destructive command. Without `--yes` the download still runs and is saved:
+/// the refusal says where the copy is, and the next invocation can erase.
+///
+/// # Errors
+///
+/// * [`Error::Safety`] when the output exists and `--force` was not given, or
+///   when `--yes` is absent (exit code 5);
+/// * [`Error::Port`] when no plausible port can be opened;
+/// * [`Error::Timeout`] / [`Error::Nmea`] / [`Error::Rejected`] when the
+///   transfer or the erase fails;
+/// * [`Error::Io`] when the backup cannot be written.
+pub fn erase(options: &EraseOptions, session: Session<'_>) -> Result<()> {
+    fileio::ensure_free(&options.output, options.force)?;
+    let port = link::resolve(session.links, &options.port)?;
+    let mut client = link::open_pmtk(session.links, &port, session.timings)?;
+
+    session
+        .console
+        .note(&format!("reading the track log from {port}"));
+    let bytes = read_log(&mut client, session.console)?;
+
+    // The file is the only copy this tool can offer once `$PMTK182,6` has run.
+    // Writing it first, and returning here if the write fails, is what makes
+    // the proof below evidence rather than a formality.
+    fileio::write(&options.output, &bytes)?;
+
+    if !options.yes {
+        session.console.note(&format!(
+            "saved {} bytes to {}; the log on the device was not erased",
+            bytes.len(),
+            options.output.display()
+        ));
+        return Err(Error::Safety {
+            reason: format!(
+                "saved {} bytes to {}, but the log was not erased; re-run with --yes (and \
+                 --force to reuse this path) to erase it",
+                bytes.len(),
+                options.output.display()
+            ),
+        });
+    }
+
+    let proof = BackupProof::of_bytes(&bytes);
+    let mut eraser =
+        LogEraser::new(client.into_transport()).with_reply_timeout(session.timings.reply);
+    eraser.erase(proof)?;
+
+    if options.json {
+        return session.console.json(&serde_json::json!({
+            "port": port,
+            "output": options.output.display().to_string(),
+            "bytes": bytes.len(),
+            "erased": true,
+        }));
+    }
+    print_erase(session.console, &port, &options.output, bytes.len());
+    Ok(())
+}
+
+/// The labelled lines `log erase` prints on stdout.
+fn print_erase(console: &dyn Console, port: &str, output: &Path, bytes: usize) {
+    console.result(&format!("{:<12}: {port}", "port"));
+    console.result(&format!("{:<12}: {}", "output", output.display()));
+    console.result(&format!("{:<12}: {bytes}", "bytes"));
+    console.result(&format!("{:<12}: yes", "erased"));
 }
 
 /// The labelled lines `log download` prints on stdout.
@@ -550,7 +637,9 @@ mod tests {
     };
     use m241_core::Error;
     use m241_core::protocol::simulator::FakeDevice;
-    use std::path::PathBuf;
+    use std::cell::Cell;
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
 
     fn write_dump(scratch: &Scratch, name: &str, points: usize) -> PathBuf {
         let path = scratch.join(name);
@@ -1162,6 +1251,172 @@ mod tests {
             "stderr must tell the user where the raw dump was saved: {}",
             console.stderr()
         );
+    }
+
+    /// A fake logger that answers the erase with `reply`, plus the backup path
+    /// and a cell that says whether the backup existed when the erase arrived.
+    fn erase_fixture(scratch: &Scratch, reply: &str) -> (DeviceHandle, Rc<Cell<bool>>, PathBuf) {
+        let output = scratch.join("track.bin");
+        let handle = DeviceHandle::new(|| FakeDevice::new().with_log(&synthetic_dump(3)))
+            .with_erase_reply(reply);
+        let saved_at_erase = Rc::new(Cell::new(false));
+        let saved = Rc::clone(&saved_at_erase);
+        let backup = output.clone();
+        handle.on_erase(move || saved.set(backup.exists()));
+        (handle, saved_at_erase, output)
+    }
+
+    fn erase_options(output: &Path) -> EraseOptions {
+        EraseOptions {
+            port: String::from("auto"),
+            output: output.to_path_buf(),
+            force: false,
+            yes: true,
+            json: false,
+        }
+    }
+
+    #[test]
+    fn erase_saves_the_log_then_sends_the_erase_sentence_once() {
+        let scratch = Scratch::new("erase");
+        let (handle, saved_at_erase, output) = erase_fixture(&scratch, "PMTK001,182,6,3");
+        let links = FakePorts::shared(handle.clone());
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        erase(&erase_options(&output), fast(&links, &console, &confirm)).expect("erase");
+
+        assert_eq!(
+            fileio::read(&output).expect("backup"),
+            synthetic_dump(3),
+            "the saved bytes must be the dump the device sent"
+        );
+        assert!(
+            saved_at_erase.get(),
+            "the backup must be on disk before $PMTK182,6 is sent"
+        );
+        let commands = handle.commands();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.as_str() == "PMTK182,6")
+                .count(),
+            1,
+            "exactly one erase sentence: {commands:?}"
+        );
+        let erase_at = commands
+            .iter()
+            .position(|command| command == "PMTK182,6")
+            .expect("the erase was recorded");
+        assert!(
+            commands[..erase_at]
+                .iter()
+                .any(|command| command == "PMTK182,4"),
+            "the download must finish (logging resumed) before the erase: {commands:?}"
+        );
+        assert!(
+            handle.logging_enabled(),
+            "a completed download leaves the unit recording"
+        );
+        let stdout = console.stdout();
+        assert!(stdout.contains("bytes"), "got {stdout}");
+        assert!(stdout.contains("erased"), "got {stdout}");
+    }
+
+    #[test]
+    fn erase_without_yes_saves_the_log_and_sends_no_erase() {
+        let scratch = Scratch::new("erase-no-yes");
+        let (handle, _, output) = erase_fixture(&scratch, "PMTK001,182,6,3");
+        let links = FakePorts::shared(handle.clone());
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        let mut options = erase_options(&output);
+        options.yes = false;
+
+        let err = erase(&options, fast(&links, &console, &confirm)).expect_err("--yes is required");
+
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        assert_eq!(crate::exit::exit_code_for(&err), 5, "got {err}");
+        assert_eq!(
+            fileio::read(&output).expect("the backup is still written"),
+            synthetic_dump(3)
+        );
+        assert!(
+            !handle
+                .commands()
+                .iter()
+                .any(|command| command == "PMTK182,6"),
+            "no erase may be sent without --yes: {:?}",
+            handle.commands()
+        );
+        assert!(format!("{err}").contains("--yes"), "got {err}");
+        assert!(handle.logging_enabled());
+    }
+
+    #[test]
+    fn erase_refuses_an_existing_output_before_opening_a_port() {
+        let scratch = Scratch::new("erase-clobber");
+        let output = scratch.join("track.bin");
+        fileio::write(&output, b"previous").expect("write");
+        // No device at all: a handler that opened the port first would fail
+        // with Error::Port instead of the safety refusal under test.
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        let err = erase(&erase_options(&output), fast(&links, &console, &confirm))
+            .expect_err("must refuse to overwrite");
+
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        assert_eq!(crate::exit::exit_code_for(&err), 5, "got {err}");
+        assert_eq!(fileio::read(&output).expect("still there"), b"previous");
+    }
+
+    #[test]
+    fn a_failed_erase_keeps_the_saved_backup() {
+        let scratch = Scratch::new("erase-refused");
+        // Status 0 is a refusal: the device answered, but did not erase.
+        let (handle, saved_at_erase, output) = erase_fixture(&scratch, "PMTK001,182,6,0");
+        let links = FakePorts::shared(handle.clone());
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        let err = erase(&erase_options(&output), fast(&links, &console, &confirm))
+            .expect_err("the device refuses the erase");
+
+        assert!(matches!(err, Error::Rejected { .. }), "got {err}");
+        assert!(saved_at_erase.get(), "the backup was written first");
+        assert_eq!(
+            fileio::read(&output).expect("the backup survives the failure"),
+            synthetic_dump(3)
+        );
+        assert_eq!(
+            handle
+                .commands()
+                .iter()
+                .filter(|command| command.as_str() == "PMTK182,6")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn erase_json_is_one_object_saying_the_log_is_gone() {
+        let scratch = Scratch::new("erase-json");
+        let (handle, _, output) = erase_fixture(&scratch, "PMTK001,182,6,3");
+        let links = FakePorts::shared(handle);
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        let mut options = erase_options(&output);
+        options.json = true;
+
+        erase(&options, fast(&links, &console, &confirm)).expect("erase --json");
+
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(document["output"], output.display().to_string());
+        assert_eq!(document["bytes"], synthetic_dump(3).len());
+        assert_eq!(document["erased"], true);
     }
 
     #[test]

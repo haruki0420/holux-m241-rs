@@ -269,7 +269,7 @@ pub enum LogCommand {
     /// Convert a dumped track log to GPX, KML, CSV, NMEA or JSON.
     Read(LogReadOptions),
     /// Erase the track log on the device (destructive).
-    Erase,
+    Erase(EraseOptions),
     /// Write capture coordinates into photos' EXIF data.
     Geotag(LogGeotagOptions),
 }
@@ -342,6 +342,32 @@ pub struct DownloadOptions {
     /// Overwrite an existing output file.
     #[arg(long)]
     pub force: bool,
+
+    /// Print one JSON object instead of labelled lines.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct EraseOptions {
+    /// Serial port, or `auto` to pick the only likely cable.
+    #[arg(long, default_value = "auto")]
+    pub port: String,
+
+    /// Where to save the copy that is taken before the log is erased.
+    ///
+    /// Required, and written before `$PMTK182,6` is considered: an erase
+    /// without a copy is the one mistake this command must not make.
+    #[arg(short, long)]
+    pub output: PathBuf,
+
+    /// Overwrite an existing output file.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Erase the log after saving it; without this the download still runs.
+    #[arg(long)]
+    pub yes: bool,
 
     /// Print one JSON object instead of labelled lines.
     #[arg(long)]
@@ -504,7 +530,7 @@ mod tests {
             vec!["m241", "log", "info", "track.bin"],
             vec!["m241", "log", "download", "-o", "track.bin"],
             vec!["m241", "log", "read", "track.bin"],
-            vec!["m241", "log", "erase"],
+            vec!["m241", "log", "erase", "-o", "track.bin"],
             vec!["m241", "log", "geotag", "track.bin", "photo.jpg"],
             vec!["m241", "nmea", "repair"],
             vec!["m241", "nmea", "proxy"],
@@ -659,6 +685,54 @@ mod tests {
         // Clap's `global` also accepts the flag after the subcommand.
         let cli = Cli::try_parse_from(["m241", "device", "ports", "--verbose"]).expect("parses");
         assert!(cli.verbose);
+    }
+
+    #[test]
+    fn log_erase_needs_a_backup_path_and_parses_its_flags() {
+        let err = Cli::try_parse_from(["m241", "log", "erase"])
+            .expect_err("an erase must say where the backup goes");
+        assert!(err.use_stderr());
+        assert!(err.to_string().contains("--output"), "got {err}");
+        assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
+
+        let cli = Cli::try_parse_from(["m241", "log", "erase", "-o", "track.bin"])
+            .expect("the documented invocation parses");
+        let Command::Log {
+            command: LogCommand::Erase(options),
+        } = cli.command
+        else {
+            panic!("expected log erase");
+        };
+        assert_eq!(options.port, "auto");
+        assert_eq!(options.output, PathBuf::from("track.bin"));
+        assert!(!options.force);
+        assert!(!options.yes);
+        assert!(!options.json);
+
+        let cli = Cli::try_parse_from([
+            "m241",
+            "log",
+            "erase",
+            "--port",
+            "COM3",
+            "-o",
+            "backup.bin",
+            "--force",
+            "--yes",
+            "--json",
+        ])
+        .expect("every erase flag parses");
+        let Command::Log {
+            command: LogCommand::Erase(options),
+        } = cli.command
+        else {
+            panic!("expected log erase");
+        };
+        assert_eq!(options.port, "COM3");
+        assert_eq!(options.output, PathBuf::from("backup.bin"));
+        assert!(options.force);
+        assert!(options.yes);
+        assert!(options.json);
     }
 
     #[test]

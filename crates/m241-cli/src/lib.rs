@@ -14,15 +14,16 @@
 //!   cal      civil dates, so the offset flags need no date library
 //!   device   ports, info, doctor
 //!   fw       dump and patch (flash is a stub, see below)
-//!   logcmd   download, info, read, geotag (erase is a stub, see below)
+//!   logcmd   download, info, read, erase, geotag
 //!   nmea     repair and proxy
 //! ```
 //!
-//! Two verbs are deliberately not wired: `fw flash` and `log erase`, the two
-//! commands that change the device. They parse, so the help is complete, and they
-//! fail with a message naming themselves and pointing at `m241 --help`. Adding a
-//! handler for either would put a destructive command behind this binary; the
-//! reference says why that is the write crate's job, not this one's.
+//! One verb is deliberately not wired: `fw flash`, which changes the firmware
+//! image on the device. It parses, so the help is complete, and it fails with a
+//! message naming itself and pointing at `m241 --help`. `log erase` is wired
+//! because `m241-flash`'s [`BackupProof`](m241_flash::erase::BackupProof) makes
+//! the copy-before-erase rule a type-level precondition rather than a promise in
+//! prose.
 //!
 //! Machine output goes to stdout; progress and warnings go to stderr. Exit codes
 //! are documented in `docs/reference/02-cli.md` and map one-to-one onto
@@ -259,7 +260,7 @@ pub(crate) fn run_with(
             LogCommand::Info(options) => logcmd::info(&options, session)?,
             LogCommand::Download(options) => logcmd::download(&options, session)?,
             LogCommand::Read(options) => logcmd::read(&options, session)?,
-            LogCommand::Erase => return Err(not_implemented("log erase").into()),
+            LogCommand::Erase(options) => logcmd::erase(&options, session)?,
             LogCommand::Geotag(options) => logcmd::geotag(&options, session)?,
         },
         Command::Nmea { command } => match command {
@@ -322,10 +323,7 @@ mod tests {
     /// list is this build's own record of how far the wiring got. The command
     /// lines are the ones `docs/reference/02-cli.md` documents.
     fn unimplemented_commands() -> Vec<(Command, &'static str)> {
-        vec![
-            (parsed(&["fw", "flash"]), "fw flash"),
-            (parsed(&["log", "erase"]), "log erase"),
-        ]
+        vec![(parsed(&["fw", "flash"]), "fw flash")]
     }
 
     #[test]
@@ -363,7 +361,7 @@ mod tests {
             .iter()
             .map(|(_command, name)| *name)
             .collect();
-        assert_eq!(names, vec!["fw flash", "log erase"]);
+        assert_eq!(names, vec!["fw flash"]);
     }
 
     #[test]
