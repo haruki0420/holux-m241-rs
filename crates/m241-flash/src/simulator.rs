@@ -47,11 +47,15 @@ use std::collections::VecDeque;
 use m241_core::Result;
 use m241_core::protocol::brom::{
     BASE_ADDR_DA, BASE_ADDR_FIRMWARE, BOOT_REPLY, BOOT_SYNC, Frame, OPCODE_READ16, OPCODE_READ32,
+    OPCODE_WRITE16,
 };
 use m241_core::protocol::frame::swap_pairs;
 use m241_core::protocol::port::Transport;
 
-use crate::da::{ACK, CONT, NAK, OPCODE_MEM_CMD, OPCODE_RESTART, OPCODE_WRITE};
+use crate::da::{
+    ACK, CONT, NAK, OPCODE_MEM_CMD, OPCODE_READ_RANGE, OPCODE_RESTART, OPCODE_WRITE,
+    PROBE_PAGE_SIZE,
+};
 
 /// Status byte the fake DA returns after a successful `0xD3`.
 const STATUS_OK: u8 = 0x00;
@@ -83,6 +87,16 @@ const FLASH_SIZE: u32 = 0x0008_0000;
 /// and the tests pin, is the property a client has to live with: `0xD5` erases
 /// whole sectors, so the bytes around a written range are destroyed too.
 const FLASH_SECTOR_SIZE: u32 = 0x4000;
+
+/// Bytes of DA RAM the fake models, from [`BASE_ADDR_DA`].
+///
+/// `DA_v3.8.4.bin` covers `0x00100800`–`0x0010422F`, so the image is
+/// [`crate::da::DA_IMAGE_SIZE`] bytes and the runtime cells the banner's last
+/// word reads (`0x00104330`, `docs/reference/01-da-protocol.md` §2) sit just
+/// past it. The window is one 16 KiB page, which holds both with room to spare
+/// and makes a write past the image visible as a byte that changed rather than
+/// as a silently truncated load.
+const DA_RAM_SIZE: usize = 0x4000;
 
 /// The mode the fake chip is in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +177,34 @@ pub struct FakeDa {
     /// the zero padding of the short final packet, and its checksum — rather
     /// than inferring it from the flash window.
     packets: Vec<Vec<u8>>,
+    /// The DA's own RAM, addressed from zero, so a `0xA1` BootROM write before
+    /// the jump lands somewhere and a `0xAF` read can see it.
+    ///
+    /// Beyond the model of `DA_v3.8.4.bin` itself: the fake does not execute
+    /// the loaded image, it marks the jump as taken once the image arrived. The
+    /// window is what makes "the write landed" and "the read-back agrees"
+    /// observable, which is the part of the loader the client owns.
+    ram: Vec<u8>,
+    /// How many `0xA1` frames landed in `ram`.
+    bootrom_writes: usize,
+    /// Whether a `0xA8` to [`BASE_ADDR_DA`] was taken (the loader's jump).
+    started: bool,
+    /// Which page of the current `0xD6`, and where it starts in the window.
+    read_page: usize,
+    read_start: u32,
+    read_page_len: usize,
+    /// The `0xD6` result still to be sent, page by page.
+    read_data: Vec<u8>,
+    /// The bytes of the last `0xD6` range a test can compare with the window.
+    read_requested: Option<(u32, usize)>,
+    /// A page the fake should send with a deliberately wrong checksum, once.
+    corrupt_page: Option<usize>,
+    /// A page the fake should always send with a wrong checksum.
+    always_corrupt_page: Option<usize>,
+    /// How many times the host sent `0xA5` to ask for a page again.
+    retries_sent: usize,
+    /// Every opcode the host sent, in order: the BootROM's frames and the DA's.
+    opcodes: Vec<u8>,
     /// The two-byte trailer of each packet, as it arrived, parallel to
     /// `packets`.
     trailers: Vec<[u8; 2]>,
@@ -227,6 +269,18 @@ impl FakeDa {
             accepted_packets: 0,
             packets: Vec::new(),
             trailers: Vec::new(),
+            ram: vec![0u8; DA_RAM_SIZE],
+            bootrom_writes: 0,
+            started: false,
+            read_page: 0,
+            read_start: 0,
+            read_page_len: PROBE_PAGE_SIZE,
+            read_data: Vec::new(),
+            read_requested: None,
+            corrupt_page: None,
+            always_corrupt_page: None,
+            retries_sent: 0,
+            opcodes: Vec::new(),
             restarted: false,
             refuse_ranges: false,
             fail_first_erase: false,
@@ -348,6 +402,58 @@ impl FakeDa {
         self.output.len()
     }
 
+    /// The DA's RAM as the loader left it.
+    #[must_use]
+    pub fn ram(&self) -> &[u8] {
+        &self.ram
+    }
+
+    /// How many `0xA1` frames the BootROM side accepted.
+    #[must_use]
+    pub fn bootrom_writes(&self) -> usize {
+        self.bootrom_writes
+    }
+
+    /// Whether a `0xA8` jump to [`BASE_ADDR_DA`] was taken.
+    #[must_use]
+    pub fn started(&self) -> bool {
+        self.started
+    }
+
+    /// Every opcode the host sent, in order: a BootROM frame's first byte, or a
+    /// DA command's first byte.
+    #[must_use]
+    pub fn opcodes(&self) -> &[u8] {
+        &self.opcodes
+    }
+
+    /// The last `0xD6` range, as `(start, length)`.
+    #[must_use]
+    pub fn read_requested(&self) -> Option<(u32, usize)> {
+        self.read_requested
+    }
+
+    /// Send page `page` of the next `0xD6` with a wrong checksum, once.
+    #[must_use]
+    pub fn corrupting_page(mut self, page: usize) -> Self {
+        self.corrupt_page = Some(page);
+        self
+    }
+
+    /// Send page `page` with a wrong checksum on **every** attempt.
+    ///
+    /// The other half of [`Self::corrupting_page`]: this one is for proving the
+    /// client's retry is bounded, so it must not clear itself after one page.
+    pub fn set_always_corrupt_page(&mut self, page: usize) {
+        self.always_corrupt_page = Some(page);
+    }
+
+    /// How many times the host sent `0xA5` to ask for a page again.
+    #[must_use]
+    pub fn retries_sent(&self) -> usize {
+        self.retries_sent
+    }
+
     /// Whether a `0xD5` arrived before any `0xD3` was accepted.
     ///
     /// That command erases and programs the sector at address zero, which is the
@@ -452,6 +558,14 @@ impl FakeDa {
     // -- the state machine -------------------------------------------------
 
     fn consume(&mut self, byte: u8) {
+        // A byte that arrives while the fake is waiting for a `0xD6` advance is
+        // that advance, not a new command: `0xD6` is a conversation that runs
+        // one page at a time and `0x5A` / `0xA5` are the only bytes in it that
+        // are not framed.
+        if self.mode == Mode::DownloadAgent && !self.read_data.is_empty() {
+            self.answer_page(byte);
+            return;
+        }
         match self.mode {
             // A unit that is running its firmware answers a BootROM frame with
             // silence: the bytes go nowhere.
@@ -494,11 +608,35 @@ impl FakeDa {
         if self.bootrom_line.is_empty() {
             self.echo_frame = byte != OPCODE_JUMP;
         }
+        // Every frame's opcode, so a test can assert the *set* of opcodes a
+        // client sent — the check that the loader and the reader never reach a
+        // destructive one. Recorded before the frame is consumed, because a
+        // jump leaves the chip part-way through it.
+        if self.bootrom_line.is_empty() {
+            self.opcodes.push(byte);
+        }
         if self.echo_frame {
             self.queue_bytes(&[byte]);
         }
         self.bootrom_line.push(byte);
-        if self.bootrom_line.len() < 9 {
+        // `0xA1` is a header and then its payload: the count at bytes 5-8 is in
+        // half-words, and the loader streams those after the header. Waiting for
+        // only nine bytes would swallow the payload as the next frame.
+        let needed = if self.bootrom_line.len() >= 9
+            && self.bootrom_line.first().copied() == Some(OPCODE_WRITE16)
+        {
+            let units = self
+                .bootrom_line
+                .get(5..9)
+                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+                .map(u32::from_be_bytes)
+                .and_then(|count| usize::try_from(count).ok())
+                .unwrap_or(0);
+            9usize.saturating_add(units.saturating_mul(2))
+        } else {
+            9
+        };
+        if self.bootrom_line.len() < needed {
             return;
         }
         let frame = std::mem::take(&mut self.bootrom_line);
@@ -522,10 +660,18 @@ impl FakeDa {
             // arrives (`measured elsewhere`). The DA then answers with its
             // report, so a client that expects nine echo bytes before the
             // report desynchronises.
+            self.started = true;
             self.mode = Mode::DownloadAgent;
             self.da_stage = DaStage::Command;
+            self.line.clear();
             let report = self.da_info_report();
             self.queue_bytes(&report);
+            return;
+        }
+        // A jump to anywhere else is not the loader's and the fake does not
+        // model it: it takes nothing. Recording `started` for it would let a
+        // client that jumped to the wrong address look correct.
+        if opcode == OPCODE_JUMP {
             return;
         }
         match opcode {
@@ -537,12 +683,29 @@ impl FakeDa {
                 let wire = swap_pairs(&data);
                 self.queue_bytes(&wire);
             }
+            // `0xA1` writes half-words, pair-swapped like `0xA2` reads, into the
+            // DA's RAM. The loader is the only client: what it writes is the
+            // image that the following `0xA8` is supposed to start.
+            OPCODE_WRITE16 => {
+                let payload = swap_pairs(frame.get(9..).unwrap_or_default());
+                let offset = address.wrapping_sub(BASE_ADDR_DA) as usize;
+                for (index, byte) in payload.iter().enumerate() {
+                    if let Some(slot) = self.ram.get_mut(offset.saturating_add(index)) {
+                        *slot = *byte;
+                    }
+                }
+                self.bootrom_writes = self.bootrom_writes.saturating_add(1);
+            }
             // `0xAF` counts dwords and reverses each 32-bit word.
             OPCODE_READ32 => {
                 self.last_read_address = Some(address);
-                let data = self.read_flash(address, count as usize * 4);
-                let mut wire = Vec::with_capacity(data.len());
-                for word in data.chunks(4) {
+                let source = if address >= BASE_ADDR_DA {
+                    self.read_ram(address, count as usize * 4)
+                } else {
+                    self.read_flash(address, count as usize * 4)
+                };
+                let mut wire = Vec::with_capacity(source.len());
+                for word in source.chunks(4) {
                     wire.extend(word.iter().rev().copied());
                 }
                 self.queue_bytes(&wire);
@@ -576,6 +739,123 @@ impl FakeDa {
             .collect()
     }
 
+    /// Copy `length` bytes of the DA's RAM, addressed from [`BASE_ADDR_DA`].
+    ///
+    /// A read below the DA's base or past the window is zero-filled, like
+    /// [`Self::read_flash`]: the client's own length checks are what catch a
+    /// request for an address that holds nothing.
+    fn read_ram(&self, address: u32, length: usize) -> Vec<u8> {
+        let offset = address.saturating_sub(BASE_ADDR_DA);
+        (0..length)
+            .map(|index| {
+                u32::try_from(index)
+                    .ok()
+                    .and_then(|index| offset.checked_add(index))
+                    .and_then(|at| usize::try_from(at).ok())
+                    .and_then(|at| self.ram.get(at).copied())
+                    .unwrap_or(0)
+            })
+            .collect()
+    }
+
+    // -- `0xD6`: read a range, one page at a time --------------------------
+
+    /// `0xD6` setup, and the first page.
+    ///
+    /// `docs/reference/01-da-protocol.md` §5.5: three big-endian `u32` — page
+    /// length, start, total length. There is no command acknowledgement; the
+    /// first thing on the wire after the command is the first page. The range is
+    /// read out of the **flash** window in the DA's own view (the same window
+    /// `0xD3`/`0xD5` address), so a test can compare what the client got with
+    /// what the fixture holds.
+    fn begin_read_range(&mut self, frame: &[u8]) {
+        let (Some(page_len), Some(start), Some(total)) =
+            (be_u32(frame, 1), be_u32(frame, 5), be_u32(frame, 9))
+        else {
+            self.queue_bytes(&[NAK]);
+            return;
+        };
+        let page_len = usize::try_from(page_len).unwrap_or(0);
+        let total = usize::try_from(total).unwrap_or(0);
+        if page_len == 0 || total == 0 {
+            // A zero length is a division by zero in the DA's page count
+            // (`0x00101E9C`); the fake refuses rather than modelling a crash.
+            self.queue_bytes(&[NAK]);
+            return;
+        }
+        self.read_page_len = page_len;
+        self.read_start = start;
+        self.read_page = 0;
+        self.read_requested = Some((start, total));
+        // The page conversation is not a `0xD5` packet transfer: leaving the
+        // stage at `Packet` would parse the host's advance byte as a packet.
+        self.da_stage = DaStage::Command;
+        self.read_data = (0..total)
+            .map(|index| {
+                u32::try_from(index)
+                    .ok()
+                    .and_then(|offset| start.checked_add(offset))
+                    .and_then(|at| usize::try_from(at).ok())
+                    .and_then(|at| self.memory.get(at).copied())
+                    .unwrap_or(0)
+            })
+            .collect();
+        self.send_page();
+    }
+
+    /// Send the current page: `page_len` bytes, zero-padded, plus the sum.
+    ///
+    /// The trailer is the independent [`sum_of_bytes`], as for a `0xD5` packet:
+    /// the client checks its own copy, and two implementations disagreeing is
+    /// the point.
+    fn send_page(&mut self) {
+        let start = self.read_page.saturating_mul(self.read_page_len);
+        let mut page = vec![0u8; self.read_page_len];
+        for (slot, source) in page
+            .iter_mut()
+            .zip(self.read_data.get(start..).unwrap_or_default().iter())
+        {
+            *slot = *source;
+        }
+        let mut packet = page.clone();
+        let mut sum = sum_of_bytes(&page);
+        if self.always_corrupt_page == Some(self.read_page) {
+            sum = sum.wrapping_add(1);
+        } else if self.corrupt_page == Some(self.read_page) {
+            // Once only: a second corruption of the same page would make the
+            // client's retry accounting unresolvable.
+            sum = sum.wrapping_add(1);
+            self.corrupt_page = None;
+        }
+        packet.extend_from_slice(&sum.to_be_bytes());
+        self.queue_bytes(&packet);
+    }
+
+    /// What the host sent after a page: advance, retry, or nothing is sent.
+    ///
+    /// §5.5: `0x5A` advances, `0xA5` sends the same page again, any other byte is
+    /// ignored and the DA keeps waiting. After the last page the range is done:
+    /// the host's advance draws **no reply**, and the fake is back to its
+    /// command loop — anything the client sends next is a command, which is how
+    /// an extra byte shows up as an opcode rather than being absorbed.
+    fn answer_page(&mut self, byte: u8) {
+        if byte == NAK {
+            self.retries_sent = self.retries_sent.saturating_add(1);
+            self.send_page();
+            return;
+        }
+        if byte != ACK {
+            return;
+        }
+        self.read_page = self.read_page.saturating_add(1);
+        let pages = self.read_data.len().div_ceil(self.read_page_len.max(1));
+        if self.read_page >= pages {
+            self.read_data.clear();
+            return;
+        }
+        self.send_page();
+    }
+
     /// The twenty-byte download-agent report, `>BHBLHHHHL`.
     ///
     /// The layout and every field follow `docs/dev/03-hardware-facts.md`'s
@@ -599,6 +879,12 @@ impl FakeDa {
 
     fn process_download_agent(&mut self, byte: u8) {
         self.line.push(byte);
+        // A `0xD6` conversation's advance and retry bytes never reach this
+        // function: `consume` routes them to `answer_page` first, so every byte
+        // recorded here is a command the client actually issued.
+        if self.line.len() == 1 {
+            self.opcodes.push(byte);
+        }
         match self.da_stage {
             DaStage::Command => self.dispatch_da_command(),
             DaStage::Packet => self.dispatch_da_packet(),
@@ -611,12 +897,25 @@ impl FakeDa {
         };
         let needed = match opcode {
             OPCODE_MEM_CMD => 10,
+            OPCODE_READ_RANGE => 13,
+            // `0xA1` is a header and then `count` half-words, so only the header
+            // is known up front; the full length is resolved below.
+            OPCODE_WRITE16 => 9,
             OPCODE_WRITE => 5,
             OPCODE_RESTART => 1,
             _ => 1,
         };
         if self.line.len() < needed {
             return;
+        }
+        if opcode == OPCODE_WRITE16 {
+            // A `0xA1` frame is not complete until its payload has arrived: the
+            // count at bytes 5–8 is in half-words. Acting on the header alone
+            // would program the chunk from bytes that have not been sent.
+            let payload = usize::try_from(be_u32(&self.line, 5).unwrap_or(0)).unwrap_or(0) * 2;
+            if self.line.len() < 9 + payload {
+                return;
+            }
         }
         let frame = std::mem::take(&mut self.line);
         match opcode {
@@ -701,6 +1000,15 @@ impl FakeDa {
                 // which a test asks for with `set_modelled`.
                 self.restarted = true;
                 self.mode = Mode::Firmware;
+                self.line.clear();
+            }
+            OPCODE_READ_RANGE => {
+                self.begin_read_range(&frame);
+                // The command's own frame is finished; what follows is the
+                // host's page-by-page conversation, which `consume` routes to
+                // `answer_page` while `read_data` is non-empty. Clearing the
+                // buffer matters: the last command byte was pushed into it just
+                // before this arm ran.
                 self.line.clear();
             }
             _ => self.queue_bytes(&[NAK]),

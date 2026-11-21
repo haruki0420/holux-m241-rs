@@ -5,7 +5,7 @@ reads as a map of the device rather than a list of verbs.
 
 ```text
 m241 device  ports | info | doctor
-m241 fw      dump  | patch | flash
+m241 fw      dump  | patch | flash | probe-da
 m241 log     info  | download | read | erase | geotag
 m241 nmea    repair | proxy
 ```
@@ -101,6 +101,28 @@ Before writing it checks, and refuses on any failure:
    `--backup` falls inside the allowed patch offsets;
 2. the image fits the flash size the DA reports;
 3. the user typed `WRITE` (or passed `--yes`).
+
+## `m241 fw probe-da`
+
+Loads the DA into the chip's RAM and reads the two candidate DA-side firmware
+bases. **Writes no flash:** only the BootROM's `0xA1` RAM writes and one `0xA8`
+jump are sent, plus the DA's read-only `0xD6`. `0xD3` / `0xD4` / `0xD5` / `0xD9`
+are never sent, and the DA is gone at the next power-on.
+
+Flags: `--da <FILE>` (the vendor `DA_v3.8.4.bin`, exactly 14,896 bytes; never
+committed here), `--port <PORT|auto>` (default `auto`), `--yes` (required:
+without it the command stops before opening a port), `--assume-brom` (skip the
+NMEA stream probe when the chip is already in BootROM), `--json`.
+
+It reads 64 bytes at each of `0` and `0x00200000` — the two addresses the
+DA-side base is documented to be — and compares the first four bytes with the
+known vector table `18 F0 9F E5`. The verdict is:
+
+* **the image is at 0x…** when exactly one address matches;
+* **inconclusive** when neither matches or both do.
+
+`fw probe-da` exists so the address `fw flash` refuses on can be settled by
+measurement; it does not change `fw flash` by itself.
 
 ## `m241 log download`
 

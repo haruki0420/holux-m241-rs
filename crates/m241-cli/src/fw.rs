@@ -23,9 +23,13 @@ use m241_core::protocol::brom::{BASE_ADDR_FIRMWARE, DEFAULT_BOOTROM_BAUD, DUMP_C
 use m241_core::protocol::pmtk::{NMEA_BAUD, StreamState};
 use m241_core::protocol::port::Transport;
 use m241_core::{Error, FirmwareProfile, PatchPlan, Result};
+use m241_flash::da::{
+    Confirmation, DaLoadId, DaLoader, DownloadAgent, PROBE_ADDRESSES, PROBE_PAGE_SIZE, VECTOR,
+    check_da_image,
+};
 
 use crate::Session;
-use crate::cli::{DumpOptions, PatchOptions};
+use crate::cli::{DumpOptions, PatchOptions, ProbeDaOptions};
 use crate::fileio;
 use crate::link::{self, Opened};
 use crate::output::Console;
@@ -214,7 +218,7 @@ fn validate_length(length: usize) -> Result<()> {
 
 /// Open, enter the BootROM, and read `options.length` bytes once.
 fn read_once(options: &DumpOptions, session: Session<'_>, port: &str) -> Result<Vec<u8>> {
-    let transport = enter_bootrom(options, session, port)?;
+    let transport = enter_bootrom(options.assume_brom, session, port)?;
     let mut rom = MtkBootRom::new(transport);
     rom.sync()?;
     session
@@ -224,8 +228,12 @@ fn read_once(options: &DumpOptions, session: Session<'_>, port: &str) -> Result<
 }
 
 /// Open `port` and put the transport at BootROM baud using the safe entry route.
-fn enter_bootrom(options: &DumpOptions, session: Session<'_>, port: &str) -> Result<Opened> {
-    if options.assume_brom {
+///
+/// `assume_brom` is the caller's own `--assume-brom` flag; taking the flag
+/// rather than one command's options struct is what lets `fw probe-da` reach the
+/// same route without copying it.
+fn enter_bootrom(assume_brom: bool, session: Session<'_>, port: &str) -> Result<Opened> {
+    if assume_brom {
         // Asked to assume the chip is already listening. Nothing is asserted:
         // this path exists for a unit that a failed write left in the BootROM.
         let mut transport = session.links.open(port, NMEA_BAUD)?;
@@ -489,6 +497,216 @@ fn plan_document(report: &PatchReport, written: Option<&std::path::Path>) -> ser
         "no_op_reason": report.plan.no_op_reason,
         "written": written.map(|path| path.display().to_string()),
     })
+}
+
+/// Which of the two candidate DA-side bases holds the firmware image.
+///
+/// The firmware starts with the vector table `18 F0 9F E5`
+/// (`docs/dev/03-hardware-facts.md` "Firmware base, BootROM view"), and only one
+/// of [`PROBE_ADDRESSES`] can be where the image sits. Three outcomes, and the
+/// third is not a failure of the command but a real answer:
+///
+/// * exactly one address starts with the vector: that address is the base;
+/// * neither does: **inconclusive** — the unit is not what this tool knows, or
+///   the DA's view is neither candidate;
+/// * both do: also **inconclusive**, because two matches is not a tie the tool
+///   may break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseVerdict {
+    /// One address matched and the other did not.
+    Settled(u32),
+    /// Zero or two addresses matched; nothing can be concluded.
+    Inconclusive,
+}
+
+/// Which candidate base a page of `length` bytes starting with `vector` implies.
+///
+/// Pure, so the rule is testable without a device. `pages` carries one entry per
+/// [`PROBE_ADDRESSES`] slot, in that order, and `None` for an address whose read
+/// failed.
+#[must_use]
+pub fn base_verdict(pages: &[(u32, Option<&[u8]>)]) -> BaseVerdict {
+    let matched: Vec<u32> = pages
+        .iter()
+        .filter(|(_address, data)| data.is_some_and(|bytes| bytes.starts_with(&VECTOR[..])))
+        .map(|(address, _data)| *address)
+        .collect();
+    match matched.as_slice() {
+        [only] => BaseVerdict::Settled(*only),
+        _ => BaseVerdict::Inconclusive,
+    }
+}
+
+/// `m241 fw probe-da`: load the DA, read the two candidate bases, say which one
+/// holds the image.
+///
+/// Writes **no** flash. The only writes in the whole path are the BootROM's
+/// `0xA1` frames that put the DA into the chip's RAM, and the DA is gone at the
+/// next power-on. `0xD3` / `0xD4` / `0xD5` / `0xD9` are never sent; a test drives
+/// the same path against the fake and asserts the fake saw none of them.
+///
+/// # Errors
+///
+/// * [`Error::Safety`] without `--yes`, or for a DA file that is not exactly
+///   [`DA_IMAGE_SIZE`] bytes. Both run before a port is opened.
+/// * [`Error::Io`] when the DA file cannot be read.
+/// * [`Error::Port`] when no plausible port can be opened, [`Error::Timeout`] /
+///   [`Error::Framing`] when the unit or the DA does not answer as the protocol
+///   says.
+pub fn probe_da(options: &ProbeDaOptions, session: Session<'_>) -> Result<()> {
+    // Everything that can be checked without a device is checked first.
+    let confirmation = Confirmation::of_probe_command_line(options.yes)?;
+    let da = fileio::read(&options.da)?;
+    check_da_image(&da)?;
+
+    let port = link::resolve(session.links, &options.port)?;
+    session.console.note(&format!(
+        "loading the DA into RAM on {port} (this writes no flash), then reading {} bytes at \
+         0x{:08X} and 0x{:08X}",
+        PROBE_PAGE_SIZE, PROBE_ADDRESSES[0], PROBE_ADDRESSES[1]
+    ));
+
+    let transport = enter_bootrom(options.assume_brom, session, &port)?;
+    let mut rom = MtkBootRom::new(transport);
+    rom.sync()?;
+    session
+        .console
+        .note("BootROM sync answered; writing the DA into the chip's RAM");
+
+    // The loader borrows the transport from the synced client; the DA
+    // conversation then takes it back, so the port has one owner throughout.
+    let mut loader = DaLoader::new(rom.transport_mut());
+    let id = loader.load(confirmation, &da)?;
+    session.console.note(&format!(
+        "DA v{}.{} answered (region 0x{:02X}, flash {:04X}:{:04X}, {} bytes); reading",
+        id.version >> 8,
+        id.version & 0xFF,
+        id.region,
+        id.manufacturer,
+        id.device,
+        id.flash_bytes
+    ));
+
+    let mut da_session = DownloadAgent::new(rom.into_transport());
+    let mut pages: Vec<(u32, Option<Vec<u8>>)> = Vec::new();
+    for address in PROBE_ADDRESSES {
+        match da_session.read_range(address, PROBE_PAGE_SIZE) {
+            Ok(page) => pages.push((address, Some(page))),
+            Err(err) => {
+                session.console.warn(&format!(
+                    "0xD6 at 0x{address:08X} failed: {err}. Recording it as unread, not as a \
+                     mismatch"
+                ));
+                pages.push((address, None));
+            }
+        }
+    }
+
+    let verdict = base_verdict(
+        &pages
+            .iter()
+            .map(|(address, page)| (*address, page.as_deref()))
+            .collect::<Vec<_>>(),
+    );
+    print_probe_result(options, session.console, &port, &id, &pages, verdict);
+    Ok(())
+}
+
+/// Format the `fw probe-da` finding.
+fn print_probe_result(
+    options: &ProbeDaOptions,
+    console: &dyn crate::output::Console,
+    port: &str,
+    id: &DaLoadId,
+    pages: &[(u32, Option<Vec<u8>>)],
+    verdict: BaseVerdict,
+) {
+    let verdict_text = match verdict {
+        BaseVerdict::Settled(address) => format!("the image is at 0x{address:08X}"),
+        BaseVerdict::Inconclusive => String::from("inconclusive"),
+    };
+    if options.json {
+        let candidates: Vec<serde_json::Value> = pages
+            .iter()
+            .map(|(address, page)| {
+                serde_json::json!({
+                    "address": format!("0x{address:08X}"),
+                    "read": page.is_some(),
+                    "vector_match": page
+                        .as_deref()
+                        .is_some_and(|bytes| bytes.starts_with(&VECTOR[..])),
+                    "first_bytes": page
+                        .as_deref()
+                        .map(|bytes| hex_bytes(bytes.get(..16).unwrap_or_default())),
+                })
+            })
+            .collect();
+        let settled = match verdict {
+            BaseVerdict::Settled(address) => Some(format!("0x{address:08X}")),
+            BaseVerdict::Inconclusive => None,
+        };
+        let _ = console.json(&serde_json::json!({
+            "port": port,
+            "da": {
+                "version": format!("0x{:04X}", id.version),
+                "region": format!("0x{:02X}", id.region),
+                "manufacturer": format!("0x{:04X}", id.manufacturer),
+                "device": format!("0x{:04X}", id.device),
+                "flash_bytes": id.flash_bytes,
+            },
+            "probe": candidates,
+            "verdict": verdict_text,
+            "firmware_base": settled,
+            "wrote_flash": false,
+        }));
+        return;
+    }
+    console.result(&format!("{:<12}: {port}", "port"));
+    console.result(&format!(
+        "{:<12}: 0x{:04X} (region 0x{:02X}, {:04X}:{:04X}, {} bytes)",
+        "DA", id.version, id.region, id.manufacturer, id.device, id.flash_bytes
+    ));
+    for (address, page) in pages {
+        match page {
+            Some(bytes) => console.result(&format!(
+                "{:<12}: {}",
+                format!("0x{address:08X}"),
+                describe_page(bytes)
+            )),
+            None => console.result(&format!(
+                "{:<12}: not read (0xD6 refused or timed out)",
+                format!("0x{address:08X}")
+            )),
+        }
+    }
+    console.result(&format!("{:<12}: {verdict_text}", "verdict"));
+    console.result(&format!("{:<12}: no", "flash write"));
+    console.note(
+        "the DA was loaded into the chip's RAM and reads only; no flash write, erase or \
+         restart command was sent. Power-cycling the unit removes the DA.",
+    );
+}
+
+/// One probe page as one line: the vector check, then the bytes.
+fn describe_page(page: &[u8]) -> String {
+    let vector = if page.starts_with(&VECTOR[..]) {
+        "vector 18 F0 9F E5"
+    } else {
+        "no vector"
+    };
+    format!(
+        "{vector}  {}",
+        hex_bytes(page.get(..16).unwrap_or_default())
+    )
+}
+
+/// Upper-case hex, space-separated, as a person reads a flash dump.
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -1160,5 +1378,162 @@ mod tests {
         options.length = (u32::MAX - BASE_ADDR_FIRMWARE) as usize + 1;
         let err = dump(&options, session).expect_err("overflowing length must fail");
         assert!(format!("{err}").contains("overflow"), "got {err}");
+    }
+
+    // -- fw probe-da -------------------------------------------------------
+
+    /// A page that starts with the M-241 vector table.
+    fn vector_page() -> Vec<u8> {
+        let mut page = vec![0x00u8; PROBE_PAGE_SIZE];
+        page.get_mut(..VECTOR.len())
+            .unwrap()
+            .copy_from_slice(&VECTOR);
+        page
+    }
+
+    #[test]
+    fn the_probe_verdict_settles_only_on_exactly_one_vector_match() {
+        let page = vector_page();
+        let other = vec![0x00u8; PROBE_PAGE_SIZE];
+        // One match: settled, and it names the address that matched.
+        assert_eq!(
+            base_verdict(&[
+                (PROBE_ADDRESSES[0], Some(other.as_slice())),
+                (PROBE_ADDRESSES[1], Some(page.as_slice())),
+            ]),
+            BaseVerdict::Settled(PROBE_ADDRESSES[1])
+        );
+        assert_eq!(
+            base_verdict(&[
+                (PROBE_ADDRESSES[0], Some(page.as_slice())),
+                (PROBE_ADDRESSES[1], Some(other.as_slice())),
+            ]),
+            BaseVerdict::Settled(PROBE_ADDRESSES[0])
+        );
+        // Both match: two answers is not a tie this tool breaks.
+        assert_eq!(
+            base_verdict(&[
+                (PROBE_ADDRESSES[0], Some(page.as_slice())),
+                (PROBE_ADDRESSES[1], Some(page.as_slice())),
+            ]),
+            BaseVerdict::Inconclusive
+        );
+        // Neither matches, or a read that failed, is inconclusive as well.
+        assert_eq!(
+            base_verdict(&[
+                (PROBE_ADDRESSES[0], Some(other.as_slice())),
+                (PROBE_ADDRESSES[1], Some(other.as_slice())),
+            ]),
+            BaseVerdict::Inconclusive
+        );
+        assert_eq!(
+            base_verdict(&[
+                (PROBE_ADDRESSES[0], None),
+                (PROBE_ADDRESSES[1], Some(other.as_slice())),
+            ]),
+            BaseVerdict::Inconclusive
+        );
+    }
+
+    fn probe_options(da: &Path) -> ProbeDaOptions {
+        ProbeDaOptions {
+            da: da.to_path_buf(),
+            port: String::from("auto"),
+            yes: false,
+            assume_brom: false,
+            json: false,
+        }
+    }
+
+    #[test]
+    fn probe_da_refuses_without_yes_before_opening_a_port_or_reading_a_file() {
+        let scratch = Scratch::new("probe-no-yes");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        // The file does not exist either, so a command that reached the read
+        // would fail with an I/O error instead of a safety refusal.
+        let err =
+            probe_da(&probe_options(&scratch.join("absent.bin")), session).expect_err("no --yes");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        assert!(format!("{err}").contains("LOAD"), "got {err}");
+        assert!(
+            console.stderr().is_empty(),
+            "nothing is announced before the refusal: {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
+    fn probe_da_refuses_a_da_of_the_wrong_size_before_opening_a_port() {
+        let scratch = Scratch::new("probe-size");
+        let path = scratch.join("DA_v3.8.4.bin");
+        fileio::write(&path, &vec![0u8; 14_895]).expect("write");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        let mut options = probe_options(&path);
+        options.yes = true;
+        let err = probe_da(&options, session).expect_err("wrong size");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        assert!(format!("{err}").contains("14896"), "got {err}");
+    }
+
+    #[test]
+    fn probe_da_with_a_valid_da_reaches_the_port_step_and_refuses_without_one() {
+        // The DA path itself is exercised against the fake in `m241-flash`; here
+        // the point is that the command gets past its own refusals and then
+        // reports the missing port as a port error, not a safety one.
+        let scratch = Scratch::new("probe-port");
+        let path = scratch.join("DA_v3.8.4.bin");
+        fileio::write(&path, &vec![0u8; 14_896]).expect("write");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        let mut options = probe_options(&path);
+        options.yes = true;
+        let err = probe_da(&options, session).expect_err("no port is available");
+        assert!(matches!(err, Error::Port { .. }), "got {err}");
+        assert_eq!(crate::exit::exit_code_for(&err), 3, "got {err}");
+    }
+
+    #[test]
+    fn probe_da_json_document_names_both_candidates_and_says_no_flash_write() {
+        let scratch = Scratch::new("probe-json");
+        let console = RecordingConsole::default();
+        let page = vector_page();
+        let mut pages = vec![(PROBE_ADDRESSES[0], Some(page.clone()))];
+        pages.push((PROBE_ADDRESSES[1], None));
+        let verdict = base_verdict(&[
+            (pages[0].0, pages[0].1.as_deref()),
+            (pages[1].0, pages[1].1.as_deref()),
+        ]);
+        print_probe_result(
+            &ProbeDaOptions {
+                da: scratch.join("DA_v3.8.4.bin"),
+                port: String::from("auto"),
+                yes: true,
+                assume_brom: false,
+                json: true,
+            },
+            &console,
+            "SIM0",
+            &DaLoadId {
+                version: 0x0308,
+                region: 0x49,
+                flash_bytes: 0x0008_0000,
+                manufacturer: 0x00C2,
+                device: 0x22BA,
+            },
+            &pages,
+            verdict,
+        );
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(document["wrote_flash"], false);
+        assert_eq!(document["firmware_base"], "0x00000000");
+        assert_eq!(document["probe"][0]["vector_match"], true);
+        assert_eq!(document["probe"][1]["read"], false);
+        assert_eq!(document["da"]["version"], "0x0308");
     }
 }

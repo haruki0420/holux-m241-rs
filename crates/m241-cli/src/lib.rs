@@ -248,6 +248,7 @@ pub(crate) fn run_with(
             FwCommand::Dump(options) => fw::dump(&options, session)?,
             FwCommand::Patch(options) => fw::patch(&options, session)?,
             FwCommand::Flash => return Err(not_implemented("fw flash").into()),
+            FwCommand::ProbeDa(options) => fw::probe_da(&options, session)?,
         },
         Command::Log { command } => match command {
             LogCommand::Info(options) => logcmd::info(&options, session)?,

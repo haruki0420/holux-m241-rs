@@ -39,6 +39,7 @@ figure on this page.
 | 4 MiB units and GR-245 variants | geometry maths is implemented and unit-tested; no device was available |
 | V1.11 and V1.12 on hardware | no V1.11 image to profile, V1.12 was never flashed |
 | Any timing figure | nothing in this repository is a stopwatch measurement |
+| The DA-side firmware base (`0` or `0x00200000`) | `fw probe-da` reads both and reports; no run has been recorded here, so `FLASH_WRITE_START` stays refused |
 
 ## 3. The simulator
 

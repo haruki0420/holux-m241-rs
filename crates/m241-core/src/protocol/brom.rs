@@ -221,6 +221,17 @@ impl<T: Transport> MtkBootRom<T> {
         &mut self.transport
     }
 
+    /// Take the transport back, for the client that follows this one.
+    ///
+    /// A BootROM client owns its transport for the duration of one conversation;
+    /// a command that reads first and then hands the chip to the Download Agent
+    /// needs the same port back. `m241-flash`'s driver takes one by this method
+    /// (`DownloadAgent::new`), so the write path's own test harness depends on it.
+    #[must_use]
+    pub fn into_transport(self) -> T {
+        self.transport
+    }
+
     /// Send the four sync probes and verify each reply.
     ///
     /// The probes must go out **back to back**: a pause between them makes the
