@@ -53,7 +53,7 @@ use m241_core::protocol::frame::swap_pairs;
 use m241_core::protocol::port::Transport;
 
 use crate::da::{
-    ACK, CONT, NAK, OPCODE_MEM_CMD, OPCODE_READ_RANGE, OPCODE_RESTART, OPCODE_WRITE,
+    ACK, CONT, DA_JUMP_COUNT, NAK, OPCODE_MEM_CMD, OPCODE_READ_RANGE, OPCODE_RESTART, OPCODE_WRITE,
     PROBE_PAGE_SIZE,
 };
 
@@ -191,6 +191,10 @@ pub struct FakeDa {
     started: bool,
     /// Which page of the current `0xD6`, and where it starts in the window.
     read_page: usize,
+    /// How many pages the current `0xD6` range has (§5.5's
+    /// `udiv(total + page - 1, page)`).
+    read_pages: usize,
+    read_data_debug: (u32, usize),
     read_start: u32,
     read_page_len: usize,
     /// The `0xD6` result still to be sent, page by page.
@@ -201,6 +205,16 @@ pub struct FakeDa {
     corrupt_page: Option<usize>,
     /// A page the fake should always send with a wrong checksum.
     always_corrupt_page: Option<usize>,
+    /// Whether a page shorter than the requested one is zero-filled over the
+    /// wire or sent short.
+    ///
+    /// §4.4 says the *serialiser* pads a short payload, and the read path uses
+    /// the same one (§5.5). A plain `true` would make the client and the fake
+    /// agree by construction; the flag lets a test set it to `false` and check
+    /// that the client tolerates a short page as well.
+    pad_pages: bool,
+    /// How many `0xA1` frames arrived with `count != 0`.
+    bad_jump_counts: usize,
     /// How many times the host sent `0xA5` to ask for a page again.
     retries_sent: usize,
     /// Every opcode the host sent, in order: the BootROM's frames and the DA's.
@@ -273,12 +287,16 @@ impl FakeDa {
             bootrom_writes: 0,
             started: false,
             read_page: 0,
+            read_pages: 1,
+            read_data_debug: (0, 0),
             read_start: 0,
             read_page_len: PROBE_PAGE_SIZE,
             read_data: Vec::new(),
             read_requested: None,
             corrupt_page: None,
             always_corrupt_page: None,
+            pad_pages: true,
+            bad_jump_counts: 0,
             retries_sent: 0,
             opcodes: Vec::new(),
             restarted: false,
@@ -452,6 +470,34 @@ impl FakeDa {
     #[must_use]
     pub fn retries_sent(&self) -> usize {
         self.retries_sent
+    }
+
+    /// Send every `0xD6` page exactly as long as the range's remaining bytes,
+    /// not zero-filled to the page length.
+    ///
+    /// The fake pads by default, which is what §4.4's serialiser does. This is
+    /// the other reading a test needs: a DA that sends the last page short.
+    pub fn without_page_padding(&mut self) {
+        self.pad_pages = false;
+    }
+
+    /// The last `0xD6` range as `(start, bytes the fake prepared)`.
+    ///
+    /// `bytes` exceeds the requested length when the fake padded a range that
+    /// was not a whole number of pages.
+    #[must_use]
+    pub fn read_data_debug(&self) -> (u32, usize) {
+        self.read_data_debug
+    }
+
+    /// How many `0xA8` frames arrived with a count other than zero.
+    ///
+    /// The jump frame's count word has no meaning in
+    /// `docs/reference/01-da-protocol.md`; the only measured client sent zero.
+    /// A fake that took any count would let a wrong one reach a unit unnoticed.
+    #[must_use]
+    pub fn bad_jump_counts(&self) -> usize {
+        self.bad_jump_counts
     }
 
     /// Whether a `0xD5` arrived before any `0xD3` was accepted.
@@ -660,6 +706,14 @@ impl FakeDa {
             // arrives (`measured elsewhere`). The DA then answers with its
             // report, so a client that expects nine echo bytes before the
             // report desynchronises.
+            //
+            // The count word is counted, not obeyed: the real field has no
+            // documented meaning (`docs/dev/03-hardware-facts.md` "DA jump"),
+            // and the only client that ran it sent zero. A wrong count here is
+            // what `bad_jump_counts` reports to a test.
+            if count != DA_JUMP_COUNT {
+                self.bad_jump_counts = self.bad_jump_counts.saturating_add(1);
+            }
             self.started = true;
             self.mode = Mode::DownloadAgent;
             self.da_stage = DaStage::Command;
@@ -790,17 +844,51 @@ impl FakeDa {
         // The page conversation is not a `0xD5` packet transfer: leaving the
         // stage at `Packet` would parse the host's advance byte as a packet.
         self.da_stage = DaStage::Command;
-        self.read_data = (0..total)
-            .map(|index| {
-                u32::try_from(index)
-                    .ok()
-                    .and_then(|offset| start.checked_add(offset))
-                    .and_then(|at| usize::try_from(at).ok())
-                    .and_then(|at| self.memory.get(at).copied())
-                    .unwrap_or(0)
-            })
-            .collect();
+        // The range is taken from the **flash window**, addressed from zero,
+        // without the BootROM's `BASE_ADDR_FIRMWARE` shift: `0xD6` carries the
+        // DA's own view, the same one `0xD3`/`0xD5` take, so a read at `0x100`
+        // returns flash offset `0x100` and not zero. `read_flash` would shift
+        // both candidates down by 2 MiB, and the probe's whole question is
+        // which view holds the image.
+        // Copied byte by byte from the DA's own address: `start` is a flash
+        // offset, so `memory[start]` is the range's first byte. A flat `map`
+        // over `memory[start..start + total]` would need a slice whose bounds
+        // are checked up front; this keeps the same "zero past the end" rule the
+        // rest of the fake uses.
+        let mut copied: Vec<u8> = Vec::with_capacity(total);
+        let mut i = 0usize;
+        while i < total {
+            let next = self.byte_at(start, i);
+            copied.push(next);
+            i += 1;
+        }
+        self.read_data = copied;
+        // A range that is not a whole number of pages leaves bytes over. §4.4's
+        // serialiser pads that last page to the page length, and the client
+        // requires the whole page; a fake that sent a short one would make every
+        // multi-page read time out. The tail is zero **only when padding was
+        // asked for**; with [`Self::without_page_padding`] the last page is sent
+        // as long as what is left of the range instead.
+        let leftover = total % page_len;
+        if leftover != 0 && self.pad_pages {
+            self.read_data
+                .resize(total.saturating_add(page_len - leftover), 0);
+        }
+        self.read_data_debug = (start, self.read_data.len());
+        // The page count follows §5.5's `udiv(total + page - 1, page)`.
+        self.read_pages = total.div_ceil(page_len);
         self.send_page();
+    }
+
+    /// The window byte at flash offset `start + index`, or `0` past the end.
+    ///
+    /// A named function rather than a closure inside `begin_read_range`: the
+    /// conversion from an index to an address is the one place this file can
+    /// silently lose a byte, so it exists once and every reader of the window
+    /// (`0xD6`) goes through it.
+    fn byte_at(&self, start: u32, index: usize) -> u8 {
+        let at = u32::try_from(index).unwrap_or(u32::MAX).wrapping_add(start) as usize;
+        self.memory.get(at).copied().unwrap_or(0)
     }
 
     /// Send the current page: `page_len` bytes, zero-padded, plus the sum.
@@ -808,14 +896,31 @@ impl FakeDa {
     /// The trailer is the independent [`sum_of_bytes`], as for a `0xD5` packet:
     /// the client checks its own copy, and two implementations disagreeing is
     /// the point.
+    ///
+    /// Written without a slice of `read_data`: a range its own `get` calls
+    /// cannot see still serves its first page, which is exactly the kind of
+    /// silent miss a test should not have to debug. This indexes byte by byte,
+    /// so a page is short only when the data really stops there.
     fn send_page(&mut self) {
-        let start = self.read_page.saturating_mul(self.read_page_len);
-        let mut page = vec![0u8; self.read_page_len];
-        for (slot, source) in page
-            .iter_mut()
-            .zip(self.read_data.get(start..).unwrap_or_default().iter())
-        {
-            *slot = *source;
+        let first = self.read_page.saturating_mul(self.read_page_len);
+        let remaining = self
+            .read_data
+            .len()
+            .saturating_sub(first)
+            .min(self.read_page_len);
+        let len = if self.padding_on() {
+            self.read_page_len
+        } else {
+            remaining
+        };
+        let mut page = Vec::with_capacity(len);
+        for index in 0..len {
+            page.push(
+                first
+                    .checked_add(index)
+                    .and_then(|at| self.read_data.get(at).copied())
+                    .unwrap_or(0),
+            );
         }
         let mut packet = page.clone();
         let mut sum = sum_of_bytes(&page);
@@ -829,6 +934,11 @@ impl FakeDa {
         }
         packet.extend_from_slice(&sum.to_be_bytes());
         self.queue_bytes(&packet);
+    }
+
+    /// Whether a page is zero-filled to the page length.
+    fn padding_on(&self) -> bool {
+        self.pad_pages
     }
 
     /// What the host sent after a page: advance, retry, or nothing is sent.
@@ -848,8 +958,7 @@ impl FakeDa {
             return;
         }
         self.read_page = self.read_page.saturating_add(1);
-        let pages = self.read_data.len().div_ceil(self.read_page_len.max(1));
-        if self.read_page >= pages {
+        if self.read_page >= self.read_pages {
             self.read_data.clear();
             return;
         }

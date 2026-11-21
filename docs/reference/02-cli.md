@@ -109,17 +109,46 @@ bases. **Writes no flash:** only the BootROM's `0xA1` RAM writes and one `0xA8`
 jump are sent, plus the DA's read-only `0xD6`. `0xD3` / `0xD4` / `0xD5` / `0xD9`
 are never sent, and the DA is gone at the next power-on.
 
-Flags: `--da <FILE>` (the vendor `DA_v3.8.4.bin`, exactly 14,896 bytes; never
-committed here), `--port <PORT|auto>` (default `auto`), `--yes` (required:
-without it the command stops before opening a port), `--assume-brom` (skip the
-NMEA stream probe when the chip is already in BootROM), `--json`.
+Flags: `--da <FILE>` (the vendor `DA_v3.8.4.bin`, exactly 14,896 bytes starting
+`00 00 A0 E1`; never committed here), `--port <PORT|auto>` (default `auto`),
+`--yes` (required: without it the command stops before opening a port; there is
+no typed prompt for this command), `--assume-brom` (the same route
+`fw dump --assume-brom` takes when the chip is already in BootROM), `--json`.
 
-It reads 64 bytes at each of `0` and `0x00200000` — the two addresses the
-DA-side base is documented to be — and compares the first four bytes with the
-known vector table `18 F0 9F E5`. The verdict is:
+It reads one 64-byte page at each of `0` and `0x00200000` — the two addresses the
+DA-side base is documented to be — and **judges only the first four bytes** of
+each page against `18 F0 9F E5`. The other 60 bytes are printed for a person
+(`first 16:`), not judged.
 
-* **the image is at 0x…** when exactly one address matches;
-* **inconclusive** when neither matches or both do.
+For every candidate the report states, as a line a user can paste into
+`docs/dev/05-verification.md`:
+
+```text
+0x00000000  : not read — 0xD6 page 0 (0 of 66 bytes): timed out
+0x00200000  : read, first bytes 18 F0 9F E5 (matches the vector 18 F0 9F E5)  first 16: 18 F0 9F E5 00 …
+verdict     : the image is at 0x00200000
+```
+
+The verdict is one of:
+
+* **the image is at 0x…** — both candidates were read and exactly one starts
+  with the vector;
+* **inconclusive: … not read** — at least one candidate did not answer (a
+  timeout, a refusal, a checksum that stayed wrong). This **blocks** the
+  verdict: a read that failed says nothing about what is at that address;
+* **inconclusive: … neither starts with the vector** — both were read;
+* **inconclusive: … both start with the vector** — both were read and matched,
+  which is not a tie the tool breaks.
+
+⚠️ The first-four-bytes test is **unverified through the DA**. `18 F0 9F E5` is
+measured in the BootROM's view only (`docs/dev/03-hardware-facts.md` "Firmware
+base, BootROM view"); `0xD6` itself — the page length the DA emits, whether it
+sends anything before the first page — has no hardware run either
+(`docs/reference/01-da-protocol.md` §5.5, §7 item 4). If `0xD6` does not answer,
+the result is "not read", and that means the DA-side question is still open, not
+that the image is absent or that the address is wrong. The V1.13 unit measured
+so far carries the WNRO patch (it reports `V1.14`); no probe has been run on
+it, and none on an unpatched V1.13.
 
 `fw probe-da` exists so the address `fw flash` refuses on can be settled by
 measurement; it does not change `fw flash` by itself.

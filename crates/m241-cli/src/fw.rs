@@ -1,10 +1,13 @@
-//! `m241 fw dump` and `m241 fw patch`.
+//! `m241 fw dump`, `m241 fw patch` and `m241 fw probe-da`.
 //!
-//! The two halves of the repair, deliberately asymmetric. [`dump`] touches the
+//! The halves of the repair, deliberately asymmetric. [`dump`] touches the
 //! device and is read-only: it reads the image twice, comparing hashes, so a
 //! read that silently truncated cannot be mistaken for success. [`patch`] never
 //! opens a port at all — it rewrites a file on this machine, and writing to the
-//! device is a different command.
+//! device is a different command. [`probe_da`] loads the DA into the chip's RAM
+//! and reads two candidate addresses through it; it writes no flash either, and
+//! exists because the address `fw flash` refuses on cannot be settled any other
+//! way.
 //!
 //! # Why the second pass exists
 //!
@@ -25,7 +28,7 @@ use m241_core::protocol::port::Transport;
 use m241_core::{Error, FirmwareProfile, PatchPlan, Result};
 use m241_flash::da::{
     Confirmation, DaLoadId, DaLoader, DownloadAgent, PROBE_ADDRESSES, PROBE_PAGE_SIZE, VECTOR,
-    check_da_image,
+    check_da_image, read_candidates,
 };
 
 use crate::Session;
@@ -229,7 +232,7 @@ fn read_once(options: &DumpOptions, session: Session<'_>, port: &str) -> Result<
 
 /// Open `port` and put the transport at BootROM baud using the safe entry route.
 ///
-/// `assume_brom` is the caller's own `--assume-brom` flag; taking the flag
+/// `assume_brom` is the caller's own `--assume-brom` flag. Taking the flag
 /// rather than one command's options struct is what lets `fw probe-da` reach the
 /// same route without copying it.
 fn enter_bootrom(assume_brom: bool, session: Session<'_>, port: &str) -> Result<Opened> {
@@ -499,41 +502,176 @@ fn plan_document(report: &PatchReport, written: Option<&std::path::Path>) -> ser
     })
 }
 
+/// One candidate address and what the `0xD6` read of it found.
+///
+/// `page` is the reader's own result: `Ok` for a page that arrived and passed
+/// its checksum, `Err` with the reason it did not. The distinction matters —
+/// "the DA does not read there" and "the DA did not answer" are different
+/// findings, and only the first says anything about where the image is.
+#[derive(Debug)]
+pub struct ProbeCandidate {
+    /// The address, one of [`PROBE_ADDRESSES`].
+    pub address: u32,
+    /// The 64-byte page, or why there is none.
+    pub page: Result<Vec<u8>>,
+}
+
+impl ProbeCandidate {
+    /// Whether the page arrived at all.
+    #[must_use]
+    pub fn was_read(&self) -> bool {
+        self.page.is_ok()
+    }
+
+    /// The page's first four bytes, when it arrived.
+    #[must_use]
+    pub fn first_bytes(&self) -> Option<&[u8]> {
+        self.page
+            .as_ref()
+            .ok()
+            .map(|page| page.get(..VECTOR.len()).unwrap_or(page))
+    }
+
+    /// The first four bytes as the CLI prints them.
+    #[must_use]
+    pub fn first_bytes_hex(&self) -> String {
+        hex_bytes(self.first_bytes().unwrap_or_default())
+    }
+
+    /// Whether the first four bytes are the M-241 vector table.
+    ///
+    /// Exactly four bytes are compared, and that is the whole decision: 64 were
+    /// read so a person can see the surroundings, the rest take no part in the
+    /// verdict.
+    #[must_use]
+    pub fn vector_matches(&self) -> bool {
+        self.first_bytes() == Some(VECTOR.as_slice())
+    }
+}
+
 /// Which of the two candidate DA-side bases holds the firmware image.
 ///
-/// The firmware starts with the vector table `18 F0 9F E5`
-/// (`docs/dev/03-hardware-facts.md` "Firmware base, BootROM view"), and only one
-/// of [`PROBE_ADDRESSES`] can be where the image sits. Three outcomes, and the
-/// third is not a failure of the command but a real answer:
+/// The assumption behind the probe is that the provisioning image starts with
+/// the vector table `18 F0 9F E5`. That is **measured in the BootROM's view**
+/// only (`docs/dev/03-hardware-facts.md` "Firmware base, BootROM view"); no run
+/// has recorded it through the DA. `0xD6` itself — the page length the DA emits,
+/// whether it sends anything before the first page — is unmeasured too
+/// (`docs/reference/01-da-protocol.md` §5.5, §7 item 4). A run whose cause is
+/// unknown therefore produces *unread*, not *no image here*, and the two are
+/// never folded together.
 ///
-/// * exactly one address starts with the vector: that address is the base;
-/// * neither does: **inconclusive** — the unit is not what this tool knows, or
-///   the DA's view is neither candidate;
-/// * both do: also **inconclusive**, because two matches is not a tie the tool
-///   may break.
+/// Two variants carry five outcomes:
+///
+/// | Read results | Verdict |
+/// |---|---|
+/// | exactly one page read, its first four bytes are the vector | `Settled(address)` |
+/// | both read, neither starts with the vector | `Inconclusive(NoMatch)` |
+/// | both read, both start with the vector | `Inconclusive(Ambiguous)` |
+/// | one page not read | `Inconclusive(Unread { .. })` |
+/// | neither read | `Inconclusive(Unread { .. })` |
+///
+/// A candidate that could not be read **blocks** `Settled`: the address that
+/// came back as a timeout could be the one holding the image, and a timeout says
+/// nothing about its contents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BaseVerdict {
-    /// One address matched and the other did not.
+    /// Both candidates were read and exactly one starts with [`VECTOR`].
     Settled(u32),
-    /// Zero or two addresses matched; nothing can be concluded.
-    Inconclusive,
+    /// Nothing can be concluded, and the variant names why.
+    Inconclusive(Inconclusive),
+}
+
+/// Why [`BaseVerdict`] could not settle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inconclusive {
+    /// At least one candidate was not read (it timed out, or the DA refused).
+    /// `read` lists the addresses that did answer, in probe order.
+    Unread {
+        /// The candidates that answered.
+        read: [bool; PROBE_ADDRESSES.len()],
+    },
+    /// Both were read, and neither starts with the vector.
+    NoMatch,
+    /// Both were read, and both start with the vector.
+    Ambiguous,
+}
+
+impl BaseVerdict {
+    /// The one-line verdict, as the console and the JSON document print it.
+    #[must_use]
+    pub fn describe(self) -> String {
+        match self {
+            Self::Settled(address) => format!("the image is at 0x{address:08X}"),
+            Self::Inconclusive(Inconclusive::Unread { read }) => {
+                let missing: Vec<String> = PROBE_ADDRESSES
+                    .iter()
+                    .zip(read.iter())
+                    .filter(|(_address, ok)| !**ok)
+                    .map(|(address, _ok)| format!("0x{address:08X}"))
+                    .collect();
+                format!(
+                    "inconclusive: {} not read (0xD6 timed out or was refused), so the address of \
+                     the image is not decided — this is a failure of the read, not evidence that \
+                     the image is absent. Check the cable and the unit, and record that the \
+                     DA-side vector check itself is still unverified",
+                    missing.join(" and ")
+                )
+            }
+            Self::Inconclusive(Inconclusive::NoMatch) => String::from(
+                "inconclusive: both addresses were read and neither starts with the vector \
+                 18 F0 9F E5 — the image is at neither candidate, or the DA's view is not the \
+                 firmware's",
+            ),
+            Self::Inconclusive(Inconclusive::Ambiguous) => String::from(
+                "inconclusive: both addresses start with the vector 18 F0 9F E5 — two matches are \
+                 not a tie this tool may break",
+            ),
+        }
+    }
 }
 
 /// Which candidate base a page of `length` bytes starting with `vector` implies.
 ///
 /// Pure, so the rule is testable without a device. `pages` carries one entry per
-/// [`PROBE_ADDRESSES`] slot, in that order, and `None` for an address whose read
-/// failed.
-#[must_use]
-pub fn base_verdict(pages: &[(u32, Option<&[u8]>)]) -> BaseVerdict {
+/// [`PROBE_ADDRESSES`] slot, in that order — [`base_verdict`] refuses anything
+/// else, which is what keeps a single-candidate run from passing — and `Err` for
+/// an address whose read failed.
+///
+/// # Errors
+///
+/// [`Error::State`] when `pages` is not one entry per [`PROBE_ADDRESSES`] slot,
+/// or when its addresses are not those slots in order.
+pub fn base_verdict(pages: &[ProbeCandidate]) -> Result<BaseVerdict> {
+    if pages.len() != PROBE_ADDRESSES.len()
+        || pages
+            .iter()
+            .zip(PROBE_ADDRESSES)
+            .any(|(candidate, address)| candidate.address != address)
+    {
+        return Err(Error::State(format!(
+            "the probe reads exactly {PROBE_ADDRESSES:08X?}; the verdict was given {} other \
+             address(es)",
+            pages.len()
+        )));
+    }
+    let read = PROBE_ADDRESSES.map(|address| {
+        pages
+            .iter()
+            .find(|candidate| candidate.address == address)
+            .is_some_and(ProbeCandidate::was_read)
+    });
+    if !read.iter().all(|ok| *ok) {
+        return Ok(BaseVerdict::Inconclusive(Inconclusive::Unread { read }));
+    }
     let matched: Vec<u32> = pages
         .iter()
-        .filter(|(_address, data)| data.is_some_and(|bytes| bytes.starts_with(&VECTOR[..])))
-        .map(|(address, _data)| *address)
+        .filter(|candidate| candidate.vector_matches())
+        .map(|candidate| candidate.address)
         .collect();
     match matched.as_slice() {
-        [only] => BaseVerdict::Settled(*only),
-        _ => BaseVerdict::Inconclusive,
+        [only] => Ok(BaseVerdict::Settled(*only)),
+        [] => Ok(BaseVerdict::Inconclusive(Inconclusive::NoMatch)),
+        _ => Ok(BaseVerdict::Inconclusive(Inconclusive::Ambiguous)),
     }
 }
 
@@ -545,14 +683,19 @@ pub fn base_verdict(pages: &[(u32, Option<&[u8]>)]) -> BaseVerdict {
 /// next power-on. `0xD3` / `0xD4` / `0xD5` / `0xD9` are never sent; a test drives
 /// the same path against the fake and asserts the fake saw none of them.
 ///
+/// The candidate addresses come from [`m241_flash::da::read_candidates`]; this
+/// function has no address of its own.
+///
 /// # Errors
 ///
-/// * [`Error::Safety`] without `--yes`, or for a DA file that is not exactly
-///   [`DA_IMAGE_SIZE`] bytes. Both run before a port is opened.
-/// * [`Error::Io`] when the DA file cannot be read.
+/// * [`Error::Safety`] without `--yes`, or for a DA file that is not the DA
+///   (wrong size, wrong first bytes). Both run before a port is opened.
+/// * [`Error::Io`] when the DA file cannot be read, [`Error::State`] when the
+///   verdict is asked for addresses other than the two candidates.
 /// * [`Error::Port`] when no plausible port can be opened, [`Error::Timeout`] /
 ///   [`Error::Framing`] when the unit or the DA does not answer as the protocol
 ///   says.
+/// * The error from writing the result, when stdout is gone.
 pub fn probe_da(options: &ProbeDaOptions, session: Session<'_>) -> Result<()> {
     // Everything that can be checked without a device is checked first.
     let confirmation = Confirmation::of_probe_command_line(options.yes)?;
@@ -588,64 +731,60 @@ pub fn probe_da(options: &ProbeDaOptions, session: Session<'_>) -> Result<()> {
     ));
 
     let mut da_session = DownloadAgent::new(rom.into_transport());
-    let mut pages: Vec<(u32, Option<Vec<u8>>)> = Vec::new();
-    for address in PROBE_ADDRESSES {
-        match da_session.read_range(address, PROBE_PAGE_SIZE) {
-            Ok(page) => pages.push((address, Some(page))),
-            Err(err) => {
+    let results = read_candidates(&mut da_session);
+    let candidates: Vec<ProbeCandidate> = PROBE_ADDRESSES
+        .into_iter()
+        .zip(results)
+        .map(|(address, page)| {
+            if let Err(err) = &page {
                 session.console.warn(&format!(
-                    "0xD6 at 0x{address:08X} failed: {err}. Recording it as unread, not as a \
-                     mismatch"
+                    "0xD6 at 0x{address:08X} failed: {err}. Recorded as not read; a failed read \
+                     is not a mismatch"
                 ));
-                pages.push((address, None));
             }
-        }
-    }
+            ProbeCandidate { address, page }
+        })
+        .collect();
 
-    let verdict = base_verdict(
-        &pages
-            .iter()
-            .map(|(address, page)| (*address, page.as_deref()))
-            .collect::<Vec<_>>(),
-    );
-    print_probe_result(options, session.console, &port, &id, &pages, verdict);
-    Ok(())
+    let verdict = base_verdict(&candidates)?;
+    print_probe_result(options, session.console, &port, &id, &candidates, verdict)
 }
 
-/// Format the `fw probe-da` finding.
+/// Format the `fw probe-da` finding. Only the first four bytes of each page take
+/// part in the verdict; the rest is printed for a person to read.
+///
+/// # Errors
+///
+/// Whatever [`Console::json`] returns when the document cannot be written.
 fn print_probe_result(
     options: &ProbeDaOptions,
     console: &dyn crate::output::Console,
     port: &str,
     id: &DaLoadId,
-    pages: &[(u32, Option<Vec<u8>>)],
+    candidates: &[ProbeCandidate],
     verdict: BaseVerdict,
-) {
-    let verdict_text = match verdict {
-        BaseVerdict::Settled(address) => format!("the image is at 0x{address:08X}"),
-        BaseVerdict::Inconclusive => String::from("inconclusive"),
-    };
+) -> Result<()> {
     if options.json {
-        let candidates: Vec<serde_json::Value> = pages
+        let probe: Vec<serde_json::Value> = candidates
             .iter()
-            .map(|(address, page)| {
+            .map(|candidate| {
                 serde_json::json!({
-                    "address": format!("0x{address:08X}"),
-                    "read": page.is_some(),
-                    "vector_match": page
-                        .as_deref()
-                        .is_some_and(|bytes| bytes.starts_with(&VECTOR[..])),
-                    "first_bytes": page
-                        .as_deref()
-                        .map(|bytes| hex_bytes(bytes.get(..16).unwrap_or_default())),
+                    "address": format!("0x{:08X}", candidate.address),
+                    "read": candidate.was_read(),
+                    "read_error": match &candidate.page {
+                        Ok(_) => serde_json::Value::Null,
+                        Err(err) => serde_json::Value::String(format!("{err}")),
+                    },
+                    "first_bytes": candidate.first_bytes_hex(),
+                    "vector_match": candidate.vector_matches(),
                 })
             })
             .collect();
         let settled = match verdict {
             BaseVerdict::Settled(address) => Some(format!("0x{address:08X}")),
-            BaseVerdict::Inconclusive => None,
+            BaseVerdict::Inconclusive(_) => None,
         };
-        let _ = console.json(&serde_json::json!({
+        console.json(&serde_json::json!({
             "port": port,
             "da": {
                 "version": format!("0x{:04X}", id.version),
@@ -654,50 +793,56 @@ fn print_probe_result(
                 "device": format!("0x{:04X}", id.device),
                 "flash_bytes": id.flash_bytes,
             },
-            "probe": candidates,
-            "verdict": verdict_text,
+            "vector": hex_bytes(&VECTOR),
+            "vector_verified_through_da": false,
+            "probe": probe,
+            "verdict": verdict.describe(),
+            "conclusion": match verdict {
+                BaseVerdict::Settled(_) => "settled",
+                BaseVerdict::Inconclusive(Inconclusive::Unread { .. }) => "unread",
+                BaseVerdict::Inconclusive(Inconclusive::NoMatch) => "no_match",
+                BaseVerdict::Inconclusive(Inconclusive::Ambiguous) => "ambiguous",
+            },
             "firmware_base": settled,
             "wrote_flash": false,
-        }));
-        return;
+        }))?;
+        return Ok(());
     }
     console.result(&format!("{:<12}: {port}", "port"));
     console.result(&format!(
         "{:<12}: 0x{:04X} (region 0x{:02X}, {:04X}:{:04X}, {} bytes)",
         "DA", id.version, id.region, id.manufacturer, id.device, id.flash_bytes
     ));
-    for (address, page) in pages {
-        match page {
-            Some(bytes) => console.result(&format!(
-                "{:<12}: {}",
-                format!("0x{address:08X}"),
-                describe_page(bytes)
-            )),
-            None => console.result(&format!(
-                "{:<12}: not read (0xD6 refused or timed out)",
-                format!("0x{address:08X}")
-            )),
-        }
+    for candidate in candidates {
+        console.result(&describe_candidate(candidate));
     }
-    console.result(&format!("{:<12}: {verdict_text}", "verdict"));
+    console.result(&format!("{:<12}: {}", "verdict", verdict.describe()));
     console.result(&format!("{:<12}: no", "flash write"));
     console.note(
         "the DA was loaded into the chip's RAM and reads only; no flash write, erase or \
          restart command was sent. Power-cycling the unit removes the DA.",
     );
+    Ok(())
 }
 
-/// One probe page as one line: the vector check, then the bytes.
-fn describe_page(page: &[u8]) -> String {
-    let vector = if page.starts_with(&VECTOR[..]) {
-        "vector 18 F0 9F E5"
-    } else {
-        "no vector"
-    };
-    format!(
-        "{vector}  {}",
-        hex_bytes(page.get(..16).unwrap_or_default())
-    )
+/// One candidate as two lines: what was read and whether it matched, then the
+/// first sixteen bytes for a person to look at (they take no part in the
+/// verdict).
+fn describe_candidate(candidate: &ProbeCandidate) -> String {
+    let head = format!("0x{:08X}", candidate.address);
+    match &candidate.page {
+        Err(err) => format!("{head:<12}: not read — {err}"),
+        Ok(page) => format!(
+            "{head:<12}: read, first bytes {} ({})  first 16: {}",
+            candidate.first_bytes_hex(),
+            if candidate.vector_matches() {
+                format!("matches the vector {}", hex_bytes(&VECTOR))
+            } else {
+                String::from("does not match the vector")
+            },
+            hex_bytes(page.get(..16).unwrap_or_default())
+        ),
+    }
 }
 
 /// Upper-case hex, space-separated, as a person reads a flash dump.
@@ -1382,7 +1527,11 @@ mod tests {
 
     // -- fw probe-da -------------------------------------------------------
 
-    /// A page that starts with the M-241 vector table.
+    /// A page that starts with the M-241 vector table and nothing else set.
+    ///
+    /// Only the first byte is followed by zeros: a four-byte vector compare
+    /// must not pass on `18 00 00 00`, so the remaining three bytes of the
+    /// vector have to differ from the filler around them.
     fn vector_page() -> Vec<u8> {
         let mut page = vec![0x00u8; PROBE_PAGE_SIZE];
         page.get_mut(..VECTOR.len())
@@ -1391,48 +1540,186 @@ mod tests {
         page
     }
 
+    /// A page whose first byte is the vector's but whose rest is not.
+    fn one_byte_of_vector() -> Vec<u8> {
+        let mut page = vec![0x00u8; PROBE_PAGE_SIZE];
+        if let Some(first) = page.first_mut() {
+            *first = VECTOR[0];
+        }
+        page
+    }
+
+    /// A candidate slot: `Ok(page)` or `Err(reason)`.
+    fn candidate(slot: usize, page: Result<Vec<u8>>) -> ProbeCandidate {
+        ProbeCandidate {
+            address: PROBE_ADDRESSES[slot],
+            page,
+        }
+    }
+
+    fn settled(candidates: &[ProbeCandidate]) -> Result<BaseVerdict> {
+        base_verdict(candidates)
+    }
+
     #[test]
     fn the_probe_verdict_settles_only_on_exactly_one_vector_match() {
         let page = vector_page();
         let other = vec![0x00u8; PROBE_PAGE_SIZE];
         // One match: settled, and it names the address that matched.
         assert_eq!(
-            base_verdict(&[
-                (PROBE_ADDRESSES[0], Some(other.as_slice())),
-                (PROBE_ADDRESSES[1], Some(page.as_slice())),
-            ]),
+            settled(&[
+                candidate(0, Ok(other.clone())),
+                candidate(1, Ok(page.clone())),
+            ])
+            .expect("two candidates"),
             BaseVerdict::Settled(PROBE_ADDRESSES[1])
         );
         assert_eq!(
-            base_verdict(&[
-                (PROBE_ADDRESSES[0], Some(page.as_slice())),
-                (PROBE_ADDRESSES[1], Some(other.as_slice())),
-            ]),
+            settled(&[
+                candidate(0, Ok(page.clone())),
+                candidate(1, Ok(other.clone())),
+            ])
+            .expect("two candidates"),
             BaseVerdict::Settled(PROBE_ADDRESSES[0])
         );
         // Both match: two answers is not a tie this tool breaks.
         assert_eq!(
-            base_verdict(&[
-                (PROBE_ADDRESSES[0], Some(page.as_slice())),
-                (PROBE_ADDRESSES[1], Some(page.as_slice())),
-            ]),
-            BaseVerdict::Inconclusive
+            settled(&[
+                candidate(0, Ok(page.clone())),
+                candidate(1, Ok(page.clone())),
+            ])
+            .expect("two candidates"),
+            BaseVerdict::Inconclusive(Inconclusive::Ambiguous)
         );
-        // Neither matches, or a read that failed, is inconclusive as well.
+        // Neither matches: a real answer, not a failed read.
         assert_eq!(
-            base_verdict(&[
-                (PROBE_ADDRESSES[0], Some(other.as_slice())),
-                (PROBE_ADDRESSES[1], Some(other.as_slice())),
-            ]),
-            BaseVerdict::Inconclusive
+            settled(&[
+                candidate(0, Ok(other.clone())),
+                candidate(1, Ok(other.clone())),
+            ])
+            .expect("two candidates"),
+            BaseVerdict::Inconclusive(Inconclusive::NoMatch)
+        );
+    }
+
+    #[test]
+    fn a_candidate_that_was_not_read_blocks_settling_even_when_the_other_matches() {
+        // The findings of this branch's first review: "unread" was read as
+        // "mismatch", so a timed-out first candidate plus a matching second one
+        // produced `Settled`. Unread says nothing about contents, so it must
+        // block the verdict in both slots.
+        let page = vector_page();
+        let unread = || -> Result<Vec<u8>> {
+            Err(Error::Timeout {
+                what: String::from("0xD6 page 0"),
+                timeout: m241_core::error::TimeoutDuration::from_std(
+                    std::time::Duration::from_secs(5),
+                ),
+            })
+        };
+        assert_eq!(
+            settled(&[candidate(0, unread()), candidate(1, Ok(page.clone()))])
+                .expect("two candidates"),
+            BaseVerdict::Inconclusive(Inconclusive::Unread {
+                read: [false, true]
+            }),
+            "an unread first candidate must not let the second one settle the address"
         );
         assert_eq!(
-            base_verdict(&[
-                (PROBE_ADDRESSES[0], None),
-                (PROBE_ADDRESSES[1], Some(other.as_slice())),
-            ]),
-            BaseVerdict::Inconclusive
+            settled(&[candidate(0, Ok(page.clone())), candidate(1, unread())])
+                .expect("two candidates"),
+            BaseVerdict::Inconclusive(Inconclusive::Unread {
+                read: [true, false]
+            })
         );
+        assert_eq!(
+            settled(&[candidate(0, unread()), candidate(1, unread())]).expect("two candidates"),
+            BaseVerdict::Inconclusive(Inconclusive::Unread {
+                read: [false, false]
+            })
+        );
+        let text = BaseVerdict::Inconclusive(Inconclusive::Unread {
+            read: [false, true],
+        })
+        .describe();
+        assert!(text.contains("inconclusive"), "got {text}");
+        assert!(text.contains("not read"), "got {text}");
+        assert!(
+            text.contains(&format!("0x{:08X}", PROBE_ADDRESSES[0])),
+            "the unread address is named: {text}"
+        );
+        assert!(
+            !text.contains(&format!("0x{:08X}", PROBE_ADDRESSES[1])),
+            "the address that was read is not reported as missing: {text}"
+        );
+        // The other two reasons read differently, so a reader can tell them
+        // apart in a log.
+        let no_match = BaseVerdict::Inconclusive(Inconclusive::NoMatch).describe();
+        let ambiguous = BaseVerdict::Inconclusive(Inconclusive::Ambiguous).describe();
+        assert!(no_match.contains("neither"), "got {no_match}");
+        assert!(ambiguous.contains("both"), "got {ambiguous}");
+        assert_ne!(no_match, text);
+        assert_ne!(ambiguous, text);
+    }
+
+    #[test]
+    fn the_probe_verdict_compares_all_four_vector_bytes() {
+        // A page that shares only the vector's first byte is not the vector.
+        // Comparing one byte would pass here; comparing all four cannot.
+        let page = vector_page();
+        assert_eq!(
+            settled(&[
+                candidate(0, Ok(one_byte_of_vector())),
+                candidate(1, Ok(vec![0x00u8; PROBE_PAGE_SIZE])),
+            ])
+            .expect("two candidates"),
+            BaseVerdict::Inconclusive(Inconclusive::NoMatch),
+            "18 00 00 00 is not 18 F0 9F E5"
+        );
+        // And a page that differs in the last vector byte only.
+        let mut almost = page.clone();
+        if let Some(slot) = almost.get_mut(VECTOR.len() - 1) {
+            *slot ^= 0xFF;
+        }
+        assert_eq!(
+            settled(&[
+                candidate(0, Ok(almost)),
+                candidate(1, Ok(vec![0u8; PROBE_PAGE_SIZE]))
+            ])
+            .expect("two candidates"),
+            BaseVerdict::Inconclusive(Inconclusive::NoMatch),
+            "a difference in the fourth byte must be seen"
+        );
+    }
+
+    #[test]
+    fn the_probe_verdict_refuses_anything_but_the_two_candidate_slots() {
+        // The verdict is the only place in the CLI that decides an address, so
+        // it refuses a list that is not exactly `PROBE_ADDRESSES`: a command
+        // that read one candidate, or a third address, fails here instead of
+        // producing a verdict from half the evidence.
+        let page = vector_page();
+        let only_one = [candidate(0, Ok(page.clone()))];
+        assert!(matches!(settled(&only_one), Err(Error::State(_))));
+        let wrong_order = [
+            ProbeCandidate {
+                address: PROBE_ADDRESSES[1],
+                page: Ok(page.clone()),
+            },
+            ProbeCandidate {
+                address: PROBE_ADDRESSES[0],
+                page: Ok(vec![0u8; PROBE_PAGE_SIZE]),
+            },
+        ];
+        assert!(matches!(settled(&wrong_order), Err(Error::State(_))));
+        let third = [
+            candidate(0, Ok(vec![0u8; PROBE_PAGE_SIZE])),
+            ProbeCandidate {
+                address: PROBE_ADDRESSES[1] + 4,
+                page: Ok(page),
+            },
+        ];
+        assert!(matches!(settled(&third), Err(Error::State(_))));
     }
 
     fn probe_options(da: &Path) -> ProbeDaOptions {
@@ -1442,6 +1729,16 @@ mod tests {
             yes: false,
             assume_brom: false,
             json: false,
+        }
+    }
+
+    fn da_load_id() -> DaLoadId {
+        DaLoadId {
+            version: 0x0308,
+            region: 0x49,
+            flash_bytes: 0x0008_0000,
+            manufacturer: 0x00C2,
+            device: 0x22BA,
         }
     }
 
@@ -1456,7 +1753,14 @@ mod tests {
         let err =
             probe_da(&probe_options(&scratch.join("absent.bin")), session).expect_err("no --yes");
         assert!(matches!(err, Error::Safety { .. }), "got {err}");
-        assert!(format!("{err}").contains("LOAD"), "got {err}");
+        let text = format!("{err}");
+        assert!(text.contains("--yes"), "got {text}");
+        // There is no typed prompt for this command, and the refusal must not
+        // claim there is one.
+        assert!(
+            !text.contains("prompt") || text.contains("no typed prompt"),
+            "the refusal must not offer a prompt that does not exist: {text}"
+        );
         assert!(
             console.stderr().is_empty(),
             "nothing is announced before the refusal: {}",
@@ -1480,13 +1784,45 @@ mod tests {
     }
 
     #[test]
+    fn probe_da_refuses_a_14896_byte_file_that_does_not_start_like_the_da() {
+        // The size alone used to be the whole check. The same length filled
+        // with zeros must be refused before the port step, not after a RAM
+        // write and a jump.
+        let scratch = Scratch::new("probe-head");
+        let path = scratch.join("DA_v3.8.4.bin");
+        fileio::write(&path, &vec![0u8; 14_896]).expect("write");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        let mut options = probe_options(&path);
+        options.yes = true;
+        let err = probe_da(&options, session).expect_err("not the DA");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        let text = format!("{err}");
+        assert!(
+            text.contains("A0 E1"),
+            "the refusal names the first bytes it wanted: {text}"
+        );
+        assert!(
+            console.stderr().is_empty(),
+            "the port step is never reached: {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
     fn probe_da_with_a_valid_da_reaches_the_port_step_and_refuses_without_one() {
         // The DA path itself is exercised against the fake in `m241-flash`; here
         // the point is that the command gets past its own refusals and then
         // reports the missing port as a port error, not a safety one.
         let scratch = Scratch::new("probe-port");
         let path = scratch.join("DA_v3.8.4.bin");
-        fileio::write(&path, &vec![0u8; 14_896]).expect("write");
+        let mut image = vec![0u8; 14_896];
+        image
+            .get_mut(..4)
+            .expect("four bytes")
+            .copy_from_slice(&m241_flash::da::DA_IMAGE_HEAD);
+        fileio::write(&path, &image).expect("write");
         let links = FakePorts::empty();
         let console = RecordingConsole::default();
         let session = Session::new(&links, &console, &AutoConfirm);
@@ -1501,13 +1837,19 @@ mod tests {
     fn probe_da_json_document_names_both_candidates_and_says_no_flash_write() {
         let scratch = Scratch::new("probe-json");
         let console = RecordingConsole::default();
-        let page = vector_page();
-        let mut pages = vec![(PROBE_ADDRESSES[0], Some(page.clone()))];
-        pages.push((PROBE_ADDRESSES[1], None));
-        let verdict = base_verdict(&[
-            (pages[0].0, pages[0].1.as_deref()),
-            (pages[1].0, pages[1].1.as_deref()),
-        ]);
+        let candidates = vec![
+            candidate(0, Ok(vector_page())),
+            candidate(
+                1,
+                Err(Error::Timeout {
+                    what: String::from("0xD6 page 0"),
+                    timeout: m241_core::error::TimeoutDuration::from_std(
+                        std::time::Duration::from_secs(5),
+                    ),
+                }),
+            ),
+        ];
+        let verdict = base_verdict(&candidates).expect("two candidates");
         print_probe_result(
             &ProbeDaOptions {
                 da: scratch.join("DA_v3.8.4.bin"),
@@ -1518,22 +1860,92 @@ mod tests {
             },
             &console,
             "SIM0",
-            &DaLoadId {
-                version: 0x0308,
-                region: 0x49,
-                flash_bytes: 0x0008_0000,
-                manufacturer: 0x00C2,
-                device: 0x22BA,
-            },
-            &pages,
+            &da_load_id(),
+            &candidates,
             verdict,
-        );
+        )
+        .expect("json");
         let document: serde_json::Value =
             serde_json::from_str(&console.stdout()).expect("one JSON object");
         assert_eq!(document["wrote_flash"], false);
-        assert_eq!(document["firmware_base"], "0x00000000");
+        assert_eq!(
+            document["firmware_base"],
+            serde_json::Value::Null,
+            "one candidate was unread, so nothing is settled"
+        );
+        assert_eq!(document["conclusion"], "unread");
+        assert_eq!(document["vector"], "18 F0 9F E5");
+        assert_eq!(document["vector_verified_through_da"], false);
+        assert_eq!(document["probe"][0]["read"], true);
+        assert_eq!(document["probe"][0]["first_bytes"], "18 F0 9F E5");
         assert_eq!(document["probe"][0]["vector_match"], true);
         assert_eq!(document["probe"][1]["read"], false);
+        assert_eq!(document["probe"][1]["vector_match"], false);
+        assert!(
+            document["probe"][1]["read_error"]
+                .as_str()
+                .is_some_and(|text| text.contains("0xD6 page 0")),
+            "the read failure is carried, not just the absence: {}",
+            document["probe"][1]["read_error"]
+        );
         assert_eq!(document["da"]["version"], "0x0308");
+    }
+
+    #[test]
+    fn probe_da_text_result_shows_read_state_first_bytes_and_the_match_for_both() {
+        // The log a person pastes into `05-verification.md` has to state, per
+        // candidate, whether it was read, its first four bytes and whether they
+        // matched — not just a verdict line.
+        let scratch = Scratch::new("probe-text");
+        let console = RecordingConsole::default();
+        let candidates = vec![
+            candidate(0, Ok(vec![0x00u8; PROBE_PAGE_SIZE])),
+            candidate(1, Ok(vector_page())),
+        ];
+        let verdict = base_verdict(&candidates).expect("two candidates");
+        print_probe_result(
+            &ProbeDaOptions {
+                da: scratch.join("DA_v3.8.4.bin"),
+                port: String::from("auto"),
+                yes: true,
+                assume_brom: false,
+                json: false,
+            },
+            &console,
+            "SIM0",
+            &da_load_id(),
+            &candidates,
+            verdict,
+        )
+        .expect("text");
+        let stdout = console.stdout();
+        for address in PROBE_ADDRESSES {
+            assert!(
+                stdout.contains(&format!("0x{address:08X}")),
+                "both candidates are printed: {stdout}"
+            );
+        }
+        assert!(
+            stdout.contains("read, first bytes 18 F0 9F E5 (matches the vector 18 F0 9F E5)"),
+            "the matching candidate states its first bytes and the match: {stdout}"
+        );
+        assert!(
+            stdout.contains("does not match the vector"),
+            "the other candidate states the mismatch: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!(
+                "verdict     : the image is at 0x{:08X}",
+                PROBE_ADDRESSES[1]
+            )) || stdout.contains(&format!(
+                "verdict: the image is at 0x{:08X}",
+                PROBE_ADDRESSES[1]
+            )),
+            "the settled verdict names the address: {stdout}"
+        );
+        assert!(
+            stdout.contains("flash write: no") || stdout.contains("flash write : no"),
+            "got {stdout}"
+        );
     }
 }

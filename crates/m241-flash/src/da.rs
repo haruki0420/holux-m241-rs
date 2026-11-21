@@ -69,10 +69,11 @@
 //! covers is the hand-over of the device to a program that does.
 //!
 //! The image is **not** acceptable from anywhere: [`DaLoader::load`] insists on
-//! exactly [`DA_IMAGE_SIZE`] bytes and requires the four-byte reset vector at
-//! its start, then reads the whole image back before it jumps. Those two checks
-//! are what turn "a 14,896-byte file" into "the DA v3.8.4 the rest of this crate
-//! was written against".
+//! exactly [`DA_IMAGE_SIZE`] bytes starting with the DA's own first four bytes
+//! ([`DA_IMAGE_HEAD`]), then reads the whole image back before it jumps. Those
+//! three checks are what turn "a 14,896-byte file" into "the DA v3.8.4 the rest
+//! of this crate was written against"; the 20-byte report afterwards is the
+//! fourth, and the only one the DA itself contributes.
 //!
 //! # Reading the flash from the DA's side: `0xD6`
 //!
@@ -372,6 +373,33 @@ pub const DA_IMAGE_SIZE: usize = 14_896;
 /// a test pins the two.
 pub const DA_LOAD_ADDRESS: u32 = BASE_ADDR_DA;
 
+/// The count word of the `0xA8` jump frame: zero.
+///
+/// `docs/reference/01-da-protocol.md` §5 and §9 describe `0xA8` as taking an
+/// address and nothing else; `docs/dev/03-hardware-facts.md` "DA jump" records
+/// the count as **not established**. The one client that ran it on a unit
+/// (`python/src/m241/protocol/brom.py`, `BootRom.jump`) sent zero, and zero is
+/// the only value this crate can justify: a count the BootROM does not read
+/// changes nothing, and one it does read would be an argument nobody measured.
+/// Pinned by `the_jump_frame_carries_count_zero_and_the_fake_refuses_any_other`.
+pub const DA_JUMP_COUNT: u32 = 0;
+
+/// The first four bytes of `DA_v3.8.4.bin`.
+///
+/// Read from the vendor image (`holux/M-241 Firmware V1.13 update package/
+/// DA_v3.8.4.bin`, 14,896 bytes, SHA-256 `190d7064…9aa`). The four ARM
+/// instructions are `mov r0, r0` (`00 00 A0 E1`, NOP), `mrs r0, CPSR`
+/// (`00 00 0F E1`), `mov r0, #C0_32` (`C0 10 A0 E3`) and
+/// `orr r0, r0, r1` (`01 00 80 E1`) — `docs/reference/01-da-protocol.md` §2
+/// reads the entry at `0x00100800` the same way. It is **not**
+/// [`VECTOR`] (`18 F0 9F E5`, the firmware's first instruction): the two
+/// images share only `0x00100800` as an address.
+///
+/// This is a fingerprint of the image at [`DA_LOAD_ADDRESS`], not a protocol
+/// constant. [`check_da_image`] compares it so "14,896 bytes" narrows to
+/// "the DA v3.8.4 image", before the size check even has a port to write to.
+pub const DA_IMAGE_HEAD: [u8; 4] = [0x00, 0x00, 0xA0, 0xE1];
+
 /// The DA version the 20-byte report must carry at bytes 1–2.
 ///
 /// `docs/reference/01-da-protocol.md` §2: `0x00102C40` and `0x00102C48` push the
@@ -405,9 +433,26 @@ pub const DA_LOAD_CHUNK: usize = m241_core::protocol::brom::WRITE_CHUNK;
 /// firmware image, as the two documents of the module header name it. `0` is
 /// where `m241_core::protocol::brom::BASE_ADDR_FIRMWARE_M3318` says the DA sees
 /// the flash; `0x0020_0000` is `docs/reference/01-da-protocol.md` §4.2's base.
-/// The probe in `m241-cli` reads exactly these and nothing else: there is no
-/// parameter for "some other address" anywhere in that path.
 pub const PROBE_ADDRESSES: [u32; 2] = UNRESOLVED_STARTS;
+
+/// The whole of `fw probe-da`'s read path: one `0xD6` page at each candidate.
+///
+/// The only caller of [`DownloadAgent::read_range`] outside tests, and the only
+/// place in the workspace that decides an address for a DA read. Both are fixed
+/// by [`PROBE_ADDRESSES`]; no flag, environment variable or caller parameter
+/// reaches this list. `docs/dev/11-safety-review.md` records why the probe stays
+/// this narrow.
+///
+/// # Errors
+///
+/// One entry per address, in [`PROBE_ADDRESSES`] order. An address whose read
+/// failed is `Err` with the reader's own error — a timeout, a framing error, a
+/// bad checksum after the retries — never silently an empty page.
+pub fn read_candidates<T: Transport>(
+    da: &mut DownloadAgent<T>,
+) -> [Result<Vec<u8>>; PROBE_ADDRESSES.len()] {
+    PROBE_ADDRESSES.map(|address| da.read_range(address, PROBE_PAGE_SIZE))
+}
 
 /// Bytes per page in a `0xD6` page-length argument: 64.
 ///
@@ -415,7 +460,15 @@ pub const PROBE_ADDRESSES: [u32; 2] = UNRESOLVED_STARTS;
 /// §4.3 records that even `0xD5`'s length has no maximum in the DA, and §7 item 4
 /// leaves `0xD6`'s emitted page size unmeasured. 64 is small enough that a page
 /// that goes wrong costs one retry and large enough to carry a vector table and
-/// its neighbours. Even, as the serialiser's 16-bit sum and pair-swap need.
+/// its neighbours.
+///
+/// The value being even is **not** a `0xD6` requirement. The read page's
+/// checksum is a byte sum (§4.4, [`byte_sum`]) and the serialiser pads the page
+/// to the length asked for; the pair-swap and the half-word units belong to the
+/// write path's payload (`0xD5`, `0xA1`), not to this page. §5.5 does not even
+/// say whether the DA accepts an odd page length, so the number of choice that
+/// a caller may raise to 128 is "who chooses it", not "which values are legal".
+/// 未検証: the page size the DA actually emits for this argument.
 pub const PROBE_PAGE_SIZE: usize = 64;
 
 /// How many times one `0xD6` page with a bad checksum is asked for again.
@@ -450,9 +503,6 @@ impl Confirmation {
     /// The word a typed prompt accepts as the confirmation (`AGENTS.md` §2.2).
     pub const WORD: &'static str = "WRITE";
 
-    /// The word `fw probe-da` accepts; it reads and loads, and writes no flash.
-    pub const PROBE_WORD: &'static str = "LOAD";
-
     /// The token for "the caller was told and said yes".
     #[must_use]
     pub fn granted() -> Self {
@@ -486,6 +536,11 @@ impl Confirmation {
     /// the flag is absent, because the hand-over itself is the thing being
     /// confirmed: a DA that is talking can program flash on the next command.
     ///
+    /// `fw probe-da` has no typed prompt — the flag is its only input — so the
+    /// refusal names `--yes` and nothing else. Telling a user to type a word
+    /// that no code reads would send them looking for a prompt that does not
+    /// exist.
+    ///
     /// # Errors
     ///
     /// [`Error::Safety`] when `yes` is false.
@@ -494,10 +549,10 @@ impl Confirmation {
             return Ok(Self::granted());
         }
         Err(Error::Safety {
-            reason: format!(
-                "refusing to load the DA without an explicit confirmation (--yes, \
-                 or {WORD:?} typed at the prompt)",
-                WORD = Self::PROBE_WORD
+            reason: String::from(
+                "refusing to load the DA without an explicit confirmation: pass --yes. \
+                 (fw probe-da has no typed prompt; --yes writes no flash, it authorises the \
+                 hand-over of the unit to the DA in RAM)",
             ),
         })
     }
@@ -561,17 +616,21 @@ impl<'a, T: Transport> DaLoader<'a, T> {
         self
     }
 
-    /// Check the image's size and reset vector, write it to [`DA_LOAD_ADDRESS`],
+    /// Check the image's size and first bytes, write it to [`DA_LOAD_ADDRESS`],
     /// read it back, jump to it, and check the DA's report.
     ///
     /// # Errors
     ///
-    /// * [`Error::Safety`] when no confirmation token is given, when the image
-    ///   is not exactly [`DA_IMAGE_SIZE`] bytes, or when it does not start with
-    ///   the DA reset vector. All three run **before** the first byte goes out.
-    /// * [`Error::Framing`] when the write-back disagrees or the report is not
-    ///   the DA this crate was written against.
-    /// * [`Error::Timeout`] / [`Error::Io`] from the transport.
+    /// All of these run **before the first byte goes out**; the port is not
+    /// touched, so a refusal leaves a unit exactly as it was.
+    ///
+    /// 1. [`Error::Safety`] when no confirmation token is given.
+    /// 2. [`Error::Safety`] when the image is not exactly [`DA_IMAGE_SIZE`]
+    ///    bytes.
+    /// 3. [`Error::Safety`] when its first four bytes are not [`DA_IMAGE_HEAD`].
+    /// 4. [`Error::Framing`] when the write-back disagrees, or when the report
+    ///    is not the DA this crate was written against.
+    /// 5. [`Error::Timeout`] / [`Error::Io`] from the transport.
     pub fn load(&mut self, confirmation: Confirmation, image: &[u8]) -> Result<DaLoadId> {
         if !confirmation.is_given() {
             return Err(Error::Safety {
@@ -637,8 +696,18 @@ impl<'a, T: Transport> DaLoader<'a, T> {
         // starts its own frame. Draining it is what keeps the DA's first reply
         // from being read one byte short (the failure is a one-byte shift in
         // every later frame, which looks like a different bug).
-        let _ = self.transport.clear_input();
-        Ok(())
+        //
+        // A failed drain does not mean "something shifted": the drain is
+        // post-transfer housekeeping, and the stream that follows (`read_back`,
+        // `jump`, the banner) reads from the same buffer, so a byte the drain
+        // could not take is still in front of the next read. Consuming it later
+        // is not a false success either: `read_back` compares the nine-byte
+        // `0xAF` echo against the frame it sent, so anything out of place —
+        // an echo that arrived late, a byte the drain missed, a frame that
+        // arrived short — is `Framing` there, before the jump. The drain's own
+        // failure is therefore reported without a recovery paragraph: no
+        // `0xD3` has been sent in this path and nothing has been erased.
+        self.transport.clear_input()
     }
 
     /// Read the image back through `0xAF` and require it byte for byte.
@@ -688,8 +757,22 @@ impl<'a, T: Transport> DaLoader<'a, T> {
 
     /// `0xA8` to [`DA_LOAD_ADDRESS`], and no echo to read (the chip hands
     /// control over part-way through the frame).
+    ///
+    /// The frame's count is **0**, not 1. `docs/reference/01-da-protocol.md`
+    /// gives no meaning for `0xA8`'s count word, and the only client that ran
+    /// this jump on a unit sent zero (`python/src/m241/protocol/brom.py`,
+    /// `BootRom.jump`; `03-hardware-facts.md` "DA jump"). A non-zero count is
+    /// unmeasured and, if the BootROM reads the field at all, a value it also
+    /// used would send control somewhere other than [`DA_LOAD_ADDRESS`] — so
+    /// the frame is built by hand rather than through
+    /// [`Frame::for_bytes`], whose `1`-byte unit would turn a byte count into
+    /// something the protocol defines nowhere.
     fn jump(&mut self) -> Result<()> {
-        let frame = Frame::for_bytes(OPCODE_JUMP, DA_LOAD_ADDRESS, 1)?;
+        let frame = Frame {
+            opcode: OPCODE_JUMP,
+            address: DA_LOAD_ADDRESS,
+            count: DA_JUMP_COUNT,
+        };
         self.transport.write_all(&frame.to_bytes())?;
         self.transport.flush()
     }
@@ -759,20 +842,27 @@ pub const REPORT_SCAN_LIMIT: usize = 256;
 
 /// Refuse an image that is not the DA the rest of this crate is written for.
 ///
-/// The size check is the one `m241 device doctor` makes against the file name:
-/// only a file of exactly [`DA_IMAGE_SIZE`] bytes is accepted. Content is not
-/// hashed, and deliberately so: the DA is a user's own copy of a vendor binary,
-/// never committed here, so no hash could be checked in
+/// Two checks, in this order, and both are cheap enough to run before a port is
+/// opened:
+///
+/// 1. the file is exactly [`DA_IMAGE_SIZE`] bytes — the size check
+///    `m241 device doctor` makes against the file name;
+/// 2. its first four bytes are [`DA_IMAGE_HEAD`], the vendor image's first
+///    instruction (`mov r0, r0`), so a 14,896-byte file that is not the DA is
+///    refused before anything is written to RAM.
+///
+/// Content is not hashed, and deliberately so: the DA is a user's own copy of a
+/// vendor binary, never committed here, so no hash could be checked in
 /// (`docs/reference/01-da-protocol.md` §9 records where the bytes came from, not
-/// what they hash to). What makes the load safe is therefore the report
-/// afterwards, not a fingerprint here: [`parse_report`] refuses a DA that answers
-/// with any other version, flash part or region, and [`DaLoader::load`] runs it
-/// before it returns; [`DaLoader::read_back`] refuses to jump at RAM that did not
-/// take the write.
+/// what they hash to). A four-byte head narrows "the right size" to "the right
+/// image"; what makes the load safe is still the steps after it
+/// ([`parse_report`] refusing any other version, flash part or region, and
+/// [`DaLoader::read_back`] refusing to jump at RAM that did not take the write).
 ///
 /// # Errors
 ///
-/// [`Error::Safety`] for a wrong length, or an empty image.
+/// [`Error::Safety`] for a wrong length, an empty image, or first bytes that are
+/// not [`DA_IMAGE_HEAD`].
 pub fn check_da_image(image: &[u8]) -> Result<()> {
     if image.len() != DA_IMAGE_SIZE {
         return Err(Error::Safety {
@@ -780,6 +870,16 @@ pub fn check_da_image(image: &[u8]) -> Result<()> {
                 "the DA image is {} bytes; DA_v3.8.4.bin is exactly {DA_IMAGE_SIZE} bytes \
                  (0x00100800–0x0010422F, docs/reference/01-da-protocol.md §9). Nothing was written",
                 image.len()
+            ),
+        });
+    }
+    if !image.starts_with(&DA_IMAGE_HEAD) {
+        let head: Vec<u8> = image.iter().copied().take(DA_IMAGE_HEAD.len()).collect();
+        return Err(Error::Safety {
+            reason: format!(
+                "the DA image starts {head:02X?}; DA_v3.8.4.bin starts {DA_IMAGE_HEAD:02X?} \
+                 (00 00 A0 E1, mov r0, r0). The size alone does not make a file the DA. Nothing \
+                 was written"
             ),
         });
     }
@@ -1115,6 +1215,10 @@ impl<T: Transport> DownloadAgent<T> {
     }
 
     /// `0xD6`: read `length` bytes at DA address `address`, one page at a time.
+    ///
+    /// `length` is in whole [`PROBE_PAGE_SIZE`] pages (that is what the checks
+    /// below accept); `fw probe-da` reads one page per candidate through
+    /// [`read_candidates`], which is the only non-test caller.
     ///
     /// Arguments are three big-endian `u32` — the page length, the start
     /// address, the total length (`docs/reference/01-da-protocol.md` §5.5,
@@ -2777,6 +2881,13 @@ mod loader_tests {
             .collect();
         for (slot, byte) in image
             .iter_mut()
+            .take(DA_IMAGE_HEAD.len())
+            .zip(DA_IMAGE_HEAD)
+        {
+            *slot = byte;
+        }
+        for (slot, byte) in image
+            .iter_mut()
             .skip(DA_REPORT_OFFSET)
             .zip(report_bytes().iter())
         {
@@ -2807,6 +2918,21 @@ mod loader_tests {
         assert_eq!(DA_IMAGE_SIZE, 0x3A30);
         assert_eq!(DA_LOAD_ADDRESS, BASE_ADDR_DA);
         assert_eq!(DA_LOAD_ADDRESS, 0x0010_0800);
+        assert_eq!(
+            DA_IMAGE_HEAD,
+            [0x00, 0x00, 0xA0, 0xE1],
+            "the vendor DA_v3.8.4.bin starts 00 00 A0 E1 (mov r0, r0)"
+        );
+        assert_ne!(
+            DA_IMAGE_HEAD, VECTOR,
+            "the DA's first instruction is not the firmware's: the two images share only the \
+             address 0x00100800"
+        );
+        assert_eq!(
+            DA_JUMP_COUNT, 0,
+            "0xA8's count is undocumented; the only measured client sent zero \
+             (python/src/m241/protocol/brom.py, BootRom.jump)"
+        );
         assert_eq!(DA_VERSION, 0x0308);
         assert_eq!(
             (DA_REGION_ID, DA_FLASH_MANUFACTURER, DA_FLASH_DEVICE),
@@ -2822,9 +2948,65 @@ mod loader_tests {
         assert_eq!(
             DA_IMAGE_SIZE % DA_LOAD_CHUNK,
             6,
-            "14,896 is not a multiple of 10; the last 0xA1 frame carries 6 bytes"
+            "14,896 is not a multiple of 10; the last 0xA1 frame carries 6 bytes. This is why \
+             `write_image` must accept a short final chunk: if the image size changes, the \
+             frame count and that short frame change with it, and the echo rule 5 (N−1 bytes \
+             per frame) has to be re-read"
         );
         assert!(DA_IMAGE_SIZE.is_multiple_of(4), "0xAF reads dwords");
+    }
+
+    #[test]
+    fn the_load_range_does_not_touch_the_bootrom_stack() {
+        // `docs/reference/01-da-protocol.md` §9 and `docs/dev/03-hardware-facts.md`
+        // "DA load address": `0x00100000`–`0x001007FF` is the BootROM's own
+        // stack, and writing there kills the chip. The load covers
+        // `0x00100800`–`0x0010422F`; this states the gap as an interval, so a
+        // load that grew downwards or started lower fails here even if the
+        // constants above are edited together.
+        const STACK_START: u32 = 0x0010_0000;
+        const STACK_END: u32 = 0x0010_07FF;
+        let length = u32::try_from(DA_IMAGE_SIZE).expect("fits");
+        let load_end = DA_LOAD_ADDRESS.saturating_add(length).saturating_sub(1);
+        let overlaps = DA_LOAD_ADDRESS <= STACK_END && STACK_START <= load_end;
+        assert!(
+            !overlaps,
+            "the load range 0x{DA_LOAD_ADDRESS:08X}–0x{load_end:08X} must not overlap the \
+             BootROM stack 0x{STACK_START:08X}–0x{STACK_END:08X}"
+        );
+        assert_eq!(
+            DA_LOAD_ADDRESS - STACK_END,
+            1,
+            "0x00100800 is the first address past the stack"
+        );
+        assert_eq!(load_end, 0x0010_422F, "the image ends where §9 says");
+    }
+
+    #[test]
+    fn the_jump_frame_carries_count_zero_and_the_fake_refuses_any_other() {
+        // The only value `0xA8`'s count may carry is zero: the protocol page
+        // gives it no meaning and the one measured client sent zero. The fake
+        // counts any other value, and a load must leave that count at zero.
+        let image = da_image();
+        let mut device = bootrom();
+        load(&mut device, &image).expect("the DA starts");
+        assert!(device.started());
+        assert_eq!(
+            device.bad_jump_counts(),
+            0,
+            "the loader's 0xA8 must carry count 0"
+        );
+
+        // And the same load with a count of 1 — what `Frame::for_bytes` would
+        // produce from a one-byte length — is seen by the fake.
+        let mut device = bootrom();
+        let frame = Frame {
+            opcode: OPCODE_JUMP,
+            address: DA_LOAD_ADDRESS,
+            count: 1,
+        };
+        device.write_all(&frame.to_bytes()).expect("jump");
+        assert_eq!(device.bad_jump_counts(), 1);
     }
 
     #[test]
@@ -2913,7 +3095,13 @@ mod loader_tests {
             .err()
             .unwrap_or_else(|| panic!("no flag must be refused"));
         assert!(matches!(err, Error::Safety { .. }), "got {err}");
-        assert!(format!("{err}").contains("LOAD"), "got {err}");
+        let text = format!("{err}");
+        assert!(text.contains("--yes"), "got {text}");
+        assert!(
+            !text.contains("\"LOAD\""),
+            "fw probe-da has no typed prompt, so the refusal must not ask for a word nobody \
+             reads: {text}"
+        );
 
         let mut device = bootrom();
         let mut loader = DaLoader::new(&mut device);
@@ -2922,6 +3110,44 @@ mod loader_tests {
             .expect_err("a token that was never granted is refused");
         assert!(matches!(err, Error::Safety { .. }), "got {err}");
         assert_eq!(device.opcodes(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn the_loader_refuses_an_image_whose_first_bytes_are_not_the_da() {
+        // The size-only check let any 14,896-byte file through to a RAM write
+        // and a jump. `load` documents a first-bytes check; this is what makes
+        // that true, and the sizes below are all exactly right.
+        assert!(check_da_image(&da_image()).is_ok(), "the fixture is the DA");
+
+        let wrong_head = {
+            let mut image = da_image();
+            image[..DA_IMAGE_HEAD.len()].copy_from_slice(&VECTOR);
+            image
+        };
+        // The firmware's vector at the DA's address: same length, right size,
+        // and an image the old check would have loaded.
+        let err = check_da_image(&wrong_head).expect_err("the firmware head is not the DA");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        let text = format!("{err}");
+        assert!(
+            text.contains("A0 E1") && text.contains("F0, 9F, E5"),
+            "the refusal names both the bytes it found and the ones it wanted: {text}"
+        );
+        // And through `load`: nothing is sent and nothing is written.
+        let mut device = bootrom();
+        let err = load(&mut device, &wrong_head).expect_err("refused");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        assert_eq!(device.opcodes(), &[] as &[u8], "nothing goes on the wire");
+        assert_eq!(device.bootrom_writes(), 0);
+        assert!(!device.started());
+
+        // One byte off in the last of the four.
+        let mut last_byte = da_image();
+        last_byte[DA_IMAGE_HEAD.len() - 1] ^= 0xFF;
+        assert!(matches!(
+            check_da_image(&last_byte),
+            Err(Error::Safety { .. })
+        ));
     }
 
     #[test]
@@ -3191,5 +3417,78 @@ mod loader_tests {
         assert_eq!(device.recorded_range(), (0, 0), "no range was recorded");
         assert!(!device.wrote_an_empty_range());
         assert!(!device.restarted());
+    }
+
+    #[test]
+    fn the_probe_path_reads_both_candidates_and_nothing_else() {
+        // `read_candidates` is the only non-test caller of `read_range`, and
+        // this is where its two addresses come from: `PROBE_ADDRESSES`, in
+        // order, with no parameter to widen them. A probe reduced to one
+        // candidate, or pointed at a third address, fails here.
+        let window = flash(0x00);
+        let mut da =
+            DownloadAgent::new(da_with(&window)).with_reply_timeout(Duration::from_millis(50));
+        let results = read_candidates(&mut da);
+        assert_eq!(results.len(), 2);
+        let device = da.into_transport();
+        assert_eq!(
+            device.read_requested(),
+            Some((PROBE_ADDRESSES[1], PROBE_PAGE_SIZE)),
+            "the second read is the second candidate, at the page size the probe asks for"
+        );
+        assert_eq!(
+            read_opcodes(&device),
+            &[OPCODE_READ_RANGE, OPCODE_READ_RANGE],
+            "one 0xD6 per candidate, in order: {:02X?}",
+            device.opcodes()
+        );
+        assert_eq!(device.recorded_range(), (0, 0), "no range was recorded");
+        assert!(!device.wrote_an_empty_range());
+        assert!(!device.restarted());
+        // Both were read: each result is a whole page.
+        for result in &results {
+            assert_eq!(
+                result
+                    .as_ref()
+                    .map(Vec::len)
+                    .expect("both candidates were read"),
+                PROBE_PAGE_SIZE,
+                "a candidate that the DA answers is a whole page"
+            );
+        }
+    }
+
+    #[test]
+    fn a_two_page_read_is_the_same_bytes_however_the_da_pads_the_range() {
+        // §5.5: a read page goes through the same serialiser as `0xD5`. Each
+        // page here is the full 64 bytes, so neither is short; what varies is
+        // whether the fake pads the range up to a whole page (which the client
+        // never asks for) or stops at the range length. The client's bytes must
+        // not depend on that.
+        //
+        // The read is at `0x100`, and the window is `0x11` with one `0x3C` at
+        // `0x180`: the page served by the second advance is the window's
+        // `0x180`–`0x1BF`, so a fake that ignored the start address — or
+        // shifted it by the BootROM base — returns the wrong bytes here.
+        let mut window: Vec<u8> = Vec::new();
+        window.resize(0x400, 0x11);
+        if let Some(slot) = window.get_mut(0x180) {
+            *slot = 0x3C;
+        }
+        let padded = {
+            let (page, _device) = read(da_with(&window), 0x0100, 2 * PROBE_PAGE_SIZE);
+            page.expect("two pages, the fake pads the range")
+        };
+        let unpadded = {
+            let mut device = da_with(&window);
+            device.without_page_padding();
+            let (page, _device) = read(device, 0x0100, 2 * PROBE_PAGE_SIZE);
+            page.expect("two pages, the fake stops at the range length")
+        };
+        assert_eq!(padded.len(), 2 * PROBE_PAGE_SIZE);
+        assert_eq!(
+            padded, unpadded,
+            "the client's bytes must not depend on how the DA pads the range"
+        );
     }
 }

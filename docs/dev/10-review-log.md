@@ -557,3 +557,80 @@ main `3f72107` を先にマージ済み。実機ポートは開いていない�
 - **記録の補完**: 本節は Stage 3 再レビューの N4（本ラウンドの記録が `10-review-log.md` に無い）を
   埋めるために、マージ後に追記した。
 
+
+## 2026-11-21 / DA ローダーと `fw probe-da`（`feat/da-loader-probe`）
+
+対象: `git diff 7f520c2..c06bcef`（10 ファイル、+1916 / −13）。DA をチップの RAM へロードする
+`DaLoader`（`0xA1` / `0xAF` / `0xA8`）と、読み出し専用 `0xD6` で DA 側のファームウェア基底
+（`0` と `0x00200000`）を判定する `m241 fw probe-da`。フラッシュへは書き込まない。
+
+- **Stage 1 並行レビュー**（仕様検収＋可読性、互いの結果を見せずに並行実施）: 仕様 Must 3 / Should 7 / Could 6、
+  可読性 Must 5 / Should 12 / Could 7。
+- **Stage 2 修正**（別エージェント）: 下の表のとおり Must 8 件をすべて解消。Should 19 件のうち 15 件を解消し、
+  4 件を見送った（理由を本節末尾に記録）。
+
+### Stage 1 の指摘（抜粋）
+
+| # | 指摘 | 出典 |
+|---|---|---|
+| M1 | `fw probe-da` の判定（先頭 4 バイト = `18 F0 9F E5`）は DA ビューで実測がなく、`da.rs` の「`0xD6` 未検証」と `fw.rs` / `02-cli.md` の断定が同居 | 仕様 Must-1 |
+| M2 | `base_verdict` が「第 1 候補が未読・第 2 候補が一致」で `Settled` を返す（未読を不一致として扱う） | 仕様 Must-2 |
+| M3 | `0xA8` の count が旧実装の `0` でなく `1`。偽 DA もテストも count を見ていない（変異 M1c 未検出） | 仕様 Must-3 |
+| M4 | `load` の doc とモジュール doc が「リセットベクタを検査する」と書くが、`check_da_image` はサイズしか見ない | 可読性 M1 |
+| M5 | `write_image` 末尾の `let _ = clear_input()` が失敗を捨てる理由を書いていない | 可読性 M2 |
+| M6 | `02-cli.md` が「64 バイトを比較」と読み取れる書き方（実際に判定するのは 4 バイト） | 可読性 M3 |
+| M7 | `PROBE_PAGE_SIZE` の「偶数」の理由が `0xD6` に当たらない（チェックサムはバイト和） | 可読性 M4 |
+| M8 | `Confirmation::PROBE_WORD`（`LOAD`）はどこからも入力されないのに、エラー文が入力を促す | 可読性 M5 / 仕様 Should-5 |
+
+**変異（Stage 1 実測）**: M1/M1b/M2–M8・C3–C5 は検出。**M1c（`0xA8` count）、C1（候補を 1 つに減らす）、
+C2（ベクタ比較を 1 バイトに）は未検出**。
+
+### Stage 2 の修正
+
+| # | 処置 | 固定するテスト |
+|---|---|---|
+| M1 | `BaseVerdict` を `Settled` / `Inconclusive(Inconclusive)` に分け、`Inconclusive` を `Unread` / `NoMatch` / `Ambiguous` に分ける。`Unread` は読めた候補を列挙する。CLI と `--json` は候補ごとに「読めた/読めない」「先頭 4 バイト」「一致/不一致」を出す。doc と `02-cli.md` に「DA ビューでは未検証」を明記 | `a_candidate_that_was_not_read_blocks_settling_even_when_the_other_matches`, `probe_da_json_document_names_both_candidates_and_says_no_flash_write`, `probe_da_text_result_shows_read_state_first_bytes_and_the_match_for_both` |
+| M2 | `Settled` は「2 候補とも読めて、ちょうど片方が一致」のときだけ | 同上 + `the_probe_verdict_settles_only_on_exactly_one_vector_match` |
+| M3 | `0xA8` を `Frame { count: DA_JUMP_COUNT = 0 }` で構築（旧実装と同じ zero）。偽 DA が `count != 0` を数え、テストで固定。`03-hardware-facts.md` と `01-da-protocol.md` §3.2 に根拠と未検証を記載。ロード範囲と BootROM スタックの非重複を区間で固定 | `the_jump_frame_carries_count_zero_and_the_fake_refuses_any_other`, `the_load_range_does_not_touch_the_bootrom_stack` |
+| M4 | 選択肢 (a): `DA_IMAGE_HEAD = [00, 00, A0, E1]`（ベンダー `DA_v3.8.4.bin` の先頭 4 バイト = `mov r0, r0`）を追加し、`check_da_image` がサイズの次に比較。DA バイナリはコミットしない | `the_loader_refuses_an_image_whose_first_bytes_are_not_the_da`, `the_loader_constants_are_pinned_to_the_documents_and_the_read_crate` |
+| M5 | 失敗を捨てず `Result` を返す。理由（ずれた echo は次の `read_back` の 9 バイト echo 比較で `Framing` になる）をコメントに書く。ポーリング抽象は持たないので、1 回の drain 失敗はそのままエラーになる | `the_loader_writes_the_whole_image_to_the_da_base_and_starts_it`（drain が失敗しないことの経路） |
+| M6 | `02-cli.md` を「判定は先頭 4 バイトだけ、残りは表示用」に書き直し、実機ログとして貼れる出力例も追記 | — |
+| M7 | `PROBE_PAGE_SIZE` の doc を「偶数は `0xD6` の要件ではなく、ページ長は DA が受け付けるか未検証」に修正 | — |
+| M8 | `PROBE_WORD` を削除し、`of_probe_command_line` のエラーを `--yes` のみに。`11-safety-review.md` の記述も追随 | `the_loader_refuses_without_a_confirmation_and_sends_nothing`, `probe_da_refuses_without_yes_before_opening_a_port_or_reading_a_file` |
+
+**追加で解消した Should**: C1 / C2 の検出（`the_probe_path_reads_both_candidates_and_nothing_else`、
+`the_probe_verdict_compares_all_four_vector_bytes`）、候補一覧の検証（`base_verdict` が 2 つ以外を拒否）、
+`read_candidates` を `m241-flash` に置いて CLI からアドレスを消した（Should-7 / `11-safety-review.md` の
+「任意アドレスを受け付けない」を実装に合わせた）。
+
+**偽 DA の `0xD6` に見つかった既存の欠陥（本節で修正）**: c06bcef の `send_page` はページの開始位置を
+`read_page × page_len` として範囲の先頭からのオフセットで数え、`begin_read_range` は固定長のページだけを
+用意していたため、**開始アドレスが `0` 以外の読み出しに、要求した範囲と違うバイト列を返していた**
+（`0x100` を読むと `0x00` の内容）。`read_returns_the_window_at_the_address_asked_for` はデータを窓の
+`0x100` に置いていたので、偽 DA 側のずれとテストの前提が同じだけずれて一致していた。範囲全体を
+`start` からコピーし、ページをその中の位置で切り出し、ページ数を §5.5 の `udiv(total+page-1, page)` に
+合わせた。固定するテストは `a_two_page_read_is_the_same_bytes_however_the_da_pads_the_range`。
+併せて `05-verification.md` に `0xD6` / DA ビューのベクタ / V1.14 個体で probe を走らせていないことを追記した。
+
+**見送った Should と理由**
+
+- Should-2 の「最終ページの advance を送らない」側への寄せ: 送る／送らないは実機でのみ決まる。§5.5 の
+  「Nothing is sent when the range is complete.」は DA の返信についての文であり、host 側の advance を
+  省略してよいとは書いていない。テストとシミュレータは「最終ページ後も 1 バイト送り、DA は何も返さない」
+  で一致させ、未検証点として `05-verification.md` に新設の行で記録した。片方に寄せる根拠が無い。
+- Should-1 の「クライアント側が短いページを受ける」側: `PROBE_PAGE_SIZE` は 64 で固定なので、判定が
+  必要とする最初のページが短くなる経路は無い。範囲全体がページ長の倍数でない場合の最終ページは
+  クライアントが要求しない。偽 DA に `without_page_padding` を足して「ページ長の倍数でない範囲」でも
+  同じバイト列が返ることは固定した。
+- Could-2（`0x7D` 待ちの境界）・Could-3（`PROBE_PAGE_SIZE` を可変にする）は実機の値が要る。片付けず、
+  `05-verification.md` に未検証として残した。
+- Could-5（偽 DA の `0xA1` アドレス未検査）と Could-6（`03-hardware-facts.md` の追記）は解消済み。Could-4
+  （テスト名）は `the_loader_refuses_an_image_whose_first_bytes_are_not_the_da` 等の改名で解消。
+
+### ゲート
+
+`./tools/check.sh` 6/6、`cargo test -p m241-flash -p m241-cli`。Gate の詳細は Stage 3 の節（未検証）。
+
+### Stage 3 検証
+
+未検証（別エージェントが記入する）。

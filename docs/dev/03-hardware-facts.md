@@ -26,6 +26,7 @@ If you change a constant, change the line, and say what new measurement moved it
 | `0xD3` on refusal | records nothing from the refused command, but **keeps the ranges recorded by earlier ones** | the handler returns before overwriting the range table |
 | WRITE16 echo | trails by one byte | after N bytes only N−1 echoes exist; the final byte's echo never arrives |
 | Write sequence | `0xD3` records the range, `0xD5` erases and writes: `0x100`-byte packets each + sum-of-bytes → `0x69`, then two `0x5A` | the only sequence that completed on hardware |
+| DA jump (`0xA8`) | address `0x00100800`, **count `0`** | the only client that ran it on a unit sent zero (`python/src/m241/protocol/brom.py`, `BootRom.jump`). ⚠️ 未検証 whether the BootROM reads the count at all; a non-zero value has never been sent to a unit |
 
 The 20-byte info report is `>BHBLHHHHL`, but the field name "block geometry" that
 layout suggests is wrong: the four middle `H` fields are **not** flash geometry.
