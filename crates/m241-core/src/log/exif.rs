@@ -2018,13 +2018,14 @@ mod tests {
             "the rest of the IFD still reads: {tags:?}"
         );
 
-        // The count is part of the contract too: BYTE with three values. This
-        // must stay a BYTE typed tag, or the test would pass on the type check
-        // alone.
+        // The count is part of the contract too: BYTE with five values. Five,
+        // not three, because a three-byte value would be `None` from the
+        // four-byte conversion alone — the count check has to be the thing that
+        // rejects it. Keep it BYTE, or the test would pass on the type check.
         let short = fixture::exif_jpeg(
             ByteOrder::Little,
             &[],
-            Some(&[fixture::Entry::version_id_bytes(vec![2, 2, 0])]),
+            Some(&[fixture::Entry::version_id_bytes(vec![2, 2, 0, 0, 0])]),
             None,
         );
         let tags = read_gps(&short)
