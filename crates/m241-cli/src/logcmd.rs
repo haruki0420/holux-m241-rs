@@ -157,9 +157,21 @@ pub fn erase(options: &EraseOptions, session: Session<'_>) -> Result<()> {
     }
 
     let proof = BackupProof::of_bytes(&bytes);
+    // Logging must be stopped (`$PMTK182,5`) before `$PMTK182,6,1` and always
+    // resumed (`$PMTK182,4`) afterwards, even when the erase fails — otherwise
+    // a failed erase would leave the unit silently not recording.
+    client.log_stop()?;
     let mut eraser =
-        LogEraser::new(client.into_transport()).with_reply_timeout(session.timings.reply);
-    eraser.erase(proof)?;
+        LogEraser::new(client.into_transport()).with_reply_timeout(session.timings.erase);
+    let outcome = eraser.erase(proof);
+    let mut client = PmtkClient::new(eraser.into_transport())
+        .with_reply_timeout(session.timings.reply)
+        .with_stream_window(session.timings.stream);
+    let resumed = client.log_resume();
+    match outcome {
+        Err(err) => return Err(err),
+        Ok(()) => resumed?,
+    }
 
     if options.json {
         return session.console.json(&serde_json::json!({
@@ -1299,24 +1311,28 @@ mod tests {
         assert_eq!(
             commands
                 .iter()
-                .filter(|command| command.as_str() == "PMTK182,6")
+                .filter(|command| command.as_str() == "PMTK182,6,1")
                 .count(),
             1,
             "exactly one erase sentence: {commands:?}"
         );
         let erase_at = commands
             .iter()
-            .position(|command| command == "PMTK182,6")
+            .position(|command| command == "PMTK182,6,1")
             .expect("the erase was recorded");
-        assert!(
-            commands[..erase_at]
-                .iter()
-                .any(|command| command == "PMTK182,4"),
-            "the download must finish (logging resumed) before the erase: {commands:?}"
+        assert_eq!(
+            commands.get(erase_at.saturating_sub(1)).map(String::as_str),
+            Some("PMTK182,5"),
+            "logging must be stopped immediately before the erase: {commands:?}"
+        );
+        assert_eq!(
+            commands.get(erase_at + 1).map(String::as_str),
+            Some("PMTK182,4"),
+            "logging must be resumed immediately after the erase: {commands:?}"
         );
         assert!(
             handle.logging_enabled(),
-            "a completed download leaves the unit recording"
+            "a completed erase leaves the unit recording"
         );
         let stdout = console.stdout();
         assert!(stdout.contains("bytes"), "got {stdout}");
@@ -1345,7 +1361,7 @@ mod tests {
             !handle
                 .commands()
                 .iter()
-                .any(|command| command == "PMTK182,6"),
+                .any(|command| command.starts_with("PMTK182,6")),
             "no erase may be sent without --yes: {:?}",
             handle.commands()
         );
@@ -1394,9 +1410,13 @@ mod tests {
             handle
                 .commands()
                 .iter()
-                .filter(|command| command.as_str() == "PMTK182,6")
+                .filter(|command| command.as_str() == "PMTK182,6,1")
                 .count(),
             1
+        );
+        assert!(
+            handle.logging_enabled(),
+            "logging must be resumed even when the erase is refused"
         );
     }
 

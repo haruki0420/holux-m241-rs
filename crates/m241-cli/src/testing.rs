@@ -445,7 +445,7 @@ impl Transport for SharedFake {
         // about it.
         self.handle.current.borrow_mut().write_all(buf)?;
         self.pending.extend_from_slice(buf);
-        let erase_line = pmtk::line("PMTK182,6");
+        let erase_line = pmtk::line("PMTK182,6,1");
         while let Some(position) = self.pending.iter().position(|&byte| byte == b'\n') {
             let raw: Vec<u8> = self.pending.drain(..=position).collect();
             let line = String::from_utf8_lossy(&raw);

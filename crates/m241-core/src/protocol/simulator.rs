@@ -1379,4 +1379,52 @@ mod tests {
         assert_eq!(garbage(4).len(), 4);
         assert!(matches!(unsupported("x"), Error::State(_)));
     }
+
+    #[test]
+    fn log_resume_ignores_a_stale_chunk_read_ack_and_waits_for_subcommand_4() {
+        #[derive(Debug)]
+        struct QueuedTransport {
+            replies: Vec<u8>,
+            cursor: usize,
+        }
+        impl Transport for QueuedTransport {
+            fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+                let left = self.replies.len().saturating_sub(self.cursor);
+                if left == 0 || buf.is_empty() {
+                    return Ok(0);
+                }
+                let take = left.min(buf.len());
+                buf[..take].copy_from_slice(&self.replies[self.cursor..self.cursor + take]);
+                self.cursor += take;
+                Ok(take)
+            }
+            fn write_all(&mut self, _buf: &[u8]) -> Result<()> {
+                Ok(())
+            }
+            fn flush(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn clear_input(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn set_baud(&mut self, _baud: u32) -> Result<()> {
+                Ok(())
+            }
+            fn set_control_lines(&mut self, _asserted: bool) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        // A stale `$PMTK001,182,7,3` (from the last read chunk) followed by a
+        // refused `$PMTK001,182,4,0` must not be mistaken for a successful resume.
+        let mut replies = Vec::new();
+        replies.extend_from_slice(pmtk_line("PMTK001,182,7,3").as_bytes());
+        replies.extend_from_slice(pmtk_line("PMTK001,182,4,0").as_bytes());
+        let mut client = PmtkClient::new(QueuedTransport { replies, cursor: 0 })
+            .with_reply_timeout(std::time::Duration::from_millis(50));
+        let err = client
+            .log_resume()
+            .expect_err("must skip subcommand 7 ACK and see subcommand 4 refusal");
+        assert!(matches!(err, Error::Rejected { .. }), "got {err}");
+    }
 }

@@ -720,9 +720,15 @@ impl<T: Transport> PmtkClient<T> {
     }
 
     fn log_control(&mut self, body: &str, subcommand: u8) -> Result<()> {
+        // Match the exact subcommand prefix (`$PMTK001,182,<subcommand>,`) rather
+        // than `$PMTK001,182,`: the final `$PMTK182,7` read chunk can emit a
+        // trailing `$PMTK001,182,7,3` ACK after `$PMTK182,8`, and matching only
+        // command `182` would mistake that stale read ACK for `$PMTK182,4`'s
+        // reply — leaving the real `$PMTK001,182,4,3` in flight on the wire.
+        let prefix = format!("$PMTK001,182,{subcommand},");
         let reply = self.await_reply(
             body,
-            "$PMTK001,182,",
+            &prefix,
             self.reply_timeout,
             &format!("$PMTK001,182,{subcommand} acknowledgement"),
         )?;

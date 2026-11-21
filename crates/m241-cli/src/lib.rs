@@ -71,11 +71,11 @@ pub(crate) use output::Console;
 
 /// How long the wire commands wait.
 ///
-/// Three numbers, not one: a reply may take seconds because the device has to
-/// parse and answer, the stream probe watches for one sentence per second, and
-/// the `$PMTK180` hand-over has its own quiet/settle/watch sequence.
-/// All are exposed so a test can run the same code paths without spending
-/// seconds proving a timeout.
+/// Four numbers, not one: a reply may take seconds because the device has to
+/// parse and answer, the stream probe watches for one sentence per second, the
+/// `$PMTK180` hand-over has its own quiet/settle/watch sequence, and a full
+/// flash log erase takes longer than a normal command reply. All are exposed so
+/// a test can run the same code paths without waiting out real device timeouts.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Timings {
     /// How long one command's direct reply may take.
@@ -84,6 +84,8 @@ pub(crate) struct Timings {
     pub stream: Duration,
     /// The `$PMTK180` hand-over timings.
     pub entry: EntryTiming,
+    /// How long `$PMTK182,6,1` (log erase) may take to acknowledge.
+    pub erase: Duration,
 }
 
 impl Timings {
@@ -94,6 +96,7 @@ impl Timings {
             reply: DEFAULT_REPLY_TIMEOUT,
             stream: DEFAULT_STREAM_WINDOW,
             entry: EntryTiming::real(),
+            erase: m241_flash::erase::DEFAULT_REPLY_TIMEOUT,
         }
     }
 
@@ -105,6 +108,7 @@ impl Timings {
             reply: Duration::from_millis(20),
             stream: Duration::from_millis(1),
             entry: EntryTiming::fast(),
+            erase: Duration::from_millis(20),
         }
     }
 }
@@ -372,6 +376,7 @@ mod tests {
         assert_eq!(timings.entry.quiet_budget, DEFAULT_ENTRY_QUIET_BUDGET);
         assert_eq!(timings.entry.settle, DEFAULT_ENTRY_SETTLE);
         assert_eq!(timings.entry.watch, DEFAULT_ENTRY_WATCH);
+        assert_eq!(timings.erase, m241_flash::erase::DEFAULT_REPLY_TIMEOUT);
         assert_eq!(Timings::default().reply, timings.reply);
     }
 

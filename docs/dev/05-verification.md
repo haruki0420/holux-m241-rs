@@ -27,13 +27,24 @@ The measured dump's SHA-256 differs per unit because the image contains
 per-unit runtime fields; compare against your own backup, never against a
 figure on this page.
 
+## 1a. The Linux log-erase hardware session (2026-11-21)
+
+Device: retail Holux M-241 (MT3318) over USB serial (CP210x bridge).
+Host: Linux (`m241` built from `feat/log-erase-wire`).
+
+| Step | Command / detail | Result | Status |
+|---|---|---|---|
+| Bare `$PMTK182,6` (negative result) | `m241 log erase --port <port> --output <backup> --yes` before fix | backup saved (`225,028` bytes), failed on trailing `$PMTK001,182,4,3*23`; follow-up `m241 log download` showed `225,060` bytes / `7,846` records (log untouched) | ✅ (negative) |
+| Log download & erase (`$PMTK182,5` → `$PMTK182,6,1*3E` → `$PMTK182,4`) | `m241 log erase --port <port> --output <backup> --yes` | backup saved (`225,092` bytes), `erased: yes`, exit `0` | ✅ |
+| Post-erase verification | `m241 log download --port <port> --output <check> --force` | `528` bytes (`0x210`), `records: 0`, `fixes: 0`, exit `0` | ✅ |
+
 ## 2. What was never measured
 
 | Claim | Why it is still open |
 |---|---|
 | The OLED after flashing | never observed; the display was not photographed |
 | The binary log's timestamps after flashing | inferred from the shared NMEA conversion path; no post-flash log was downloaded |
-| Linux with a real logger | code runs in CI; no device was connected |
+| Linux BootROM / firmware dump & flash with a real logger | `log download` and `log erase` ran on Linux on 2026-11-21 (§1a); BootROM / DA paths have not been recorded on Linux yet |
 | macOS with a real logger | same |
 | Bluetooth SPP | all hardware work went over USB |
 | 4 MiB units and GR-245 variants | geometry maths is implemented and unit-tested; no device was available |

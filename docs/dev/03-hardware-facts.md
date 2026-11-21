@@ -74,6 +74,8 @@ what fills that cell. On the measured unit the report began
 | BootROM baud | 115200 |
 | Sentences at 1 Hz | `$GPGGA`, `$GPGSA`, `$GPGSV`, `$GPRMC`, `$GPVTG` |
 | Log chunk accepted by the device | `0x800` bytes |
+| Log erase command | `$PMTK182,6,1*3E` (after `$PMTK182,5`, before `$PMTK182,4`), ACK `$PMTK001,182,6,3` |
+| Post-erase log usage (`$PMTK182,2,8`) | `528` bytes (`0x210`: fresh `0x200` block header + 16 B, 0 records / 0 fixes); bare `$PMTK182,6` without `,1` leaves the log untouched |
 
 ## UI languages
 

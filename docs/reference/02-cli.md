@@ -180,7 +180,9 @@ The log is downloaded first, exactly as `log download` does, and written to
 `-o/--output <FILE>` before any erase is considered. If that write fails, the
 device is not touched. The erase client in `m241-flash` accepts only a
 `BackupProof` made from the saved bytes, and refuses an empty one, so there is no
-path from this command to `$PMTK182,6` without a copy on disk.
+path from this command to `$PMTK182,6,1` without a copy on disk. Logging is
+paused (`$PMTK182,5`) immediately before `$PMTK182,6,1` and resumed
+(`$PMTK182,4`) afterwards even if the erase fails.
 
 Without `--yes` the download still runs and the backup is saved; the command then
 stops with exit code 5 and says where the copy is. Re-run with `--yes` to erase
