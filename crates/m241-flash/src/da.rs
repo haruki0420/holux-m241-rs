@@ -1387,8 +1387,9 @@ mod tests {
         // write. The first call must be refused (the shipped start is still on
         // the list); the second must be refused by the *pinned-value* stage. If
         // `expected_start` inside `check_layout` ever drifts, the shipped
-        // constant and the pin stop matching, and a test that checks the pin
-        // against the shipped value is the only thing that can say so.
+        // constant and the pin stop matching. This test covers the refusal
+        // path; the pin itself is compared with the shipped value in
+        // `the_pinned_start_is_the_shipped_start_and_not_the_other_candidate`.
         let length = FLASH_WRITE_LENGTH;
         let shipped = FLASH_WRITE_START;
 
