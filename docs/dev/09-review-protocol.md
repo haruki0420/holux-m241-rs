@@ -57,6 +57,75 @@
 仕様を知っていると、コードの不明瞭さを仕様で補って読めてしまい、
 初見の読み手が感じる引っかかりが消える。実装者の説明を読ませないのも同じ理由。
 
+## Tier 制（レビューの深さ）
+
+差分の大きさと危険度で、読む範囲を変える。Tier が低くても「著者とは別の
+セッション」は必須で、`review-gate` も必要。
+
+**Tier 1 でも `review-gate` status は必須。** Tier で変わるのはレビューの深さだけで、
+「著者とは別のセッション」「マージ前の status」はどの Tier でも同じ。
+
+| Tier | 対象 | Stage 1 | Stage 2 | Stage 3 | 変異テスト |
+|---|---|---|---|---|---|
+| 1 | docs のみ、テストのみ、または非テスト 1–100 行 | 独立レビュアー1本（仕様検収。可読性は n/a） | 必要なら別エージェント | 原則不要。挙動を変えるなら必要 | 挙動変更時のみ |
+| 2 | 通常のコード。非テスト 101–300 行、1 つのモジュールに閉じる | 仕様検収 + 可読性の2本。変更ファイルのみ | 別エージェント | 必須 | 3〜5 件 |
+| 3 | 安全-critical（`m241-flash`、プロトコル、ジオタグ = EXIF 書き換え、破壊的経路）は行数に関係なく。または非テスト 301 行以上、または複数モジュール横断 | 2本。変更ファイル全体 + 関係する仕様 | 別エージェント | 必須・深掘り | 10 件以上 |
+
+Tier 3 の「関係する仕様」は**仕様検収だけが読む**。可読性レビューはどの Tier でも
+仕様書を読まない（上の「2 種類のレビュー」）。
+
+行数は「非テスト行」で数える。テストと docs は行数に含めないが、レビュー対象からは外さない。
+数え方の例: `git diff --numstat <base>..HEAD -- ':!**/tests/**' ':!**/*_test.rs'` の
+追加行 + 削除行の合計。`#[cfg(test)]` など**ソース内の inline テストは含める**。
+迷ったら多めに数え、上の Tier に倒す。
+
+301 行以上の通常コードは、まず PR を分割する。分割できない理由を PR に書き、
+そのうえで Tier 3 とする。このルールを入れる前に始まっている大きなブランチ
+（`feat/eztour`、CLI の残り、GUI の残り、DA 書き込み実装
+[`08-parallel-work.md`](08-parallel-work.md)）は「分割前の既存ブランチ」として
+Tier 3 で深くレビューし、次の変更から分割を前提にする。
+
+Tier 3 の例: DA 書き込み、ファーム書き込み、ログ消去、ジオタグ（EXIF 書き換え）。
+Tier 1 でも、安全ゲートや実機未検証の主張に触れるなら Tier 2 以上に上げる。
+
+## Review gate（マージ前の機械ゲート）
+
+`main` へのマージ前に、独立レビュアーが **レビューした head SHA** に
+`review-gate` status を付ける。branch protection はこの status を必須に
+しているため、status のない PR はマージできない。付けるのは **Stage 3 の後、
+マージ直前**（Tier 1 はその限りで Stage 3 を省くことがある）。
+
+```bash
+python3 tools/review_gate.py <head-sha> --pr <number> \
+  --verdict mergeable --tier <1|2|3> \
+  --reviewer "<label>" \
+  --review-url "<レビュー記録の URL>"
+```
+
+- `<head-sha>` は **40 桁の完全な SHA**。短縮 SHA は「full 40-character SHA
+  required」で明示的に拒否される。`gh pr view <n> --json headRefOid
+  --jq .headRefOid` で取れる。
+- `--reviewer` は独立セッションのラベル。`<stage>:<session-id>`
+  （例 `stage3:ses_abcdef`）の形にする。著者のアカウント名を含めると
+  スクリプトが警告を出す（部分一致なので、`stage3:ses_...` 形式では
+  自己レビューを検出できない）。
+- `--review-url` は 3 つの役割を兼ねる。**レビューの記録**（PR コメント、
+  または [`10-review-log.md`](10-review-log.md) の該当節）であり、status の
+  **`target_url`**（status カードのリンク先）であり、`--verdict blocked` の
+  ときの**理由の置き場**でもある。ここが空だと、status から根拠に辿れない。
+- `--dry-run` は投稿しないが、**`gh` は呼ぶ**。PR の head を読んで SHA を
+  照合してから、投稿コマンドをシェルに貼り戻せる形（`shlex.join`）で表示する。
+  認証済みの `gh` とネットワークが要る。オフラインの下見はできない。
+- status は commit ごと。修正を push したら SHA が変わるので、新しい head を
+  レビューして status を付け直すまでマージできない。
+- スクリプトが PR から読むキーは `state`（`open` であること）、`head.sha`
+  （照合する SHA）、`user.login`（著者警告）の 3 つ。
+- 著者のセッションは status を付けない。付けるのは独立レビュアーだけ。
+- `--verdict blocked` は `failure` を付ける。理由を `--review-url` に残す。
+- 技術的な限界: write 権限があれば status は偽装できる。branch protection が
+  強制できるのは status の存在まで。より強くするなら、2 人目のアカウント +
+  required approvals、または信頼できる GitHub App の app-scoped check を使う。
+
 ## 共通のルール
 
 - レビュー担当は**コードを書き換えない**。指摘だけ返す。
