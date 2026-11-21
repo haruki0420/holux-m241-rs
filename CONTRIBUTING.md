@@ -66,6 +66,25 @@ firmware bytes.
   what was only tested against the simulator. Never move a claim across that
   line without a hardware run.
 
+## Before you open a pull request
+
+The merge gate is more than CI. Read
+[`docs/dev/09-review-protocol.md`](docs/dev/09-review-protocol.md) for the full
+three-stage process. In short:
+
+- **Tier 1** — docs/tests only, or under 100 non-test lines: one independent
+  reviewer reads the diff and the tests.
+- **Tier 2** — 100–300 non-test lines, one module: specification and
+  readability reviews by two agents, then a third agent verifies the fix.
+- **Tier 3** — safety-critical (`m241-flash`, the protocol, geotag/destructive
+  paths) or over 300 non-test lines: full-file reviews, at least ten mutation
+  tests, and a deep third-agent verification. Split the pull request first if
+  you can.
+
+After the independent review, the reviewer posts the `review-gate` status on
+the exact head SHA. Branch protection requires it, and a new push needs a new
+review. `./tools/check.sh` must be 6/6 and every required CI check must pass.
+
 ## Commits
 
 Conventional prefixes: `feat:`, `fix:`, `docs:`, `chore:`, `test:`. Say what was
