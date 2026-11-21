@@ -70,24 +70,44 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
    `docs/reference/01-da-protocol.md` §4.2 のとおり `0xD3` の範囲は
    `(start, end)` の生バイトで、`end` は長さではない。定数は
    `m241-flash` のソース上でリテラルとして読めること。
+   *現状:* `crates/m241-flash/src/da.rs` の `FLASH_WRITE_START` / `FLASH_WRITE_LENGTH`
+   が唯一の範囲で、どちらもリテラル。`0xD3` に渡す `end` は
+   `FLASH_WRITE_END = start + length - 1` として定数から導出し、
+   `check_layout` が両者が期待値どおりか確認する。範囲を受け取る公開関数は無い。
 2. **`0x00000000` を含む範囲を消せる経路がないか。** 👁
    `0xD5` は範囲が触れるセクタを、書く直前に消す（同 §5.6）。`start = 0` は
    リセットベクタを消し、装置は起動しなくなる。範囲定数が 0 を含まないことを
    ユニットテストで固定し、書き込み経路が 1 本だけであることをレビューで確認する。
-   *現状:* `crates/m241-flash/src/da.rs` は `DownloadAgent::unsupported` のみの
-   拒否スタブで、範囲定数もそのテストも未実装である。DA 書き込みを実装する差分で
-   必ず範囲定数と `start > 0` のテストを追加し、その時点で再確認する。
+   *現状:* `crates/m241-flash/src/da.rs` に書き込み経路を実装した。範囲は
+   `FLASH_WRITE_START` / `FLASH_WRITE_LENGTH` のリテラルのみで、`check_layout`
+   が期待値と照合し、**開始アドレスが `0` のときは常に `Error::Safety` を返す**。
+   範囲を引数で受け取る公開 API は無い。開始アドレスの DA 側表現が未確定
+   （`docs/reference/01-da-protocol.md` §4.2 は `0x00200000`、`m241_core` の
+   `BASE_ADDR_FIRMWARE_M3318` は `0` と書き、実機の読み出しで決着していない）ため、
+   出荷定数は `0` であり、したがって**この経路は現在どの実機にも書き込めない**。
+   テストは非公開の `write_range` にテスト専用の開始アドレスを渡してプロトコルだけを
+   検証している（🧪）。`start > 0` の保証と `check_layout` の拒否は
+   `crates/m241-flash/src/da.rs` の
+   `the_shipped_start_is_zero_and_the_layout_check_refuses_it` が固定する。
+   開始アドレスが実機で確定した時点で、定数・テスト・この段落を同時に更新する。
 3. **書き込み後に読み戻して照合しているか。** 👁
    書いたバイト列をそのまま信じない。BootROM 経由で同じ範囲を読み、イメージと
    比較する。比較は `m241-core` の読み取り API で行う（書き込みクレートが読み取り
-   側を再実装しない）。
+   側を再実装しない）。*現状:* `PendingWrite::verify_written` が `0xD9` を送ってから
+   `m241_core` の `MtkBootRom` で読み戻し、先頭の不一致オフセットを報告する。
+   読み出しそのものは再実装していない（比較だけがこのクレートにある）。🧪
 4. **失敗時に装置を既知の状態に戻せるか。** 👁
    途中で失敗したとき、どこまで書けたかを報告し、リセット（`0xD9`）後に
    BootROM へ再入する手順が案内されること。`0xD9` は応答を返さないので、
-   待ってはいけない（同 §8.4）。
+   待ってはいけない（同 §8.4）。*現状:* `0xD5` 送信後の失敗はすべて
+   `PartialWrite::recovery` の文面を伴う。書けたバイト数、`0xD9` の送信有無、
+   `--assume-brom` での再入、自分のバックアップの書き戻しを名指しする。🧪
 5. **citation のない定数がないか。** 👁
    `m241-flash` の全ての定数は `docs/reference/01-da-protocol.md` の関数と
    命令範囲を指すこと。指せないなら、その定数は書けない（`CONTRIBUTING.md`）。
+   *現状:* `da.rs` の全定数が同ページの節か `03-hardware-facts.md` の行を指す。
+   指せない値（`REPLY_TIMEOUT`、`BYTES_BETWEEN_FINAL_ACKS`、DA 側の開始アドレス）は
+   プロトコル定数ではない／未検証であると本文に明記した。
 
 ## 読み取り経路のレビュー（必須）
 
