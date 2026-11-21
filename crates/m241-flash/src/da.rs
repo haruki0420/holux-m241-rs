@@ -134,24 +134,24 @@
 //!
 //! # The start address is settled: the image begins at DA address 0
 //!
-//! Two documents used to disagree:
+//! Two sources described the base in different views:
 //!
-//! * `docs/reference/01-da-protocol.md` §4.2 spoke of a "firmware base
-//!   `0x00200000`";
+//! * `docs/reference/01-da-protocol.md` §6 records the driver vtable's `+0x38`
+//!   firmware base as `0x00200000` — the BootROM's view of the image;
 //! * `m241_core::protocol::brom::BASE_ADDR_FIRMWARE_M3318` said the DA addresses
 //!   the same flash from `0`.
 //!
 //! A `0xD6` read through the DA's own view settled it on 2026-11-21: DA address
 //! `0` returns the vector `18 F0 9F E5` and the first 64 bytes are the vendor
 //! V1.13 image's first 64, while DA address `0x0020_0000` returns
-//! `02 02 20 42` — the unmapped-bus pattern (`42 20 02 02` byte-reversed), not
-//! firmware. The run, its command and its manual checks are recorded in
-//! `docs/dev/05-verification.md` §1.
+//! `02 02 20 42` — consistent with the unmapped-bus pattern `42 20 02 02`
+//! byte-reversed, and not the firmware vector. The run, its command and its
+//! manual checks are recorded in `docs/dev/05-verification.md` §1.
 //!
 //! The two views therefore address the same image differently: `0` in the DA's
 //! view is `0x0020_0000` in the BootROM's. The same number is not the same
-//! thing, and `0x00200000` in the DA's view is unmapped even though the BootROM
-//! reads firmware there.
+//! thing, and `0x00200000` in the DA's view does not return the image even
+//! though the BootROM reads firmware there.
 //!
 //! [`FLASH_WRITE_START`] is `0` and [`UNRESOLVED_STARTS`] is empty. The range
 //! includes the reset vector; that is intended, because the image's own first
@@ -300,13 +300,14 @@ pub const PACKET_SIZE: usize = 0x100;
 /// **Settled: `0x0000_0000`.** The DA answers a `0xD6` read at address `0` with
 /// the firmware vector `18 F0 9F E5`, and its first 64 bytes are the vendor
 /// V1.13 image's first 64. The same read at DA address `0x0020_0000` returns
-/// `02 02 20 42`, the unmapped-bus pattern (`42 20 02 02` byte-reversed).
-/// Measured 2026-11-21 on `/dev/ttyUSB0` with `fw probe-da --assume-brom`; the
-/// output is recorded in `docs/dev/05-verification.md` §1.
+/// `02 02 20 42`, consistent with the unmapped-bus pattern (`42 20 02 02`
+/// byte-reversed). Measured 2026-11-21 on `/dev/ttyUSB0` with
+/// `fw probe-da --assume-brom`; the output is recorded in
+/// `docs/dev/05-verification.md` §1.
 ///
 /// The BootROM reads the same image at `BASE_ADDR_FIRMWARE` (`0x0020_0000`).
 /// That is a different view, not a different image: the same number means the
-/// firmware to the BootROM and unmapped memory to the DA.
+/// firmware to the BootROM and does not return the image to the DA.
 ///
 /// ➡️ The range starts at zero and therefore includes the reset vector. That is
 /// intended: those are the image's own first instructions, erased and
@@ -406,8 +407,9 @@ pub fn profile_patch_offsets(profile: &FirmwareProfile) -> Option<&'static [usiz
 ///
 /// V1.13's is [`V1_13_WRITE_LENGTH`], the shipped range. A patched image is
 /// written at its own profile's length — V1.14 is V1.13-based, so it uses the
-/// same one — which is the number [`write_plan`] reports and the one an actual
-/// write will use once the start address is settled.
+/// same one — which is the number [`write_plan`] reports. A V1.12 plan is
+/// reported but not writable by this build: [`DownloadAgent::write`] sends the
+/// V1.13 range, and [`check_image`] refuses a length that is not V1.13's.
 #[must_use]
 pub fn profile_write_length(profile: &FirmwareProfile) -> usize {
     if profile.name == PROFILE_V1_12.name {
@@ -533,13 +535,14 @@ pub const DA_LOAD_CHUNK: usize = m241_core::protocol::brom::WRITE_CHUNK;
 ///
 /// The probe is a read-only diagnostic, so it still reads both former
 /// candidates after the start was settled: `0` is the DA-side base
-/// ([`FLASH_WRITE_START`]) and `0x0020_0000` is the BootROM-side base, which is
-/// unmapped in the DA's view. The 2026-11-21 run is what established that
-/// difference. Keeping both means a later unit can be compared with this one,
-/// and no caller chooses the address. `0` is where
+/// ([`FLASH_WRITE_START`]) and `0x0020_0000` is the BootROM-side base, which
+/// does not return the image in the DA's view. The 2026-11-21 run is what
+/// established that difference. Keeping both means a later unit can be compared
+/// with this one, and no caller chooses the address. `0` is where
 /// `m241_core::protocol::brom::BASE_ADDR_FIRMWARE_M3318` says the DA sees the
-/// flash; `0x0020_0000` is `docs/reference/01-da-protocol.md` §4.2's base in the
-/// BootROM's view.
+/// flash; `0x0020_0000` is the BootROM-side base recorded in
+/// `docs/reference/01-da-protocol.md` §6 (driver vtable `+0x38`), which does not
+/// return the image through the DA.
 ///
 /// Deliberately **not** derived from [`UNRESOLVED_STARTS`]: that list is empty
 /// now, while the probe must keep reading both addresses.
@@ -1603,6 +1606,11 @@ impl<T: Transport> DownloadAgent<T> {
     /// caller who skipped the device check still cannot write an image other
     /// than their own dump with only [`PATCH_OFFSETS`] moved.
     ///
+    /// The device check is the caller's: `write` does not call
+    /// [`Self::verify_device`]. The CLI design runs it against `--backup` before
+    /// opening the DA; a library caller that skips it has only [`check_image`],
+    /// which compares the image with the backup file, not with the unit.
+    ///
     /// `confirmation` is required and checked: a token whose flag was never set
     /// is [`Error::Safety`]. Nothing about the type forces a caller to build it
     /// from a prompt, but every route into this function names the step.
@@ -1948,8 +1956,8 @@ pub fn byte_sum(data: &[u8]) -> u16 {
 /// [`UNRESOLVED_STARTS`] is empty. This function is the gate: it passes only
 /// while that list is empty, the pinned start is the settled `0`, and the length
 /// is [`FLASH_WRITE_LENGTH`]. A non-empty list closes the gate again, and so
-/// does any other start — `0x0020_0000` is the BootROM's view and reads as
-/// unmapped memory through the DA.
+/// does any other start — `0x0020_0000` is the BootROM's view and does not
+/// return the image through the DA (consistent with an unmapped bus).
 ///
 /// The range does include address zero, which is where the DA sees the image
 /// begin. `0xD5` erases every sector the range touches
@@ -1976,8 +1984,8 @@ pub fn check_layout() -> Result<()> {
 ///
 /// `docs/dev/05-verification.md` §1 records the run: a `0xD6` read at this
 /// address returned the vector `18 F0 9F E5` and the vendor image's first 64
-/// bytes, while `0x0020_0000` returned the unmapped-bus pattern. A change to
-/// this constant needs a new row in that section.
+/// bytes, while `0x0020_0000` returned `02 02 20 42`, consistent with an
+/// unmapped bus. A change to this constant needs a new row in that section.
 const SETTLED_WRITE_START: u32 = 0x0000_0000;
 
 /// The pinned start, in one place so a test can compare it with the constant.
@@ -2029,14 +2037,15 @@ fn check_layout_of(
     }
 
     // Every other start is refused, including the BootROM's 0x0020_0000: the
-    // DA reads that address as unmapped memory, not as the image.
+    // DA does not return the image at that address.
     if write_start != expected_start {
         return Err(Error::Safety {
             reason: format!(
                 "the write range starts at 0x{write_start:08X}, not the settled DA-side base \
                  0x{expected_start:08X}. The image begins at DA address 0; 0x0020_0000 is the \
-                 BootROM's view and reads as unmapped through the DA \
-                 (docs/dev/05-verification.md §1). Refusing to write an unpinned range"
+                 BootROM's view and reads 02 02 20 42 through the DA, consistent with an \
+                 unmapped bus (docs/dev/05-verification.md §1). Refusing to write an unpinned \
+                 range"
             ),
         });
     }
@@ -2446,7 +2455,8 @@ mod tests {
     fn the_shipped_start_is_zero_and_the_layout_check_accepts_it() {
         // The 2026-11-21 DA read settled the base at 0 (05-verification §1):
         // a `0xD6` at 0 returns the vector and the vendor image's first 64
-        // bytes, and 0x00200000 returns the unmapped-bus pattern.
+        // bytes, and 0x00200000 returns `02 02 20 42`, consistent with an
+        // unmapped bus.
         assert_eq!(FLASH_WRITE_START, 0x0000_0000);
         assert_eq!(FLASH_WRITE_START, SETTLED_WRITE_START);
         assert_eq!(FLASH_WRITE_LENGTH, 0x0006_345C);
@@ -2462,10 +2472,10 @@ mod tests {
 
     #[test]
     fn the_layout_check_refuses_an_unsettled_start() {
-        // `0x0020_0000` is the BootROM's view of the image, and the DA reads
-        // unmapped memory there. A write at that address would erase and
-        // program the wrong sectors. The probe still reads it, but the
-        // write gate does not accept it.
+        // `0x0020_0000` is the BootROM's view of the image, and the DA does
+        // not return the image there (consistent with an unmapped bus). A
+        // write at that address would erase and program the wrong sectors.
+        // The probe still reads it, but the write gate does not accept it.
         assert_eq!(PROBE_ADDRESSES[0], FLASH_WRITE_START);
         assert_eq!(PROBE_ADDRESSES[1], 0x0020_0000);
 
@@ -3471,7 +3481,7 @@ mod tests {
         let mut rom = MtkBootRom::new(in_bootrom(fake_in_da(&not_an_m241)));
         rom.sync().expect("sync");
         let err = DownloadAgent::verify_device_at(&mut rom, &not_an_m241, WIRE_START)
-            .expect_err("unmapped bus");
+            .expect_err("a vector table that is not an M-241 image");
         assert!(matches!(err, Error::Safety { .. }), "got {err}");
         assert!(format!("{err}").contains("vector table"), "got {err}");
     }

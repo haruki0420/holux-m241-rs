@@ -20,8 +20,8 @@ use clap::Parser;
 use m241_cli::{Cli, exit, run};
 
 // `m241-flash` is a dependency of this package because `fw flash` (the Download
-// Agent) and `log erase` (`$PMTK182,6`) write to the device. The library wires
-// `fw flash`; `log erase` is still a stub in `m241-cli/src/lib.rs`.
+// Agent) and `log erase` (`$PMTK182,6`) write to the device. Both are wired in
+// the library, so this binary reaches the write path only through `m241_cli`.
 
 fn main() -> ExitCode {
     let cli = match Cli::try_parse() {

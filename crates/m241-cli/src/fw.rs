@@ -939,12 +939,13 @@ impl ProbeCandidate {
 /// the vector table `18 F0 9F E5`. That is **measured in the BootROM's view**
 /// (`docs/dev/03-hardware-facts.md` "Firmware base, BootROM view") and, on
 /// 2026-11-21, through the DA (`docs/dev/05-verification.md` §1): DA address
-/// `0` returned the vector and DA address `0x00200000` returned the
-/// unmapped-bus pattern. A 64-byte page emits 64 data bytes plus the two-byte
-/// trailer; multi-page reads and the advance after the last page remain
-/// unmeasured (`docs/reference/01-da-protocol.md` §5.5, §7 item 4). A run whose
-/// cause is unknown therefore produces *unread*, not *no image here*, and the
-/// two are never folded together.
+/// `0` returned the vector and DA address `0x00200000` returned
+/// `02 02 20 42`, consistent with an unmapped bus. A 64-byte page emits 64 data
+/// bytes plus the two-byte trailer; multi-page reads and the advance after the
+/// final page of a multi-page read remain unmeasured
+/// (`docs/reference/01-da-protocol.md` §5.5, §7 item 4). A run whose cause is
+/// unknown therefore produces *unread*, not *no image here*, and the two are
+/// never folded together.
 ///
 /// Two variants carry five outcomes:
 ///
@@ -999,7 +1000,7 @@ impl BaseVerdict {
                     "inconclusive: {} not read (0xD6 timed out or was refused), so the address of \
                      the image is not decided — this is a failure of the read, not evidence that \
                      the image is absent. Check the cable and the unit, and record that the \
-                     DA-side vector check itself is still unverified",
+                     DA-side vector check itself is not yet verified on this unit",
                     missing.join(" and ")
                 )
             }
@@ -1858,7 +1859,10 @@ mod tests {
             let links = FakePorts::shared(handle.clone());
             let console = RecordingConsole::default();
             let confirm = PowerCycle::new(handle);
-            let session = Session::new(&links, &console, &confirm).with_timings(Timings::fast());
+            // 500 ms, not `fast()`'s 20 ms: the fake answers synchronously but
+            // loses replies when the workspace tests run in parallel.
+            let session =
+                Session::new(&links, &console, &confirm).with_timings(Timings::generous());
             let mut options = dump_options(&output);
             options.assume_brom = assume_brom;
 
@@ -3073,7 +3077,10 @@ mod tests {
         let links = fake_da::FakeDaPorts::new(chip.clone());
         let record = links.record();
         let console = RecordingConsole::default();
-        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        // 500 ms, not `fast()`'s 20 ms: the fake DA answers synchronously but
+        // loses replies when the workspace tests run in parallel.
+        let session =
+            Session::new(&links, &console, &AutoConfirm).with_timings(Timings::generous());
         let mut options = probe_options(&da);
         options.yes = true;
         options.json = true;
@@ -3181,7 +3188,10 @@ mod tests {
         let links = fake_da::FakeDaPorts::new(chip);
         let record = links.record();
         let console = RecordingConsole::default();
-        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        // 500 ms, not `fast()`'s 20 ms: the fake DA answers synchronously but
+        // loses replies when the workspace tests run in parallel.
+        let session =
+            Session::new(&links, &console, &AutoConfirm).with_timings(Timings::generous());
         let mut options = probe_options(&da);
         options.yes = true;
         options.json = true;
@@ -3211,7 +3221,10 @@ mod tests {
         let links = fake_da::FakeDaPorts::new(chip);
         let record = links.record();
         let console = RecordingConsole::default();
-        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        // 500 ms, not `fast()`'s 20 ms: the fake DA answers synchronously but
+        // loses replies when the workspace tests run in parallel.
+        let session =
+            Session::new(&links, &console, &AutoConfirm).with_timings(Timings::generous());
         let mut options = probe_options(&da);
         options.yes = true;
 

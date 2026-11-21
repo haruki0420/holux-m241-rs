@@ -11,7 +11,7 @@ write or erase routine. That is not a property the compiler can verify on its
 own: nothing stops someone adding `0xD3` back to a helper in `m241-core`, or
 naming the write crate in its manifest. This gate is the mechanical half.
 
-Six checks, each for a different way the split can rot:
+Seven checks, each for a different way the split can rot:
 
 1. **No destructive command in `m241-core`'s sources or tests.** `$PMTK182,6`
    (erase the log) and the DA opcodes `0xD3` / `0xD4` / `0xD5` / `0xD9` (record
@@ -52,6 +52,12 @@ Six checks, each for a different way the split can rot:
    can stand in for the vendor package: a synthetic image never hashes to the
    real digest, so an end-to-end test alone cannot catch the old branch coming
    back.
+7. **The write path runs the layout gate.** `crates/m241-flash/src/da.rs`'s
+   `pub fn write` must call `check_layout()?` at its own brace depth, before it
+   reaches `write_range`. That call is what refuses every start other than the
+   settled `0`; without it the fixed range is a comment. The check looks inside
+   `write`'s body only, so a call in another function, a comment, or an uncalled
+   nested function does not satisfy it.
 
 A rule enforced only by review is a rule that holds until the reviewer is busy.
 These are mechanical so they hold every commit.
@@ -71,6 +77,7 @@ CORE_SRC = CORE / "src"
 CORE_TESTS = CORE / "tests"
 CORE_MANIFEST = CORE / "Cargo.toml"
 FLASH = REPO / "crates" / "m241-flash"
+FLASH_DA = FLASH / "src" / "da.rs"
 GUI = REPO / "crates" / "m241-gui"
 GUI_MANIFEST = GUI / "Cargo.toml"
 
@@ -130,6 +137,13 @@ DIGEST_ACCEPTANCE = re.compile(
 
 #: Start of a Rust raw string literal (`r"`, `r#"`, `br#"`, `cr#"`).
 RAW_STRING_START = re.compile(r'(?:b|c)?r(#*)"')
+
+#: The one function that may reach the write range, and the gate it must run
+#: first. `check_layout()` refuses a start other than the settled `0`; if the
+#: call moves, disappears, or sits in another function, the write runs ungated.
+WRITE_FUNCTION = re.compile(r"\bpub\s+fn\s+write\s*\(")
+WRITE_LAYOUT_CALL = re.compile(r"\bcheck_layout\s*\(\s*\)\s*\?")
+WRITE_RANGE_CALL = re.compile(r"\bwrite_range\s*\(")
 
 
 def rust_sources(root: Path) -> list[Path]:
@@ -224,6 +238,188 @@ def code_lines(text: str) -> Iterable[tuple[int, str]]:
         code = "".join(out)
         if code.strip():
             yield number, code
+
+
+def masked_source(text: str) -> str:
+    """Return `text` with comments and literal contents blanked.
+
+    Offsets and line breaks survive: replaced characters become spaces, so a
+    brace inside a string or a comment cannot close `write`'s body early. The
+    same literals `code_lines` recognises are handled, plus block comments,
+    because this is used for brace matching over a whole file rather than one
+    line at a time.
+    """
+    out = list(text)
+    i = 0
+    n = len(text)
+    in_string = False
+    in_block_comment = False
+    raw_hashes: int | None = None
+
+    while i < n:
+        ch = text[i]
+        if raw_hashes is not None:
+            if ch == '"' and text[i + 1 : i + 1 + raw_hashes] == "#" * raw_hashes:
+                i += 1 + raw_hashes
+                raw_hashes = None
+                continue
+            if ch != "\n":
+                out[i] = " "
+            i += 1
+        elif in_block_comment:
+            if text[i : i + 2] == "*/":
+                out[i] = out[i + 1] = " "
+                i += 2
+                in_block_comment = False
+            else:
+                if ch != "\n":
+                    out[i] = " "
+                i += 1
+        elif in_string:
+            if ch == "\\" and i + 1 < n:
+                out[i] = " "
+                if text[i + 1] != "\n":
+                    out[i + 1] = " "
+                i += 2
+                continue
+            if ch == '"':
+                in_string = False
+                i += 1
+                continue
+            if ch != "\n":
+                out[i] = " "
+            i += 1
+        else:
+            if text[i : i + 2] == "//":
+                while i < n and text[i] != "\n":
+                    out[i] = " "
+                    i += 1
+                continue
+            if text[i : i + 2] == "/*":
+                out[i] = out[i + 1] = " "
+                i += 2
+                in_block_comment = True
+                continue
+            raw_match = RAW_STRING_START.match(text, i)
+            if raw_match and (
+                i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")
+            ):
+                raw_hashes = len(raw_match.group(1))
+                i = raw_match.end()
+                continue
+            if text[i : i + 3] == "'\"'":
+                i += 3
+                continue
+            if text[i : i + 4] == "'\\\"'":
+                i += 4
+                continue
+            if ch == "'":
+                # A character literal (`'x'`, `'\xNN'`), not a lifetime (`'a`).
+                end = i + 1
+                if end < n and text[end] == "\\":
+                    end += 2
+                    while end < n and text[end] != "'":
+                        end += 1
+                elif end < n:
+                    end += 1
+                if end < n and text[end] == "'":
+                    for blank in range(i + 1, end):
+                        out[blank] = " "
+                    i = end + 1
+                    continue
+            if ch == '"':
+                in_string = True
+            i += 1
+
+    return "".join(out)
+
+
+def write_body_span(masked: str) -> tuple[int, int, int] | str:
+    """The span of `pub fn write` and its body in masked source.
+
+    Returns `(function_start, body_open, body_end)`, where `body_open` is the
+    index of the body's opening `{` and `body_end` is just past its matching
+    `}`. Returning the brace positions lets the caller require a call at the
+    body's own level rather than anywhere inside it.
+    """
+    matches = list(WRITE_FUNCTION.finditer(masked))
+    if not matches:
+        return "no `pub fn write`"
+    if len(matches) > 1:
+        return "more than one `pub fn write`; the write path is ambiguous"
+    opening = masked.find("{", matches[0].end())
+    if opening < 0:
+        return "`pub fn write` has no body"
+    depth = 0
+    for index in range(opening, len(masked)):
+        if masked[index] == "{":
+            depth += 1
+        elif masked[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return (matches[0].start(), opening, index + 1)
+    return "`pub fn write`'s body is not balanced"
+
+
+def top_level_source(body: str) -> str:
+    """Blank everything below the function body's first brace depth.
+
+    `body` starts at the body's opening `{`. Only code directly inside it
+    (depth 1) survives. An uncalled nested function is depth 2 and is blanked,
+    so its `check_layout()` cannot satisfy the gate; neither can a call inside
+    a conditional block, which is the conservative reading of "the gate runs
+    before the write".
+    """
+    out = list(body)
+    depth = 0
+    for index, ch in enumerate(body):
+        if ch == "{":
+            depth += 1
+            out[index] = " "
+        elif ch == "}":
+            out[index] = " "
+            depth -= 1
+        elif depth != 1 and ch != "\n":
+            out[index] = " "
+    return "".join(out)
+
+
+def check_write_layout_gate() -> list[str]:
+    """`DownloadAgent::write` must run `check_layout()` before `write_range`."""
+    if not FLASH_DA.is_file():
+        return [
+            f"{relative(FLASH_DA)} is missing; cannot verify that the write path "
+            "runs the layout gate"
+        ]
+
+    text = FLASH_DA.read_text(encoding="utf-8")
+    masked = masked_source(text)
+    span = write_body_span(masked)
+    if isinstance(span, str):
+        return [f"{relative(FLASH_DA)}: {span}"]
+
+    function_start, body_open, body_end = span
+    number = text.count("\n", 0, function_start) + 1
+    top = top_level_source(masked[body_open:body_end])
+    layout = WRITE_LAYOUT_CALL.search(top)
+    if layout is None:
+        return [
+            f"{relative(FLASH_DA)}:{number}: `pub fn write` does not call "
+            "`check_layout()?` at its top level; the fixed write range is not gated"
+        ]
+
+    write_at = WRITE_RANGE_CALL.search(top)
+    if write_at is None:
+        return [
+            f"{relative(FLASH_DA)}:{number}: `pub fn write` does not call "
+            "`write_range`; cannot verify that `check_layout()` runs before the write"
+        ]
+    if layout.start() > write_at.start():
+        return [
+            f"{relative(FLASH_DA)}:{number}: `pub fn write` calls `write_range` "
+            "before `check_layout()`; the layout gate is not in front of the write"
+        ]
+    return []
 
 
 def check_destructive_symbols() -> list[str]:
@@ -422,10 +618,12 @@ def main() -> int:
         + check_control_lines()
         + check_flash_acceptance()
         + check_dependency_direction()
+        + check_write_layout_gate()
     )
     print(
         f"checked {len(files)} m241-core source/test file(s) for destructive commands, "
-        "write identifiers and the dependency direction"
+        "write identifiers and the dependency direction, and the flash write path for "
+        "its layout gate"
     )
     for problem in problems:
         print(f"  [!] {problem}")
@@ -434,7 +632,8 @@ def main() -> int:
         return 1
     print(
         "no write path in m241-core or m241-gui; the dependency runs one way; "
-        "m241-flash accepts images only by the backup diff"
+        "m241-flash accepts images only by the backup diff; "
+        "DownloadAgent::write runs check_layout() first"
     )
     return 0
 

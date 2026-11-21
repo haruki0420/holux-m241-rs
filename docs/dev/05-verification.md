@@ -29,6 +29,23 @@ The measured dump's SHA-256 differs per unit because the image contains
 per-unit runtime fields; compare against your own backup, never against a
 figure on this page.
 
+A **settlement row** for the DA-side firmware base is the only row that may
+justify emptying `UNRESOLVED_STARTS`. It must contain at least:
+
+* the exact `fw probe-da` command line that ran, including the resolved
+  `--port` and the `--da` path;
+* what `0xD6` returned at **both** candidates, `0` and `0x00200000` — a failed
+  read is recorded as "not read", never as a mismatch;
+* whether the first four bytes at the adopted base are `18 F0 9F E5`;
+* the base adopted, and why the other candidate was excluded;
+* the date;
+* an explicit statement that the run wrote no flash (DA load into RAM only).
+
+The `Flash write through the DA … ✅` row above is the earlier manual flash.
+It is **not** a settlement row: it records no `fw probe-da` run and says
+nothing about which base the DA uses, so it cannot justify emptying
+`UNRESOLVED_STARTS`.
+
 ### 1.2 The DA-side base read (2026-11-21)
 
 Device: the same retail M-241. Host: Linux, `/dev/ttyUSB0` (USB serial).
@@ -55,10 +72,10 @@ flash write : no
   `18 F0 9F E5`, and the first 64 bytes match the vendor V1.13 image's first 64
   bytes exactly.
 * **`0x00200000` in the DA's view is not firmware.** It reads `02 02 20 42`,
-  the unmapped-bus pattern `42 20 02 02` byte-reversed. This is a different
-  address view from the BootROM's: the BootROM reads the firmware vector at
-  `0x00200000`, while the DA reads it at `0`. The same number means different
-  things in the two views.
+  consistent with the unmapped-bus pattern `42 20 02 02` byte-reversed. This is
+  a different address view from the BootROM's: the BootROM reads the firmware
+  vector at `0x00200000`, while the DA reads it at `0`. The same number means
+  different things in the two views.
 * **No flash was written.** The only writes were the BootROM's `0xA1` frames
   into the DA's RAM at `0x00100800`–`0x0010422F`, and the `0xA8` jump. No
   `0xD3`, `0xD4`, `0xD5` or `0xD9` was sent.
@@ -70,26 +87,27 @@ flash write : no
   the drain fix the read succeeded. **Four bytes remained after the banner**;
   their origin is not established.
 * Only **one page** was read at each address. Multi-page reads, the advance
-  after the final page, and bytes between pages were not exercised.
+  after the final page of a multi-page read, and bytes between pages were not
+  exercised.
 
-### 1.3 What qualifies as a settlement row
+## 1a. The Linux log-erase hardware session (2026-11-21)
 
-A **settlement row** for the DA-side firmware base is the only row that may
-justify emptying `UNRESOLVED_STARTS`. It must contain at least:
+Device: retail Holux M-241 (MT3318) over USB serial (CP210x bridge).
+Host: Linux, `m241` built from commit `bf41c2e`, the then-head of
+`feat/log-erase-wire`. That commit is **not** an ancestor of this branch, and no
+binary from this branch's final head has been run on hardware.
 
-* the exact `fw probe-da` command line that ran, including the resolved
-  `--port` and the `--da` path;
-* what `0xD6` returned at **both** candidates, `0` and `0x00200000` — a failed
-  read is recorded as "not read", never as a mismatch;
-* whether the first four bytes at the adopted base are `18 F0 9F E5`;
-* the base adopted, and why the other candidate was excluded;
-* the date;
-* an explicit statement that the run wrote no flash (DA load into RAM only).
+The rows below were measured with that binary only. The log-erase work has
+gained changes since: the empty-log refusal (`ea53d1a`) and the lost-stop-ACK
+resume with its tests. **Those changes have not been run on hardware**, so
+nothing on this page makes the final head verified.
 
-The `Flash write through the DA … ✅` row above is the earlier manual flash.
-It is **not** a settlement row: it records no `fw probe-da` run and says
-nothing about which base the DA uses, so it cannot justify emptying
-`UNRESOLVED_STARTS`.
+| Step | Command / detail | Result | Status |
+|---|---|---|---|
+| Bare `$PMTK182,6` (negative result) | `m241 log erase --port <port> --output <backup> --yes` before fix | backup saved (`225,028` bytes), failed on trailing `$PMTK001,182,4,3*23`; follow-up `m241 log download` showed `225,060` bytes / `7,846` records (log untouched) | ✅ (negative) |
+| Log download & erase (`$PMTK182,5` → `$PMTK182,6,1*3E` → `$PMTK182,4`) | `m241 log erase --port <port> --output <backup> --yes` | backup saved (`225,092` bytes), `erased: yes`, exit `0` | ✅ |
+| Post-erase verification | `m241 log download --port <port> --output <check> --force` | `528` bytes (`0x210`), `records: 0`, `fixes: 0`, exit `0` | ✅ |
+| Final-head re-run (empty-log refusal, lost-stop-ACK resume) | not run: the binary above predates both changes | — | ⚠️ |
 
 ## 2. What was never measured
 
@@ -97,7 +115,7 @@ nothing about which base the DA uses, so it cannot justify emptying
 |---|---|
 | The OLED after flashing | never observed; the display was not photographed |
 | The binary log's timestamps after flashing | inferred from the shared NMEA conversion path; no post-flash log was downloaded |
-| Linux with a real logger | code runs in CI; no device was connected |
+| Linux BootROM / firmware dump & flash with a real logger | `log download` and `log erase` ran on Linux on 2026-11-21 (§1a); BootROM / DA paths have not been recorded on Linux yet |
 | macOS with a real logger | same |
 | Bluetooth SPP | all hardware work went over USB |
 | 4 MiB units and GR-245 variants | geometry maths is implemented and unit-tested; no device was available |
@@ -105,10 +123,10 @@ nothing about which base the DA uses, so it cannot justify emptying
 | Any timing figure | nothing in this repository is a stopwatch measurement |
 | The Rust `fw flash` command on a unit | the 2026-11-15 flash was an earlier manual/v1 run; this Rust client has never opened a port for a write. The write, erase, restart and backup-diff gates are covered only by the simulator |
 | The `0xD9` → NMEA probe → `$PMTK180*3B` re-entry and read-back | implemented in the CLI and exercised against the fake only; no unit has been asked to boot its firmware and hand the BootROM back after a write. The 2026-11-15 row records that the unit booted, not that this read-back ran |
-| The DA's `0xD6` read across multiple pages | one page per address was read on 2026-11-21; the advance between pages, the advance after the **last** page, and any bytes the DA sends between pages are unmeasured (`docs/reference/01-da-protocol.md` §5.5, §7 item 4) |
+| The DA's `0xD6` read across multiple pages | one page per address was read on 2026-11-21; the advance between pages, the advance after the **last** page of a multi-page read, and any bytes the DA sends between pages are unmeasured (`docs/reference/01-da-protocol.md` §5.5, §7 item 4) |
 | The four bytes after the DA banner | observed once on 2026-11-21; their origin is not established. The client drains them before `0xD6` |
 | `0xD6`'s page length for arguments other than 64 | only a 64-byte page-length argument was measured (64 data bytes + 2-byte trailer) |
-| `fw probe-da` on stock V1.13 and on a second unit | the 2026-11-21 run read one unit; no stock V1.13 or V1.14 comparison was recorded |
+| `fw probe-da` on stock V1.13 and on a second unit | the 2026-11-21 run read the unit from §1.1, which already carries the WNRO patch (the version marker is patched to V1.14); its first 64 bytes match the vendor V1.13 image's, but no stock unit and no second unit were probed |
 | The `0xA8` jump frame's count word | the protocol page gives it no meaning; the only client that ran the jump on a unit sent `0`, and this crate does too. Whether the BootROM reads the field at all is not established (`docs/dev/03-hardware-facts.md` "DA jump") |
 
 ## 3. The simulator

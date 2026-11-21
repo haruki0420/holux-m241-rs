@@ -155,6 +155,71 @@ impl Error {
         }
     }
 
+    /// Append a sentence about a second failure, keeping this error's variant.
+    ///
+    /// Used where one failure must not hide another: a lost `$PMTK182,5`
+    /// acknowledgement and a failed `$PMTK182,4` resume both matter, and the
+    /// first one still decides the exit code and whether a retry is safe.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use m241_core::Error;
+    ///
+    /// let stop = Error::Rejected {
+    ///     what: String::from("$PMTK182,5"),
+    /// };
+    /// let both = stop.with_note("logging could not be resumed: no reply");
+    /// assert!(matches!(both, Error::Rejected { .. }));
+    /// assert!(both.to_string().contains("$PMTK182,5"));
+    /// assert!(both.to_string().contains("could not be resumed"));
+    /// ```
+    #[must_use]
+    pub fn with_note(self, note: impl fmt::Display) -> Self {
+        let note = note.to_string();
+        match self {
+            Self::Port { message } => Self::Port {
+                message: format!("{message}; {note}"),
+            },
+            Self::Timeout { what, timeout } => Self::Timeout {
+                what: format!("{what}; {note}"),
+                timeout,
+            },
+            Self::Framing { what, offset } => Self::Framing {
+                what: format!("{what}; {note}"),
+                offset,
+            },
+            Self::Rejected { what } => Self::Rejected {
+                what: format!("{what}; {note}"),
+            },
+            Self::Safety { reason } => Self::Safety {
+                reason: format!("{reason}; {note}"),
+            },
+            Self::Firmware { message, offset } => Self::Firmware {
+                message: format!("{message}; {note}"),
+                offset,
+            },
+            Self::Profile { message, offset } => Self::Profile {
+                message: format!("{message}; {note}"),
+                offset,
+            },
+            Self::Log { message, offset } => Self::Log {
+                message: format!("{message}; {note}"),
+                offset,
+            },
+            Self::Nmea { message } => Self::Nmea {
+                message: format!("{message}; {note}"),
+            },
+            Self::State(message) => Self::State(format!("{message}; {note}")),
+            Self::Io { path, source } => Self::Io {
+                path,
+                // `kind()` survives: appending to the message must not turn
+                // "not found" into a generic `Other`.
+                source: std::io::Error::new(source.kind(), format!("{source}; {note}")),
+            },
+        }
+    }
+
     /// A suggested next action, in the same voice as the interface's hint line.
     ///
     /// This is not a `Display` concern: the message names the problem, the hint
@@ -372,6 +437,41 @@ mod tests {
             .hint()
             .is_some()
         );
+    }
+
+    #[test]
+    fn a_note_keeps_the_variant_and_names_both_failures() {
+        let stop = Error::Timeout {
+            what: String::from("$PMTK001,182,5 acknowledgement"),
+            timeout: std::time::Duration::from_millis(500).into(),
+        };
+        let both = stop.with_note("logging could not be resumed: no reply");
+        assert!(
+            matches!(both, Error::Timeout { .. }),
+            "the first failure's variant decides the exit code: got {both:?}"
+        );
+        let text = format!("{both}");
+        assert!(text.contains("$PMTK001,182,5"), "got {text}");
+        assert!(text.contains("could not be resumed"), "got {text}");
+
+        // `kind()` must survive the rewrite: a not-found file is still not
+        // found, even with a note.
+        let io = Error::io(
+            "backup/stock.bin",
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        )
+        .with_note("the destructive step was not attempted");
+        match io {
+            Error::Io { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+                assert!(
+                    source
+                        .to_string()
+                        .contains("the destructive step was not attempted")
+                );
+            }
+            other => panic!("expected Error::Io, got {other}"),
+        }
     }
 
     #[test]

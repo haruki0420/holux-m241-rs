@@ -39,7 +39,11 @@ A fourth offset means the image is not the version this tool expects. Stop.
 > against `docs/reference/01-da-protocol.md` and
 > `docs/dev/11-safety-review.md`.
 
-The tool refuses unless all of these hold:
+The command first compares the unit's whole firmware span with `--backup`
+(`DownloadAgent::verify_device`). The library's `DownloadAgent::write` does not
+call that check itself: it compares the image with `backup`, not with the unit.
+The device check belongs to the CLI route, not to the library `write`. After
+that it refuses unless all three of these hold:
 
 1. the image matches a known firmware profile and is either identical to
    `--backup` or differs from it only at that profile's patch offsets. There is

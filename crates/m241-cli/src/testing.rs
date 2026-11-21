@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Mutex;
 
+use m241_core::protocol::pmtk;
 use m241_core::protocol::port::Transport;
 use m241_core::protocol::simulator::FakeDevice;
 use m241_core::{Error, Result};
@@ -276,6 +277,9 @@ impl crate::Confirm for AutoConfirm {
     }
 }
 
+/// A callback run when the fake firmware receives the erase sentence.
+type EraseHook = Box<dyn Fn()>;
+
 /// A simulated chip that survives being closed and reopened.
 ///
 /// The factory rebuilds it: opening the port again after [`Self::power_cycle`]
@@ -287,6 +291,12 @@ pub struct DeviceHandle {
     current: Rc<RefCell<FakeDevice>>,
     stream: Rc<RefCell<Vec<u8>>>,
     open_baud: Rc<Cell<Option<u32>>>,
+    /// The reply the fake firmware gives to `$PMTK182,6`, or `None` for the
+    /// default silence (which is what [`FakeDevice`] does on purpose).
+    erase_reply: Rc<RefCell<Option<Vec<u8>>>>,
+    /// Run when `$PMTK182,6` arrives, so a test can inspect the disk at the
+    /// moment the destructive command is sent.
+    erase_hook: Rc<RefCell<Option<EraseHook>>>,
 }
 
 impl std::fmt::Debug for DeviceHandle {
@@ -306,6 +316,41 @@ impl DeviceHandle {
             factory: Rc::new(factory),
             stream: Rc::new(RefCell::new(Vec::new())),
             open_baud: Rc::new(Cell::new(None)),
+            erase_reply: Rc::new(RefCell::new(None)),
+            erase_hook: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    /// Make the fake firmware acknowledge `$PMTK182,6` with `reply`.
+    ///
+    /// [`FakeDevice`] deliberately leaves the erase command unanswered, because
+    /// the read crate must not model a destructive one. The CLI still needs the
+    /// real firmware's answer to exercise its own path, so the reply lives here,
+    /// in the CLI's test double, and never in `m241-core`.
+    #[must_use]
+    pub fn with_erase_reply(self, reply: &str) -> Self {
+        *self.erase_reply.borrow_mut() = Some(pmtk::line(reply).into_bytes());
+        self
+    }
+
+    /// Make the fake firmware answer `$PMTK182,6` with `reply`, or stay silent
+    /// when `reply` is `None`.
+    pub fn set_erase_reply(&self, reply: Option<&str>) {
+        *self.erase_reply.borrow_mut() = reply.map(|reply| pmtk::line(reply).into_bytes());
+    }
+
+    /// Run `hook` when the erase sentence reaches the fake firmware.
+    pub fn on_erase(&self, hook: impl Fn() + 'static) {
+        *self.erase_hook.borrow_mut() = Some(Box::new(hook));
+    }
+
+    fn erase_reply(&self) -> Option<Vec<u8>> {
+        self.erase_reply.borrow().clone()
+    }
+
+    fn note_erase(&self) {
+        if let Some(hook) = self.erase_hook.borrow().as_ref() {
+            hook();
         }
     }
 
@@ -357,15 +402,34 @@ impl DeviceHandle {
 
 /// The transport a command gets when it opens the simulated port.
 #[derive(Debug)]
-struct SharedFake(DeviceHandle);
+struct SharedFake {
+    handle: DeviceHandle,
+    /// Acknowledgements for `$PMTK182,6`, queued by this transport instance.
+    erase_replies: VecDeque<u8>,
+    /// A request line being assembled across `write_all` calls.
+    pending: Vec<u8>,
+}
 
 impl Transport for SharedFake {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        // The raw stream first (it is the traffic a *live* unit emits), then
+        // The erase acknowledgement goes first: `LogEraser` reads it directly
+        // after writing the sentence, before any other traffic exists.
+        let mut from_erase = 0usize;
+        while from_erase < buf.len() {
+            let Some(byte) = self.erase_replies.pop_front() else {
+                break;
+            };
+            buf[from_erase] = byte;
+            from_erase += 1;
+        }
+        if from_erase > 0 {
+            return Ok(from_erase);
+        }
+        // The raw stream next (it is the traffic a *live* unit emits), then
         // whatever the fake device has queued as a command reply.
         let mut from_stream = 0usize;
         {
-            let mut stream = self.0.stream.borrow_mut();
+            let mut stream = self.handle.stream.borrow_mut();
             while from_stream < buf.len() {
                 let Some(byte) = stream.first().copied() else {
                     break;
@@ -378,27 +442,45 @@ impl Transport for SharedFake {
         if from_stream > 0 {
             return Ok(from_stream);
         }
-        self.0.current.borrow_mut().read(buf)
+        self.handle.current.borrow_mut().read(buf)
     }
 
     fn write_all(&mut self, buf: &[u8]) -> Result<()> {
-        self.0.current.borrow_mut().write_all(buf)
+        // Forward first, so `FakeDevice::commands()` still records the body;
+        // then answer the erase here, because the fake device must stay silent
+        // about it.
+        self.handle.current.borrow_mut().write_all(buf)?;
+        self.pending.extend_from_slice(buf);
+        let erase_line = pmtk::line("PMTK182,6,1");
+        while let Some(position) = self.pending.iter().position(|&byte| byte == b'\n') {
+            let raw: Vec<u8> = self.pending.drain(..=position).collect();
+            let line = String::from_utf8_lossy(&raw);
+            if line.trim() == erase_line.trim() {
+                self.handle.note_erase();
+                if let Some(reply) = self.handle.erase_reply() {
+                    self.erase_replies.extend(reply);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.0.current.borrow_mut().flush()
+        self.handle.current.borrow_mut().flush()
     }
 
     fn clear_input(&mut self) -> Result<()> {
-        self.0.current.borrow_mut().clear_input()
+        self.erase_replies.clear();
+        self.pending.clear();
+        self.handle.current.borrow_mut().clear_input()
     }
 
     fn set_baud(&mut self, baud: u32) -> Result<()> {
-        self.0.current.borrow_mut().set_baud(baud)
+        self.handle.current.borrow_mut().set_baud(baud)
     }
 
     fn set_control_lines(&mut self, asserted: bool) -> Result<()> {
-        self.0.current.borrow_mut().set_control_lines(asserted)
+        self.handle.current.borrow_mut().set_control_lines(asserted)
     }
 }
 
@@ -467,7 +549,11 @@ impl Links for FakePorts {
         // it spoke NMEA at 38400 rather than at the BootROM's rate.
         device.open_baud.set(Some(baud));
         device.current.borrow_mut().set_baud(baud)?;
-        Ok(Opened::new(Box::new(SharedFake(device.clone()))))
+        Ok(Opened::new(Box::new(SharedFake {
+            handle: device.clone(),
+            erase_replies: VecDeque::new(),
+            pending: Vec::new(),
+        })))
     }
 }
 

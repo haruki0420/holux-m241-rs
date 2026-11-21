@@ -14,15 +14,18 @@
 //!   cal      civil dates, so the offset flags need no date library
 //!   device   ports, info, doctor
 //!   fw       dump, patch and flash
-//!   logcmd   download, info, read, geotag (erase is a stub, see below)
+//!   logcmd   download, info, read, erase, geotag
 //!   nmea     repair and proxy
 //! ```
 //!
-//! `fw flash` is the one destructive verb wired here, and it is a thin front end
-//! to `m241-flash`: the erase, the program and the restart live in that crate,
-//! and the handler only decides the order of the refusals and what to print.
-//! `log erase` is still not wired; it parses, so the help is complete, and fails
-//! with a message naming itself and pointing at `m241 --help`.
+//! `fw flash` and `log erase` are the two destructive verbs wired here, and both
+//! are thin front ends to `m241-flash`: the erase, the program and the restart
+//! live in that crate, and the handler only decides the order of the refusals and
+//! what to print. `log erase` is wired because `m241-flash`'s
+//! [`BackupProof`](m241_flash::erase::BackupProof) can only be built by handing
+//! over the dump that was taken first. That check is deliberately weak — it
+//! compares lengths, not contents — but it makes "erase without a copy" a line of
+//! code a reviewer sees rather than an argument nobody reads.
 //!
 //! 🧪 The firmware write has not run against a unit. It is exercised end to end
 //! against `m241-flash`'s fake DA; `docs/dev/05-verification.md` records what
@@ -74,11 +77,11 @@ pub(crate) use output::Console;
 
 /// How long the wire commands wait.
 ///
-/// Three numbers, not one: a reply may take seconds because the device has to
-/// parse and answer, the stream probe watches for one sentence per second, and
-/// the `$PMTK180` hand-over has its own quiet/settle/watch sequence.
-/// All are exposed so a test can run the same code paths without spending
-/// seconds proving a timeout.
+/// Four numbers, not one: a reply may take seconds because the device has to
+/// parse and answer, the stream probe watches for one sentence per second, the
+/// `$PMTK180` hand-over has its own quiet/settle/watch sequence, and a full
+/// flash log erase takes longer than a normal command reply. All are exposed so
+/// a test can run the same code paths without waiting out real device timeouts.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Timings {
     /// How long one command's direct reply may take.
@@ -87,6 +90,8 @@ pub(crate) struct Timings {
     pub stream: Duration,
     /// The `$PMTK180` hand-over timings.
     pub entry: EntryTiming,
+    /// How long `$PMTK182,6,1` (log erase) may take to acknowledge.
+    pub erase: Duration,
 }
 
 impl Timings {
@@ -97,6 +102,7 @@ impl Timings {
             reply: DEFAULT_REPLY_TIMEOUT,
             stream: DEFAULT_STREAM_WINDOW,
             entry: EntryTiming::real(),
+            erase: m241_flash::erase::DEFAULT_REPLY_TIMEOUT,
         }
     }
 
@@ -108,6 +114,20 @@ impl Timings {
             reply: Duration::from_millis(20),
             stream: Duration::from_millis(1),
             entry: EntryTiming::fast(),
+            erase: Duration::from_millis(20),
+        }
+    }
+
+    /// Generous enough that a synchronous fake-device exchange never times out
+    /// under parallel CPU load.
+    #[cfg(test)]
+    #[must_use]
+    pub fn generous() -> Self {
+        Self {
+            reply: Duration::from_millis(500),
+            stream: Duration::from_millis(1),
+            entry: EntryTiming::fast(),
+            erase: Duration::from_millis(500),
         }
     }
 }
@@ -263,7 +283,7 @@ pub(crate) fn run_with(
             LogCommand::Info(options) => logcmd::info(&options, session)?,
             LogCommand::Download(options) => logcmd::download(&options, session)?,
             LogCommand::Read(options) => logcmd::read(&options, session)?,
-            LogCommand::Erase => return Err(not_implemented("log erase").into()),
+            LogCommand::Erase(options) => logcmd::erase(&options, session)?,
             LogCommand::Geotag(options) => logcmd::geotag(&options, session)?,
         },
         Command::Nmea { command } => match command {
@@ -272,18 +292,6 @@ pub(crate) fn run_with(
         },
     }
     Ok(())
-}
-
-/// The error for a command this build parses but cannot carry out yet.
-///
-/// The message names the command the user actually typed and says where to find
-/// one that works. "not implemented yet" on its own leaves them with no next
-/// step, and naming internal work items tells them nothing they can act on.
-fn not_implemented(command: &str) -> m241_core::Error {
-    m241_core::Error::State(format!(
-        "`m241 {command}` is not implemented in this build; \
-         see `m241 --help` for the commands that work"
-    ))
 }
 
 /// Install the tracing subscriber, writing to stderr.
@@ -302,70 +310,10 @@ pub fn init_tracing(verbose: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{AutoConfirm, FakePorts, RecordingConsole};
     use super::*;
     use m241_core::protocol::pmtk::{
         DEFAULT_ENTRY_QUIET_BUDGET, DEFAULT_ENTRY_SETTLE, DEFAULT_ENTRY_WATCH,
     };
-
-    /// Parse a command line, so the stub list is built the way a user builds it.
-    fn parsed(args: &[&str]) -> Command {
-        use clap::Parser as _;
-
-        let mut argv = vec!["m241"];
-        argv.extend_from_slice(args);
-        Cli::try_parse_from(argv)
-            .expect("the grammar accepts this command line")
-            .command
-    }
-
-    /// Every command this build still stubs, with the name its message must
-    /// carry.
-    ///
-    /// One entry leaves this list with each commit that wires a handler, so the
-    /// list is this build's own record of how far the wiring got. The command
-    /// lines are the ones `docs/reference/02-cli.md` documents.
-    fn unimplemented_commands() -> Vec<(Command, &'static str)> {
-        vec![(parsed(&["log", "erase"]), "log erase")]
-    }
-
-    #[test]
-    fn an_unimplemented_command_names_itself_and_a_next_step() {
-        let links = FakePorts::empty();
-        let console = RecordingConsole::default();
-        let session = Session::new(&links, &console, &AutoConfirm);
-        for (command, name) in unimplemented_commands() {
-            let err = run_with(session, command).expect_err("a stub command must fail");
-            let text = err.to_string();
-            assert!(
-                text.contains(&format!("`m241 {name}`")),
-                "{name}: message does not name the command: {text}"
-            );
-            assert!(
-                text.contains("not implemented in this build"),
-                "{name}: does not say what is missing: {text}"
-            );
-            assert!(
-                text.contains("`m241 --help`"),
-                "{name}: no next step for the user: {text}"
-            );
-            assert!(
-                !text.contains("vendor") && !text.contains("未実装"),
-                "{name}: internal work item, or not in the language of the rest of the CLI: {text}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_stub_list_records_how_far_the_wiring_got() {
-        // Pins the set: a command that gains an implementation must leave this
-        // list, so a half-wired command cannot stay "stubbed but advertised".
-        let names: Vec<&str> = unimplemented_commands()
-            .iter()
-            .map(|(_command, name)| *name)
-            .collect();
-        assert_eq!(names, vec!["log erase"]);
-    }
 
     #[test]
     fn the_real_timings_are_the_measured_ones() {
@@ -375,7 +323,11 @@ mod tests {
         assert_eq!(timings.entry.quiet_budget, DEFAULT_ENTRY_QUIET_BUDGET);
         assert_eq!(timings.entry.settle, DEFAULT_ENTRY_SETTLE);
         assert_eq!(timings.entry.watch, DEFAULT_ENTRY_WATCH);
+        assert_eq!(timings.erase, m241_flash::erase::DEFAULT_REPLY_TIMEOUT);
+        assert_eq!(timings.erase, Duration::from_secs(30));
         assert_eq!(Timings::default().reply, timings.reply);
+        assert_eq!(Timings::default().stream, timings.stream);
+        assert_eq!(Timings::default().erase, timings.erase);
     }
 
     #[test]

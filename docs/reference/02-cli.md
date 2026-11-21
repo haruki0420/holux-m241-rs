@@ -95,7 +95,12 @@ and an image that is already patched.
 
 Writes an image through the Download Agent. **Destructive.**
 
-Before opening a port it checks, and refuses on any failure:
+Before writing, `fw flash` compares the unit's whole firmware span with
+`--backup` (`DownloadAgent::verify_device`); the library's
+`DownloadAgent::write` does not call that check itself — it compares the image
+with `backup`, not with the unit.
+
+Before writing it checks, and refuses on any failure:
 
 1. the image matches a known profile, and is either identical to `--backup` or
    differs from it only at that profile's patch offsets. There is **no**
@@ -155,8 +160,8 @@ no typed prompt for this command), `--assume-brom` (the same route
 
 It reads one 64-byte page at each of `0` and `0x00200000` — the DA-side base and
 the BootROM-side base — and **judges only the first four bytes** of each page
-against `18 F0 9F E5`. The other 60 bytes are printed for a person (`first 16:`),
-not judged.
+against `18 F0 9F E5`. The first 16 bytes are printed for a person (`first 16:`);
+the remaining 48 are neither printed nor judged.
 
 For every candidate the report states, as a line a user can paste into
 `docs/dev/05-verification.md`:
@@ -179,11 +184,12 @@ The verdict is one of:
   which is not a tie the tool breaks.
 
 ✅ A run on 2026-11-21 (`/dev/ttyUSB0`, after `--assume-brom`) returned the
-output above: the DA's view has the image at `0`, while `0x00200000` reads the
-unmapped-bus pattern `02 02 20 42`. The same session measured one `0xD6` page as
-64 data bytes + a 2-byte checksum, and observed four bytes after the banner
-before the first page. Multi-page reads and the advance after the final page are
-still unmeasured (`docs/reference/01-da-protocol.md` §5.5, §7 item 4). See
+output above: the DA's view has the image at `0`, while `0x00200000` reads
+`02 02 20 42`, consistent with the unmapped-bus pattern. The same session
+measured one `0xD6` page as 64 data bytes + a 2-byte checksum, and observed four
+bytes after the banner before the first page. Multi-page reads and the advance
+after the final page of a multi-page read are still unmeasured
+(`docs/reference/01-da-protocol.md` §5.5, §7 item 4). See
 `docs/dev/05-verification.md` §1.2 for the full transcript.
 
 `fw probe-da` was how the DA-side base was settled; it remains a **read-only**
@@ -211,12 +217,33 @@ The field is absent when nothing was shifted.
 
 ## `m241 log erase`
 
-Erases the track log. **Destructive.** Requires confirmation or `--yes`, and
-`--require-backup FILE` refuses unless the log you meant to keep is already on
-disk.
+Erases the track log. **Destructive.**
 
-The command lives in the `m241-flash` crate, not in `m241-core`: a binary that
-only reads cannot link it. See [`11-safety-review.md`](../dev/11-safety-review.md).
+The log is downloaded first, through the same `$PMTK182` transfer `log download`
+uses, and the raw bytes are written to `-o/--output <FILE>` before any erase is
+considered. Unlike `log download`, the erase command does not parse the dump: it
+saves the bytes as the device sent them, because that raw copy is the recovery
+route and a parser's opinion must not stand between the user and it. If the
+device reports an empty log (`0` bytes), nothing is written or erased and the
+command stops with exit code 5. If the backup write fails, the device is not
+touched. The erase client in `m241-flash` accepts only a `BackupProof` made from
+the saved bytes, and refuses an empty one, so there is no path from this command
+to `$PMTK182,6,1` without a copy on disk. Logging is paused (`$PMTK182,5`)
+immediately before `$PMTK182,6,1` and resumed (`$PMTK182,4`) afterwards even if
+the erase fails or the stop's acknowledgement is lost. When the stop cannot be
+confirmed, no erase is sent at all.
+
+Without `--yes` the download still runs and the backup is saved; the command then
+stops with exit code 5 and says where the copy is. Re-run with `--yes` to erase
+(add `--force` when reusing the same output path). `--force` allows replacing an
+existing output file.
+
+Flags: `--port <PORT|auto>` (default `auto`), `-o/--output <FILE>` (required),
+`--force`, `--yes`, `--json`. The JSON object carries `port`, `output`, `bytes`
+and `erased`.
+
+The erase itself lives in the `m241-flash` crate, not in `m241-core`: a binary
+that only reads cannot link it. See [`11-safety-review.md`](../dev/11-safety-review.md).
 
 ## `m241 log geotag`
 
