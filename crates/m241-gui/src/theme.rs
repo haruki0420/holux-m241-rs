@@ -42,6 +42,28 @@ pub const DANGER: Color32 = Color32::from_rgb(0xE3, 0xA0, 0x08);
 /// Track line, chart series, map selection.
 pub const DATA: Color32 = Color32::from_rgb(0x5F, 0xB3, 0xC4);
 
+/// The ten colours a where-the-logger-has-been marker can take, in ezTour's
+/// order (purple → pink → olive …; 07-eztour-spec §5).
+///
+/// The product paints one track with one line, so the cycle shows up on the
+/// plotted records rather than on ten polylines: the trip is still a single
+/// series in [`DATA`], and the record dots carry the sequence. The hues are
+/// desaturated to sit on `ground` and `panel` without competing with the ink
+/// that marks the selection; [`DATA`] is the first entry, so a track less than
+/// ten points long stays in the product's own colour.
+pub const TRACK_PALETTE: [Color32; 10] = [
+    DATA,
+    Color32::from_rgb(0xB4, 0x7E, 0xC8),
+    Color32::from_rgb(0xD9, 0x85, 0xA8),
+    Color32::from_rgb(0xA8, 0xB0, 0x5E),
+    Color32::from_rgb(0x74, 0xB8, 0x8E),
+    Color32::from_rgb(0xE0, 0xA0, 0x66),
+    Color32::from_rgb(0x86, 0x9E, 0xD6),
+    Color32::from_rgb(0x9B, 0x8F, 0xD9),
+    Color32::from_rgb(0xC9, 0x9A, 0x6E),
+    Color32::from_rgb(0x8F, 0x9A, 0xA6),
+];
+
 /// Verified, success.
 pub const OK: Color32 = Color32::from_rgb(0x6F, 0xBF, 0x73);
 
@@ -97,6 +119,35 @@ pub mod metric {
     pub const FOCUS_RING: f32 = 2.0;
     /// Width of a track line, a chart series, or a plotted path.
     pub const TRACK_LINE: f32 = 2.0;
+    /// Numbers carried over from the reference implementation's polyline
+    /// (07-eztour-spec §5 「既定の線幅 5 px、不透明度 0.7」).
+    pub mod track {
+        /// Stroke width of the map's track polyline.
+        pub const LINE_WIDTH: f32 = 5.0;
+        /// Opacity of the map's track polyline and of the plotted records.
+        pub const LINE_OPACITY: f32 = 0.7;
+
+        /// The map's track polyline stroke: the specified width and opacity, in
+        /// the product's data colour.
+        ///
+        /// `PathStroke` rather than `Stroke` because the map line is a path.
+        pub fn line_stroke() -> egui::epaint::PathStroke {
+            egui::epaint::PathStroke::new(
+                LINE_WIDTH,
+                super::super::DATA.gamma_multiply(LINE_OPACITY),
+            )
+        }
+
+        /// The fill of one plotted record in the colour cycle.
+        pub fn record_fill(index: usize) -> egui::Color32 {
+            let palette = super::super::TRACK_PALETTE;
+            palette
+                .get(index % palette.len())
+                .copied()
+                .unwrap_or(super::super::DATA)
+                .gamma_multiply(LINE_OPACITY)
+        }
+    }
     /// Radius of one plotted point.
     pub const POINT_DOT: f32 = 3.0;
     /// Width of a screen's subordinate rail block (DESIGN.md §5, ログ).

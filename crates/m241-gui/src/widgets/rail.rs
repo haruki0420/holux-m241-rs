@@ -39,17 +39,53 @@ pub fn tab_left(screen: Screen) -> f32 {
     INSET + STEP * screen.index() as f32
 }
 
+/// The left edge of a tab once its selection offset is applied, relative to the rail.
+///
+/// `progress` is the tab's animated selection value (0 = off the staircase,
+/// 1 = fully selected). Kept as a pure function so the 4px move can be asserted
+/// without painting.
+#[must_use]
+pub fn tab_left_at(screen: Screen, progress: f32) -> f32 {
+    tab_left(screen) - active_step_out(progress)
+}
+
+/// How far the active tab steps out of the staircase while it is selected.
+///
+/// It is this product's one authored motion (DESIGN.md §3): 4 px, on the left
+/// edge only, because the right edge stays pinned to the content.
+pub const ACTIVE_STEP_OUT: f32 = space::XS;
+
 /// Draw the rail. Returns `Some(screen)` only when the selection changed this
 /// frame, so the caller can cancel in-flight work for the screen it left.
 #[must_use]
 pub fn rail(ui: &mut Ui, current: Screen) -> Option<Screen> {
-    rail_with_transition(ui, current, 0.15)
+    rail_with_transition(
+        ui,
+        current,
+        crate::screens::settings::AppSettings::DEFAULT_RAIL_TRANSITION_SECS,
+    )
+}
+
+/// The horizontal movement a tab makes when its selection changes.
+///
+/// `progress` is 0 for an unselected tab and 1 for the selected one; it is the
+/// *selected* tab that moves, from [`tab_left`] to [`tab_left`] −
+/// [`ACTIVE_STEP_OUT`]. A tab that has just been left moves the other way, from
+/// the protruded edge back onto the staircase.
+#[must_use]
+pub fn active_step_out(progress: f32) -> f32 {
+    (ACTIVE_STEP_OUT * progress).round()
 }
 
 /// Draw the rail with an explicit tab transition duration in seconds.
 ///
-/// Pass `0.0` when reduced motion is enabled so the active tab steps out
-/// immediately without animation (DESIGN.md §3).
+/// `transition_secs` is how long a tab takes to slide between the staircase and
+/// the protruded edge — the *outgoing* and *incoming* tab both use it, so a
+/// selection swap is one movement rather than a jump.
+///
+/// Pass `0.0` when reduced motion is enabled: DESIGN.md §3 says the tab keeps
+/// its 4px offset as a static state and only the transition goes away, so the
+/// offset is applied at once instead of being animated.
 #[must_use]
 pub fn rail_with_transition(ui: &mut Ui, current: Screen, transition_secs: f32) -> Option<Screen> {
     let mut selected = None;
@@ -73,11 +109,12 @@ fn tab(ui: &mut Ui, screen: Screen, active: bool, transition_secs: f32) -> Respo
     let progress = ui.ctx().animate_bool_with_time(
         ui.scope_id().with(("m241-rail-active", screen.index())),
         active,
+        // egui rejects a negative animation time; the caller passing a negative
+        // number of seconds means "none", not "go backwards".
         transition_secs.max(0.0),
     );
-    let step_out = (space::XS * progress).round();
     let rect = Rect::from_min_max(
-        pos2(row.left() + tab_left(screen) - step_out, row.top()),
+        pos2(row.left() + tab_left_at(screen, progress), row.top()),
         row.right_bottom(),
     );
     let response = ui.interact(
@@ -180,5 +217,24 @@ mod tests {
         for screen in Screen::ALL {
             assert!(!screen.label().is_empty());
         }
+    }
+
+    #[test]
+    fn the_selected_tab_steps_out_by_four_points_and_the_others_do_not() {
+        // DESIGN.md §3: the one authored motion is the active tab stepping out by
+        // 4px. Written as a literal, so a 0 (no protrusion) or a 2 (two XS steps)
+        // fails here rather than in a screenshot review.
+        let unselected = tab_left_at(Screen::Log, 0.0);
+        let selected = tab_left_at(Screen::Log, 1.0);
+        assert!(
+            (unselected - selected - 4.0).abs() < f32::EPSILON,
+            "a selected tab moved {:.2}pt, expected 4pt",
+            unselected - selected
+        );
+        // Reduced motion keeps the same static offset: it removes the transition,
+        // not the protrusion (DESIGN.md §3).
+        assert!((tab_left_at(Screen::Log, 0.0) - tab_left(Screen::Log)).abs() < f32::EPSILON);
+        assert_eq!(active_step_out(1.0), 4.0);
+        assert_eq!(active_step_out(0.0), 0.0);
     }
 }

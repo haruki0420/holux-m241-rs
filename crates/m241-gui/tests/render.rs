@@ -752,6 +752,169 @@ fn connect_screen_renders_connected_and_failed_probes_without_blocking() {
 }
 
 #[test]
+fn dragging_the_playback_slider_moves_the_selected_point() {
+    // 「再生位置」 is the only continuous control that moves the selection, so it
+    // is driven for real: press on its track, drag to the right, release. A
+    // control rebuilt from `self.selected` every frame passes any state test and
+    // fails here unless the drag itself writes the selection back.
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Log);
+    app.log_mut().show_sample();
+    assert_eq!(app.log_mut().selected_index(), Some(0));
+
+    let width = 1280.0;
+    let height = 2400.0;
+    let _ = render_at(&ctx, &mut app, width, height);
+    let shapes = render_shapes_at(&ctx, &mut app, width, height);
+
+    // The slider is the horizontal rule on the same row as 「再生位置」 and the
+    // `n/240` counter: find the rule by its y, not by a guessed offset.
+    let mut flat = Vec::new();
+    flatten_shapes(&shapes, &mut flat);
+    let row_y = flat
+        .iter()
+        .find_map(|shape| match shape {
+            egui::Shape::Text(text) if text.galley.job.text == "再生位置" => Some(text.pos.y),
+            _ => None,
+        })
+        .expect("the 再生位置 label did not render");
+    let track = flat
+        .iter()
+        .find_map(|shape| match shape {
+            egui::Shape::LineSegment { points, .. }
+                if (points[0].y - points[1].y).abs() < f32::EPSILON
+                    && (points[0].y - row_y).abs() < 16.0
+                    && (points[1].x - points[0].x).abs() > 300.0 =>
+            {
+                Some(*points)
+            }
+            _ => None,
+        })
+        .expect("the playback slider track did not render");
+
+    let y = track[0].y;
+    let from = egui::pos2(track[0].x + 4.0, y);
+    let to = egui::pos2(track[0].x + (track[1].x - track[0].x) * 0.75, y);
+    let input = |events: Vec<egui::Event>| RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(width, height),
+        )),
+        events,
+        ..RawInput::default()
+    };
+    for events in [
+        vec![
+            egui::Event::PointerMoved(from),
+            egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+        vec![egui::Event::PointerMoved(egui::pos2(
+            from.x + (to.x - from.x) / 2.0,
+            y,
+        ))],
+        vec![
+            egui::Event::PointerMoved(to),
+            egui::Event::PointerButton {
+                pos: to,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+        Vec::new(),
+    ] {
+        let output = ctx.run_ui(input(events), |ui| app.draw(ui));
+        output.drop_without_applying_deltas();
+    }
+
+    let selected = app.log_mut().selected_index();
+    let len = app.log_mut().track().points.len();
+    assert!(
+        selected.is_some_and(|index| index > len / 2),
+        "dragging the slider three quarters along left the selection at {selected:?} of {len}"
+    );
+}
+
+#[test]
+fn the_map_draws_a_poi_ring_at_the_waypoint() {
+    // The POI bit is the device's own button. It is drawn as a ring at twice a
+    // record's radius, in ink; the count is asserted so a ring that stops being
+    // painted (or one painted for every record) fails here.
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Log);
+    app.log_mut().show_sample();
+
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    let mut flat = Vec::new();
+    flatten_shapes(&shapes, &mut flat);
+
+    let rings: Vec<&egui::epaint::CircleShape> = flat
+        .iter()
+        .filter_map(|shape| match shape {
+            egui::Shape::Circle(circle)
+                if circle.fill == egui::Color32::TRANSPARENT
+                    && circle.stroke.width > 0.0
+                    && (circle.radius - (theme::metric::POINT_DOT * 2.0)).abs() < 0.01 =>
+            {
+                Some(circle)
+            }
+            _ => None,
+        })
+        .collect();
+
+    // One POI ring, plus the start (1.5×) and end (2.5×) markers which are not
+    // this radius. The selection marker is drawn at 3×, also not this radius.
+    assert_eq!(
+        rings.len(),
+        1,
+        "expected exactly one POI ring at {}pt, found {}",
+        theme::metric::POINT_DOT * 2.0,
+        rings.len()
+    );
+    let ring = rings.first().expect("the POI ring");
+    assert_eq!(ring.stroke.color, theme::INK);
+}
+
+#[test]
+fn the_map_track_is_five_points_wide_at_seventy_percent_opacity() {
+    // 07-eztour-spec §5 「幅 5・不透明度 0.7」, read off the painted line rather
+    // than off the constant that produced it.
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Log);
+    app.log_mut().show_sample();
+
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    let mut flat = Vec::new();
+    flatten_shapes(&shapes, &mut flat);
+    let track = flat
+        .iter()
+        .find_map(|shape| match shape {
+            egui::Shape::Path(path) if path.points.len() > 100 => Some(path),
+            _ => None,
+        })
+        .expect("the track polyline did not render");
+
+    assert!(
+        (track.stroke.width - 5.0).abs() < f32::EPSILON,
+        "the track is {:.1}pt wide, expected 5",
+        track.stroke.width
+    );
+    assert_eq!(
+        track.stroke.color,
+        egui::epaint::ColorMode::Solid(theme::DATA.gamma_multiply(0.7)),
+        "the track is not painted at 70% opacity"
+    );
+}
+
+#[test]
 fn log_screen_renders_playback_follow_mode_and_imperial_units() {
     let ctx = context();
     let mut app = App::default();

@@ -340,3 +340,38 @@ main は `e58c5d3` → `5d6ad74` → `19e07c6` と進んだが、いずれも本
 
 - **ゲート・テスト**: `./tools/check.sh` 全ゲート PASS、`m241-cli` テスト **108 件**（84 → 108、削除・弱体化 0 件）。本番コードの `unwrap`/`expect`/`panic!`/`unsafe`/無検証添字 0 件、個人情報違反なし。
 - **判定**: **合格**（`main` へマージ）。
+
+---
+
+## 2026-11-21 / GUI のログ画面と接続（`feat/gui-eztour-live` → `fix/gui-eztour-live`）
+
+対象: `crates/m241-gui/`（`app.rs`, `screens/connect.rs`, `screens/log.rs`, `screens/settings.rs`, `widgets/rail.rs`, `tests/render.rs`）と `docs/dev/01-design-decisions.ja.md`。
+仕様書: `DESIGN.md` §3・§5・§6、`docs/dev/07-eztour-spec.ja.md` §5・§8。実機ポートは開いていない。
+
+- **Stage 1 並行レビュー**（仕様検収＋可読性、互いの結果を見せずに並行実施）: **不合格**。
+  変異 13 件中 7 件が生存（M2 `$PMTK182,5` 送信、M3 確認なしジオタグ、M4 無限再生、M6 スライダー無効化、
+  M7 速度パネル常時メートル、M8 rail transition 無視、M9 rail の 4px を 0）。仕様違反は
+  E5（軌跡が単色・幅 2）、E6（始点／終点マーカー無し）、E4（`fit_all` 後の追従が点を選ばない）。
+- **Stage 2 修正（別エージェント）**: 6 ファイル＋設計記録 1 ファイル。
+
+| # | 指摘 | 解消 | 確認箇所・検出テスト |
+|---|---|---|---|
+| 1 | `probe_client` の送信内容が未固定（M2） | 解消 | `probe_client` を crate 内に落とし、`probe_client_sends_only_read_requests` で `$PMTK605` / `$PMTK182,2,8` / `$PMTK182,2,1` の 3 通だけを assert。変異 M2 で FAIL |
+| 2 | ジオタグの確認ゲートが未固定（M3、可読性 Must 1） | 解消 | `GeotagConfirmation` トークン（`confirm_geotag_write` だけが発行）を `apply_geotags` が要求。`asking_to_geotag_changes_no_bytes_until_the_write_is_confirmed` / `confirming_needs_an_open_prompt` を追加。変異 M3 で FAIL |
+| 3 | 再生の自動前進が未検証（M4） | 解消 | `advance_playback(now, interval)` に時計を引数化し、`playback_only_steps_once_the_interval_has_passed` / `playback_stops_at_the_last_point_and_does_not_run_on` / `reduced_motion_slows_playback_to_the_longer_interval` を追加。M4b・M4c で FAIL |
+| 4 | スライダーの確定が未検証（M6） | 解消 | `egui::Slider` を自前のトラックに置き換え、押下→ドラッグ→解放を実イベントで流す `dragging_the_playback_slider_moves_the_selected_point` を追加。変異 M6 で FAIL |
+| 5 | 軌跡の 10 色・幅 5・不透明度 0.7（E5） | 部分解消＋記録 | 線は幅 5・不透明度 0.7（`theme::metric::track`）、10 色は点の塗りに移した（`theme::TRACK_PALETTE`）。理由は `01-design-decisions.ja.md` §8。`the_track_uses_the_specified_width_and_opacity` / `the_map_track_is_five_points_wide_at_seventy_percent_opacity`。変異 M5 で FAIL |
+| 6 | POI（`rcr=0x0008`）のリング表示が未検証（E7） | 解消 | `the_map_draws_a_poi_ring_at_the_waypoint`（描画プリミティブの半径・色）と `a_waypoint_is_drawn_as_a_ring`。変異 M7 で FAIL |
+| 7 | `set_follow(true)` が点を選ばず追従が止まる（E4） | 解消 | 追従オンで位置付きの点が無ければ先頭点を選ぶ。`following_picks_the_first_point_that_can_be_plotted` / `following_centres_the_map_on_the_selected_point`（投影座標で中心を assert）。変異 M8 で FAIL |
+| 8 | 写真マッチの不変条件・確認件数・`point_index` doc・確認の無効化 | 解消 | `sync_photo_to_selected` と `find_matching_point_index` に不変条件の why、`PhotoEntry::point_index` の doc、確認文はファイル名を列挙（`geotag_targets`）、選択・写真選択・日フィルタ・再読込・トラック差し替えで確認を閉じる（`a_change_that_moves_what_would_be_written_closes_the_prompt`） |
+| D2 | rail の reduced motion 配線が未検証（M8 相当） | 解消 | レールの 4px オフセットを `tab_left_at` / `active_step_out` の純関数に切り出し、`the_selected_tab_steps_out_by_four_points_and_the_others_do_not` を追加 |
+| D4 | rail の 4px 段差が未検証 | 同上 | 同上（4.0 をリテラルで assert） |
+
+- **見送った Should と理由**
+  - 速度パネルの帝国単位の数値突き合わせ（仕様検収 Should 6 / 可読性 31）: `log_screen_renders_playback_follow_mode_and_imperial_units` は `mph` の有無だけを見る。変異 M7 は今回の修正範囲外（`speed_panel` の系列値）なので未解消。
+  - OS の reduced motion を読む（Should 4）: 既定の変更は「これまでより動きが減る／増える」の判断を含むため、修正担当の裁量で既定を変えず保留。
+  - 上書き拒否の TOCTOU（Should 3）、単位切替の不揃い（2）、`pub` 範囲の残り（1）: 実害の判断が必要で、範囲外の `m241-core` か設計判断に属する。
+  - 可読性 Should 11（エラー経路の重複）、27（bounds の 3 重走査）: 挙動を変えない整理で、今回の検証対象外。
+- **ゲート・テスト**: `./tools/check.sh` 6/6 PASS。`crates/m241-gui` テスト **112 件**（`ec06f03` の 93 → 112、+19、削除・弱体化 0 件）。
+- **変異テスト**: 8 変異を実行し 7 検出。M4a（末尾で `playing = false` を消し `last_step_at` だけ更新）は生存 — 次のティックで再度 `step_next` が失敗して停止するため、状態は 1 フレーム遅れて同じ結果になる。害がない変異として記録する。M4c（`self.playing` を停止前に返す）は検出。
+- **未検証**: `probe_serial_port` の実機動作、追従の実描画、GUI 経由の実 JPEG 書き込みは 05-verification.md に記録が無く、**未検証**のまま（合格に含めない）。

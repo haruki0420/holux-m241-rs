@@ -84,7 +84,8 @@ impl UnitSystem {
 pub struct AppSettings {
     /// Unit system for speed, distance, and altitude.
     pub units: UnitSystem,
-    /// When true, rail tab transitions drop to 0 ms and playback omits rapid steps.
+    /// When true, rail tab transitions drop to 0 ms and playback steps at half
+    /// the rate (500 ms instead of 250 ms).
     pub reduced_motion: bool,
 }
 
@@ -136,15 +137,16 @@ const ROW_LANG: Row = Row {
     note: "日本語以外の表示は未検証",
 };
 
-const ROW_MOTION: Row = Row {
-    label: "視差低減",
-    value: "オフ",
-    note: "オンにするとタブ切替の移動時間を 0 ms にします",
-};
+/// The 視差低減 row's label. Its value is the live setting, so the row is drawn
+/// from the buttons rather than from a constant that could disagree with them.
+const ROW_MOTION_LABEL: &str = "視差低減";
 
 /// The rows DESIGN.md §5 names, in its order (checked in tests).
+///
+/// 視差低減 is absent from this list on purpose: unlike the fixed rows it has no
+/// static value, because its value is whatever the buttons currently show.
 #[cfg(test)]
-const ROWS: [Row; 5] = [ROW_CACHE, ROW_UNITS, ROW_THEME, ROW_LANG, ROW_MOTION];
+const FIXED_ROWS: [Row; 4] = [ROW_CACHE, ROW_UNITS, ROW_THEME, ROW_LANG];
 
 /// Draw the screen body. The rail is drawn by the shell, not here.
 pub fn ui(ui: &mut Ui, settings: &mut AppSettings) {
@@ -200,7 +202,7 @@ pub fn ui(ui: &mut Ui, settings: &mut AppSettings) {
             // 5. 視差低減 (interactive)
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(ROW_MOTION.label)
+                    RichText::new(ROW_MOTION_LABEL)
                         .size(size::CAPTION)
                         .color(theme::MUTE),
                 );
@@ -220,11 +222,14 @@ pub fn ui(ui: &mut Ui, settings: &mut AppSettings) {
                 });
             });
             let motion_note = if settings.reduced_motion {
-                "オン（0 ms — タブ切替の移動アニメーションを無効化中）"
+                "オン（0 ms — タブ切替の移動アニメーションを無効化中）".to_owned()
             } else {
-                "オフ（150 ms — 選択タブが 4px 飛び出します）"
+                format!(
+                    "オフ（{} ms — 選択タブが 4px 飛び出します）",
+                    (AppSettings::DEFAULT_RAIL_TRANSITION_SECS * 1000.0).round() as u32
+                )
             };
-            note_label(ui, motion_note);
+            note_label(ui, &motion_note);
             ui.add_space(space::S);
         });
 
@@ -262,7 +267,7 @@ mod tests {
         // A settings row that only says "not implemented" is a blank screen with a
         // label. The invariant: each row states a value, and each row that cannot be
         // changed says so in words (DESIGN.md §6, unverified feature).
-        for row in &ROWS {
+        for row in &FIXED_ROWS {
             assert!(!row.label.is_empty());
             assert!(!row.value.is_empty());
             assert!(
@@ -276,8 +281,13 @@ mod tests {
     #[test]
     fn the_rows_are_the_ones_the_design_names() {
         // DESIGN.md §5 lists exactly five settings; a sixth added here is a design
-        // change rather than a detail.
-        let labels: Vec<&str> = ROWS.iter().map(|row| row.label).collect();
+        // change rather than a detail. The four fixed rows plus the live 視差低減
+        // row, which has no static value to assert.
+        let labels: Vec<&str> = FIXED_ROWS
+            .iter()
+            .map(|row| row.label)
+            .chain(std::iter::once(ROW_MOTION_LABEL))
+            .collect();
         assert_eq!(
             labels,
             ["地図キャッシュ", "単位", "テーマ", "言語", "視差低減"]
@@ -288,7 +298,7 @@ mod tests {
     fn no_row_is_marked_with_amber() {
         // §3: unverified is mute, never danger. The rows are the easiest place in the
         // product to reach for an amber warning, which is exactly why this is asserted.
-        for row in &ROWS {
+        for row in &FIXED_ROWS {
             assert!(!row.note.contains("危険") && !row.note.contains("注意"));
         }
     }
@@ -296,7 +306,7 @@ mod tests {
     #[test]
     fn no_row_exposes_internal_document_names() {
         // User-facing copy must not leak repository file names or spec sections.
-        for row in &ROWS {
+        for row in &FIXED_ROWS {
             for field in [row.label, row.value, row.note] {
                 assert!(
                     !field.contains(".md") && !field.contains('§'),

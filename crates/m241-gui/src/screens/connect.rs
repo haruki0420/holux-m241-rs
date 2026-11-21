@@ -24,6 +24,9 @@ use crate::screens::common::{self, Status};
 use crate::theme::{self, metric, size, space};
 
 /// Read-only identity and log-usage snapshot returned by probing a port.
+///
+/// Public because `tests/render.rs` hands one back through `start_probe_with`;
+/// nothing outside this crate constructs it otherwise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceProbe {
     /// Device identity from `$PMTK605` → `$PMTK705`.
@@ -91,9 +94,9 @@ impl ConnectScreen {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         }
 
-        // At 1024×640 the body is taller than the window, and the review found the
-        // "next step" block ending at its first line — below the fold, and therefore
-        // unreachable rather than merely cropped.
+        // At 1024×640 the body is taller than the window, and the "next step" block
+        // used to end at its first line — below the fold, and therefore unreachable
+        // rather than merely cropped. Scrolling the body keeps it reachable.
         common::scrolling(ui, "m241-connect-body", |ui| {
             // The heading is the screen's name, not the product's: the title bar
             // already says "Holux M-241", and a heading that repeated it made the
@@ -171,6 +174,13 @@ impl ConnectScreen {
 
     /// Start a non-blocking read-only probe of the selected serial port.
     pub fn start_probe(&mut self, port: String) {
+        if matches!(self.probe, ProbeState::Probing { .. }) {
+            // Re-entering would drop the receiver of the probe already running and
+            // start a second thread: whichever finished last would win, and its port
+            // may not be the one on screen. The button is disabled while probing, but
+            // the guard belongs to the function, not to the button.
+            return;
+        }
         self.start_probe_with(port, probe_serial_port);
     }
 
@@ -185,7 +195,9 @@ impl ConnectScreen {
         self.sample = false;
         std::thread::spawn(move || {
             let result = task(&port);
-            let _ignored = tx.send(result);
+            // Nobody is listening when `start_probe` refused a re-entry after this
+            // one; the send failing is that case, not an error worth reporting.
+            let _ = tx.send(result);
         });
     }
 
@@ -200,7 +212,7 @@ impl ConnectScreen {
     }
 
     /// Re-enumerate the serial ports.
-    pub fn refresh(&mut self) {
+    fn refresh(&mut self) {
         self.ports = match Port::list() {
             Ok(ports) => {
                 // Keep a selection only if that port still exists: a stale
@@ -491,7 +503,13 @@ fn probe_serial_port(port_name: &str) -> std::result::Result<DeviceProbe, ProbeE
 
 /// Query `$PMTK605` (`request_identity`) and `$PMTK182,2,8` (`log_used_bytes`)
 /// through an open [`PmtkClient`], without issuing any write or erase commands.
-pub fn probe_client<T: Transport>(
+///
+/// Read-only is the whole contract of this function (AGENTS.md §2.1): the probe
+/// runs again on every click of 「接続して確認」, so a `$PMTK182,5` (stop recording)
+/// or `$PMTK182,6` (erase) added here would silently change the device on a
+/// command that only claims to look. `probe_client_sends_only_read_requests`
+/// pins the three sentences that may go out.
+fn probe_client<T: Transport>(
     client: &mut PmtkClient<T>,
 ) -> std::result::Result<DeviceProbe, ProbeError> {
     let info = client.request_identity().map_err(probe_error_for)?;
@@ -505,6 +523,11 @@ pub fn probe_client<T: Transport>(
 }
 
 /// Format a [`CoreError`] into the device/OS message first and an actionable hint second.
+///
+/// Matched without a wildcard arm: a hint is the sentence a person reads when the
+/// connection failed, and a new [`CoreError`] variant that falls into a catch-all
+/// produces a vague one that still compiles. Listing every variant makes
+/// `m241-core` adding one a compile error here.
 #[must_use]
 fn probe_error_for(err: CoreError) -> ProbeError {
     let message = err.to_string();
@@ -515,10 +538,17 @@ fn probe_error_for(err: CoreError) -> ProbeError {
         CoreError::Timeout { .. } => String::from(
             "端末の電源が入っているか、他のアプリがポートを開いていないか確認してください。起動直後は数秒待ってから再試行してください。",
         ),
-        CoreError::Nmea { .. } | CoreError::Framing { .. } => String::from(
+        CoreError::Nmea { .. }
+        | CoreError::Framing { .. }
+        | CoreError::Rejected { .. }
+        | CoreError::Log { .. } => String::from(
             "38400 bps の通信が不安定です。USB ケーブルの接触を確認し、端末の電源を入れ直してから再試行してください。",
         ),
-        _ => String::from(
+        CoreError::Safety { .. }
+        | CoreError::State(_)
+        | CoreError::Profile { .. }
+        | CoreError::Firmware { .. }
+        | CoreError::Io { .. } => String::from(
             "接続と端末の状態を確認してから、もう一度「接続して確認」を押してください。",
         ),
     };
@@ -668,6 +698,64 @@ mod tests {
         assert_eq!(probe.info.model, "01017-00F");
         assert_eq!(probe.log_used_bytes, 0x0003_3F7C);
         assert_eq!(probe.log_enabled, Some(true));
+    }
+
+    /// Split what the client wrote into the sentence bodies it sent.
+    ///
+    /// The transport logs every byte in write order, and `pmtk::line` wraps a body
+    /// as `$<body>*<checksum>\r\n`, so the bodies are what a test can compare
+    /// against the protocol rather than a substring of the whole buffer.
+    fn sent_bodies(tx: &[u8]) -> Vec<String> {
+        let text = String::from_utf8_lossy(tx);
+        text.split('$')
+            .skip(1)
+            .filter_map(|sentence| sentence.split('*').next())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn probe_client_sends_only_read_requests() {
+        // AGENTS.md §2.1 and the branch's own claim: 「接続して確認」 looks, it never
+        // writes. Pinning the exact set of sentences — not a `!contains` — is what
+        // catches a `log_stop()` ($PMTK182,5), a log erase ($PMTK182,6) or a config
+        // write ($PMTK182,0 / $PMTK182,1) being added to the probe later.
+        let mut client = PmtkClient::new(FakePmtkTransport::default())
+            .with_reply_timeout(Duration::from_millis(200));
+        probe_client(&mut client).expect("fake probe succeeds");
+        let bodies = sent_bodies(&client.transport_mut().tx_log);
+        assert_eq!(
+            bodies,
+            vec![
+                String::from("PMTK605"),
+                String::from("PMTK182,2,8"),
+                String::from("PMTK182,2,1"),
+            ],
+            "the read-only probe sent something other than its three read requests"
+        );
+    }
+
+    #[test]
+    fn a_second_probe_is_refused_while_one_is_running() {
+        // Two probes at once would race to fill the panels, and the loser's port
+        // could be the stale one left on screen. The guard lives in `start_probe`
+        // itself, not only in the disabled button.
+        let mut screen = screen();
+        screen.start_probe_with(String::from("/dev/ttyFake0"), |_port| {
+            std::thread::sleep(Duration::from_millis(20));
+            Err(ProbeError {
+                message: String::from("first"),
+                hint: String::new(),
+            })
+        });
+        screen.start_probe(String::from("/dev/ttyFake1"));
+        assert_eq!(
+            screen.probe_state(),
+            &ProbeState::Probing {
+                port: String::from("/dev/ttyFake0")
+            },
+            "the second start replaced the probe that was already running"
+        );
     }
 
     #[test]
