@@ -105,23 +105,26 @@ larger than the DA-reported flash size (`:148-153`). The backup is only ever
 exits (`:176-185`); nothing is read back. `verify` appears in that script only in
 the docstring, about dumping twice.
 
-**This project.** The specification has three refusals — the image matches a
-known profile **or** every byte that differs from `--backup` falls inside the
-patch offsets; the image fits the flash size the DA reports; the user typed
-`WRITE` (`docs/reference/02-cli.md` §`m241 fw flash`, `AGENTS.md` §2.3,
-`CONTRIBUTING.md` safety-gate table) — plus a read-back after the write.
-**The write path is implemented in `m241-flash` but not wired into the CLI.**
-`crates/m241-flash/src/da.rs` accepts only the settled DA-side range
-(`FLASH_WRITE_START = 0`, `check_layout`), while `crates/m241-cli/src/lib.rs`
-returns "not implemented" for `fw flash`; the offline gates that *are* code are
-the profile and epoch checks in `crates/m241-core/src/firmware/patch.rs`.
+**This project.** The specification has two refusals — the image matches a
+known profile **and** is either identical to `--backup` or differs from it only
+inside the patch offsets; the user passed `--yes` (`docs/reference/02-cli.md`
+§`m241 fw flash`, `AGENTS.md` §2.3) — plus a read-back after the write. There is
+no vendor-package or cross-model exception; the backup is the only image the
+backup check will accept. **It is implemented and wired into `fw flash`, but it
+has not run against a unit.** `crates/m241-flash/src/da.rs` accepts only the
+settled DA-side range (`FLASH_WRITE_START = 0`, `check_layout`) and drives
+`verify_device`, the DA load, `0xD3`/`0xD5` and the `0xD9` read-back;
+`crates/m241-cli/src/lib.rs` calls it from `fw flash` after the confirmation,
+layout and DA-file checks, and re-enters the BootROM by the same NMEA probe and
+`$PMTK180*3B` route before reading back. The offline gates are the profile and
+epoch checks in `crates/m241-core/src/firmware/patch.rs`.
 
-**Verdict: the largest difference, and the one where this project is currently
-the weakest of the three.** Nekoba and v1 both have a working write path with a
-typed confirmation; this project has an implemented write path and a read-back,
-neither of which has run against a unit, and no CLI wiring yet. The backup diff
-check and the read-back are the two gates that do not exist upstream in any
-form, and they stay unproven until the flash path runs on hardware.
+**Verdict: the write path now exists, and the next step is the hardware
+session.** Nekoba and v1 both have a working write path with a typed
+confirmation; this project has the same sequence with `--yes` (no typed prompt),
+plus the backup diff check and the read-back, which do not exist upstream in any
+form. Those two gates are proven against the simulator only until
+`docs/dev/05-verification.md` records a run on a unit.
 
 ### 3. Which firmware images the patch tool will accept
 
@@ -235,8 +238,9 @@ reconstructed from the repository.
   measured on.
 - **`--start-addr` as user input** (both prior projects). Replaced by a constant
   range with an expected-value check.
-- **Not verifying after the write** (both prior projects). Replaced — in the
-  specification, not yet in code — by re-entering the BootROM and re-reading.
+- **Not verifying after the write** (both prior projects). Replaced by
+  re-entering the BootROM (`0xD9` → NMEA probe → `$PMTK180*3B`) and re-reading
+  the whole range; implemented and simulated, not yet run on a unit.
 - **Porting the DA framing.** Neither prior implementation is a source for the
   command semantics; they disagree, and the disassembly decides
   (`CONTRIBUTING.md`, "The one rule that is not negotiable").

@@ -1108,7 +1108,7 @@ fn recovery_command(source: &str, patched: &str) -> String {
     } else {
         patched.trim()
     };
-    format!("m241 fw flash PORT --da DA_v3.8.4.bin --fw {image} --backup {backup} --yes")
+    format!("m241 fw flash {image} --da DA_v3.8.4.bin --backup {backup} --port PORT --yes")
 }
 
 /// The write button's (surface, label) pair for its two states.
@@ -1371,6 +1371,20 @@ mod tests {
         assert!(command.contains("backup/stock.bin"), "got {command}");
         assert!(command.contains("backup/stock.fixed.bin"), "got {command}");
         assert!(command.trim_start().starts_with("m241 "), "got {command}");
+        assert!(
+            command.starts_with("m241 fw flash backup/stock.fixed.bin "),
+            "the image is the positional argument: {command}"
+        );
+        assert!(
+            !command.contains("--fw"),
+            "the CLI has no --fw flag: {command}"
+        );
+        assert!(
+            command.contains("--backup backup/stock.bin"),
+            "got {command}"
+        );
+        assert!(command.contains("--port PORT"), "got {command}");
+        assert!(command.contains("--yes"), "got {command}");
     }
 
     #[test]

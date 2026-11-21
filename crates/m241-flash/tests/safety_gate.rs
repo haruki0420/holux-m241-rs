@@ -7,8 +7,8 @@
 //! touching the real repository), asserting:
 //!
 //! * each forbidden command, escape form, write-shaped identifier, misplaced
-//!   `set_control_lines` reference, and reversed dependency fails and names
-//!   the violated rule;
+//!   `set_control_lines` reference, reversed dependency, and digest-based image
+//!   acceptance fails and names the violated rule;
 //! * `DownloadAgent::write` without its `check_layout()?` call at the body's
 //!   top level fails, including when the call appears only in a comment,
 //!   another function, or an uncalled nested function;
@@ -82,10 +82,22 @@ edition = \"2024\"
 m241-core = { path = \"../m241-core\" }
 ";
 
-/// The smallest `da.rs` that satisfies the layout-gate check: `write` calls
-/// `check_layout()` before it reaches `write_range`. Not compiled; the gate
-/// reads it as text.
+/// The smallest `da.rs` that satisfies both `m241-flash` rules: `check_image`
+/// accepts only by the backup diff (the doc comment names the forbidden tokens
+/// on purpose: prose must stay allowed), and `write` calls `check_layout()`
+/// before it reaches `write_range`. Not compiled; the gate reads it as text.
 const CLEAN_DA_RS: &str = "\
+//! Acceptance is the backup diff; this comment may name sha256 and firmware::digest.
+pub fn check_image(backup: &[u8], image: &[u8]) -> bool {
+    // A trailing comment may also name profile.sha256.
+    backup == image
+}
+
+// W2a may hash the DA file here; only the firmware acceptance is forbidden a digest.
+pub fn check_da_image(image: &[u8]) -> bool {
+    m241_core::firmware::sha256_hex(image).len() == 64
+}
+
 pub fn write(backup: &[u8], image: &[u8]) -> Result<()> {
     check_layout()?;
     write_range(backup, image)
@@ -144,6 +156,13 @@ impl FakeRepo {
         std::fs::write(path, content).unwrap();
     }
 
+    /// Write a file under `crates/m241-flash/` (e.g. `src/da.rs`).
+    fn write_flash_file(&self, relative: &str, content: &str) {
+        let path = self.root.join("crates").join("m241-flash").join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
     /// Replace a crate manifest under `crates/<crate_name>/Cargo.toml`.
     fn write_manifest(&self, crate_name: &str, content: &str) {
         let path = self.root.join("crates").join(crate_name).join("Cargo.toml");
@@ -166,6 +185,12 @@ impl FakeRepo {
         let output: Output = Command::new(python())
             .arg(self.root.join("tools").join("check_safety.py"))
             .current_dir(&self.root)
+            // The gate's violations quote `AGENTS.md §2.3`. A pipe on Windows
+            // uses the ANSI code page, so `§` reached the test as `?` and an
+            // assertion on the exact message failed for an encoding reason, not
+            // because the rule stopped firing. Pin the child's output to UTF-8.
+            .env("PYTHONIOENCODING", "utf-8")
+            .env("PYTHONUTF8", "1")
             .output()
             .unwrap();
         let mut report = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -266,6 +291,60 @@ fn compliant_sources_and_valid_exclusions_pass() {
         report.contains("no write path in m241-core or m241-gui"),
         "the gate passed without its expected summary:\n{report}"
     );
+}
+
+#[test]
+fn digest_based_image_acceptance_in_flash_is_reported() {
+    // This is the mutation the review found: put the old vendor branch back in
+    // `check_image`, and the Rust tests still pass because no synthetic fixture
+    // hashes to the real vendor digest. The safety gate reads the source, so it
+    // must fail even when the runtime branch would never fire in a test.
+    let fully_qualified = "\
+pub fn check_image(backup: &[u8], image: &[u8]) -> bool {
+    if m241_core::firmware::digest::matches(image, PROFILE.sha256) {
+        return true;
+    }
+    backup == image
+}
+";
+    let imported = "\
+use m241_core::firmware::digest::matches;
+
+pub fn check_image(backup: &[u8], image: &[u8], profile: &Profile) -> bool {
+    if matches(image, profile.sha256) {
+        return true;
+    }
+    backup == image
+}
+";
+    let hash_comparison = "\
+pub fn check_image(backup: &[u8], image: &[u8], profile: &Profile) -> bool {
+    let digest = m241_core::firmware::sha256_hex(image);
+    if digest == profile.sha256 {
+        return true;
+    }
+    backup == image
+}
+";
+    for (label, source) in [
+        ("digest-fully-qualified", fully_qualified),
+        ("digest-imported", imported),
+        ("digest-hash-comparison", hash_comparison),
+    ] {
+        let repo = FakeRepo::new(label, &[]);
+        repo.write_flash_file("src/da.rs", source);
+        repo.assert_reports("digest-based image acceptance");
+        let (passed, report) = repo.run();
+        assert!(!passed, "{label} was accepted:\n{report}");
+        assert!(
+            report.contains("crates/m241-flash/src/da.rs"),
+            "{label} did not name the file:\n{report}"
+        );
+        assert!(
+            report.contains("AGENTS.md §2.3"),
+            "{label} did not name the rule:\n{report}"
+        );
+    }
 }
 
 #[test]

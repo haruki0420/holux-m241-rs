@@ -69,7 +69,7 @@ Confirmed for v2:
 Constraints:
 
 - Flash safety gates carried over: NMEA pre-probe tri-state, backup diff check,
-  typed `WRITE` confirmation, hard-coded load addresses.
+  `--yes` confirmation, hard-coded load addresses.
 - `clippy -D warnings`, plus `unwrap` / `expect` / `unsafe` denied outside tests.
 - Flash behaviour is rebuilt from a disassembly of `DA_v3.8.4.bin`; the previous
   version and the upstream project are hypotheses, not sources of truth.

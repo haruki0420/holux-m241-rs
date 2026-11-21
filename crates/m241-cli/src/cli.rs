@@ -173,14 +173,62 @@ pub enum FwCommand {
     Dump(DumpOptions),
     /// Apply the WNRO and version-marker patch to a dumped image.
     Patch(PatchOptions),
-    /// Write a firmware image back (destructive).
-    Flash,
+    /// Write a firmware image back (destructive; `--dry-run` writes nothing).
+    Flash(FlashOptions),
     /// Load the DA and read the two candidate firmware bases through it.
     ///
     /// **Writes no flash.** The DA is loaded into the chip's RAM and reads the
     /// two addresses the DA-side firmware base could be, so the start address
     /// `fw flash` refuses on can be settled by measurement.
     ProbeDa(ProbeDaOptions),
+}
+
+/// `m241 fw flash`: check an image against a backup, or write it.
+///
+/// The position argument is the image, and `--backup` is the dump that was taken
+/// first — `AGENTS.md` §2.3 makes the second mandatory, so it is not optional
+/// here. `--dry-run` is the only thing that does not need a port: it reads the
+/// two files, accepts or refuses the image, and prints the plan.
+#[derive(Debug, Args)]
+pub struct FlashOptions {
+    /// The image to write: your own backup with the WNRO patch applied.
+    #[arg(value_name = "IMAGE")]
+    pub image: PathBuf,
+
+    /// Your own dump of the unit, taken before anything was written. Required:
+    /// it is how a failed write is undone.
+    #[arg(long, value_name = "FILE")]
+    pub backup: PathBuf,
+
+    /// The vendor download agent (`DA_v3.8.4.bin`, 14,896 bytes).
+    ///
+    /// Required for a real write because the DA has to be loaded into the
+    /// chip's RAM before it can program flash. Not used by `--dry-run`.
+    #[arg(long, value_name = "FILE", required_unless_present = "dry_run")]
+    pub da: Option<PathBuf>,
+
+    /// Check the image and print the write plan; open no port and send nothing.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Confirm the write. There is no typed prompt in this build, so this is
+    /// the only confirmation input; `AGENTS.md` §2.5 governs who may pass it.
+    #[arg(long)]
+    pub yes: bool,
+
+    /// The chip is already in the BootROM; send the sync without `$PMTK180`.
+    #[arg(long)]
+    pub assume_brom: bool,
+
+    /// Serial port for a real write, or `auto` for the only likely cable.
+    ///
+    /// Not used by `--dry-run`, which opens no port at all.
+    #[arg(long, default_value = "auto", value_name = "PORT|auto")]
+    pub port: String,
+
+    /// Print one JSON object instead of labelled lines.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -526,7 +574,15 @@ mod tests {
             vec!["m241", "device", "doctor"],
             vec!["m241", "fw", "dump", "-o", "stock.bin"],
             vec!["m241", "fw", "patch", "stock.bin", "--dry-run"],
-            vec!["m241", "fw", "flash"],
+            vec![
+                "m241",
+                "fw",
+                "flash",
+                "image.bin",
+                "--backup",
+                "backup.bin",
+                "--dry-run",
+            ],
             vec!["m241", "log", "info", "track.bin"],
             vec!["m241", "log", "download", "-o", "track.bin"],
             vec!["m241", "log", "read", "track.bin"],
@@ -685,6 +741,132 @@ mod tests {
         // Clap's `global` also accepts the flag after the subcommand.
         let cli = Cli::try_parse_from(["m241", "device", "ports", "--verbose"]).expect("parses");
         assert!(cli.verbose);
+    }
+
+    #[test]
+    fn fw_flash_parses_the_documented_flags_and_defaults() {
+        let cli = Cli::try_parse_from([
+            "m241",
+            "fw",
+            "flash",
+            "image.bin",
+            "--backup",
+            "backup.bin",
+            "--dry-run",
+        ])
+        .expect("the documented dry-run command line");
+        let Command::Fw {
+            command: FwCommand::Flash(flash),
+        } = cli.command
+        else {
+            panic!("expected fw flash");
+        };
+        assert_eq!(flash.image, PathBuf::from("image.bin"));
+        assert_eq!(flash.backup, PathBuf::from("backup.bin"));
+        assert_eq!(flash.da, None, "a dry run needs no DA file");
+        assert!(flash.dry_run);
+        assert!(!flash.yes);
+        assert!(!flash.assume_brom);
+        assert_eq!(flash.port, "auto");
+        assert!(!flash.json);
+
+        let cli = Cli::try_parse_from([
+            "m241",
+            "fw",
+            "flash",
+            "image.bin",
+            "--backup",
+            "backup.bin",
+            "--da",
+            "DA_v3.8.4.bin",
+            "--yes",
+            "--assume-brom",
+            "--port",
+            "COM3",
+            "--json",
+        ])
+        .expect("the documented real-write command line");
+        let Command::Fw {
+            command: FwCommand::Flash(flash),
+        } = cli.command
+        else {
+            panic!("expected fw flash");
+        };
+        assert!(!flash.dry_run);
+        assert_eq!(
+            flash.da,
+            Some(PathBuf::from("DA_v3.8.4.bin")),
+            "a real write needs the vendor DA"
+        );
+        assert!(flash.yes);
+        assert!(flash.assume_brom);
+        assert_eq!(flash.port, "COM3");
+        assert!(flash.json);
+    }
+
+    #[test]
+    fn fw_flash_without_a_da_is_a_usage_error_unless_dry_run() {
+        // The DA is loaded into the chip's RAM before a real write, so the
+        // grammar asks for it up front rather than opening a port and then
+        // failing with "no DA". A dry run touches no device and needs none.
+        let err = Cli::try_parse_from([
+            "m241",
+            "fw",
+            "flash",
+            "image.bin",
+            "--backup",
+            "backup.bin",
+            "--yes",
+        ])
+        .expect_err("no --da");
+        assert!(err.use_stderr(), "got {err}");
+        assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
+        assert!(err.to_string().contains("--da"), "got {err}");
+
+        Cli::try_parse_from([
+            "m241",
+            "fw",
+            "flash",
+            "image.bin",
+            "--backup",
+            "backup.bin",
+            "--dry-run",
+        ])
+        .expect("a dry run needs no --da");
+    }
+
+    #[test]
+    fn fw_flash_no_longer_accepts_allow_cross_model() {
+        // The vendor/cross-model route was removed (`AGENTS.md` §2.3). If the
+        // flag is put back without the rule that made it reachable, this fails
+        // before a user can believe the bypass exists again.
+        let err = Cli::try_parse_from([
+            "m241",
+            "fw",
+            "flash",
+            "image.bin",
+            "--backup",
+            "backup.bin",
+            "--allow-cross-model",
+        ])
+        .expect_err("--allow-cross-model must be an unknown argument");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        assert!(
+            err.to_string().contains("--allow-cross-model"),
+            "the usage error must name the removed flag: {err}"
+        );
+    }
+
+    #[test]
+    fn fw_flash_without_a_backup_is_a_usage_error() {
+        // `AGENTS.md` §2.3: no write is planned without the user's own dump, so
+        // a command line that names no backup is a usage error (exit 2), not a
+        // runtime refusal after the files are read.
+        let err =
+            Cli::try_parse_from(["m241", "fw", "flash", "image.bin"]).expect_err("no --backup");
+        assert!(err.use_stderr(), "got {err}");
+        assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
+        assert!(err.to_string().contains("--backup"), "got {err}");
     }
 
     #[test]
