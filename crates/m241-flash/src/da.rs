@@ -1238,6 +1238,13 @@ impl<T: Transport> DownloadAgent<T> {
     /// retry of its own, so a page that arrives wrong twice is a cable problem
     /// rather than a protocol one.
     ///
+    /// The line is cleared before the command goes out: a byte that arrived
+    /// earlier cannot be this command's answer. On the unit, four bytes follow
+    /// the DA banner that [`DaLoader::load`] does not consume (its report is
+    /// exactly [`DA_REPORT_SIZE`]), and reading the first page without the
+    /// drain shifted it by four bytes — every retry repeated the same shift
+    /// (measured 2026-11-21).
+    ///
     /// # Errors
     ///
     /// * [`Error::State`] when `length` is zero or is not a whole number of
@@ -1260,6 +1267,11 @@ impl<T: Transport> DownloadAgent<T> {
                 ))
             })?;
         let pages = length / PROBE_PAGE_SIZE;
+        // Anything already on the line belongs to an earlier exchange. The
+        // unit sends four bytes after its banner that the loader's
+        // twenty-byte report does not consume; leaving them in place shifted
+        // the first page by four bytes (measured 2026-11-21).
+        self.transport.clear_input()?;
         let mut frame = Vec::with_capacity(13);
         frame.push(OPCODE_READ_RANGE);
         frame.extend_from_slice(&u32::try_from(PROBE_PAGE_SIZE).unwrap_or(64).to_be_bytes());
@@ -3410,6 +3422,31 @@ mod loader_tests {
             device.output_len(),
             0,
             "the DA sends nothing when the range is complete"
+        );
+    }
+
+    #[test]
+    fn four_bytes_left_over_from_the_banner_do_not_shift_the_first_page() {
+        let mut window = flash(0x00);
+        let data: Vec<u8> = (0..PROBE_PAGE_SIZE)
+            .map(|index| 0xB0u8.wrapping_add(index as u8))
+            .collect();
+        place(&mut window, 0, &data);
+        let mut device = da_with(&window);
+        // The unit sends four bytes after the banner (measured 2026-11-21);
+        // the loader reads exactly twenty and leaves them on the line.
+        device.queue_output(&[0x7D, 0x00, 0x00, 0x00]);
+
+        let (page, device) = read(device, 0, PROBE_PAGE_SIZE);
+        assert_eq!(
+            page.expect("0xD6 after a leftover prefix"),
+            data,
+            "the read must start at the page, not four bytes into it"
+        );
+        assert_eq!(
+            device.output_len(),
+            0,
+            "the drain that starts the read took the leftovers"
         );
     }
 

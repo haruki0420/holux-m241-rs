@@ -423,6 +423,16 @@ impl FakeDa {
         self.output.len()
     }
 
+    /// Put bytes on the line as if the DA had sent them before the next command.
+    ///
+    /// The unit emits four bytes after its banner that the twenty-byte report
+    /// read does not consume (measured 2026-11-21). A test uses this to put the
+    /// same leftovers in front of the first `0xD6`, which is the shape that
+    /// shifted the read by four bytes on hardware.
+    pub fn queue_output(&mut self, bytes: &[u8]) {
+        self.output.extend(bytes);
+    }
+
     /// The DA's RAM as the loader left it.
     #[must_use]
     pub fn ram(&self) -> &[u8] {
