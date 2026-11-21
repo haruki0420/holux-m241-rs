@@ -523,3 +523,37 @@ main `3f72107` を先にマージ済み。実機ポートは開いていない�
 - **未検証**: `0xD3` の 1 バイト拒否、`0xD9` 無応答、消去失敗の `0xA5`、ゼロ詰めはいずれも
   **実機未検証**（命令列のみ）。`docs/dev/05-verification.md` に記録が無い限り動かさない。
 
+---
+
+## 2026-11-21 / CLI 非破壊 3 コマンド（`fix/cli-non-destructive`）
+
+対象: `crates/m241-cli/`（`cli.rs` / `device.rs` / `lib.rs` / `logcmd.rs` / `nmea.rs` / `testing.rs`）と
+`docs/reference/02-cli.md`。`device doctor`（環境・ポート・同定・ログ使用量・drop スキャン・DA 抽出）、
+`log geotag`（dry-run / タイムゾーン / シフト / バックアップ）、`nmea proxy`（stdout / TCP、loopback ガード）
+を追加した。`fw flash` / `log erase` はスタブのまま。
+
+- **Stage 1 並行レビュー**（仕様検収＋可読性、互いの結果を見せずに並行実施）: 仕様 Must 2 / Should 8、
+  可読性 Must 4 / Should 16。
+- **Stage 2 修正**（別エージェント、`b82f3ce`）: 上記の Must / Should を解消。
+- **Stage 3 独立検証**（三人目、`b82f3ce`）: **合格**。変異 15/15 検出。Should は 19/20 解消
+  （R13 のみ部分解消で理由を記録）。
+- **Windows CI 修正**（`d1160a1`）: `the_drop_scan_stops_one_level_past_max_drop_depth` が
+  `d4/bound.txt` を文字列で比較しており、Windows の `\` で落ちた。`Path::new(path).ends_with(
+  Path::new("d4").join("bound.txt"))` に変更。差分はテスト 1 箇所のみで、本番コードは不変。
+- **新 head 再レビュー**（`feaaeb6` と `d1160a1`）: **合格**。CLI の 7 ファイルは `b82f3ce` と
+  バイト一致で、main 取り込みは機械的。変異 16/17 検出（未検出は `DA_SIZE_BYTES` の定数自体を
+  書き換える D1b のみ）。
+- **ゲート・テスト**: `./tools/check.sh` 6/6 PASS。`m241-cli` は **131 + 1（`nmea_stdin`）**、
+  テストの削除・弱体化 0 件。`fw flash` / `log erase` がスタブであることは
+  `the_stub_list_records_how_far_the_wiring_got` が固定している。
+- **残した Should / Could（マージを妨げない）**:
+  - N1: 誤サイズ DA のテストが期待値を `DA_SIZE_BYTES + 1` から作っており、定数自体の書き換えでは通る。
+    リテラル 1 回の assert で塞げる。
+  - N2: `--port` 未指定時に probe 行が出ないことの assert が無い。
+  - N3: `shift_timestamp_seconds` の到達不能分岐（前回 N1 の継続）。
+  - N5: `02-cli.md` の geotag 節に「実カメラ JPEG では未検証」の 1 行が無い。
+- **未検証**: 実機の `device doctor` probe、実カメラ JPEG への `log geotag`、Bluetooth SPP の
+  `nmea proxy`。いずれも `05-verification.md` に記録が無い限り未検証のまま。
+- **記録の補完**: 本節は Stage 3 再レビューの N4（本ラウンドの記録が `10-review-log.md` に無い）を
+  埋めるために、マージ後に追記した。
+
