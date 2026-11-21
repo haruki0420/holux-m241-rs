@@ -82,8 +82,8 @@ pub const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// The drain exists to let sentences already in the UART queue finish. Sending
 /// into a busy line is what the previous Python client avoided, and it is the
-/// sequence that worked on this unit (`python/src/m241/protocol/brom.py`,
-/// `_send_pmtk180`).
+/// sequence measured by v1 (`_send_pmtk180` in that repository's
+/// `m241/protocol/brom.py`).
 pub const DEFAULT_ENTRY_QUIET_BUDGET: Duration = Duration::from_millis(350);
 
 /// How long the client stays quiet after `$PMTK180` before it listens again.
@@ -110,10 +110,12 @@ pub const ENTRY_EVIDENCE_BYTES: usize = 96;
 
 /// The timing of the `$PMTK180` hand-over, in the order it happens.
 ///
-/// The values are the previous Python client's: `_send_pmtk180` in that
-/// repository's `m241/protocol/brom.py`, the only `$PMTK180` route verified on
-/// hardware. Three things differ from it on purpose, and each is a deliberate
-/// difference rather than an accident of the port:
+/// The values are the previous Python client's (`_send_pmtk180` in that
+/// repository's `m241/protocol/brom.py`), **measured by v1** on hardware.
+/// This Rust `$PMTK180` sequence itself is still ⚠️ 未検証 (unverified on
+/// hardware in this Rust implementation; see `docs/dev/05-verification.md`).
+/// Three things differ from v1 on purpose, and each is a deliberate difference
+/// rather than an accident of the port:
 ///
 /// * the client does not re-open or re-set the port's baud before the sequence,
 ///   because `link::open_pmtk` already leaves it at the NMEA baud;
@@ -136,7 +138,10 @@ pub struct EntryTiming {
 }
 
 impl EntryTiming {
-    /// The hardware-verified timings.
+    /// The timings measured by the v1 Python client (`DEFAULT_ENTRY_*`).
+    ///
+    /// The Rust `$PMTK180` sequence using them is still ⚠️ 未検証 (unverified on
+    /// hardware in this Rust implementation; see `docs/dev/05-verification.md`).
     #[must_use]
     pub fn real() -> Self {
         Self {
@@ -466,8 +471,11 @@ impl<T: Transport> PmtkClient<T> {
 
     /// Override the `$PMTK180` hand-over timings.
     ///
-    /// The defaults are the hardware-verified ones; this exists so a test can
-    /// run the same code path without the second of real waiting it needs.
+    /// The defaults are the timings measured by the v1 Python client (the Rust
+    /// `$PMTK180` sequence is still ⚠️ 未検証 — unverified on hardware in this
+    /// Rust implementation; see `docs/dev/05-verification.md`). This exists so
+    /// a test can run the same code path without the second of real waiting it
+    /// needs.
     #[must_use]
     pub fn with_entry_timing(mut self, timing: EntryTiming) -> Self {
         self.entry_timing = timing;
@@ -568,11 +576,13 @@ impl<T: Transport> PmtkClient<T> {
 
     /// Hand the unit over using the stream state a caller's own probe produced.
     ///
-    /// The sequence is the previous Python client's `_send_pmtk180` (see
-    /// [`EntryTiming`] for the three places it deliberately differs), the only
-    /// `$PMTK180` route verified on hardware. Nothing here touches the reset
-    /// lines, and nothing here writes flash: this method stops at the BootROM
-    /// listener, which only answers reads.
+    /// The sequence follows the previous Python client's `_send_pmtk180`
+    /// (measured by v1; see [`EntryTiming`] for the three places it
+    /// deliberately differs), though this Rust `$PMTK180` sequence is still
+    /// ⚠️ 未検証 (unverified on hardware in this Rust implementation; see
+    /// `docs/dev/05-verification.md`). Nothing here touches the reset lines, and
+    /// nothing here writes flash: this method stops at the BootROM listener,
+    /// which only answers reads.
     ///
     /// 1. clear the input, drain the line for [`EntryTiming::quiet_budget`],
     ///    clear again;
@@ -620,7 +630,6 @@ impl<T: Transport> PmtkClient<T> {
         self.transport.clear_input()?;
 
         self.send("PMTK180")?;
-        self.transport.flush()?;
 
         std::thread::sleep(timing.settle);
         let observed = drain_for(&mut self.transport, timing.watch)?;

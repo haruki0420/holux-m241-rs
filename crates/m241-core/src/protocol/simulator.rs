@@ -32,11 +32,11 @@ use std::collections::VecDeque;
 
 use crate::error::{Error, Result};
 use crate::protocol::brom::{
-    BASE_ADDR_FIRMWARE, BOOT_REPLY, BOOT_SYNC, OPCODE_CHECKSUM, OPCODE_JUMP, OPCODE_READ16,
-    OPCODE_READ32,
+    BASE_ADDR_FIRMWARE, BOOT_REPLY, BOOT_SYNC, DEFAULT_BOOTROM_BAUD, OPCODE_CHECKSUM, OPCODE_JUMP,
+    OPCODE_READ16, OPCODE_READ32,
 };
 use crate::protocol::frame::{checksum_xor16, swap_pairs};
-use crate::protocol::pmtk::{checksum, line as pmtk_line};
+use crate::protocol::pmtk::{NMEA_BAUD, checksum, line as pmtk_line};
 use crate::protocol::port::Transport;
 
 /// The firmware base the fake chip maps its flash window at.
@@ -136,7 +136,7 @@ impl FakeDevice {
             // is exactly the condition `$PMTK180` needs.
             streaming: true,
             logging_enabled: true,
-            baud: 115_200,
+            baud: NMEA_BAUD,
             control_lines: false,
             release: release.to_owned(),
             build: build.to_owned(),
@@ -185,6 +185,7 @@ impl FakeDevice {
         self.output.clear();
         self.mode = Mode::BootRom;
         self.bootrom_stage = BootRomStage::Command;
+        self.baud = DEFAULT_BOOTROM_BAUD;
         self
     }
 
@@ -869,11 +870,17 @@ mod tests {
     fn pmtk180_stops_the_stream_and_moves_the_chip_to_the_bootrom() {
         let mut client = client();
         client.transport_mut().queue_nmea(1);
+        assert_eq!(client.transport_mut().baud(), NMEA_BAUD);
+        let mark = client.transport_mut().call_mark();
         client.enter_bootrom().expect("the stream is live");
         let device = client.transport_mut();
         assert_eq!(device.mode(), Mode::BootRom);
         assert!(!device.streaming());
-        assert_eq!(device.baud(), crate::protocol::brom::DEFAULT_BOOTROM_BAUD);
+        assert_eq!(device.baud(), DEFAULT_BOOTROM_BAUD);
+        assert!(
+            device.calls_since(mark).contains(&"baud:115200"),
+            "enter_bootrom must switch the transport to the BootROM baud"
+        );
     }
 
     #[test]
@@ -888,6 +895,14 @@ mod tests {
         // ignored anyway, and sending it blind is the habit that later becomes a
         // pulse at a streaming firmware.
         assert!(client.transport_mut().commands().is_empty());
+        assert_eq!(client.transport_mut().baud(), NMEA_BAUD);
+        assert!(
+            !client
+                .transport_mut()
+                .call_log()
+                .iter()
+                .any(|call| call == "baud:115200")
+        );
     }
 
     #[test]
@@ -1015,10 +1030,17 @@ mod tests {
     fn the_entry_switches_to_the_bootrom_baud_and_sends_one_sentence() {
         let mut client = client();
         client.transport_mut().queue_nmea(1);
+        assert_eq!(client.transport_mut().baud(), NMEA_BAUD);
+        let mark = client.transport_mut().call_mark();
         client.enter_bootrom().expect("the stream is live");
         let device = client.transport_mut();
         assert_eq!(device.pmtk180_count(), 1, "one sentence, sent once");
-        assert_eq!(device.baud(), crate::protocol::brom::DEFAULT_BOOTROM_BAUD);
+        assert_eq!(device.baud(), DEFAULT_BOOTROM_BAUD);
+        assert!(
+            device.calls_since(mark).contains(&"baud:115200"),
+            "enter_bootrom must call set_baud(115200): {:?}",
+            device.calls_since(mark)
+        );
         assert!(!device.control_lines(), "the reset lines stay released");
     }
 
@@ -1064,6 +1086,8 @@ mod tests {
             crate::protocol::StreamState::Streaming,
             "the deaf firmware must look like a live stream (got {probe:?})"
         );
+        assert_eq!(client.transport_mut().device.baud(), NMEA_BAUD);
+        let mark = client.transport_mut().device.call_mark();
         let Err(err) = client.enter_bootrom_after(probe) else {
             panic!(
                 "a firmware that never stopped streaming was accepted as a switch: the \
@@ -1082,8 +1106,16 @@ mod tests {
         );
         assert_eq!(
             client.transport_mut().device.baud(),
-            115_200,
+            NMEA_BAUD,
             "a failure must not pretend the chip switched"
+        );
+        assert!(
+            !client
+                .transport_mut()
+                .device
+                .calls_since(mark)
+                .contains(&"baud:115200"),
+            "a failed switch must not call set_baud(115200)"
         );
     }
 
@@ -1212,6 +1244,15 @@ mod tests {
             .expect_err("the old mode's tail must be seen without a settle");
         let text = format!("{err}");
         assert!(text.contains("kept talking after $PMTK180"), "got {text}");
+        assert_eq!(client.transport_mut().device.baud(), NMEA_BAUD);
+        assert!(
+            !client
+                .transport_mut()
+                .device
+                .call_log()
+                .iter()
+                .any(|call| call == "baud:115200")
+        );
     }
 
     #[test]

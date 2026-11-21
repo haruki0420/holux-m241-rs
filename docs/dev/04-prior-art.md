@@ -77,10 +77,10 @@ tri-state — streaming, silent, cannot tell — and asserting the lines is allo
 only on "definitively silent" (`AGENTS.md` §2.1, `StreamState` and `probe_stream`
 in `crates/m241-core/src/protocol/pmtk.rs`, and the warning on
 `set_control_lines` in `crates/m241-core/src/protocol/port.rs:44`).
-For a live stream it writes `$PMTK180*3B` with the same 350/200/500 ms windows as
-Nekoba's flashing path: the previous Python client's `_send_pmtk180`, which is
-the route measured on this unit — clear, drain, clear, write, flush, quiet,
-listen (`AGENTS.md` §4.6; the sequence itself is documented on
+For a live stream it writes `$PMTK180*3B` (like Nekoba's flashing path), using
+the 350/200/500 ms windows and sequence from the v1 Python client's
+`_send_pmtk180` (`m241/protocol/brom.py`, measured by v1 — clear, drain, clear,
+write, flush, quiet, listen; `AGENTS.md` §4.6 and
 `PmtkClient::enter_bootrom_after`). The Rust client differs from the Python one
 in three details, listed on `EntryTiming`: it does not switch the baud first
 (the port is already at the NMEA baud), the pre-write drain is not a reason to
