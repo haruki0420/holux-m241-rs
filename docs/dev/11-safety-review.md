@@ -83,20 +83,21 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
    が期待値と照合する。DA 側の開始アドレスは 2026-11-21 の実機読み出しで
    **`0x00000000` に確定**した（`docs/dev/05-verification.md` §1.2: DA アドレス
    `0` がベクタ `18 F0 9F E5` とベンダー V1.13 イメージの先頭 64 バイトを返し、
-   DA アドレス `0x00200000` は未実装バスの `02 02 20 42` を返した）。
+   DA アドレス `0x00200000` は未実装バスと整合する `02 02 20 42` を返した）。
    `FLASH_WRITE_START = 0`、`UNRESOLVED_STARTS` は空である。`check_layout` は
    「候補リストが空」「期待開始が確定値 `0`」「開始が期待値と一致」
    「長さが `FLASH_WRITE_LENGTH`」のすべてを満たすときだけ通し、それ以外の
    開始は拒否する。範囲はリセットベクタを含むが、それはイメージ自身の先頭
    バイトであり、`check_image` がバックアップとの差分をパッチ表の外に許さず、
-   `verify_device` が範囲全体の一致を要求するため、消去後は同じバイト列が
-   書き戻される。テストは非公開の `write_range` にテスト専用の開始アドレスを
-   渡してプロトコルだけを検証する（🧪）。
+   CLI は書き込み前に `verify_device` で範囲全体の一致を要求する設計だが、
+   ライブラリの `write` 単体は `verify_device` を呼ばない。テストは非公開の
+   `write_range` にテスト専用の開始アドレスを渡してプロトコルだけを検証する（🧪）。
    `crates/m241-flash/src/da.rs` の
    `the_shipped_start_is_zero_and_the_layout_check_accepts_it`、
    `the_layout_check_refuses_an_unsettled_start`、
    `a_pinned_range_that_disagrees_is_refused_on_its_own` が固定する。
-   実機への書き込み・消去・再起動は引き続き**未検証**である。
+   **このコードによる実機への書き込みはまだ一度も行っていない**ので、
+   書き込み経路そのものは未検証のままである。
 3. **書き込み後に読み戻して照合しているか。** 👁
    書いたバイト列をそのまま信じない。BootROM 経由で同じ範囲を読み、イメージと
    比較する。比較は `m241-core` の読み取り API で行う（書き込みクレートが読み取り
@@ -173,8 +174,9 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
    `check_layout` は候補リストが空で、期待開始が確定値 `0` と一致し、開始が
    その期待値と一致し、長さが `FLASH_WRITE_LENGTH` のときだけ通す。候補
    リストが再び非空になれば、開始が何であれ拒否する。`fw probe-da` は今後も
-   判定を表示するだけで、`da.rs` の定数を書き換えない。**実機への書き込みは
-   まだ一度も行っていない**ので、書き込み経路そのものは未検証のままである。
+   判定を表示するだけで、`da.rs` の定数を書き換えない。**このコードによる
+   実機への書き込みはまだ一度も行っていない**ので、書き込み経路そのものは
+   未検証のままである（2026-11-15 の手動フラッシュは本コードではない）。
 
 ### この経路で担保していないこと（マージ時に「担保済み」と読まない）
 
@@ -242,6 +244,7 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
 | `cargo tree -p m241-flash --edges normal,build,dev` に `m241-core` がある | 正しい向きの依存が消えていない |
 | `crates/m241-core/Cargo.toml` と `crates/m241-gui/Cargo.toml` が `m241-flash` を名指ししない | 解決結果に出ない形の依存（dev 依存など）も塞ぐ |
 | `set_control_lines` が `crates/m241-core/src/protocol/brom.rs` / `crates/m241-core/src/protocol/port.rs` / `crates/m241-core/src/protocol/simulator.rs` 以外に無い | DTR/RTS を触る場所が増えていない（同名別パスのすり抜けも防ぐ） |
+| `crates/m241-flash/src/da.rs` の `pub fn write` 本体が `write_range` より前に `check_layout()?` を含む | 開始アドレスのゲートが書き込み経路から外れていない（コメントや別関数の呼び出しでは通らない） |
 
 すべての検査と `tools/check.sh` への配線は
 `crates/m241-flash/tests/safety_gate.rs` で自動検証している。違反を植えた一時
@@ -255,10 +258,11 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
   ような実行時文字列組み立て、間接参照によるバイト構築、あるいは公開されている
   `Port::open` / `Transport::write_all` / `pmtk::line` / `Frame` を使った意図的な生
   フレーム送信は、正規表現ベースの静的検査では完全に防げない。
-- **書き込み手順そのものの正しさ:** 範囲定数の妥当性、`start = 0` が正しい
-  ことの根拠（`docs/dev/05-verification.md` §1.2）、読み戻し照合の有無、失敗時の
-  リカバリ案内は `tools/check_safety.py` の対象外であり、上の 2 つのレビュー節と
-  テストで担保する。
+- **書き込み手順そのものの正しさ:** 範囲定数の値そのものの妥当性、`start = 0`
+  が正しいことの根拠（`docs/dev/05-verification.md` §1.2）、読み戻し照合の有無、
+  失敗時のリカバリ案内は `tools/check_safety.py` の対象外であり、上の 2 つの
+  レビュー節とテストで担保する。同ファイルの `write` が `check_layout()` を
+  呼ぶこと自体は機械的に検査するが、そのゲートの中身は検査しない。
 
 ## 書き込み可能な実行（`fw flash --yes` / `fw probe-da --yes`）の承認（2026-11-21 変更）
 

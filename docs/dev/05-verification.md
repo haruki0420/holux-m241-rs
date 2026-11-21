@@ -72,10 +72,10 @@ flash write : no
   `18 F0 9F E5`, and the first 64 bytes match the vendor V1.13 image's first 64
   bytes exactly.
 * **`0x00200000` in the DA's view is not firmware.** It reads `02 02 20 42`,
-  the unmapped-bus pattern `42 20 02 02` byte-reversed. This is a different
-  address view from the BootROM's: the BootROM reads the firmware vector at
-  `0x00200000`, while the DA reads it at `0`. The same number means different
-  things in the two views.
+  consistent with the unmapped-bus pattern `42 20 02 02` byte-reversed. This is
+  a different address view from the BootROM's: the BootROM reads the firmware
+  vector at `0x00200000`, while the DA reads it at `0`. The same number means
+  different things in the two views.
 * **No flash was written.** The only writes were the BootROM's `0xA1` frames
   into the DA's RAM at `0x00100800`–`0x0010422F`, and the `0xA8` jump. No
   `0xD3`, `0xD4`, `0xD5` or `0xD9` was sent.
@@ -87,7 +87,8 @@ flash write : no
   the drain fix the read succeeded. **Four bytes remained after the banner**;
   their origin is not established.
 * Only **one page** was read at each address. Multi-page reads, the advance
-  after the final page, and bytes between pages were not exercised.
+  after the final page of a multi-page read, and bytes between pages were not
+  exercised.
 
 ## 2. What was never measured
 
@@ -101,10 +102,10 @@ flash write : no
 | 4 MiB units and GR-245 variants | geometry maths is implemented and unit-tested; no device was available |
 | V1.11 and V1.12 on hardware | no V1.11 image to profile, V1.12 was never flashed |
 | Any timing figure | nothing in this repository is a stopwatch measurement |
-| The DA's `0xD6` read across multiple pages | one page per address was read on 2026-11-21; the advance between pages, the advance after the **last** page, and any bytes the DA sends between pages are unmeasured (`docs/reference/01-da-protocol.md` §5.5, §7 item 4) |
+| The DA's `0xD6` read across multiple pages | one page per address was read on 2026-11-21; the advance between pages, the advance after the **last** page of a multi-page read, and any bytes the DA sends between pages are unmeasured (`docs/reference/01-da-protocol.md` §5.5, §7 item 4) |
 | The four bytes after the DA banner | observed once on 2026-11-21; their origin is not established. The client drains them before `0xD6` |
 | `0xD6`'s page length for arguments other than 64 | only a 64-byte page-length argument was measured (64 data bytes + 2-byte trailer) |
-| `fw probe-da` on stock V1.13 and on a second unit | the 2026-11-21 run read one unit; no stock V1.13 or V1.14 comparison was recorded |
+| `fw probe-da` on stock V1.13 and on a second unit | the 2026-11-21 run read the unit from §1.1, which already carries the WNRO patch (it reports V1.14); its first 64 bytes match the vendor V1.13 image's, but no stock unit and no second unit were probed |
 | The `0xA8` jump frame's count word | the protocol page gives it no meaning; the only client that ran the jump on a unit sent `0`, and this crate does too. Whether the BootROM reads the field at all is not established (`docs/dev/03-hardware-facts.md` "DA jump") |
 
 ## 3. The simulator

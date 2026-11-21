@@ -15,10 +15,10 @@ If you change a constant, change the line, and say what new measurement moved it
 | Reads carry no trailer | — | `0xA2`/`0xAF` return echo + data; consuming a checksum trailer desynchronises every read |
 
 The BootROM and the DA address the same flash differently. `0x00200000` is the
-firmware base **in the BootROM's view**; in the DA's view that address is
-unmapped, and the image begins at `0`. Do not carry an address from one view to
-the other without converting it; the measured DA-view row is under "Download
-Agent".
+firmware base **in the BootROM's view**; in the DA's view that address does not
+return the image, and the image begins at `0`. Do not carry an address from one
+view to the other without converting it; the measured DA-view row is under
+"Download Agent".
 
 ## Download Agent
 
@@ -27,8 +27,8 @@ Agent".
 | Info report | `>BHBLHHHHL`, 20 bytes, starts `0xC0` | DA v3.8.4 answers `C0 03 08 49 …` |
 | DA version | `0x0308` | the report's second field |
 | Flash on the retail unit | 512 KiB, MX29LV400CB | report: total-bytes field `0x80000`, region id `0x49`, mfr `0xC2`, device `0x22BA` |
-| Firmware base, DA view | `0x00000000` | `fw probe-da --assume-brom` on 2026-11-21: a `0xD6` read at DA address `0` returns `18 F0 9F E5`, and its first 64 bytes equal the vendor V1.13 image's first 64. DA address `0x00200000` returns `02 02 20 42` (unmapped bus). `docs/dev/05-verification.md` §1.2 |
-| `0xD6` page, 64-byte argument | 64 data bytes + 2-byte big-endian checksum (66 bytes) | manual read on 2026-11-21: the trailer was `0x17FF`, equal to the sum of the 64 bytes. ⚠️ multi-page reads and the advance after the final page are unmeasured |
+| Firmware base, DA view | `0x00000000` | `fw probe-da --assume-brom` on 2026-11-21: a `0xD6` read at DA address `0` returns `18 F0 9F E5`, and its first 64 bytes equal the vendor V1.13 image's first 64. DA address `0x00200000` returns `02 02 20 42`, consistent with an unmapped bus. `docs/dev/05-verification.md` §1.2 |
+| `0xD6` page, 64-byte argument | 64 data bytes + 2-byte big-endian checksum (66 bytes) | manual read on 2026-11-21: the trailer was `0x17FF`, equal to the sum of the 64 bytes. ⚠️ multi-page reads and the advance after the final page of a multi-page read are unmeasured |
 | `0xD3` reply, accepted | two bytes: `5A 00` | reading one leaves the status byte in the buffer and shifts every later frame |
 | `0xD3` reply, refused | **one** byte: `A5` | the failure path at `0x0010202C` skips both sends of the success path and reaches the shared tail call once; instruction sequence only, ⚠️ 未検証 — no refusal was ever seen on hardware |
 | `0xD3` on refusal | records nothing from the refused command, but **keeps the ranges recorded by earlier ones** | the handler returns before overwriting the range table |

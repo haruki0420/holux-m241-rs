@@ -95,6 +95,11 @@ and an image that is already patched.
 
 Writes an image through the Download Agent. **Destructive.**
 
+Before writing, `fw flash` compares the unit's whole firmware span with
+`--backup` (`DownloadAgent::verify_device`); the library's
+`DownloadAgent::write` does not call that check itself — it compares the image
+with `backup`, not with the unit. `fw flash` is still a stub in this build.
+
 Before writing it checks, and refuses on any failure:
 
 1. the image matches a known profile, **or** every differing byte against
@@ -122,8 +127,8 @@ no typed prompt for this command), `--assume-brom` (the same route
 
 It reads one 64-byte page at each of `0` and `0x00200000` — the DA-side base and
 the BootROM-side base — and **judges only the first four bytes** of each page
-against `18 F0 9F E5`. The other 60 bytes are printed for a person (`first 16:`),
-not judged.
+against `18 F0 9F E5`. The first 16 bytes are printed for a person (`first 16:`);
+the remaining 48 are neither printed nor judged.
 
 For every candidate the report states, as a line a user can paste into
 `docs/dev/05-verification.md`:
@@ -146,11 +151,12 @@ The verdict is one of:
   which is not a tie the tool breaks.
 
 ✅ A run on 2026-11-21 (`/dev/ttyUSB0`, after `--assume-brom`) returned the
-output above: the DA's view has the image at `0`, while `0x00200000` reads the
-unmapped-bus pattern `02 02 20 42`. The same session measured one `0xD6` page as
-64 data bytes + a 2-byte checksum, and observed four bytes after the banner
-before the first page. Multi-page reads and the advance after the final page are
-still unmeasured (`docs/reference/01-da-protocol.md` §5.5, §7 item 4). See
+output above: the DA's view has the image at `0`, while `0x00200000` reads
+`02 02 20 42`, consistent with the unmapped-bus pattern. The same session
+measured one `0xD6` page as 64 data bytes + a 2-byte checksum, and observed four
+bytes after the banner before the first page. Multi-page reads and the advance
+after the final page of a multi-page read are still unmeasured
+(`docs/reference/01-da-protocol.md` §5.5, §7 item 4). See
 `docs/dev/05-verification.md` §1.2 for the full transcript.
 
 `fw probe-da` was how the DA-side base was settled; it remains a **read-only**

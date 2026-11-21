@@ -9,6 +9,9 @@
 //! * each forbidden command, escape form, write-shaped identifier, misplaced
 //!   `set_control_lines` reference, and reversed dependency fails and names
 //!   the violated rule;
+//! * `DownloadAgent::write` without its `check_layout()?` call in the body
+//!   fails, including when the call appears only in a comment or another
+//!   function;
 //! * valid exclusions (comments, trailing inline comments, `erased`, SHA-256
 //!   constants like `0xd5a7_9147`, and `set_control_lines` inside its exact
 //!   allowlisted files) pass;
@@ -78,6 +81,16 @@ edition = \"2024\"
 m241-core = { path = \"../m241-core\" }
 ";
 
+/// The smallest `da.rs` that satisfies the layout-gate check: `write` calls
+/// `check_layout()` before it reaches `write_range`. Not compiled; the gate
+/// reads it as text.
+const CLEAN_DA_RS: &str = "\
+pub fn write(backup: &[u8], image: &[u8]) -> Result<()> {
+    check_layout()?;
+    write_range(backup, image)
+}
+";
+
 /// A temporary workspace holding the real `tools/check_safety.py` plus the
 /// `m241-core`, `m241-flash`, and `m241-gui` layouts a test wants to inspect.
 /// Uses zero external dependencies so `cargo tree` runs offline and fast.
@@ -109,6 +122,7 @@ impl FakeRepo {
         std::fs::create_dir_all(flash.join("src")).unwrap();
         std::fs::write(flash.join("Cargo.toml"), CLEAN_FLASH_TOML).unwrap();
         std::fs::write(flash.join("src").join("lib.rs"), "pub fn write_path() {}\n").unwrap();
+        std::fs::write(flash.join("src").join("da.rs"), CLEAN_DA_RS).unwrap();
 
         let gui = root.join("crates").join("m241-gui");
         std::fs::create_dir_all(gui.join("src")).unwrap();
@@ -132,6 +146,17 @@ impl FakeRepo {
     /// Replace a crate manifest under `crates/<crate_name>/Cargo.toml`.
     fn write_manifest(&self, crate_name: &str, content: &str) {
         let path = self.root.join("crates").join(crate_name).join("Cargo.toml");
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// Replace `crates/m241-flash/src/da.rs`, which the layout-gate check reads.
+    fn write_flash_da(&self, content: &str) {
+        let path = self
+            .root
+            .join("crates")
+            .join("m241-flash")
+            .join("src")
+            .join("da.rs");
         std::fs::write(path, content).unwrap();
     }
 
@@ -326,6 +351,68 @@ fn write_path_identifiers_in_src_and_tests_are_reported() {
         let repo = FakeRepo::new(label, &[(path, snippet)]);
         repo.assert_reports(ident);
     }
+}
+
+#[test]
+fn removing_check_layout_from_the_real_write_body_is_reported() {
+    // The exact regression this gate exists for: the call is deleted from
+    // `DownloadAgent::write` and every unit test still passes, because they
+    // exercise `write_range` directly. The temporary workspace holds the real
+    // file with only that line removed.
+    let real = std::fs::read_to_string(
+        repo_root()
+            .join("crates")
+            .join("m241-flash")
+            .join("src")
+            .join("da.rs"),
+    )
+    .expect("crates/m241-flash/src/da.rs is missing");
+    let without = real.replacen("        check_layout()?;\n", "", 1);
+    assert_ne!(
+        without, real,
+        "the `check_layout()?;` line was not found in the real write body"
+    );
+
+    let repo = FakeRepo::new("da-real-minus-layout", &[]);
+    repo.write_flash_da(&without);
+    repo.assert_reports("does not call `check_layout()?`");
+}
+
+#[test]
+fn a_layout_gate_only_in_a_comment_does_not_count() {
+    let repo = FakeRepo::new("da-layout-comment", &[]);
+    repo.write_flash_da(
+        "pub fn write(backup: &[u8], image: &[u8]) -> Result<()> {\n\
+         // check_layout()?;\n\
+         write_range(backup, image)\n\
+         }\n",
+    );
+    repo.assert_reports("does not call `check_layout()?`");
+}
+
+#[test]
+fn a_layout_gate_only_in_another_function_does_not_count() {
+    let repo = FakeRepo::new("da-layout-other-function", &[]);
+    repo.write_flash_da(
+        "fn prepare() -> Result<()> { check_layout()?; Ok(()) }\n\
+         pub fn write(backup: &[u8], image: &[u8]) -> Result<()> {\n\
+         write_range(backup, image)\n\
+         }\n",
+    );
+    repo.assert_reports("does not call `check_layout()?`");
+}
+
+#[test]
+fn a_layout_gate_after_write_range_is_reported() {
+    let repo = FakeRepo::new("da-layout-after-write", &[]);
+    repo.write_flash_da(
+        "pub fn write(backup: &[u8], image: &[u8]) -> Result<()> {\n\
+         write_range(backup, image)?;\n\
+         check_layout()?;\n\
+         Ok(())\n\
+         }\n",
+    );
+    repo.assert_reports("calls `write_range` before `check_layout()`");
 }
 
 #[test]
