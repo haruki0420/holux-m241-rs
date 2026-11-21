@@ -1362,6 +1362,48 @@ mod tests {
     }
 
     #[test]
+    fn a_photo_taken_near_the_epoch_is_skipped_when_shifted_before_it() {
+        // `shift_capture_time` must refuse a shift that leaves the `u32` range
+        // rather than wrapping. A photo shot at 00:00:40 on 1970-01-01 shifted
+        // back by 100 s is the smallest reachable version of that: the shift is
+        // valid, the shifted time is not.
+        let dir = TempDir::new("shift-below-epoch");
+        let photo = dir.photo("epoch.jpg", &photo_taken_at(40));
+        let options = GeotagOptions {
+            photo_shift_seconds: -100,
+            ..GeotagOptions::default()
+        };
+        let plans = plan(
+            std::slice::from_ref(&photo),
+            &track_at(&[SHUTTER]),
+            &options,
+        )
+        .expect("plan");
+        assert!(
+            !plans[0].will_write(),
+            "a shift below the epoch must not produce a photo tagged at 2106"
+        );
+        assert!(
+            plans[0].capture_time.is_none(),
+            "no shifted time exists to report"
+        );
+        let reason = plans[0].skipped.as_deref().expect("a reason");
+        assert!(
+            reason.contains("-100") && reason.contains("outside"),
+            "the reason must name the shift and the range: {reason}"
+        );
+    }
+
+    #[test]
+    fn the_longest_possible_shift_above_is_still_computed_exactly() {
+        // The other end: a shift that stays in range must not be clamped or
+        // wrapped on the way through `i64`.
+        let shifted = shift_capture_time(CaptureTime::Exif(SHUTTER), 86_400)
+            .expect("a day forward is representable");
+        assert_eq!(shifted, CaptureTime::Exif(SHUTTER + 86_400));
+    }
+
+    #[test]
     fn a_shift_is_refused_when_it_leaves_the_representable_range() {
         // Mutation guard for `shift_capture_time`'s failure path: a shift below
         // the epoch must be reported, not wrapped into 2106.
