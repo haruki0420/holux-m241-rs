@@ -734,9 +734,11 @@ impl Transport for QuietTransport {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
     use crate::protocol::brom::MtkBootRom;
-    use crate::protocol::pmtk::{EntryTiming, PmtkClient};
+    use crate::protocol::pmtk::{DEFAULT_ENTRY_SETTLE, EntryTiming, PmtkClient};
 
     fn client() -> PmtkClient<FakeDevice> {
         PmtkClient::new(FakeDevice::new())
@@ -1047,10 +1049,11 @@ mod tests {
     }
 
     #[test]
-    fn a_firmware_that_ignores_the_sentence_is_reported_with_what_it_said() {
+    fn a_firmware_that_ignores_the_sentence_is_reported_with_the_streams_own_words() {
         // The unit that produced this bug: NMEA keeps flowing, and the error has
         // to say so in the log's own words rather than "the sentence was not
-        // honoured" alone.
+        // honoured" alone. `DeafFirmware` never switches, so every read after the
+        // write returns stream.
         let device = DeafFirmware::new(FakeDevice::new());
         let mut client = PmtkClient::new(device)
             .with_stream_window(std::time::Duration::from_millis(300))
@@ -1061,28 +1064,10 @@ mod tests {
             crate::protocol::StreamState::Streaming,
             "the deaf firmware must look like a live stream (got {probe:?})"
         );
-        let mut direct = DeafFirmware::new(FakeDevice::new());
-        let mut buf = [0u8; 64];
-        let n = direct.read(&mut buf).expect("read");
-        assert!(n > 0, "the drain itself sees nothing");
-        let mut d2 = DeafFirmware::new(FakeDevice::new());
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
-        let mut total = 0usize;
-        while std::time::Instant::now() < deadline {
-            let n = d2.read(&mut buf).expect("read");
-            total += n;
-            if total > 64 {
-                break;
-            }
-        }
-        assert!(total > 0, "the drain loop reads nothing");
         let Err(err) = client.enter_bootrom_after(probe) else {
-            let t = EntryTiming::fast();
-            let log = client.transport_mut().device.call_log.len();
-            let pending = client.transport_mut().pending;
             panic!(
-                "success at a firmware that never stopped; quiet={:?} settle={:?} watch={:?} reads={log} pending={pending}",
-                t.quiet_budget, t.settle, t.watch
+                "a firmware that never stopped streaming was accepted as a switch: the \
+                 post-write watch saw nothing, so it did not run or returned early"
             )
         };
         let text = format!("{err}");
@@ -1100,6 +1085,144 @@ mod tests {
             115_200,
             "a failure must not pretend the chip switched"
         );
+    }
+
+    /// A firmware that honours `$PMTK180` only after it has finished re-entering
+    /// its BootROM listener, which [`EntryTiming::settle`] is there to wait out.
+    ///
+    /// The old mode's last sentence is emitted once, [`Self::EMIT_AT`] after the
+    /// write — the next line of a 1 Hz stream. What happens to it depends on when
+    /// the host looks, and the fake models that rather than a queue: a read that
+    /// starts while the sentence is still in the UART (`emit .. emit +
+    /// TAIL_WINDOW`) gets it, and a read that starts later gets nothing, because
+    /// the hardware only held it for the 1 Hz slot. A 10 ms settle outlasts
+    /// neither; a client that listens at once catches it.
+    #[derive(Debug)]
+    struct SlowSwitchingFirmware {
+        device: FakeDevice,
+        /// When `$PMTK180` was written, if it has been.
+        written: Option<Instant>,
+        /// Whether the sentence has been handed over already.
+        emitted: bool,
+    }
+
+    impl SlowSwitchingFirmware {
+        fn new() -> Self {
+            let mut device = FakeDevice::new();
+            device.queue_nmea(1);
+            Self {
+                device,
+                written: None,
+                emitted: false,
+            }
+        }
+
+        /// When the old mode's next sentence arrives after the write. Outside
+        /// `EntryTiming::fast().settle` (10 ms) so a settle covers it, inside
+        /// `EntryTiming::fast().watch` (100 ms) so a client with no settle sees
+        /// it.
+        const EMIT_AT: Duration = Duration::from_millis(25);
+
+        /// How long the emitted sentence stays readable, i.e. the tail of the
+        /// old mode. Short enough to be over before a settled client's watch
+        /// begins, long enough that a read starting at zero settle catches it.
+        const TAIL_WINDOW: Duration = Duration::from_millis(15);
+    }
+
+    impl Transport for SlowSwitchingFirmware {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+            if let Some(written) = self.written {
+                let elapsed = written.elapsed();
+                let readable = elapsed >= Self::EMIT_AT
+                    && elapsed < Self::EMIT_AT.saturating_add(Self::TAIL_WINDOW);
+                if readable && !self.emitted {
+                    self.emitted = true;
+                    self.device.queue_nmea(1);
+                }
+            }
+            self.device.read(buf)
+        }
+
+        fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+            self.device.write_all(buf)?;
+            if buf.ends_with(b"\n") && self.written.is_none() {
+                self.written = Some(Instant::now());
+            }
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<()> {
+            self.device.flush()
+        }
+
+        fn clear_input(&mut self) -> Result<()> {
+            self.device.clear_input()
+        }
+
+        fn set_baud(&mut self, baud: u32) -> Result<()> {
+            self.device.set_baud(baud)
+        }
+
+        fn set_control_lines(&mut self, asserted: bool) -> Result<()> {
+            self.device.set_control_lines(asserted)
+        }
+    }
+
+    #[test]
+    fn the_settle_window_is_what_keeps_the_old_modes_tail_out_of_the_verdict() {
+        // The hardware fact behind `DEFAULT_ENTRY_SETTLE` (AGENTS.md §4.6): the
+        // firmware needs a moment to stop streaming, so a client that listens at
+        // once reads the old mode's tail and calls a good switch a failure. The
+        // fake emits that tail `SlowSwitchingFirmware::EMIT_AT` after the write;
+        // a settle longer than that must swallow it. Removing the settle has to
+        // fail here, and only here: the ordinary entry tests use a fake that goes
+        // silent on the sentence.
+        let mut client = PmtkClient::new(SlowSwitchingFirmware::new())
+            .with_stream_window(Duration::from_millis(300))
+            .with_entry_timing(EntryTiming {
+                settle: SlowSwitchingFirmware::EMIT_AT.saturating_mul(2),
+                ..EntryTiming::fast()
+            });
+        let probe = client.probe_stream().expect("probe");
+        assert_eq!(probe, crate::protocol::StreamState::Streaming);
+        client
+            .enter_bootrom_after(probe)
+            .expect("the settle outlasts the old mode's tail");
+        assert_eq!(
+            client.transport_mut().device.baud(),
+            crate::protocol::brom::DEFAULT_BOOTROM_BAUD
+        );
+    }
+
+    #[test]
+    fn a_settle_of_zero_reads_the_old_modes_tail_and_refuses_the_switch() {
+        // The other half of the test above: with no settle the watch begins at
+        // the write and reads the tail, and "any byte means it did not switch"
+        // turns that into a refusal. This is the failure a user of the earlier
+        // sequence saw, so it must stay reproducible. `quiet_budget` and `watch`
+        // stay at `fast()` so this one case does not sleep on the real windows.
+        let mut client = PmtkClient::new(SlowSwitchingFirmware::new())
+            .with_stream_window(Duration::from_millis(300))
+            .with_entry_timing(EntryTiming {
+                settle: Duration::ZERO,
+                ..EntryTiming::fast()
+            });
+        let probe = client.probe_stream().expect("probe");
+        let err = client
+            .enter_bootrom_after(probe)
+            .expect_err("the old mode's tail must be seen without a settle");
+        let text = format!("{err}");
+        assert!(text.contains("kept talking after $PMTK180"), "got {text}");
+    }
+
+    #[test]
+    fn the_steady_timings_never_settle_to_zero() {
+        // `fast()` is the timing every unit test uses, so a zero settle there
+        // would silently remove the wait from every one of them: the positive
+        // test above sets its own settle and would still pass. Pin it directly.
+        assert!(EntryTiming::fast().settle > Duration::ZERO);
+        assert!(EntryTiming::real().settle > Duration::ZERO);
+        assert!(EntryTiming::fast().settle <= SlowSwitchingFirmware::EMIT_AT);
+        assert_eq!(EntryTiming::real().settle, DEFAULT_ENTRY_SETTLE);
     }
 
     #[test]

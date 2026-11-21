@@ -2052,6 +2052,17 @@ mod tests {
             record.nmea_after, 0,
             "the fake switches on the sentence, so nothing may stream after it"
         );
+        // One probe, not two. The fake gives each `clear_input`-delimited segment
+        // one sentence and no segment more than one, and `probe_stream` returns
+        // on the first sentence it sees. So a second probe — what
+        // `enter_bootrom()` does internally where `enter_bootrom_after(state)`
+        // does not — finds its segment already spent and the command refuses
+        // instead of getting this far.
+        assert_eq!(
+            record.nmea_before, 1,
+            "one sentence, one probe: {} before $PMTK180",
+            record.nmea_before
+        );
 
         // Both candidates were read, in order, at the page size the probe asks
         // for — dropping the second one must fail here.

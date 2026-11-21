@@ -102,17 +102,29 @@ pub const DEFAULT_ENTRY_WATCH: Duration = Duration::from_millis(500);
 
 /// How much of the observed traffic an error message quotes.
 ///
-/// Enough to tell a `$GPGGA` (the stream is still live) from an echo or an
-/// `$PMTK001` acknowledgement (the sentence was parsed but not acted on) without
-/// pasting a kilobyte of NMEA into a terminal.
+/// One NMEA sentence is at most 82 bytes by the standard, and the `$GPGGA` this
+/// unit emits is 88; 96 holds one whole sentence plus the `$` of the next, which
+/// is what tells a live stream from a single acknowledgement. The cap also keeps
+/// a kilobyte of NMEA out of a terminal.
 pub const ENTRY_EVIDENCE_BYTES: usize = 96;
 
 /// The timing of the `$PMTK180` hand-over, in the order it happens.
 ///
-/// The defaults reproduce the sequence the previous Python client used on this
-/// unit (`python/src/m241/protocol/brom.py:228-277`, `_send_pmtk180`), which is
-/// the only `$PMTK180` route verified on hardware. Tests shrink it so they do
-/// not spend a second per case.
+/// The values are the previous Python client's: `_send_pmtk180` in that
+/// repository's `m241/protocol/brom.py`, the only `$PMTK180` route verified on
+/// hardware. Three things differ from it on purpose, and each is a deliberate
+/// difference rather than an accident of the port:
+///
+/// * the client does not re-open or re-set the port's baud before the sequence,
+///   because `link::open_pmtk` already leaves it at the NMEA baud;
+/// * what the pre-write drain hears is **not** a reason to refuse. The Python
+///   client raised when the drain was empty; here the caller's `probe_stream`
+///   is the verdict, so a quiet pre-write drain continues (see
+///   [`PmtkClient::enter_bootrom_after`]);
+/// * a failure does not put the baud back, because the sequence never changes
+///   it before the failure can happen.
+///
+/// Tests shrink it so they do not spend a second per case.
 #[derive(Debug, Clone, Copy)]
 pub struct EntryTiming {
     /// How long the line is drained before the sentence is written.
@@ -140,6 +152,12 @@ impl EntryTiming {
     /// a window shorter than the time a debug-build loop needs to pull one line
     /// off a fake turns "the stream is live" into "the stream is silent". The
     /// values here are the smallest that consistently distinguish the two.
+    ///
+    /// `settle` is the one that cannot be observed against the simulator's
+    /// switching fake, which silences the line the moment it parses the sentence;
+    /// `settle = 0` is caught by tests that need a fake still talking after the
+    /// write (see `simulator::tests::the_settle_window_is_what_keeps_the_old_modes_tail_out_of_the_verdict`),
+    /// not by the ordinary entry tests.
     #[must_use]
     pub fn fast() -> Self {
         Self {
@@ -521,16 +539,20 @@ impl<T: Transport> PmtkClient<T> {
 
     /// Hand the unit over to the BootROM with `$PMTK180*3B`.
     ///
-    /// The sentence is honoured only while NMEA is still streaming (measured), so
-    /// the stream is probed first and the refusal names that condition instead of
-    /// leaving a bare sync timeout. This never touches the reset lines: pulsing
-    /// them at a running firmware leaves the unit unresponsive until the battery
-    /// is removed.
+    /// This is the probe-plus-hand-over spelling: the stream is probed once
+    /// here, then [`Self::enter_bootrom_after`] runs the sequence. It is kept
+    /// for callers whose probe is not otherwise available (the integration
+    /// tests); a caller that has already probed should pass that answer to
+    /// `enter_bootrom_after` instead.
     ///
-    /// The probe is taken here and handed to [`Self::enter_bootrom_after`]. A
-    /// caller that has already probed should use that method instead: probing
-    /// twice reads the stream twice, and the second read starts from a line the
-    /// first one left half-consumed.
+    /// The sentence is honoured only while NMEA is still streaming (measured), so
+    /// the refusal names that condition instead of leaving a bare sync timeout.
+    /// This never touches the reset lines: pulsing them at a running firmware
+    /// leaves the unit unresponsive until the battery is removed.
+    ///
+    /// Probing twice is what the split avoids: a second probe reads the stream
+    /// again, and the second read starts from a line the first one left
+    /// half-consumed.
     ///
     /// On success the transport is left at [`DEFAULT_BOOTROM_BAUD`], where the
     /// four-byte BootROM sync will be answered.
@@ -546,20 +568,26 @@ impl<T: Transport> PmtkClient<T> {
 
     /// Hand the unit over using the stream state a caller's own probe produced.
     ///
-    /// The sequence is the previous Python client's `_send_pmtk180`, which is
-    /// the only `$PMTK180` route verified on this unit:
+    /// The sequence is the previous Python client's `_send_pmtk180` (see
+    /// [`EntryTiming`] for the three places it deliberately differs), the only
+    /// `$PMTK180` route verified on hardware. Nothing here touches the reset
+    /// lines, and nothing here writes flash: this method stops at the BootROM
+    /// listener, which only answers reads.
     ///
-    /// 1. clear the input, then drain the line for
-    ///    [`EntryTiming::quiet_budget`] so sentences already queued are not
-    ///    mistaken for an answer to a sentence not yet sent;
-    /// 2. clear the input again, write `$PMTK180*3B` and flush;
+    /// 1. clear the input, drain the line for [`EntryTiming::quiet_budget`],
+    ///    clear again;
+    /// 2. write `$PMTK180*3B` and flush;
     /// 3. stay silent for [`EntryTiming::settle`];
     /// 4. listen for [`EntryTiming::watch`]: **any** byte means the firmware did
     ///    not switch, and the error quotes what arrived so "NMEA still streaming"
     ///    can be told from "an acknowledgement, but no switch".
     ///
-    /// Draining *before* the write is the part the earlier Rust version lacked,
-    /// and it is what the unit rejected. Nothing here asserts DTR or RTS.
+    /// The drain in step 1 is there for the **line**, not for a verdict: it
+    /// reads off whatever is still in flight before a sentence is written into
+    /// it, and what it read is then discarded by the second clear. It is not a
+    /// check that the stream is live — `state`, from the caller's probe, already
+    /// decided that. Draining *before* the write is the part the earlier Rust
+    /// version lacked, and it is what the unit rejected.
     ///
     /// # Errors
     ///
@@ -584,7 +612,11 @@ impl<T: Transport> PmtkClient<T> {
 
         let timing = self.entry_timing;
         self.transport.clear_input()?;
-        let _ = drain_for(&mut self.transport, timing.quiet_budget)?;
+        // What is read here is discarded on purpose: the next `clear_input` drops
+        // it, and a quiet drain is not a reason to refuse. Only the timing of
+        // this read matters. The verdict comes from `state` above and from the
+        // watch below.
+        let _observed = drain_for(&mut self.transport, timing.quiet_budget)?;
         self.transport.clear_input()?;
 
         self.send("PMTK180")?;
@@ -595,7 +627,9 @@ impl<T: Transport> PmtkClient<T> {
         if !observed.bytes.is_empty() {
             return Err(Error::State(format!(
                 "the logger kept talking after $PMTK180 ({} bytes within {} ms): {}{}; the \
-                 sentence was not honoured",
+                 sentence was not honoured — a quoted $GP… or $GN… line means the stream never \
+                 stopped, a quoted $PMTK001 means the firmware answered but did not switch, \
+                 and hex means the line carried something that is not a sentence",
                 observed.bytes.len(),
                 timing.watch.as_millis(),
                 observed.evidence(),
@@ -907,6 +941,23 @@ impl Observed {
 /// re-arming deadline cannot expire while a stream is flowing, and this is
 /// called precisely when NMEA may still be streaming (the previous Python
 /// client learned that the hard way; see its `_drain_for`).
+///
+/// This is not a third copy of [`read_line`] by accident. `read_line` returns
+/// once a sentence ends, which is wrong here: "nothing arrived" can only be
+/// said after the **whole** window, so a drain that stopped at the first `\n`
+/// would miss the tail of a stream it was supposed to see.
+///
+/// Two differences from the Python `_drain_for`, both deliberate:
+///
+/// * it does not shorten the port's read timeout to `min(0.05, window)`. The
+///   port's timeout is fixed at open (`protocol::port`), so one `read` may
+///   block for that long and the effective window can run past `window`. With
+///   a 1 Hz stream and windows of 350/500 ms that still separates a live
+///   stream from a silent line, and it was preferred to changing the port
+///   settings mid-sequence.
+/// * a read that returns zero immediately does not sleep between polls. On the
+///   real port `read` already waited out its timeout; the busy loop only
+///   appears against a fake transport, where it lasts for the window.
 fn drain_for<T: Transport>(transport: &mut T, window: Duration) -> Result<Observed> {
     let deadline = Instant::now() + window;
     let mut observed = Observed::default();
