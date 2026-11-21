@@ -333,6 +333,12 @@ impl DeviceHandle {
         self
     }
 
+    /// Make the fake firmware answer `$PMTK182,6` with `reply`, or stay silent
+    /// when `reply` is `None`.
+    pub fn set_erase_reply(&self, reply: Option<&str>) {
+        *self.erase_reply.borrow_mut() = reply.map(|reply| pmtk::line(reply).into_bytes());
+    }
+
     /// Run `hook` when the erase sentence reaches the fake firmware.
     pub fn on_erase(&self, hook: impl Fn() + 'static) {
         *self.erase_hook.borrow_mut() = Some(Box::new(hook));

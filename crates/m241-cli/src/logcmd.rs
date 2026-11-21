@@ -1368,16 +1368,90 @@ mod tests {
             fileio::read(&output).expect("the backup is still written"),
             synthetic_dump(3)
         );
+        // The fake device records a bare body when the checksum is right, so a
+        // malformed sentence is not hidden behind the prefix check.
         assert!(
-            !handle
-                .commands()
-                .iter()
-                .any(|command| command.starts_with("PMTK182,6")),
+            !handle.commands().iter().any(
+                |command| command.starts_with("PMTK182,6") || command.starts_with("$PMTK182,6")
+            ),
             "no erase may be sent without --yes: {:?}",
             handle.commands()
         );
         assert!(format!("{err}").contains("--yes"), "got {err}");
         assert!(handle.logging_enabled());
+    }
+
+    #[test]
+    fn erase_sends_the_checksummed_sentence_and_leaves_logging_on() {
+        // The device-level test in `m241-flash` proves the bytes `LogEraser`
+        // writes; this one proves they survive the CLI's own transport, which
+        // is where a wrong checksum would be dropped by the fake firmware.
+        let scratch = Scratch::new("erase-sentence");
+        let (handle, _, output) = erase_fixture(&scratch, "PMTK001,182,6,3");
+        let links = FakePorts::shared(handle.clone());
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        erase(&erase_options(&output), fast(&links, &console, &confirm)).expect("erase");
+
+        let commands = handle.commands();
+        assert!(
+            commands.iter().any(|command| command == "PMTK182,6,1"),
+            "the erase must be recognised as the checksummed $PMTK182,6,1*3E: {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("$PMTK182,6") || command.contains("*3E")),
+            "a raw sentence in the recorded body means the line was not parsed and framed, so \
+             the checksum was not checked: {commands:?}"
+        );
+        assert!(
+            handle.logging_enabled(),
+            "logging must be on again once the erase finished"
+        );
+    }
+
+    #[test]
+    fn a_timed_out_erase_still_resumes_logging() {
+        // The erase itself fails; the resume that follows it must still run, or
+        // the unit is left silently not recording.
+        let scratch = Scratch::new("erase-timeout-resume");
+        let (handle, _, output) = erase_fixture(&scratch, "PMTK001,182,6,3");
+        handle.set_erase_reply(None);
+        let links = FakePorts::shared(handle.clone());
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        let mut options = erase_options(&output);
+        let timings = Timings {
+            reply: std::time::Duration::from_millis(50),
+            stream: std::time::Duration::from_millis(1),
+            entry: m241_core::protocol::pmtk::EntryTiming::fast(),
+            erase: std::time::Duration::from_millis(20),
+        };
+
+        let err = erase(
+            &options,
+            Session::new(&links, &console, &confirm).with_timings(timings),
+        )
+        .expect_err("a silent erase must time out");
+
+        assert!(matches!(err, Error::Timeout { .. }), "got {err}");
+        let commands = handle.commands();
+        assert!(
+            commands.iter().any(|command| command == "PMTK182,4"),
+            "the resume must be sent after a failed erase: {commands:?}"
+        );
+        assert!(
+            handle.logging_enabled(),
+            "logging must be on again after a timed-out erase"
+        );
+        options.json = true;
+        assert!(
+            console.stdout().is_empty(),
+            "a failed erase must not print a success object: {}",
+            console.stdout()
+        );
     }
 
     #[test]
