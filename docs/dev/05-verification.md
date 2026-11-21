@@ -30,13 +30,19 @@ figure on this page.
 ## 1a. The Linux log-erase hardware session (2026-11-21)
 
 Device: retail Holux M-241 (MT3318) over USB serial (CP210x bridge).
-Host: Linux (`m241` built from `feat/log-erase-wire`).
+Host: Linux, `m241` built from commit `bf41c2e` (not the branch's final head).
+
+The rows below were measured with that binary only. The branch has gained
+changes since: the empty-log refusal (`ea53d1a`) and the lost-stop-ACK resume
+with its tests. **Those changes have not been run on hardware**, so nothing on
+this page makes the final head verified.
 
 | Step | Command / detail | Result | Status |
 |---|---|---|---|
 | Bare `$PMTK182,6` (negative result) | `m241 log erase --port <port> --output <backup> --yes` before fix | backup saved (`225,028` bytes), failed on trailing `$PMTK001,182,4,3*23`; follow-up `m241 log download` showed `225,060` bytes / `7,846` records (log untouched) | ✅ (negative) |
 | Log download & erase (`$PMTK182,5` → `$PMTK182,6,1*3E` → `$PMTK182,4`) | `m241 log erase --port <port> --output <backup> --yes` | backup saved (`225,092` bytes), `erased: yes`, exit `0` | ✅ |
 | Post-erase verification | `m241 log download --port <port> --output <check> --force` | `528` bytes (`0x210`), `records: 0`, `fixes: 0`, exit `0` | ✅ |
+| Final-head re-run (empty-log refusal, lost-stop-ACK resume) | not run: the binary above predates both changes | — | ⚠️ |
 
 ## 2. What was never measured
 

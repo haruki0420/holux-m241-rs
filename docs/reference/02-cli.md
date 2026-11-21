@@ -176,14 +176,19 @@ The field is absent when nothing was shifted.
 
 Erases the track log. **Destructive.**
 
-The log is downloaded first, exactly as `log download` does, and written to
-`-o/--output <FILE>` before any erase is considered. If the device reports an
-empty log (`0` bytes), nothing is written or erased and the command stops with
-exit code 5. If the backup write fails, the device is not touched. The erase
-client in `m241-flash` accepts only a `BackupProof` made from the saved bytes,
-and refuses an empty one, so there is no path from this command to `$PMTK182,6,1`
-without a copy on disk. Logging is paused (`$PMTK182,5`) immediately before
-`$PMTK182,6,1` and resumed (`$PMTK182,4`) afterwards even if the erase fails.
+The log is downloaded first, through the same `$PMTK182` transfer `log download`
+uses, and the raw bytes are written to `-o/--output <FILE>` before any erase is
+considered. Unlike `log download`, the erase command does not parse the dump: it
+saves the bytes as the device sent them, because that raw copy is the recovery
+route and a parser's opinion must not stand between the user and it. If the
+device reports an empty log (`0` bytes), nothing is written or erased and the
+command stops with exit code 5. If the backup write fails, the device is not
+touched. The erase client in `m241-flash` accepts only a `BackupProof` made from
+the saved bytes, and refuses an empty one, so there is no path from this command
+to `$PMTK182,6,1` without a copy on disk. Logging is paused (`$PMTK182,5`)
+immediately before `$PMTK182,6,1` and resumed (`$PMTK182,4`) afterwards even if
+the erase fails or the stop's acknowledgement is lost. When the stop cannot be
+confirmed, no erase is sent at all.
 
 Without `--yes` the download still runs and the backup is saved; the command then
 stops with exit code 5 and says where the copy is. Re-run with `--yes` to erase

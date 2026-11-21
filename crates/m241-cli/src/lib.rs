@@ -21,9 +21,11 @@
 //! One verb is deliberately not wired: `fw flash`, which changes the firmware
 //! image on the device. It parses, so the help is complete, and it fails with a
 //! message naming itself and pointing at `m241 --help`. `log erase` is wired
-//! because `m241-flash`'s [`BackupProof`](m241_flash::erase::BackupProof) makes
-//! the copy-before-erase rule a type-level precondition rather than a promise in
-//! prose.
+//! because `m241-flash`'s [`BackupProof`](m241_flash::erase::BackupProof) can
+//! only be built by handing over the dump that was taken first. That check is
+//! deliberately weak — it compares lengths, not contents — but it makes "erase
+//! without a copy" a line of code a reviewer sees rather than an argument
+//! nobody reads.
 //!
 //! Machine output goes to stdout; progress and warnings go to stderr. Exit codes
 //! are documented in `docs/reference/02-cli.md` and map one-to-one onto
