@@ -615,6 +615,15 @@ pub mod fake_da {
         pub reads: Vec<(u32, u32, u32)>,
         /// Whether `$PMTK180` arrived while the firmware streamed.
         pub pmtk180: bool,
+        /// How many NMEA lines the fake put on the wire before `$PMTK180` and
+        /// after it.
+        ///
+        /// A second `probe_stream` — what `enter_bootrom` does when the caller
+        /// did not pass its state — pulls considerably more before the sentence
+        /// and is what the real unit rejected.
+        pub nmea_before: usize,
+        /// Lines emitted after `$PMTK180`; on a successful switch this stays 0.
+        pub nmea_after: usize,
         /// Whether any reset line was asserted (`set_control_lines(true)`).
         pub control_lines_asserted: bool,
     }
@@ -706,6 +715,9 @@ pub mod fake_da {
         sync: usize,
         /// The `0xD6` range being served, when one is running.
         pages: Option<Pages>,
+        /// Whether the current segment (since the last `clear_input`) has
+        /// already been given its one NMEA sentence.
+        served: bool,
     }
 
     /// A `0xD6` range being served one page at a time.
@@ -728,6 +740,7 @@ pub mod fake_da {
                 echo: true,
                 sync: 0,
                 pages: None,
+                served: false,
             };
             if transport.mode() == Mode::Firmware {
                 transport.queue(NMEA_LINE);
@@ -745,12 +758,13 @@ pub mod fake_da {
 
         fn consume(&mut self, byte: u8) {
             // A running firmware never runs dry: it emits a sentence a second,
-            // and a probe that eavesdrops for a window must see one. Re-queueing
-            // after every byte is what makes `probe_stream` find a `$` instead
-            // of looping until its deadline and reporting silence.
+            // and a probe that eavesdrops for a window must see one. The
+            // sentence is queued by `read` when it finds the buffer empty, not
+            // here: queueing on every byte would leave whole sentences in the
+            // buffer at the moment `$PMTK180` switches the chip, and the entry's
+            // observation window would read them as a live stream.
             if self.mode() == Mode::Firmware {
                 self.consume_firmware(byte);
-                self.queue(NMEA_LINE);
                 return;
             }
             match self.mode() {
@@ -971,10 +985,35 @@ pub mod fake_da {
             let mut count = 0usize;
             while count < buf.len() {
                 if self.output.is_empty() && self.mode() == Mode::Firmware {
-                    // A live unit never stops talking: a read that finds the
-                    // buffer empty is answered with the next sentence, the same
-                    // way the stream arrives once a second on the wire.
-                    self.queue(NMEA_LINE);
+                    // A running firmware emits a sentence about once a second,
+                    // and a probe that eavesdrops for a window must see one. It
+                    // is queued here, when a read finds the buffer empty, so the
+                    // buffer holds no leftovers at the moment `$PMTK180` switches
+                    // the chip.
+                    //
+                    // Before the sentence, each `clear_input` starts a new
+                    // segment and each segment gets exactly one sentence: the
+                    // probe reads the one after the port is opened, the drain
+                    // reads the one after the first clear. A second probe is not
+                    // preceded by a clear, so it finds its segment already spent,
+                    // sees silence, and the caller refuses. That is the failure
+                    // the split entry avoids, and it is what makes a double probe
+                    // visible in a test.
+                    let mut refill = false;
+                    {
+                        let mut record = self.record.borrow_mut();
+                        if record.pmtk180 {
+                            record.nmea_after += 1;
+                            refill = true;
+                        } else if !self.served {
+                            self.served = true;
+                            record.nmea_before += 1;
+                            refill = true;
+                        }
+                    }
+                    if refill {
+                        self.queue(NMEA_LINE);
+                    }
                 }
                 let Some(byte) = self.output.pop_front() else {
                     break;
@@ -984,7 +1023,6 @@ pub mod fake_da {
             }
             Ok(count)
         }
-
         fn write_all(&mut self, buf: &[u8]) -> Result<()> {
             for byte in buf {
                 self.consume(*byte);
@@ -998,6 +1036,14 @@ pub mod fake_da {
 
         fn clear_input(&mut self) -> Result<()> {
             self.output.clear();
+            // A new segment: the drain that follows gets one sentence of its
+            // own, so a quiet line during the drain is not mistaken for a dead
+            // firmware.
+            self.served = false;
+            // A half-assembled line belongs to the traffic being dropped: keeping
+            // it would prefix the next sentence with stale bytes, and a
+            // `$PMTK180` that arrived as `...$PMTK180` would not be recognised.
+            self.line.clear();
             Ok(())
         }
 
@@ -1048,6 +1094,41 @@ pub mod fake_da {
             let mut transport = FakeDaTransport::new(&self.chip);
             transport.set_baud(baud)?;
             Ok(Opened::new(Box::new(transport)))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The fake assembles a line from wire bytes, so a `clear_input` that
+        /// kept what was assembled would carry a fragment into the next
+        /// sentence.
+        ///
+        /// The failure is a `$PMTK180` that arrives as `...$PMTK180` on the
+        /// wire: the firmware branch ignores bytes before a `$`, but only when
+        /// nothing is assembled, so the fragment sticks to the front of the
+        /// sentence and it is not recognised. Real hardware drops received bytes
+        /// on `reset_input_buffer`, and a fake that kept them would be stricter
+        /// than the unit in a way nothing else in the suite would notice.
+        #[test]
+        fn clear_input_drops_a_half_assembled_line() {
+            let chip = FakeChip::new(Mode::Firmware, vec![0u8; 16]);
+            let mut transport = FakeDaTransport::new(&chip);
+
+            // A partial line left over from before the hand-over.
+            for byte in b"$GPRMC,0000" {
+                transport.consume(*byte);
+            }
+            transport.clear_input().expect("clear");
+
+            for byte in b"$PMTK180*3B\r\n" {
+                transport.consume(*byte);
+            }
+            assert!(
+                chip.record().borrow().pmtk180,
+                "the stale fragment hid the sentence"
+            );
         }
     }
 }
