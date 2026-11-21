@@ -12,14 +12,16 @@
 use crate::screens::connect::ConnectScreen;
 use crate::screens::firmware::FirmwareScreen;
 use crate::screens::log::LogScreen;
+use crate::screens::settings::AppSettings;
 use crate::screens::{self, Screen};
 use crate::theme::{self, size, space};
 use crate::widgets::rail;
 
-/// Application state: the selected screen and the three screens' own state.
+/// Application state: the selected screen, preferences, and the screens' own state.
 #[derive(Debug, Default)]
 pub struct App {
     current: Screen,
+    settings: AppSettings,
     connect: ConnectScreen,
     log: LogScreen,
     firmware: FirmwareScreen,
@@ -33,9 +35,21 @@ impl App {
     }
 
     /// Select a screen. Tests use this; the rail uses the return of
-    /// [`crate::widgets::rail::rail`].
+    /// [`crate::widgets::rail::rail_with_transition`].
     pub fn select(&mut self, screen: Screen) {
         self.current = screen;
+    }
+
+    /// Application display and motion preferences.
+    #[must_use]
+    pub fn settings(&self) -> &AppSettings {
+        &self.settings
+    }
+
+    /// Mutable access to application display and motion preferences.
+    #[must_use]
+    pub fn settings_mut(&mut self) -> &mut AppSettings {
+        &mut self.settings
     }
 
     /// The Connect screen's state, for a caller that has just read a device.
@@ -90,12 +104,13 @@ impl App {
         // because the staircase is not a widget egui has. The width is pinned
         // rather than content-sized: otherwise the current screen's deepest tab
         // decides the rail width, and the heading shifts sideways when you navigate.
+        let transition_secs = rail::rail_transition_secs_for(self);
         egui::Panel::left("rail")
             .exact_size(rail::WIDTH)
             .show_separator_line(false)
             .frame(egui::Frame::new().fill(theme::RAIL))
             .show(ui, |ui| {
-                if let Some(next) = rail::rail(ui, self.current) {
+                if let Some(next) = rail::rail_with_transition(ui, self.current, transition_secs) {
                     self.current = next;
                 }
             });
@@ -103,6 +118,7 @@ impl App {
         // Copied out of `self` before the closure: a `&mut` to one screen field and
         // a borrow of `self.current` cannot coexist inside it.
         let current = self.current;
+        let settings = &mut self.settings;
         let connect = &mut self.connect;
         let log = &mut self.log;
         let firmware = &mut self.firmware;
@@ -113,9 +129,9 @@ impl App {
                 .inner_margin(space::XL)
                 .show(ui, |ui| match current {
                     Screen::Connect => connect.ui(ui),
-                    Screen::Log => log.ui(ui),
+                    Screen::Log => log.ui_with_settings(ui, settings),
                     Screen::Firmware => firmware.ui(ui),
-                    Screen::Settings => screens::settings::ui(ui),
+                    Screen::Settings => screens::settings::ui(ui, settings),
                 });
         });
     }
@@ -130,6 +146,47 @@ impl eframe::App for App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shell_hands_the_reduced_motion_setting_to_the_rail() {
+        // Stage 3 review, N5: the settings getter was tested and the rail's
+        // duration parameter was tested, but nothing checked what `App::draw`
+        // actually passes — hard-coding 0.15 at the call site (M11b) left every
+        // test green.
+        //
+        // So this draws the real shell and asks the rail what it was handed. The
+        // draw runs on its own thread because the rail records per thread: the
+        // parallel render tests draw the rail too, and this thread must read its
+        // own frame rather than whichever one finished last.
+        let draw_and_read = |reduced_motion: bool| -> Option<f32> {
+            std::thread::spawn(move || {
+                let ctx = egui::Context::default();
+                crate::theme::install(&ctx);
+                let mut app = App::default();
+                app.settings_mut().reduced_motion = reduced_motion;
+                let output = ctx.run_ui(egui::RawInput::default(), |ui| app.draw(ui));
+                output.drop_without_applying_deltas();
+                rail::last_transition_secs()
+            })
+            .join()
+            .ok()
+            .flatten()
+        };
+
+        let reduced = draw_and_read(true);
+        assert_eq!(
+            reduced,
+            Some(0.0),
+            "with reduced motion on the shell handed the rail {reduced:?}s, expected 0"
+        );
+        let motion = draw_and_read(false);
+        assert_eq!(
+            motion,
+            Some(rail::TRANSITION_MOTION_SECS),
+            "with reduced motion off the shell handed the rail {motion:?}s, expected {}",
+            rail::TRANSITION_MOTION_SECS
+        );
+    }
 
     #[test]
     fn the_shell_starts_on_connect() {

@@ -12,10 +12,17 @@
 //!   output   stdout for data, stderr for progress (the seam the tests replace)
 //!   fileio   reading and writing the files a command works on
 //!   cal      civil dates, so the offset flags need no date library
+//!   device   ports, info, doctor
+//!   fw       dump and patch (flash is a stub, see below)
+//!   logcmd   download, info, read, geotag (erase is a stub, see below)
+//!   nmea     repair and proxy
 //! ```
 //!
-//! The handlers land one verb at a time; a command whose handler is not here yet
-//! fails with a message naming itself and pointing at `m241 --help`.
+//! Two verbs are deliberately not wired: `fw flash` and `log erase`, the two
+//! commands that change the device. They parse, so the help is complete, and they
+//! fail with a message naming themselves and pointing at `m241 --help`. Adding a
+//! handler for either would put a destructive command behind this binary; the
+//! reference says why that is the write crate's job, not this one's.
 //!
 //! Machine output goes to stdout; progress and warnings go to stderr. Exit codes
 //! are documented in `docs/reference/02-cli.md` and map one-to-one onto
@@ -235,7 +242,7 @@ pub(crate) fn run_with(
         Command::Device { command } => match command {
             DeviceCommand::Ports(options) => device::ports(&options, session)?,
             DeviceCommand::Info(options) => device::info(&options, session)?,
-            DeviceCommand::Doctor => return Err(not_implemented("device doctor").into()),
+            DeviceCommand::Doctor(options) => device::doctor(&options, session)?,
         },
         Command::Fw { command } => match command {
             FwCommand::Dump(options) => fw::dump(&options, session)?,
@@ -247,11 +254,11 @@ pub(crate) fn run_with(
             LogCommand::Download(options) => logcmd::download(&options, session)?,
             LogCommand::Read(options) => logcmd::read(&options, session)?,
             LogCommand::Erase => return Err(not_implemented("log erase").into()),
-            LogCommand::Geotag => return Err(not_implemented("log geotag").into()),
+            LogCommand::Geotag(options) => logcmd::geotag(&options, session)?,
         },
         Command::Nmea { command } => match command {
             NmeaCommand::Repair(options) => nmea::repair(&options, session)?,
-            NmeaCommand::Proxy => return Err(not_implemented("nmea proxy").into()),
+            NmeaCommand::Proxy(options) => nmea::proxy(&options, session)?,
         },
     }
     Ok(())
@@ -264,8 +271,8 @@ pub(crate) fn run_with(
 /// step, and naming internal work items tells them nothing they can act on.
 fn not_implemented(command: &str) -> m241_core::Error {
     m241_core::Error::State(format!(
-        "このビルドでは `m241 {command}` は未実装です。\
-         `m241 --help` で使えるコマンドを確認してください。"
+        "`m241 {command}` is not implemented in this build; \
+         see `m241 --help` for the commands that work"
     ))
 }
 
@@ -307,11 +314,8 @@ mod tests {
     /// lines are the ones `docs/reference/02-cli.md` documents.
     fn unimplemented_commands() -> Vec<(Command, &'static str)> {
         vec![
-            (parsed(&["device", "doctor"]), "device doctor"),
             (parsed(&["fw", "flash"]), "fw flash"),
             (parsed(&["log", "erase"]), "log erase"),
-            (parsed(&["log", "geotag"]), "log geotag"),
-            (parsed(&["nmea", "proxy"]), "nmea proxy"),
         ]
     }
 
@@ -327,14 +331,17 @@ mod tests {
                 text.contains(&format!("`m241 {name}`")),
                 "{name}: message does not name the command: {text}"
             );
-            assert!(text.contains("未実装"), "{name}: not in Japanese: {text}");
+            assert!(
+                text.contains("not implemented in this build"),
+                "{name}: does not say what is missing: {text}"
+            );
             assert!(
                 text.contains("`m241 --help`"),
                 "{name}: no next step for the user: {text}"
             );
             assert!(
-                !text.contains("not implemented") && !text.contains("vendor"),
-                "{name}: still an internal work item: {text}"
+                !text.contains("vendor") && !text.contains("未実装"),
+                "{name}: internal work item, or not in the language of the rest of the CLI: {text}"
             );
         }
     }
@@ -347,16 +354,7 @@ mod tests {
             .iter()
             .map(|(_command, name)| *name)
             .collect();
-        assert_eq!(
-            names,
-            vec![
-                "device doctor",
-                "fw flash",
-                "log erase",
-                "log geotag",
-                "nmea proxy",
-            ]
-        );
+        assert_eq!(names, vec!["fw flash", "log erase"]);
     }
 
     #[test]
