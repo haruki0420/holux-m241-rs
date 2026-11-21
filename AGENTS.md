@@ -109,7 +109,9 @@ Rules:
 * refuse to run if that constant is anything unexpected;
 * verify a known-intact marker before erasing;
 * require an explicit confirmation: type `WRITE` at the prompt, or pass `--yes`;
-* an agent may pass `--yes` only through the reviewer gate in §2.5.
+* an agent may pass `--yes` to `fw flash` only when §2.5 applies and its
+  reviewer gate has approved (read-only `fw probe-da --yes` loads the DA into
+  RAM and writes no flash, so it is not subject to §2.5).
 
 ### 2.3 Take a dump before writing anything
 
@@ -121,30 +123,67 @@ that check.
 
 See §6.
 
-### 2.5 Who may approve a flash write
+### 2.5 Who may approve a flash write (`fw flash --yes`)
 
-The user delegated the approval of a firmware write: instead of asking the user
-each time, the agent that prepared the write asks a **different** subagent —
-one that did not prepare it — whether the exact write may run, and passes
-`--yes` only when that reviewer answers "approved".
+By default, passing `--yes` to `fw flash` requires the user's own approval.
+Subagent approval under this section applies **only** when the user has
+explicitly delegated firmware-write approval in that session or instruction;
+any explicit user requirement for prior human approval on destructive changes
+**always** takes precedence and overrides this section. Read-only
+`fw probe-da --yes` (RAM-only DA load, no flash write) is not covered here.
 
-The request must contain, and the reviewer must check against the artifacts:
+When delegated, the agent preparing `fw flash` asks an **independent**
+reviewer session — not the preparing session and **not forked** from the
+preparing session's history — whether the exact write may run, and passes
+`--yes` only after that reviewer records `"approved"`. The preparer must pass
+raw artifacts and command paths only, **never** its own summary, narrative, or
+conclusions (`docs/dev/09-review-protocol.md`). If a reviewer refuses, the
+preparer must fix the underlying cause and restart the request from fresh
+artifacts; shopping for a different approver without fixing the cause and
+re-gathering fresh artifacts is forbidden.
 
-* the unit's identity read in this session: `B-core_1.20`, model `01017-00F`,
-  flash `00C2:22BA`, and the port;
-* the image path, its SHA-256, and its provenance: an official V1.12 / V1.13
-  vendor package, or the user's own backup plus the recorded patch offsets;
-* the backup path and SHA-256, taken in this session, whose differing bytes fall
-  only at the patch offsets;
-* the write range: `FLASH_WRITE_START` (measured as `0` on 2026-11-21) and the
-  image length, covering the firmware and nothing else;
-* the read-back plan (whole-image compare) and the recovery step (power cycle);
-* the exact command line, including `--yes`, the image path and the backup path.
+The request must supply raw artifacts for, and the reviewer must independently
+verify against those artifacts:
 
-A missing item, a hash that does not match, or a reviewer that is the preparing
-session is a refusal. The approval, the hashes and the reviewer's session id are
-written to `docs/dev/05-verification.md` (or the write's PR) **before** `--yes`
-is passed. The reviewer does not open the port and does not edit the branch.
+* current-session raw command logs for `device info`, `fw dump`, and
+  `fw probe-da`, confirming the unit's identity (`B-core_1.20`, model
+  `01017-00F`, flash `00C2:22BA`) and the exact resolved serial port (never
+  `--port auto`);
+* the backup path and its SHA-256 recomputed independently by the reviewer from
+  the current session's `fw dump` artifact;
+* the write image path, its independently recomputed SHA-256, and its
+  provenance per §2.3 and `da.rs::check_image`: it must be either identical to
+  the user's own backup from this session or differ from that backup **only**
+  at the recorded patch offsets for the unit's supported profile (currently
+  V1.13 `01017-00F`, length `0x6345C`, `PATCH_OFFSETS` `[0x402F6, 0x402F7, 0x59C2C]`),
+  verified independently to have zero differing bytes outside those offsets
+  (never an unrelated image or unverified vendor package);
+* the `--da` binary (`DA_v3.8.4.bin`, 14,896 bytes) path and its independently
+  recomputed SHA-256;
+* the write range: `FLASH_WRITE_START` and `FLASH_WRITE_LENGTH` (`0x6345C`),
+  covering the firmware and nothing else, with `FLASH_WRITE_START` **already
+  settled** by a hardware run recorded in `docs/dev/05-verification.md` §1 and
+  `UNRESOLVED_STARTS` emptied in `crates/m241-flash/src/da.rs` (if
+  `UNRESOLVED_STARTS` is non-empty or §1 lacks that settlement row, approval
+  must be refused);
+* the read-back plan (whole-image BootROM compare) and the recovery step
+  matching `crates/m241-flash/src/da.rs` (`0xD9` restart without waiting for a
+  reply, or power-cycle, then re-enter BootROM with `--assume-brom` or retry the
+  four-probe sync and write the user's own backup image back; do not download
+  the log from a partly written unit);
+* the exact full command line to run, including `--yes`, the resolved `--port`,
+  `--da`, the image path, and the backup path.
+
+A missing item, a hash or byte-diff mismatch, an unsettled
+`FLASH_WRITE_START`, `--port auto`, or a non-independent/forked reviewer is a
+refusal. The independent reviewer does not open the port and does not edit the
+preparing branch, and **authors its own verdict record directly** (for example,
+a PR comment or review record posted by the reviewer session itself, citing
+the verified SHA-256s, command line, and reviewer session ID) **before** `--yes`
+is passed. The preparer must never author or edit the approval record on the
+reviewer's behalf, and pre-write approvals must **never** be written into
+`docs/dev/05-verification.md` §1 (which records actual post-run hardware
+measurements only).
 
 `log erase` is not covered: it destroys the user's track data, which a reviewer
 cannot consent to on the user's behalf. It still needs the user's own

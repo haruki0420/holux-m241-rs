@@ -29,9 +29,10 @@
 //! 2. **A confirmation token must be passed** ([`Confirmation`]). It has one
 //!    public constructor, [`Confirmation::granted`], and [`DownloadAgent::write`]
 //!    takes one as its first argument and refuses a token that is not given.
-//!    That makes the prompt a step every caller goes through; it is a convention
-//!    of the call site, not a type-level proof that an approval was recorded
-//!    (`AGENTS.md` §2.5 names who may give it).
+//!    That makes confirmation a named step at every call site; it only records
+//!    that `--yes` was passed via [`Confirmation::of_command_line`] and does
+//!    not mechanically verify a reviewer record or session ID (`AGENTS.md` §2.5
+//!    defines the procedural gate).
 //! 3. **The device must still hold the image the write was planned from.**
 //!    [`DownloadAgent::verify_device`] compares the whole span, read back by
 //!    `m241_core`'s BootROM reader, with the user's own backup, so a backup from
@@ -480,20 +481,21 @@ pub const PROBE_PAGE_SIZE: usize = 64;
 /// short enough that a wrong cable is reported instead of hammered.
 pub const READ_RETRIES: usize = 3;
 
-/// The evidence that an approval was recorded for this write.
+/// A call-site confirmation token indicating that `--yes` (or an interactive
+/// confirmation) was supplied for this operation.
 ///
 /// No `Default`, no public field: the only way to obtain one is
 /// [`Confirmation::granted`] — the token [`Confirmation::of_command_line`]
-/// returns for `--yes`. [`DownloadAgent::write`] takes one as its first
-/// argument and refuses a token whose flag is not set, so "write the firmware"
-/// cannot appear in code without a line that says who said so.
-/// [`DaLoader::load`] takes one for the same reason: loading the DA is what
-/// hands the device to a program that can erase and program flash.
+/// returns when `--yes` is `true` (and [`Confirmation::of_probe_command_line`]
+/// returns for `fw probe-da --yes`). [`DownloadAgent::write`] takes one as its
+/// first argument so confirmation is an explicit step at every call site.
+/// [`DaLoader::load`] takes one for the same reason: loading the DA hands the
+/// device to a program that can erase and program flash.
 ///
-/// That is a convention of the call site, not a proof: the type carries no
-/// information a plain `bool` does not. What it buys is a named step at every
-/// call site and one place ([`Self::of_command_line`]) where the flag is
-/// turned into a token.
+/// This is strictly a call-site convention, not a proof: the type carries no
+/// information a plain `bool` does not, and [`Self::of_command_line`] only
+/// checks that `--yes` was passed. It does **not** mechanically verify a
+/// reviewer record, approval ledger, or session ID (`AGENTS.md` §2.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Confirmation {
     /// Always `true`; a token that exists was given.
@@ -504,7 +506,11 @@ impl Confirmation {
     /// The word a typed prompt accepts as the confirmation (`AGENTS.md` §2.2).
     pub const WORD: &'static str = "WRITE";
 
-    /// The token for "the caller was told and said yes".
+    /// Construct the confirmation token indicating that the call-site
+    /// confirmation flag was supplied.
+    ///
+    /// Like [`Self::of_command_line`], this performs no mechanical verification
+    /// of an external reviewer record or session ID (`AGENTS.md` §2.5).
     #[must_use]
     pub fn granted() -> Self {
         Self { given: true }
