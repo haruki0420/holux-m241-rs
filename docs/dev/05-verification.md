@@ -30,12 +30,14 @@ figure on this page.
 ## 1a. The Linux log-erase hardware session (2026-11-21)
 
 Device: retail Holux M-241 (MT3318) over USB serial (CP210x bridge).
-Host: Linux, `m241` built from commit `bf41c2e` (not the branch's final head).
+Host: Linux, `m241` built from commit `bf41c2e`, the then-head of
+`feat/log-erase-wire`. That commit is **not** an ancestor of this branch, and no
+binary from this branch's final head has been run on hardware.
 
-The rows below were measured with that binary only. The branch has gained
-changes since: the empty-log refusal (`ea53d1a`) and the lost-stop-ACK resume
-with its tests. **Those changes have not been run on hardware**, so nothing on
-this page makes the final head verified.
+The rows below were measured with that binary only. The log-erase work has
+gained changes since: the empty-log refusal (`ea53d1a`) and the lost-stop-ACK
+resume with its tests. **Those changes have not been run on hardware**, so
+nothing on this page makes the final head verified.
 
 | Step | Command / detail | Result | Status |
 |---|---|---|---|
