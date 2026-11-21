@@ -626,6 +626,10 @@ pub mod fake_da {
         pub nmea_after: usize,
         /// Whether any reset line was asserted (`set_control_lines(true)`).
         pub control_lines_asserted: bool,
+        /// How many times a port was opened. A dry run must leave this at zero.
+        pub opens: usize,
+        /// Whether the serial line was ever read or written.
+        pub bytes_moved: usize,
     }
 
     impl Record {
@@ -1021,9 +1025,11 @@ pub mod fake_da {
                 buf[count] = byte;
                 count += 1;
             }
+            self.record.borrow_mut().bytes_moved += count;
             Ok(count)
         }
         fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+            self.record.borrow_mut().bytes_moved += buf.len();
             for byte in buf {
                 self.consume(*byte);
             }
@@ -1091,6 +1097,7 @@ pub mod fake_da {
         }
 
         fn open(&self, _name: &str, baud: u32) -> Result<Opened> {
+            self.chip.record().borrow_mut().opens += 1;
             let mut transport = FakeDaTransport::new(&self.chip);
             transport.set_baud(baud)?;
             Ok(Opened::new(Box::new(transport)))

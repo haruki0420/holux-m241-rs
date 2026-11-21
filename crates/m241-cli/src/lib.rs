@@ -252,7 +252,7 @@ pub(crate) fn run_with(
         Command::Fw { command } => match command {
             FwCommand::Dump(options) => fw::dump(&options, session)?,
             FwCommand::Patch(options) => fw::patch(&options, session)?,
-            FwCommand::Flash => return Err(not_implemented("fw flash").into()),
+            FwCommand::Flash(options) => fw::flash(&options, session)?,
             FwCommand::ProbeDa(options) => fw::probe_da(&options, session)?,
         },
         Command::Log { command } => match command {
@@ -322,10 +322,7 @@ mod tests {
     /// list is this build's own record of how far the wiring got. The command
     /// lines are the ones `docs/reference/02-cli.md` documents.
     fn unimplemented_commands() -> Vec<(Command, &'static str)> {
-        vec![
-            (parsed(&["fw", "flash"]), "fw flash"),
-            (parsed(&["log", "erase"]), "log erase"),
-        ]
+        vec![(parsed(&["log", "erase"]), "log erase")]
     }
 
     #[test]
@@ -363,7 +360,7 @@ mod tests {
             .iter()
             .map(|(_command, name)| *name)
             .collect();
-        assert_eq!(names, vec!["fw flash", "log erase"]);
+        assert_eq!(names, vec!["log erase"]);
     }
 
     #[test]

@@ -60,6 +60,7 @@ pub mod erase;
 pub mod simulator;
 
 pub use da::DownloadAgent;
+pub use da::{Acceptance, AcceptedImage, WritePlan, check_image, write_plan};
 pub use da::{DaLoadId, DaLoader};
 pub use erase::{BackupProof, ERASE_SUBCOMMAND, LogEraser};
 #[cfg(test)]
