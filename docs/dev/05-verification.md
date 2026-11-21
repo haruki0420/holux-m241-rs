@@ -46,7 +46,6 @@ It is **not** a settlement row: it records no `fw probe-da` run and says
 nothing about which base the DA uses, so it cannot justify emptying
 `UNRESOLVED_STARTS`.
 
-<<<<<<< HEAD
 ### 1.2 The DA-side base read (2026-11-21)
 
 Device: the same retail M-241. Host: Linux, `/dev/ttyUSB0` (USB serial).
