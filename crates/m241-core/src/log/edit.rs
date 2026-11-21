@@ -436,7 +436,8 @@ mod tests {
         editor.merge(&[2, 0]).expect("merge 2 then 0");
         assert_eq!(editor.tracks().len(), 2, "two of three tracks became one");
         // The merged track sits where track 0 was — the lowest of the two
-        // indices, not the last one listed — and track 1 keeps its own slot.
+        // indices, not the last one listed. Track 1 is untouched, so its point
+        // is the only single-point track left in the list.
         let merged = &editor.tracks()[0];
         assert_eq!(
             merged.points.len(),
@@ -450,8 +451,11 @@ mod tests {
             "track 2's point is first because it was listed first"
         );
         assert_eq!(merged.points[1].utc, Some(1_700_000_000));
-        // The unselected track kept its place.
-        assert_eq!(editor.tracks()[1].points[0].utc, Some(1_700_000_000));
+        assert_eq!(
+            editor.tracks()[1].points.len(),
+            1,
+            "the unselected track stays separate in its own slot"
+        );
     }
 
     #[test]
