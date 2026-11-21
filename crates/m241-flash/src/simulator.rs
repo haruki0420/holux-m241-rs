@@ -710,17 +710,25 @@ impl FakeDa {
         // The packet is programmed at the cursor. A packet can be shorter than
         // the command length only if the host sent fewer bytes, and then the
         // DA zero-fills it before programming (`0x001019C0`–`0x001019D8`,
-        // §4.4); what the host puts on the wire is what `packets()` records.
+        // §4.4); the cursor therefore advances by the command's length, not by
+        // what the host happened to send. That is also why the packet count and
+        // "the cursor passed `end`" are not the same rule: with a short final
+        // packet the cursor overruns the range before the count is reached.
         // ⚠️ 未検証 for the *write* direction: §4.4 reads that padding off the
         // read serialiser, and `docs/dev/05-verification.md` §1 did not record
         // whether the final 92-byte packet's tail is padded.
         let offset = self.da_cursor as usize;
-        for (index, byte) in payload.iter().enumerate() {
+        let mut programmed = vec![0u8; self.da_packet_len];
+        programmed
+            .iter_mut()
+            .zip(payload.iter())
+            .for_each(|(slot, byte)| *slot = *byte);
+        for (index, byte) in programmed.iter().enumerate() {
             if let Some(slot) = self.memory.get_mut(offset.saturating_add(index)) {
                 *slot = *byte;
             }
         }
-        let advance = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+        let advance = u32::try_from(self.da_packet_len).unwrap_or(u32::MAX);
         self.da_cursor = self.da_cursor.saturating_add(advance);
         self.accepted_packets += 1;
         self.queue_bytes(&[CONT]);
@@ -1230,10 +1238,9 @@ mod tests {
     }
 
     #[test]
-    fn an_odd_range_with_an_even_length_still_needs_the_ceiling() {
-        // Five bytes at two bytes per packet is 2.5 -> 3 packets. A fake that
-        // completed when the cursor passed `end` would take the third packet as
-        // the first of a new command; the count stops it earlier.
+    fn three_packets_complete_a_six_byte_range() {
+        // Six bytes at two bytes per packet is exactly three packets. The fake
+        // must not complete after two, and must not answer a fourth.
         let mut device = download_agent(&[0xFFu8; 16]);
         device.write_all(&memory_range(0, 5)).expect("range");
         assert_eq!(read_reply(&mut device, 2), [ACK, STATUS_OK]);
@@ -1243,9 +1250,38 @@ mod tests {
         assert_eq!(read_reply(&mut device, 1), [CONT]);
         write_packet(&mut device, &[3, 4]);
         assert_eq!(read_reply(&mut device, 1), [CONT]);
-        write_packet(&mut device, &[5, 0]);
+        write_packet(&mut device, &[5, 6]);
         assert_eq!(read_reply(&mut device, 3), [CONT, ACK, ACK]);
-        assert_eq!(&device.memory()[..6], &[1, 2, 3, 4, 5, 0]);
+        assert_eq!(&device.memory()[..6], &[1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn the_packet_count_is_the_range_and_the_final_packet_zfills_the_rest() {
+        // Range `0..=9` (10 bytes) at 4 bytes per packet: `ceil(10/4)` = 3
+        // packets, and the last carries 2 bytes that the DA zero-fills to 4.
+        // A packet is always read as `length + 2` bytes, so the client cannot
+        // send a frame shorter than the command length — the fill happens
+        // inside the DA, which is why the packet count, not the cursor, is the
+        // rule that ends the command.
+        let mut device = download_agent(&[0xFFu8; 16]);
+        device.write_all(&memory_range(0, 9)).expect("range");
+        assert_eq!(read_reply(&mut device, 2), [ACK, STATUS_OK]);
+        write_command(&mut device, 4);
+        assert_eq!(read_reply(&mut device, 2), [ACK, ACK]);
+        write_packet(&mut device, &[1, 2, 3, 4]);
+        assert_eq!(read_reply(&mut device, 1), [CONT]);
+        write_packet(&mut device, &[5, 6, 7, 8]);
+        assert_eq!(read_reply(&mut device, 1), [CONT]);
+        write_packet(&mut device, &[9, 10, 0, 0]);
+        assert_eq!(
+            read_reply(&mut device, 3),
+            [CONT, ACK, ACK],
+            "the third packet completes the range by count"
+        );
+        assert_eq!(
+            &device.memory()[..12],
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0, 0]
+        );
     }
 
     #[test]

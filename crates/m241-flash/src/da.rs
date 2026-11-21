@@ -992,6 +992,20 @@ pub fn check_layout() -> Result<()> {
     let expected_start: u32 = 0x0000_0000;
     let expected_length: usize = 0x0006_345C;
 
+    // The expected start is a candidate, not a decision: if someone edits it to
+    // the other candidate alone, the write is still refused here rather than
+    // becoming "the pinned range". Only emptying `UNRESOLVED_STARTS` unlocks a
+    // write, and that is the edit the hardware row has to justify.
+    if !UNRESOLVED_STARTS.contains(&expected_start) {
+        return Err(Error::Safety {
+            reason: format!(
+                "the expected write start 0x{expected_start:08X} is not one of the unresolved \
+                 candidates 0x{UNRESOLVED_STARTS:08X?}; the expected start may only be a candidate \
+                 until docs/dev/05-verification.md settles it"
+            ),
+        });
+    }
+
     if UNRESOLVED_STARTS.contains(&FLASH_WRITE_START) {
         return Err(Error::Safety {
             reason: format!(
