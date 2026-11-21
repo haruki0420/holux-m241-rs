@@ -21,9 +21,8 @@ use m241_cli::{Cli, exit, run};
 
 // `m241-flash` is a dependency of this binary because two of its subcommands
 // write to the device: `fw flash` (the Download Agent) and `log erase`
-// (`$PMTK182,6`). Neither is implemented yet, so nothing from the crate is
-// called; the import keeps the dependency honest instead of declared-and-unused,
-// and marks where those two subcommands will enter the write path.
+// (`$PMTK182,6`). The erase path now calls into the crate through the library,
+// so the import here is only a marker for `fw flash`, which is still a stub.
 #[allow(unused_imports)]
 use m241_flash as _;
 

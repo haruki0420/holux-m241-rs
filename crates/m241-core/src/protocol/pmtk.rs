@@ -720,13 +720,21 @@ impl<T: Transport> PmtkClient<T> {
     }
 
     fn log_control(&mut self, body: &str, subcommand: u8) -> Result<()> {
+        // Match the exact subcommand prefix (`$PMTK001,182,<subcommand>,`) rather
+        // than `$PMTK001,182,`: the final `$PMTK182,7` read chunk can emit a
+        // trailing `$PMTK001,182,7,3` ACK after `$PMTK182,8`, and matching only
+        // command `182` would mistake that stale read ACK for `$PMTK182,4`'s
+        // reply — leaving the real `$PMTK001,182,4,3` in flight on the wire.
+        let prefix = format!("$PMTK001,182,{subcommand},");
         let reply = self.await_reply(
             body,
-            "$PMTK001,182,",
+            &prefix,
             self.reply_timeout,
             &format!("$PMTK001,182,{subcommand} acknowledgement"),
         )?;
         let ack = parse_ack(&parse_sentence(&reply)?)?;
+        // `await_reply` already matched `$PMTK001,182,<subcommand>,`, so this
+        // guard is purely defensive against future changes to `parse_ack`.
         if ack.command != 182 {
             return Err(Error::Framing {
                 what: format!("acknowledgement was for command {}, not 182", ack.command),
@@ -779,28 +787,30 @@ impl<T: Transport> PmtkClient<T> {
     ///
     /// Logging is always resumed, even when the transfer fails: a unit left with
     /// recording off loses the next trip, which is worse than a failed download.
+    /// A stop whose acknowledgement was lost counts as a stop here: the sentence
+    /// may have reached the device, so the resume is sent even though the
+    /// transfer itself is not attempted.
     ///
     /// # Errors
     ///
     /// Whatever the transfer failed with. A failure to resume is reported only
     /// when the transfer itself succeeded, so the original cause is never
-    /// masked.
+    /// masked. When the stop and the resume both fail, the stop's variant is
+    /// kept and the resume is appended to its message.
     pub fn download_log(&mut self, progress: &mut dyn FnMut(usize, usize)) -> Result<Vec<u8>> {
         let total = self.log_used_bytes()?;
         if total == 0 {
             progress(0, 0);
             return Ok(Vec::new());
         }
-        self.log_stop()?;
-        let outcome = self.transfer(total, progress);
-        let resumed = self.log_resume();
-        match outcome {
+        // The transfer is skipped when the stop failed: its reads would race a
+        // unit that may still be recording. The resume is not skipped, because
+        // the stop may well have arrived and only the acknowledgement been lost.
+        let outcome = match self.log_stop() {
+            Ok(()) => self.transfer(total, progress),
             Err(err) => Err(err),
-            Ok(data) => {
-                resumed?;
-                Ok(data)
-            }
-        }
+        };
+        resume_after(self, outcome)
     }
 
     fn transfer(
@@ -866,6 +876,31 @@ impl<T: Transport> PmtkClient<T> {
         let bytes = line(body);
         self.transport.write_all(bytes.as_bytes())?;
         self.transport.flush()
+    }
+}
+
+/// Resume logging after `outcome`, and combine the two failures if both fail.
+///
+/// `$PMTK182,5` stops recording and the unit stays stopped until `$PMTK182,4`.
+/// The stop's acknowledgement can be lost while the sentence itself arrived, so
+/// the caller must reach here on the error path too. The resume failure is
+/// appended to the first error instead of replacing it: the first failure keeps
+/// its variant, its exit code and its hint, and the message still names both
+/// sentences so a user can tell which one the device ignored.
+///
+/// # Errors
+///
+/// `outcome`'s error when the resume succeeds, the resume's error when
+/// `outcome` is `Ok`, or `outcome`'s error with the resume failure appended
+/// when both fail.
+pub fn resume_after<T: Transport, R>(client: &mut PmtkClient<T>, outcome: Result<R>) -> Result<R> {
+    match (outcome, client.log_resume()) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Ok(_), Err(resume)) => Err(resume),
+        (Err(primary), Ok(())) => Err(primary),
+        (Err(primary), Err(resume)) => {
+            Err(primary.with_note(format!("logging could not be resumed: {resume}")))
+        }
     }
 }
 

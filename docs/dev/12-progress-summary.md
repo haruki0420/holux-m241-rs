@@ -1,7 +1,7 @@
 # 進捗サマリ — holux-m241-rs
 
 **このファイルは現在の到達点、残っている課題、読むべき一次資料をまとめた記録。**
-最終更新: 2026-11-21 JST
+最終更新: 2026-11-22 JST
 
 ---
 
@@ -31,17 +31,17 @@
 
 ---
 
-## 2. 現在の到達点（`main`）
+## 2. 現在の到達点（PR #12 時点）
 
 ### 数字とゲート
 
 | 項目 | 値 |
 |---|---|
 | クレート構成 | 4 クレート（`m241-core` 読取専用 / `m241-flash` 書込専用 / `m241-cli` / `m241-gui`） |
-| テスト | **602 件全緑**（`cargo test --workspace`） |
+| テスト | **670 件全緑**（`cargo test --workspace`） |
 | ゲート | **6/6 PASS**（`./tools/check.sh`: fmt / clippy / test / docs / design / safety） |
 | CI | Linux / Windows / macOS |
-| **実機検証** | **ゼロ（未検証）** |
+| **実機検証** | `log erase` のみ [`05-verification.md`](05-verification.md) §1a（バイナリは `bf41c2e`、最終 head は未検証）。他は未検証 |
 
 ### 完成・`main` 統合済み（三段構成で検証済み、[`10-review-log.md`](10-review-log.md) 記録済み）
 
@@ -51,7 +51,7 @@
 | **ezTour 仕様化** | 完了（`docs/dev/07-eztour-spec.ja.md` 615 行、クリーンルーム仕様） |
 | **読み書き分離 + safety ゲート** | 完了（`m241-core` / `m241-flash` 分離、`tools/check_safety.py` + 配線・検出力テスト 12 件） |
 | **コア読み取り・変換・EXIF/ジオタグ基盤** | 完了（PMTK / BootROM / ログ解析 / GPX・KML・CSV・NMEA・JSON 出力 / パッチ計画 / 自前 EXIF・geotag） |
-| **CLI 11 コマンド + 2 スタブ** | 完了（`device ports` / `info` / `doctor`、`fw dump` / `patch`、`log info` / `download` / `read` / `geotag`、`nmea repair` / `proxy`。131 + 1 テスト。`fw flash` / `log erase` はスタブ） |
+| **CLI 12 コマンド + 1 スタブ** | 完了（`device ports` / `info` / `doctor`、`fw dump` / `patch`、`log info` / `download` / `read` / `erase` / `geotag`、`nmea repair` / `proxy`。158 + 1 テスト。`fw flash` はスタブ。`log erase` は PR #12） |
 | **GUI 4 画面（実データ接続・再生・写真同期）** | 完了（接続 / ログ / ファーム / 設定。実ポート probe・実ログ読込・再生・写真同期・POI・始点終点・設定反映。132 テスト。実機未検証） |
 
 - **2026-11-21 のマージ**: review-gate (#2)、CLI 非破壊 3 コマンド (#3)、GUI 実データ接続 (#4)、
@@ -66,7 +66,7 @@
 | 項目 | 状態 | ブロッカー / 注意点 |
 |---|---|---|
 | **DA 書き込み実装**（`crates/m241-flash/src/da.rs`） | 実装済みだが**書き込みは拒否**（PR #6） | `FLASH_WRITE_START = 0` は `UNRESOLVED_STARTS` に含まれ、`check_layout` がバスアクセス前に拒否する。`write_range` は private、読み戻し・消去失敗 `0xA5`・ゼロ詰め・`0xD9` 無応答はテスト済み（82 テスト）。開始アドレス（`0` か `0x00200000`）の確定と実機セッションがブロッカー。実機の書き込み・消去・再起動は**未検証** |
-| **CLI 残り 2 コマンド** | 未実装スタブ | `fw flash`（DA の開始アドレス確定後）と `log erase`。`device doctor` / `log geotag` / `nmea proxy` はマージ済み |
+| **CLI 残り 1 コマンド** | 未実装スタブ | `fw flash`（DA の開始アドレス確定後）。`log erase` は PR #12 で実装済み（実機記録は [`05-verification.md`](05-verification.md) §1a）。`device doctor` / `log geotag` / `nmea proxy` はマージ済み |
 
 ### 3.2 ezTour 代替機能の再実装（[`07-eztour-spec.ja.md`](07-eztour-spec.ja.md) §8）
 
