@@ -400,3 +400,92 @@ main は `e58c5d3` → `5d6ad74` → `19e07c6` と進んだが、いずれも本
 - **ゲート・テスト**: `./tools/check.sh` 6/6 PASS。`crates/m241-gui` テスト **132 件**（lib 88 + render 32 + design_gate 6 + design_invariants 6。Stage 2 の 112 → 132、+20、削除・弱体化 0 件）。
 - **変異テスト（v2 で追加）**: M2（コンパイル不能／UI テスト FAIL）、M3 相当（終了後 repaint、FAIL）、M13・M14・M14b（FAIL）、M11a・M11b・M11c（FAIL）、N6a マーカー削除（FAIL）、N6b amber（FAIL）、M9 点の色（FAIL）。**v2 のテストで生き残る変異は 0 件**。ただし末尾の `playing = false` の削除は、`step_next` が同じことをするため**状態に影響しない**（テストでは検出できないが、害もない。冗長な代入として残した）。
 - **実機未検証**: Stage 3 と同じ 3 項目（`probe_serial_port`、追従の実描画、GUI 経由の実 JPEG 書き込み）は未検証。
+
+---
+
+## 2026-11-21 / DA 書き込み経路の独立検証 v2（`fix/da-write-g` → `fix/da-write-g-v2`）
+
+対象: `crates/m241-flash/src/da.rs`、`simulator.rs`（+ `lib.rs`、`docs/dev/11-safety-review.md` は前段）。
+main `3f72107` を先にマージ済み。実機ポートは開いていない。`FLASH_WRITE_START = 0` と
+`check_layout` の拒否は維持し、実機書き込みは解禁していない。
+
+- **Stage 1**（仕様検収＋可読性、`af8bb4e..c9105ed`）: **不合格**。Must 7 件・Should 22 件ほか。
+- **Stage 2**（`fix/da-write-g` `142c976`, `aea7923`）: Must と可読性 Must を修正。
+- **Stage 3 独立検証**（三人目、`aea7923`）: **不合格**。理由 4 点 —
+  (1) `the_stream_stays_aligned_after_a_refused_range` が `0xD3` 拒否後の余分な読み（V11）を検出できない、
+  (2) `FakeDa::expected_packets` の `ceil` ルールが V15/V16 で固定されていない、
+  (3) `expected_start` のピンが V4（`0x0020_0000` へ変更）で生存、
+  (4) Stage 1 Should の見送り理由が未記録。
+- **Stage 2 v2**（別エージェント、`fix/da-write-g-v2`、本節）:
+
+| # | Stage 3 の指摘 | 対応 | 確認箇所・検出テスト・変異 |
+|---|---|---|---|
+| 1（Must） | `0xD3` 拒否後に余分な読みがあっても検出できない（V11 生存、実測 5.0 s） | **解消** | `FakeDa` に `read_bytes()` と `read_polls()` を追加（`simulator.rs`）。`read_byte` は 0 バイト読みを期限まで**ポーリング**するため、余分な読みはバイト数では見えない（空バッファは `Ok(0)`）ので、ポーリング回数で固定する。`the_stream_stays_aligned_after_a_refused_range` を「受理→拒否→再受理」の 3 段に書き換え、拒否コマンドが**ちょうど 1 バイト・ちょうど 1 ポーリング**で終わることを assert。フェイク側の性質は `a_refused_memory_range_leaves_nothing_behind_for_the_next_reply` が単独で固定する。変異 V11（`A5` の後に `read_byte`）で **FAIL**（ポーリング 70 万回超／`left: 701925, right: 1`） |
+| 2（Must） | フェイクの `ceil` パケット数ルールがテストで固定されていない（V15/V16 生存） | **解消（1 件は等価と判定）** | 追加: `one_byte_range_with_a_full_size_packet_is_one_packet_not_a_cursor_walk`（範囲 2 バイト・パケット `0x100` → `ceil`=1、余分パケットは `A5` のみで書かれない）、`a_packet_beyond_a_short_range_is_refused_before_it_is_programmed`、`a_packet_past_the_two_packet_count_is_refused`、`a_second_write_command_still_counts_its_own_packets`。**この過程でフェイクの実バグを発見**: `accepted_packets` が `0xD5` ごとにリセットされず、同じフェイクで 2 回目の書き込みが最初のパケットで完了扱いになっていた。`0xD5` 受理時に 0 に戻す修正を入れた。変異 **V15b**（リセット削除）**KILLED**、**旧コード**（`da_cursor > end` かつリセット無し）**KILLED**。**V15 単独**（リセット有り＋`da_cursor > end`）と **V16 単独**（完了前チェック無効化）は**等価変異**として生存（理由は G 節） |
+| 3（Must） | `expected_start` のピンが V4 で生存 | **解消** | `check_layout` のローカル `expected_start`/`expected_length` を `EXPECTED_WRITE_START` / `EXPECTED_WRITE_LENGTH`（private 定数）に名前を付け、本体を `check_layout_of(4 引数)` に分離（**公開 API に範囲引数は増やしていない**）。`the_pinned_start_is_the_shipped_start_and_not_the_other_candidate` が「ピン＝出荷値」と「ピンと違う write start は第 3 段で拒否」を assert。変異 **V4** で **FAIL** |
+| 4（Must） | Stage 1 Should の見送り理由が未記録 | **解消** | 本節 G に記録 |
+
+- **ゲート・テスト**: `./tools/check.sh` **6/6 PASS**。`cargo test -p m241-flash` = **70（lib）+ 12（safety_gate）= 82 passed**（`aea7923` の 75 → 82、+7、削除・弱体化 0 件）。
+- **変異テスト（v2 で実行、すべて HEAD から復元し `git status --porcelain` 空を確認）**:
+
+| ID | 変異 | 結果 | 落ちたテスト |
+|---|---|---|---|
+| V4 | `EXPECTED_WRITE_START` を `0x0020_0000` に | **KILLED** | `the_pinned_start_is_the_shipped_start_and_not_the_other_candidate` |
+| V11 | `0xD3` 拒否 `A5` の後に `read_byte` | **KILLED** | `the_stream_stays_aligned_after_a_refused_range` |
+| V15 | 完了判定を `da_cursor > da_range.1` に（リセット有り） | **等価（生存）** | — |
+| V15b | `0xD5` 時の `accepted_packets = 0` を削除 | **KILLED** | `a_second_write_command_still_counts_its_own_packets` |
+| 旧コード | カーソル判定 ＋ リセット無し | **KILLED** | 同上 |
+| V16 | 完了前の余分パケット拒否を無効化 | **等価（生存）** | — |
+
+### G. 見送った Should と理由（Stage 1 由来）
+
+`09-review-protocol.md`「統合」3（Should は直すか、直さないなら理由を残す）に対する記録。
+括弧内は Stage 1 の文書と番号（可 = 可読性レビュー、仕 = 仕様検収）。
+
+- **等価変異として記録するもの（コードは変更、テストは追加しない）**
+  - **V15（フェイクの完了判定を `da_cursor > end` に戻す）**: パケット長が一定でカーソルが
+    各パケットで `length` ずつ増える限り、`ceil((end - start + 1) / length)` と
+    「カーソルが初めて `end` を超えたパケット数」は**すべての整数入力で一致する**
+    （`start` を 0〜8、`en` を `start`〜`start+19`、`length` ∈ {1..7, 0x10, 0x40, 0x100}
+    の全組合せを機械的に照合して 0 件の差異）。差が出るのは `0xD5` ごとにカーソルだけが
+    0 に戻り、カウントが戻らない場合だけで、それは上の **V15b** として固定した。
+    したがって「フェイクがリセット無しでカーソル判定を使っていた」旧コードは **KILLED**、
+    「リセット有りでカーソル判定」は挙動が同一のため生存でよい。
+  - **V16（完了前の余分パケット拒否 `>= expected_packets` を無効化）**: 最後の正常パケットで
+    `== expected_packets` の枝が `DaStage::Command` へ移るため、次のパケットは
+    パケット段ではなくコマンド段で 1 バイトずつ `A5` になる。拒否の**経路**は変わるが、
+    観測できる結果（`0x69` も `0x5A` も出さない・書かない・受理数が増えない）は同じ。
+    実験で確認: 完了前チェックを無効にした状態で `cargo test -p m241-flash` が全緑（当時の 80 テスト、
+    フラッシュも不変）。両方（完了前チェック＋完了時の段移動）を同時に消す変異は **13 件**を落とす
+    （KILLED）。よって単独では等価。
+- **コードはそのまま、理由のみ記録**
+  - **可読性 2（`record_range` と `program` の ACK 読みを `read_ack_pair` に寄せる）**: 両者的に
+    似て見えるが、`0xD3` は「1 バイト目が `5A` なら 2 バイト目を読む（`A5` なら読まない）」、
+    `0xD5` は「1 バイト目 `5A` の後に `A5` か `5A` かを読む（`0xD5` は必ず 2 バイト）」で、
+    **読みの枚数が違い、その違いが安全性そのもの**。1 つの関数に寄せると、この差を
+    引数で表すことになり、`0xD3` 側の「読まない」が呼び出し側の選択になる。今回 V11 で
+    そこにテストを置いたので、集約は差を隠す方向に働く。見送り。
+  - **可読性 3（`Mode` / `Modelled` の改名・統合）**: 挙動に影響せず、`simulator.rs` の
+    テスト専用 API の語彙変更。Stage 2 の範囲で全テストを書き換える割に、見つけられる
+    誤りが「名前が悪い」以上に無い。別 PR で扱う。
+  - **可読性 4（`set_modelled` のリセット対象の明文化）**: `set_modelled` の doc は
+    「何を捨て、何を残すか」を列挙済み。残る曖昧さは `da_range`/`da_cursor` を**残す**理由で、
+    これは `FakeDa` の doc（「チップの状態を忘れるフェイクは、直前のレンジへ書くバグを隠す」）
+    に書かれている。重複を避けるため追記しない。
+  - **可読性 19（`0xD5` の消去範囲の citation が 3 か所で食い違う）**: `da.rs` のモジュール doc
+    は `0x0010251C`–`0x00102560`（`0xD5` 全体）、定数の doc は `0x0010251C`–`0x00102540`
+    （最初のセクタ消去＋失敗分岐）、`check_layout` の doc は全体、と**範囲が違うのは対象が
+    違うため**。同じ範囲に揃えると、むしろ失敗分岐（`0x0010253C`–`0x0010254C`）の位置が
+    読めなくなる。各所の対象を 1 行で書き分ける案は可読性の向上が小さく、実機未検証の
+    アドレス列を触るリスクの方が大きい。見送り。
+  - **仕 4（情報レポートが `0x22BA` の後に `0x0022`/`0x00BA` を送る）**: Stage 1 の指摘。
+    現在の `da_info_report` は `0x00C2`・`0x22BA`・`0x0000`・`0x0000` を正しく並べており
+    （`the_info_report_is_the_measured_twenty_bytes` が先頭 16 バイトを literal で固定）、
+    分岐点からのバグは Stage 2 で解消済み。追加作業なし。
+  - **仕 5（`0xD3` 単独では消えないことも書く）**: `check_layout` のメッセージは `0xD5` が
+    消すと書いており、`0xD3` が記録だけであることは `simulator.rs` のモジュール doc と
+    `a_refused_memory_range_keeps_the_range_recorded_before_it` が固定している。エラーメッセージに
+    足すと、安全側の警告（0 始まりは危険）が相対化される。見送り。
+- **未検証**: `0xD3` の 1 バイト拒否、`0xD9` 無応答、消去失敗の `0xA5`、ゼロ詰めはいずれも
+  **実機未検証**（命令列のみ）。`docs/dev/05-verification.md` に記録が無い限り動かさない。
+
