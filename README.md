@@ -38,7 +38,11 @@ cargo test --workspace
 ```
 
 Rust 1.95 以降が必要（`Cargo.toml` の `rust-version`）。端末に触れるのは `serialport`
-クレート経由だけである。オフラインのコマンドはシリアルポートを開かない。
+クレート経由だけである。オフラインのコマンドはシリアルポートを開かない。もう 1 つの依存は
+`image` で、KMZ の長辺縮小（`kmzMaxPhotoEdgeSize`）のための JPEG 復号・符号化にだけ使い、
+feature は `jpeg` のみを有効にしている（PNG 等の他の形式はビルドしない）。
+`m241-core` から見た `image` のビルド feature が `jpeg` だけであることは
+`cargo tree -p m241-core -e normal -f '{p} {f}'` で確認できる。
 
 ## このリポジトリに含まれないもの
 

@@ -31,7 +31,7 @@
 //! # What this module does not do
 //!
 //! * PNG/WebP/TIFF files: only JPEG has an APP1 segment.
-//! * XMP, IPTC, and Exif fields other than the eight GPS tags below and
+//! * XMP, IPTC, and Exif fields other than the nine GPS tags below and
 //!   `DateTimeOriginal` (read only).
 //! * Multi-segment (`Exif\0\0` repeated) or XMP-embedded Exif: the first Exif
 //!   APP1 wins, which is what every reader does.
@@ -45,10 +45,14 @@ pub const EXIF_HEADER: &[u8] = b"Exif\0\0";
 pub const MAX_SEGMENT_LENGTH: usize = 65_535;
 
 /// Largest APP1 payload: the segment length minus its own two bytes.
-pub const MAX_APP1_PAYLOAD: usize = MAX_SEGMENT_LENGTH - 2;
+///
+/// Private: only the tests use it, to build a block that fills the segment.
+#[cfg(test)]
+const MAX_APP1_PAYLOAD: usize = MAX_SEGMENT_LENGTH - 2;
 
 /// Largest TIFF block that fits an APP1 segment: the payload minus `Exif\0\0`.
-pub const MAX_TIFF_BYTES: usize = MAX_APP1_PAYLOAD - EXIF_HEADER.len();
+#[cfg(test)]
+const MAX_TIFF_BYTES: usize = MAX_APP1_PAYLOAD - EXIF_HEADER.len();
 
 /// JPEG Start-of-Image (SOI) marker second byte (`FF D8`).
 pub(crate) const JPEG_MARKER_SOI: u8 = 0xD8;
@@ -63,6 +67,8 @@ pub(crate) const JPEG_MARKER_EOI: u8 = JPEG_MARKER_SOI + 1;
 
 /// Exif tag ids this module reads or writes.
 pub mod tag {
+    /// GPS tag version: BYTE 4, `[2, 2, 0, 0]` for EXIF 2.2/2.32.
+    pub const GPS_VERSION_ID: u16 = 0x0000;
     /// GPS latitude reference: ASCII 2, `"N\0"` or `"S\0"`.
     pub const GPS_LATITUDE_REF: u16 = 0x0001;
     /// GPS latitude: RATIONAL 3, degrees / minutes / seconds.
@@ -89,7 +95,8 @@ pub mod tag {
 
     /// Every GPS tag this module owns: a rewrite replaces these and keeps the
     /// rest of the GPS IFD.
-    pub const MANAGED_GPS: [u16; 8] = [
+    pub const MANAGED_GPS: [u16; 9] = [
+        GPS_VERSION_ID,
         GPS_LATITUDE_REF,
         GPS_LATITUDE,
         GPS_LONGITUDE_REF,
@@ -198,6 +205,19 @@ impl GpsPosition {
 /// Exif at all" by [`read_gps`] returning `Ok(None)`).
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct GpsTags {
+    /// EXIF `GPSVersionID` (`0x0000`), e.g. `[2, 2, 0, 0]`.
+    ///
+    /// `None` means the tag is absent, **or** that it is present with a type or
+    /// count the specification does not allow (the tag is `BYTE[4]`). The two
+    /// cases read the same because a tag nothing can interpret carries no more
+    /// information than a missing one — the same choice [`Self::latitude`]
+    /// makes for a coordinate it cannot decode. A reader that needs to tell
+    /// them apart has to look at the IFD itself; this type cannot.
+    ///
+    /// A value of the wrong type is *not* an error ([`read_gps`] still returns
+    /// the other tags of the same IFD): the tag is a format declaration, and a
+    /// photo with a garbled one is still a photo whose position is readable.
+    pub version_id: Option<[u8; 4]>,
     /// Signed decimal degrees; the reference letter decides the sign.
     pub latitude: Option<f64>,
     /// Signed decimal degrees.
@@ -300,6 +320,72 @@ pub fn read_datetime_original(jpeg: &[u8]) -> Result<Option<u32>> {
     Ok(Some(unix))
 }
 
+/// Write `utc` into the photo's `DateTimeOriginal` and return the new bytes.
+///
+/// This is the other half of `Shift photo time`: `07-eztour-spec.ja.md` §6.1-7
+/// and §6.2 record that ezTour rewrites the capture time itself, and a geotag
+/// run that matched against a shifted time has to leave the photo saying the
+/// same thing or the next run starts one shift behind.
+///
+/// The value is a **local wall clock with no zone**, which is all EXIF can
+/// store: `utc` is rendered as if it were UTC, exactly the reading
+/// [`read_datetime_original`] makes, so write-then-read returns what was
+/// written. Everything else in the Exif block stays where it was; when the tag
+/// is missing, an Exif sub-IFD is created if IFD0 has none.
+///
+/// # Errors
+///
+/// [`Error::State`] when the bytes are not a JPEG or `utc` is outside the years
+/// EXIF can hold (0-9999); [`Error::Log`] when the structure is malformed, or
+/// when the rewritten segment would exceed the JPEG limit of 65,535 bytes.
+pub fn write_datetime_original(jpeg: &[u8], utc: u32) -> Result<Vec<u8>> {
+    let stamp = datetime_text(utc)?;
+    let Some(location) = find_exif_app1(jpeg)? else {
+        return insert_fresh_exif_with_time(jpeg, &stamp);
+    };
+    let tiff = tiff_block(jpeg, location)?;
+    let reader = TiffReader::parse(tiff)?;
+    let new_tiff = rewrite_exif_datetime(&reader, &stamp)?;
+    let segment_len = segment_length_for(new_tiff.len(), location.start)?;
+    let Some(before) = jpeg.get(..location.start) else {
+        return Err(truncated("the JPEG before the Exif segment", 0, jpeg.len()));
+    };
+    let Some(after) = jpeg.get(location.end..) else {
+        return Err(truncated(
+            "the JPEG after the Exif segment",
+            location.end,
+            jpeg.len(),
+        ));
+    };
+    let mut out = Vec::with_capacity(jpeg.len() + new_tiff.len() + 8);
+    out.extend_from_slice(before);
+    out.extend_from_slice(&[0xFF, 0xE1]);
+    out.extend_from_slice(&segment_len.to_be_bytes());
+    out.extend_from_slice(EXIF_HEADER);
+    out.extend_from_slice(&new_tiff);
+    out.extend_from_slice(after);
+    Ok(out)
+}
+
+/// `"YYYY:MM:DD HH:MM:SS\0"`, the ASCII form `DateTimeOriginal` holds.
+fn datetime_text(utc: u32) -> Result<Vec<u8>> {
+    let days = i64::from(utc / 86_400);
+    let (year, month, day) = civil_from_days(days);
+    if !(0..=9999).contains(&year) {
+        return Err(Error::State(format!(
+            "UTC timestamp {utc} is outside the years Exif can store"
+        )));
+    }
+    let seconds = utc % 86_400;
+    let text = format!(
+        "{year:04}:{month:02}:{day:02} {:02}:{:02}:{:02}\0",
+        seconds / 3_600,
+        (seconds % 3_600) / 60,
+        seconds % 60
+    );
+    Ok(text.into_bytes())
+}
+
 /// Write `position` into a JPEG's GPS IFD and return the new file bytes.
 ///
 /// When the file has no Exif APP1 segment, a minimal one (IFD0 → GPS IFD) is
@@ -321,25 +407,7 @@ pub fn write_gps(jpeg: &[u8], position: &GpsPosition) -> Result<Vec<u8>> {
     let tiff = tiff_block(jpeg, location)?;
     let reader = TiffReader::parse(tiff)?;
     let new_tiff = rewrite_tiff(&reader, position)?;
-    let payload_len = EXIF_HEADER
-        .len()
-        .checked_add(new_tiff.len())
-        .ok_or_else(|| malformed(String::from("the Exif block length overflowed usize"), 0))?;
-    let segment_len = payload_len
-        .checked_add(2)
-        .ok_or_else(|| malformed(String::from("the Exif block length overflowed usize"), 0))?;
-    if segment_len > MAX_SEGMENT_LENGTH {
-        return Err(malformed(
-            format!(
-                "the rewritten Exif block would be {segment_len} bytes, but a JPEG \
-                 segment holds at most {MAX_SEGMENT_LENGTH}; the photo was left \
-                 untouched"
-            ),
-            location.start,
-        ));
-    }
-    let segment_len = u16::try_from(segment_len)
-        .map_err(|_| malformed(String::from("Exif segment length does not fit 16 bits"), 0))?;
+    let segment_len = segment_length_for(new_tiff.len(), location.start)?;
 
     // `location` was measured on this same slice, so both halves exist; the
     // `get` calls state that instead of trusting it.
@@ -708,16 +776,35 @@ fn type_size(field_type: u16) -> Option<usize> {
 // ---------------------------------------------------------------------------
 
 fn read_gps_tags(reader: &TiffReader, ifd: &Ifd) -> Result<GpsTags> {
+    let version_id = read_gps_version(reader, ifd)?;
     let latitude = read_coordinate(reader, ifd, tag::GPS_LATITUDE_REF, tag::GPS_LATITUDE)?;
     let longitude = read_coordinate(reader, ifd, tag::GPS_LONGITUDE_REF, tag::GPS_LONGITUDE)?;
     let altitude = read_altitude(reader, ifd)?;
     let utc = read_gps_time(reader, ifd)?;
     Ok(GpsTags {
+        version_id,
         latitude,
         longitude,
         altitude_m: altitude,
         utc,
     })
+}
+
+/// Read `GPSVersionID`, which is `BYTE[4]` by definition.
+///
+/// A tag of another type or count is reported as absent rather than as an
+/// error, the same way [`read_coordinate`] drops a latitude it cannot decode:
+/// a GPS IFD full of other valid tags should still be readable. See
+/// [`GpsTags::version_id`] for what that folds together.
+fn read_gps_version(reader: &TiffReader, ifd: &Ifd) -> Result<Option<[u8; 4]>> {
+    let Some(entry) = ifd.find(tag::GPS_VERSION_ID) else {
+        return Ok(None);
+    };
+    if entry.field_type != TYPE_BYTE || entry.count != 4 {
+        return Ok(None);
+    }
+    let bytes = reader.value_bytes(entry)?;
+    Ok(<[u8; 4]>::try_from(bytes.as_slice()).ok())
 }
 
 fn read_coordinate(
@@ -995,12 +1082,16 @@ impl IfdEntry {
     }
 
     fn byte(tag: u16, value: u8) -> Self {
+        Self::bytes(tag, &[value])
+    }
+
+    fn bytes(tag: u16, data: &[u8]) -> Self {
         Self {
             tag,
             field_type: TYPE_BYTE,
-            count: 1,
+            count: u32::try_from(data.len()).unwrap_or(u32::MAX),
             fixed_field: None,
-            value: vec![value],
+            value: data.to_vec(),
         }
     }
 
@@ -1077,6 +1168,7 @@ fn to_dms_rationals(value: f64) -> Result<[(u32, u32); 3]> {
 
 fn gps_entries(position: &GpsPosition, order: ByteOrder) -> Result<Vec<IfdEntry>> {
     let mut entries = Vec::with_capacity(tag::MANAGED_GPS.len());
+    entries.push(IfdEntry::bytes(tag::GPS_VERSION_ID, &[2, 2, 0, 0]));
     let latitude_ref = if position.latitude < 0.0 {
         b"S\0"
     } else {
@@ -1251,6 +1343,20 @@ fn append_ifd(
 
 /// Replace the GPS IFD of an existing TIFF block without moving any old bytes.
 fn rewrite_tiff(reader: &TiffReader, position: &GpsPosition) -> Result<Vec<u8>> {
+    rewrite_tiff_with(reader, |kept_gps| {
+        let mut merged = kept_gps;
+        merged.extend(gps_entries(position, reader.order)?);
+        Ok(merged)
+    })
+}
+
+/// Rewrite the TIFF block the way [`write_gps`] does: replace the GPS IFD with
+/// what `merge` returns from the tags this module does not own, point IFD0 at
+/// it, and leave every other byte where it was.
+fn rewrite_tiff_with(
+    reader: &TiffReader,
+    merge: impl FnOnce(Vec<IfdEntry>) -> Result<Vec<IfdEntry>>,
+) -> Result<Vec<u8>> {
     let order = reader.order;
     let ifd0 = reader.ifd(reader.ifd0_offset()?)?;
     let gps_index = ifd0
@@ -1258,8 +1364,7 @@ fn rewrite_tiff(reader: &TiffReader, position: &GpsPosition) -> Result<Vec<u8>> 
         .iter()
         .position(|entry| entry.tag == tag::GPS_IFD_POINTER);
 
-    // Merge: keep every GPS tag this module does not own, replace the rest.
-    let old_gps = match gps_index {
+    let kept_gps: Vec<IfdEntry> = match gps_index {
         Some(index) => {
             let Some(pointer) = ifd0.entries.get(index) else {
                 return Err(malformed(
@@ -1267,20 +1372,17 @@ fn rewrite_tiff(reader: &TiffReader, position: &GpsPosition) -> Result<Vec<u8>> 
                     0,
                 ));
             };
-            Some(reader.ifd(order.u32(pointer.field))?)
-        }
-        None => None,
-    };
-    let mut gps_entries: Vec<IfdEntry> = Vec::new();
-    if let Some(old) = &old_gps {
-        gps_entries.extend(
-            old.entries
+            reader
+                .ifd(order.u32(pointer.field))?
+                .entries
                 .iter()
                 .filter(|entry| !tag::MANAGED_GPS.contains(&entry.tag))
-                .map(IfdEntry::from_raw),
-        );
-    }
-    gps_entries.extend(gps_entries_for(position, order)?);
+                .map(IfdEntry::from_raw)
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    let mut gps_entries = merge(kept_gps)?;
     // TIFF requires the entries of an IFD in ascending tag order.
     gps_entries.sort_by_key(|entry| entry.tag);
 
@@ -1312,9 +1414,82 @@ fn rewrite_tiff(reader: &TiffReader, position: &GpsPosition) -> Result<Vec<u8>> 
         }
     }
     let ifd0_offset = append_ifd(&mut tiff, &ifd0_entries, order, ifd0.next)?;
+    point_header_at(&mut tiff, order, ifd0_offset)?;
+    Ok(tiff)
+}
 
-    // The TIFF header's IFD0 pointer is at offset 4, after the byte-order mark
-    // and the magic number.
+/// Rewrite the TIFF block with a new `DateTimeOriginal`, leaving the GPS IFD
+/// alone.
+///
+/// `DateTimeOriginal` lives in the Exif sub-IFD, so that IFD is rewritten and
+/// IFD0's pointer to it is repointed; when IFD0 has no such pointer, one is
+/// inserted.
+fn rewrite_exif_datetime(reader: &TiffReader, stamp: &[u8]) -> Result<Vec<u8>> {
+    let order = reader.order;
+    let ifd0 = reader.ifd(reader.ifd0_offset()?)?;
+    let exif_index = ifd0
+        .entries
+        .iter()
+        .position(|entry| entry.tag == tag::EXIF_IFD_POINTER);
+
+    // Keep every Exif tag and replace (or add) `DateTimeOriginal`. Tags this
+    // module does not model — `OffsetTimeOriginal`, sub-seconds — stay as they
+    // were.
+    let mut exif_entries: Vec<IfdEntry> = match exif_index {
+        Some(index) => {
+            let Some(pointer) = ifd0.entries.get(index) else {
+                return Err(malformed(
+                    String::from("the Exif IFD pointer disappeared between reads"),
+                    0,
+                ));
+            };
+            reader
+                .ifd(order.u32(pointer.field))?
+                .entries
+                .iter()
+                .filter(|entry| entry.tag != tag::DATE_TIME_ORIGINAL)
+                .map(IfdEntry::from_raw)
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    exif_entries.push(IfdEntry::ascii(tag::DATE_TIME_ORIGINAL, stamp));
+    exif_entries.sort_by_key(|entry| entry.tag);
+
+    let mut tiff = reader.data.to_vec();
+    let exif_offset = append_ifd(&mut tiff, &exif_entries, order, 0)?;
+
+    let mut ifd0_entries: Vec<IfdEntry> = ifd0.entries.iter().map(IfdEntry::from_raw).collect();
+    match exif_index {
+        Some(index) => {
+            let Some(slot) = ifd0_entries.get_mut(index) else {
+                return Err(malformed(
+                    String::from("the Exif IFD pointer disappeared between reads"),
+                    0,
+                ));
+            };
+            *slot = IfdEntry::long(tag::EXIF_IFD_POINTER, exif_offset, order);
+        }
+        None => {
+            let insert_at = ifd0_entries
+                .iter()
+                .position(|entry| entry.tag > tag::EXIF_IFD_POINTER)
+                .unwrap_or(ifd0_entries.len());
+            ifd0_entries.insert(
+                insert_at,
+                IfdEntry::long(tag::EXIF_IFD_POINTER, exif_offset, order),
+            );
+        }
+    }
+    let ifd0_offset = append_ifd(&mut tiff, &ifd0_entries, order, ifd0.next)?;
+    point_header_at(&mut tiff, order, ifd0_offset)?;
+    Ok(tiff)
+}
+
+/// Point the TIFF header's IFD0 offset at `ifd0_offset`.
+///
+/// The field is at offset 4, after the byte-order mark and the magic number.
+fn point_header_at(tiff: &mut [u8], order: ByteOrder, ifd0_offset: u32) -> Result<()> {
     let Some(header_field) = tiff.get_mut(4..8) else {
         return Err(malformed(
             String::from("the Exif TIFF block lost its header"),
@@ -1322,24 +1497,62 @@ fn rewrite_tiff(reader: &TiffReader, position: &GpsPosition) -> Result<Vec<u8>> 
         ));
     };
     header_field.copy_from_slice(&order.u32_bytes(ifd0_offset));
-    Ok(tiff)
+    Ok(())
 }
 
-/// Build the GPS entries for `position`, dropping the ones it has no value for
-/// so stale tags from an earlier write are not left behind.
-fn gps_entries_for(position: &GpsPosition, order: ByteOrder) -> Result<Vec<IfdEntry>> {
-    gps_entries(position, order)
+/// The 16-bit `segment_len` the JPEG header carries for a TIFF block of
+/// `tiff_len` bytes, refusing one that would not fit.
+///
+/// Both write paths — replacing an existing APP1 and inserting a fresh one —
+/// face the same 64 KiB ceiling, so the arithmetic and the message that says
+/// *which* limit was hit live here once. `at` is the offset the error reports.
+///
+/// # Errors
+///
+/// [`Error::Log`] when the segment would exceed [`MAX_SEGMENT_LENGTH`]. Neither
+/// caller has written anything at that point, so the photo is left untouched.
+fn segment_length_for(tiff_len: usize, at: usize) -> Result<u16> {
+    let payload_len = EXIF_HEADER
+        .len()
+        .checked_add(tiff_len)
+        .ok_or_else(|| malformed(String::from("the Exif block length overflowed usize"), at))?;
+    let segment_len = payload_len
+        .checked_add(2)
+        .ok_or_else(|| malformed(String::from("the Exif block length overflowed usize"), at))?;
+    if segment_len > MAX_SEGMENT_LENGTH {
+        return Err(malformed(
+            format!(
+                "the rewritten Exif block would be {segment_len} bytes, but a JPEG \
+                 segment holds at most {MAX_SEGMENT_LENGTH}; the photo was left \
+                 untouched"
+            ),
+            at,
+        ));
+    }
+    u16::try_from(segment_len)
+        .map_err(|_| malformed(String::from("Exif segment length does not fit 16 bits"), at))
 }
 
-/// Build a fresh Exif block: a TIFF with IFD0 holding only the GPS pointer.
-fn fresh_tiff(position: &GpsPosition) -> Result<Vec<u8>> {
+/// Build a fresh Exif block: IFD0 pointing at `gps`, plus an Exif sub-IFD with
+/// `stamp` as `DateTimeOriginal` when one is given.
+fn fresh_tiff(gps: &[IfdEntry], stamp: Option<&[u8]>) -> Result<Vec<u8>> {
     let order = ByteOrder::Little;
     // Reserve the eight-byte TIFF header; the IFDs are appended after it and the
     // header is filled once their offsets are known.
     let mut tiff = vec![0u8; 8];
-    let gps = gps_entries_for(position, order)?;
+    let gps = {
+        let mut gps = gps.to_vec();
+        gps.sort_by_key(|entry| entry.tag);
+        gps
+    };
     let gps_offset = append_ifd(&mut tiff, &gps, order, 0)?;
-    let ifd0 = [IfdEntry::long(tag::GPS_IFD_POINTER, gps_offset, order)];
+    let mut ifd0 = vec![IfdEntry::long(tag::GPS_IFD_POINTER, gps_offset, order)];
+    if let Some(stamp) = stamp {
+        let exif = [IfdEntry::ascii(tag::DATE_TIME_ORIGINAL, stamp)];
+        let exif_offset = append_ifd(&mut tiff, &exif, order, 0)?;
+        ifd0.push(IfdEntry::long(tag::EXIF_IFD_POINTER, exif_offset, order));
+        ifd0.sort_by_key(|entry| entry.tag);
+    }
     let ifd0_offset = append_ifd(&mut tiff, &ifd0, order, 0)?;
 
     let Some(byte_order) = tiff.get_mut(..2) else {
@@ -1350,31 +1563,24 @@ fn fresh_tiff(position: &GpsPosition) -> Result<Vec<u8>> {
         return Err(malformed(String::from("fresh TIFF header vanished"), 2));
     };
     magic.copy_from_slice(&order.u16_bytes(42));
-    let Some(ifd0_field) = tiff.get_mut(4..8) else {
-        return Err(malformed(String::from("fresh TIFF header vanished"), 4));
-    };
-    ifd0_field.copy_from_slice(&order.u32_bytes(ifd0_offset));
+    point_header_at(&mut tiff, order, ifd0_offset)?;
     Ok(tiff)
 }
 
 /// Insert a brand-new Exif APP1 segment right after the JPEG's SOI marker.
 fn insert_fresh_exif(jpeg: &[u8], position: &GpsPosition) -> Result<Vec<u8>> {
-    let tiff = fresh_tiff(position)?;
-    let payload_len = EXIF_HEADER
-        .len()
-        .checked_add(tiff.len())
-        .ok_or_else(|| malformed(String::from("the Exif block length overflowed usize"), 0))?;
-    let segment_len = payload_len
-        .checked_add(2)
-        .ok_or_else(|| malformed(String::from("the Exif block length overflowed usize"), 0))?;
-    if segment_len > MAX_SEGMENT_LENGTH {
-        return Err(malformed(
-            format!("a new Exif block of {segment_len} bytes does not fit a JPEG segment"),
-            0,
-        ));
-    }
-    let segment_len = u16::try_from(segment_len)
-        .map_err(|_| malformed(String::from("Exif segment length does not fit 16 bits"), 0))?;
+    let gps = gps_entries(position, ByteOrder::Little)?;
+    insert_fresh_segment(jpeg, &fresh_tiff(&gps, None)?)
+}
+
+/// Insert a fresh Exif APP1 segment carrying `stamp` as `DateTimeOriginal`, for
+/// a photo that had no Exif to rewrite.
+fn insert_fresh_exif_with_time(jpeg: &[u8], stamp: &[u8]) -> Result<Vec<u8>> {
+    insert_fresh_segment(jpeg, &fresh_tiff(&[], Some(stamp))?)
+}
+
+fn insert_fresh_segment(jpeg: &[u8], tiff: &[u8]) -> Result<Vec<u8>> {
+    let segment_len = segment_length_for(tiff.len(), 0)?;
     let Some(tiff_prefix) = jpeg.get(..2) else {
         return Err(not_a_jpeg(jpeg.len()));
     };
@@ -1386,7 +1592,7 @@ fn insert_fresh_exif(jpeg: &[u8], position: &GpsPosition) -> Result<Vec<u8>> {
     out.extend_from_slice(&[0xFF, 0xE1]);
     out.extend_from_slice(&segment_len.to_be_bytes());
     out.extend_from_slice(EXIF_HEADER);
-    out.extend_from_slice(&tiff);
+    out.extend_from_slice(tiff);
     out.extend_from_slice(tiff_rest);
     Ok(out)
 }
@@ -1418,7 +1624,7 @@ fn days_in_month(year: i64, month: u32) -> u32 {
 ///
 /// Howard Hinnant's `days_from_civil`; written out because the crate has no
 /// date library and this is the only calendar arithmetic it needs.
-fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
     if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
         return None;
     }
@@ -1434,7 +1640,13 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
 /// The Gregorian date for a count of days since 1970-01-01.
 ///
 /// Hinnant's `civil_from_days`, the inverse of [`days_from_civil`].
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+///
+/// `pub(crate)` so the calendar arithmetic has one implementation in the crate:
+/// [`crate::log::export`] formats timestamps and [`crate::log::geotag`]'s tests
+/// build EXIF dates with it. A second copy of this formula is a second place
+/// for an off-by-one day to hide, and it would show up as a photo matched to
+/// the wrong day rather than as a failing test.
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let shifted = days + 719_468;
     let era = if shifted >= 0 {
         shifted
@@ -1454,7 +1666,14 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
         month_prime - 9
     };
     let year = if month <= 2 { year + 1 } else { year };
-    (year, month as u32, day as u32)
+    // `month` is 1..=12 and `day` is 1..=31 out of the algorithm above, so the
+    // fallback cannot be reached; it keeps the function infallible rather than
+    // panicking inside a formatter.
+    (
+        year,
+        u32::try_from(month).unwrap_or(1),
+        u32::try_from(day).unwrap_or(1),
+    )
 }
 
 /// Parse `"YYYY:MM:DD"` (also tolerates `-` separators), as `GPSDateStamp` holds.
@@ -1503,7 +1722,7 @@ mod tests {
     /// The repository's example coordinate. Never a real place anyone stood.
     const TOKYO_LAT: f64 = 35.681_236;
     const TOKYO_LON: f64 = 139.767_125;
-    /// 2023-11-14 22:13:20 UTC, the moment the {@link tokyo} fixture was taken.
+    /// 2023-11-14 22:13:20 UTC, the moment the `tokyo()` fixture was taken.
     const TOKYO_UTC: u32 = 1_700_000_000;
     const TOKYO_DATETIME: &str = "2023:11:14 22:13:20";
 
@@ -1738,8 +1957,164 @@ mod tests {
             "a rewrite must not switch a MM file to II"
         );
         let tags = read_gps(&tagged).expect("read").expect("an Exif block");
+        assert_eq!(tags.version_id, Some([2, 2, 0, 0]));
         assert_degrees(tags.latitude, TOKYO_LAT);
         assert_eq!(tags.utc, Some(TOKYO_UTC));
+    }
+
+    #[test]
+    fn gps_version_id_is_written_and_read_in_both_byte_orders() {
+        let plain = fixture::jpeg_without_exif();
+        let tagged_le = write_gps(&plain, &tokyo()).expect("write LE");
+        let tags_le = read_gps(&tagged_le).expect("read LE").expect("Exif LE");
+        assert_eq!(tags_le.version_id, Some([2, 2, 0, 0]));
+        let raw_le = raw_exif(&tagged_le);
+        assert_eq!(
+            raw_le.gps_value(tag::GPS_VERSION_ID),
+            Some(&[2u8, 2, 0, 0][..])
+        );
+
+        let be_base = fixture::exif_jpeg(ByteOrder::Big, &[], None, Some(TOKYO_DATETIME));
+        let tagged_be = write_gps(&be_base, &tokyo()).expect("write BE");
+        let tags_be = read_gps(&tagged_be).expect("read BE").expect("Exif BE");
+        assert_eq!(tags_be.version_id, Some([2, 2, 0, 0]));
+        let raw_be = raw_exif(&tagged_be);
+        assert_eq!(raw_be.order, ByteOrder::Big);
+        assert_eq!(
+            raw_be.gps_value(tag::GPS_VERSION_ID),
+            Some(&[2u8, 2, 0, 0][..])
+        );
+    }
+
+    #[test]
+    fn a_version_id_of_the_wrong_type_reads_as_absent_and_leaves_the_other_tags() {
+        // The documented contract (GpsTags::version_id): a tag whose type is
+        // not BYTE[4] reads as None rather than as an error, so one garbled
+        // declaration does not cost the photo its position.
+        let garbled = fixture::exif_jpeg(
+            ByteOrder::Little,
+            &[],
+            Some(&[
+                fixture::Entry::undefined_version_id(vec![2, 2, 0, 0]),
+                fixture::Entry::ascii(tag::GPS_LATITUDE_REF, "N"),
+                fixture::Entry::rationals(
+                    tag::GPS_LATITUDE,
+                    &[(35, 1), (40, 1), (52_450, 1_000)],
+                    ByteOrder::Little,
+                ),
+                fixture::Entry::ascii(tag::GPS_LONGITUDE_REF, "E"),
+            ]),
+            None,
+        );
+        let tags = read_gps(&garbled)
+            .expect("a garbled version tag is not an error")
+            .expect("an Exif block");
+        assert_eq!(
+            tags.version_id, None,
+            "a non-BYTE version id reads as absent"
+        );
+        assert!(
+            tags.latitude.is_some(),
+            "the rest of the IFD still reads: {tags:?}"
+        );
+
+        // The count is part of the contract too: BYTE with five values. Five,
+        // not three, because a three-byte value would be `None` from the
+        // four-byte conversion alone — the count check has to be the thing that
+        // rejects it. Keep it BYTE, or the test would pass on the type check.
+        let short = fixture::exif_jpeg(
+            ByteOrder::Little,
+            &[],
+            Some(&[fixture::Entry::version_id_bytes(vec![2, 2, 0, 0, 0])]),
+            None,
+        );
+        let tags = read_gps(&short)
+            .expect("a short version id is not an error")
+            .expect("an Exif block");
+        assert_eq!(tags.version_id, None);
+    }
+
+    #[test]
+    fn writing_a_capture_time_replaces_datetime_original_and_keeps_the_rest() {
+        let jpeg = fixture::exif_jpeg(
+            ByteOrder::Little,
+            &[fixture::Entry::ascii(0x010F, "TestCam")], // Make, in IFD0
+            Some(&gps_entries(ByteOrder::Little)),
+            Some(TOKYO_DATETIME),
+        );
+        assert_eq!(
+            read_datetime_original(&jpeg).expect("read"),
+            Some(TOKYO_UTC)
+        );
+
+        // One day later.
+        let later = TOKYO_UTC + 86_400;
+        let shifted = write_datetime_original(&jpeg, later).expect("write time");
+        assert_eq!(
+            read_datetime_original(&shifted).expect("read back"),
+            Some(later),
+            "write-then-read must return what was written"
+        );
+        // The GPS IFD is not this function's business and stays byte-identical
+        // in meaning: the position still reads the same.
+        let tags = read_gps(&shifted).expect("read").expect("an Exif block");
+        assert_degrees(tags.latitude, TOKYO_LAT);
+        assert_degrees(tags.longitude, TOKYO_LON);
+        // The Exif sub-IFD is rewritten (IFD0 keeps a pointer to the new one),
+        // and the unrelated IFD0 tag is copied across byte for byte: the diff
+        // is a repointed pointer, not a rebuilt IFD0.
+        let before = raw_exif(&jpeg);
+        let raw = raw_exif(&shifted);
+        assert_eq!(
+            raw.ifd0_value(0x010F),
+            before.ifd0_value(0x010F),
+            "an unrelated IFD0 tag must survive a capture-time rewrite"
+        );
+        assert_eq!(raw.order, ByteOrder::Little);
+    }
+
+    #[test]
+    fn writing_a_capture_time_into_a_photo_with_no_exif_creates_the_block() {
+        let plain = fixture::jpeg_without_exif();
+        assert!(!has_exif(&plain).expect("scan"));
+        let stamped = write_datetime_original(&plain, TOKYO_UTC).expect("insert Exif");
+        assert!(has_exif(&stamped).expect("scan"));
+        assert_eq!(
+            read_datetime_original(&stamped).expect("read"),
+            Some(TOKYO_UTC)
+        );
+        // The inserted block carries no GPS tags yet: a later `write_gps` fills
+        // them and must still leave the time alone.
+        let tagged = write_gps(&stamped, &tokyo()).expect("tag");
+        assert_eq!(
+            read_datetime_original(&tagged).expect("read"),
+            Some(TOKYO_UTC),
+            "tagging a photo must not disturb its capture time"
+        );
+    }
+
+    #[test]
+    fn writing_a_capture_time_rejects_bytes_that_are_not_a_jpeg() {
+        // The reachable failure is "not a JPEG bytes at all": every `u32` is a
+        // date between 1970 and 2106, and both are valid EXIF years, so there is
+        // no representable time that is refused.
+        let plain = fixture::jpeg_without_exif();
+        assert!(write_datetime_original(&plain, u32::MAX).is_ok());
+        let err = write_datetime_original(&[0x00, 0x01], 0)
+            .expect_err("two non-JPEG bytes cannot take an Exif segment");
+        assert!(matches!(err, Error::State(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn write_then_read_round_trips_every_second_of_a_day() {
+        // Off-by-one errors in the calendar arithmetic show up at month and
+        // year boundaries; walk a day across one.
+        for offset in 0..86_400u32 {
+            let utc = 1_701_388_800 + offset; // 2023-12-01 00:00:00 UTC
+            let stamp = datetime_text(utc).expect("a date");
+            let text = std::str::from_utf8(&stamp[..stamp.len() - 1]).expect("ASCII");
+            assert_eq!(parse_datetime_text(text), Some(i64::from(utc)));
+        }
     }
 
     #[test]

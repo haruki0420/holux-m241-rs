@@ -27,6 +27,10 @@ m241-core = { path = "crates/m241-core" }
 m241-flash = { path = "crates/m241-flash" }
 thiserror = "2"
 serialport = "4"
+# KMZ long-edge reduction (spec §6.3) needs a JPEG decoder and encoder. Only the
+# `jpeg` feature is enabled; the other format back-ends are not built. The
+# reduction is in `crates/m241-core/src/log/kmz.rs`.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 serde_json = "1"
 egui = "0.37"
 eframe = "0.37"

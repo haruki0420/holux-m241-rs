@@ -7,7 +7,13 @@
 //!   record     one record -> a TrackPoint, for that block's bitmask
 //!   parse      a whole dump -> `Track`, tolerating the damage real dumps have
 //!   export     a `Track` -> GPX / KML / CSV / NMEA / JSON
+//!   kmz        a `Track` + photos -> uncompressed KMZ (KML 2.0 + Store ZIP)
+//!   import     GPX 1.0/1.1 or NMEA 0183 -> `Track`
+//!   edit       split, merge, delete points, and multi-step Undo/Redo
+//!   coord      format coordinates as Decimal, DMS, or WGS84 UTM
 //!   exif       the GPS tags in a JPEG's Exif block: read, validate, replace
+//!              (write_gps and write_datetime_original return new bytes; only
+//!              geotag::apply puts them in a file)
 //!   geotag     a photo's capture time -> the track point it was taken at
 //! ```
 //!
@@ -25,11 +31,20 @@
 //! which reads and decides, and [`geotag::apply`], which writes — the same split
 //! that keeps `--dry-run` and the real run on one code path everywhere else in
 //! this crate.
+//!
+//! [`exif`] follows the same rule one level down: its writers return new bytes
+//! and never open a file, so the only code that replaces a photo is
+//! [`geotag::apply`]. It also means no test here can stand in for a real camera
+//! file; `exif`'s module doc says what that leaves unverified.
 
 pub mod block;
+pub mod coord;
+pub mod edit;
 pub mod exif;
 pub mod export;
 pub mod geotag;
+pub mod import;
+pub mod kmz;
 pub mod parse;
 pub mod record;
 
@@ -38,12 +53,18 @@ mod fixture;
 
 pub use crate::types::TrackPoint;
 pub use block::{BLOCK_HEADER_SIZE, BLOCK_SIZE, BlockHeader};
+pub use coord::{CoordFormat, format_coordinate};
+pub use edit::{TrackEditor, delete_points, merge_tracks, split_track};
 pub use exif::{
-    GpsPosition, GpsTags, MAX_SEGMENT_LENGTH, read_datetime_original, read_gps, write_gps,
+    GpsPosition, GpsTags, MAX_SEGMENT_LENGTH, read_datetime_original, read_gps,
+    write_datetime_original, write_gps,
 };
 pub use export::{export, to_csv, to_gpx, to_json, to_kml, to_nmea};
 pub use geotag::{
-    CaptureTime, GeotagOptions, GeotagPlan, apply as apply_geotags, plan as plan_geotags,
+    CaptureTime, GeotagOptions, GeotagPlan, apply as apply_geotags, group_matched_plans,
+    plan as plan_geotags, plan_with_shift,
 };
+pub use import::{import_gpx, import_nmea};
+pub use kmz::{KmzPhoto, export_kmz};
 pub use parse::{ParseReport, parse_dump};
 pub use record::{DEFAULT_RECORD_BYTES, MIN_RECORD_BYTES, decode};

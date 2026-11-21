@@ -2611,6 +2611,8 @@ mod tests {
             point: Some(point),
             gap_seconds: Some(0),
             skipped: None,
+            keep_backup: false,
+            group_id: None,
         };
         assert_eq!(
             find_matching_point_index(&track, &plan),
