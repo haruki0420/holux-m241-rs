@@ -1328,7 +1328,9 @@ mod tests {
             .map(|item| item["path"].as_str().unwrap_or("").to_owned())
             .collect();
         assert!(
-            listed.iter().any(|path| path.ends_with("d4/bound.txt")),
+            listed
+                .iter()
+                .any(|path| Path::new(path).ends_with(Path::new("d4").join("bound.txt"))),
             "four levels below the root is read: {listed:?}"
         );
         assert!(
