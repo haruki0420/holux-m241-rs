@@ -1391,6 +1391,25 @@ mod tests {
     }
 
     #[test]
+    fn a_full_write_consumes_exactly_its_replies() {
+        // The two final `0x5A` of 0xD5 are part of the transfer. A client that
+        // stops after the last `0x69` leaves them in the buffer, and the next
+        // command (here `0xD9`, then the sync probes) reads them as its own.
+        let backup = stock_image();
+        let mut da = DownloadAgent::new(fake_in_da(&backup));
+        write_at_wire_start(&mut da, &backup, &patched_image()).expect("accepted");
+        let mut leftover = [0u8; 8];
+        let unread = da
+            .transport_mut()
+            .read(&mut leftover)
+            .expect("read the buffer");
+        assert_eq!(
+            unread, 0,
+            "the final 0x5A pair must have been consumed, not left for the restart"
+        );
+    }
+
+    #[test]
     fn the_final_packet_is_the_short_one_and_is_zero_filled() {
         // §8 item 9: the image ends on a 92-byte packet; the client pads it.
         assert_eq!(FLASH_WRITE_LENGTH % PACKET_SIZE, 0x5C);
