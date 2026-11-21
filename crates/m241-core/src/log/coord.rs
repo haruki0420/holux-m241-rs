@@ -1,8 +1,9 @@
 //! Coordinate display formatting (`Decimal`, `Dms`, `Utm`).
 //!
-//! Covers the three practical coordinate systems from `07-eztour-spec.ja.md`
-//! §3.3, §3.6, and §8 P2 #13: decimal degrees with hemisphere letters,
-//! degrees-minutes-seconds, and WGS84 UTM.
+//! Covers the three practical coordinate systems: decimal degrees with
+//! hemisphere letters, degrees-minutes-seconds, and WGS84 UTM. The formats are
+//! the ones `07-eztour-spec.ja.md` §3.3 and §3.6 record for ezTour's display;
+//! the code does not depend on that document to explain itself.
 
 use crate::error::{Error, Result};
 
@@ -22,9 +23,10 @@ pub enum CoordFormat {
 ///
 /// # Errors
 ///
-/// Returns [`Error::State`] when `lat` or `lon` is non-finite, outside
-/// `[-90, 90]` / `[-180, 180]`, or outside the UTM latitude span `[-80, 84]`
-/// when `format == CoordFormat::Utm`.
+/// Returns [`Error::State`] when `lat` or `lon` is non-finite or outside
+/// `[-90, 90]` / `[-180, 180]`, and when `format == CoordFormat::Utm` and `lat`
+/// is outside `[-80, 84]`: UTM has no band beyond those latitudes, so `Utm`
+/// accepts a narrower range than the other two formats.
 pub fn format_coordinate(lat: f64, lon: f64, format: CoordFormat) -> Result<(String, String)> {
     if !lat.is_finite() || lat.abs() > 90.0 {
         return Err(Error::State(format!(
@@ -63,11 +65,19 @@ fn format_dms_axis(value: f64, positive: char, negative: char) -> String {
     let min = total_min % 60;
     let deg = total_min / 60;
     let sec = (sec_ms as f64) / 1000.0;
+    // Degrees are not zero-padded: the hemisphere letter already fixes the
+    // field's width, and `N 5°` reads better than `N 05°`. Minutes and seconds
+    // are padded because they are parts of a degree, not a standalone number.
     format!("{hemi} {deg}°{min:02}'{sec:06.3}\"")
 }
 
 /// WGS84 Transverse Mercator UTM projection (`k0 = 0.9996`, `FE = 500_000`,
 /// southern hemisphere false northing `10_000_000`).
+///
+/// The series expansions are the standard ones given in Snyder, *Map
+/// Projections — A Working Manual* (USGS Professional Paper 1395), §8-9, with
+/// the 4th-order tangent and 6th-order meridional terms carried far enough for
+/// errors well under a metre inside a zone; the display rounds to whole metres.
 fn format_utm(lat: f64, lon: f64) -> Result<(String, String)> {
     if !(-80.0..=84.0).contains(&lat) {
         return Err(Error::State(format!(
@@ -76,6 +86,9 @@ fn format_utm(lat: f64, lon: f64) -> Result<(String, String)> {
     }
 
     const BANDS: &[u8; 20] = b"CDEFGHJKLMNPQRSTUVWX";
+    // 8-degree bands from -80: band 0 is C. Latitude 84, the top of band X,
+    // computes to (84 + 80) / 8 = 20.5 -> 20, one past the table, because X is
+    // 12 degrees tall where every other band is 8; `min(19)` folds it into X.
     let band_idx = (((lat + 80.0) / 8.0).floor() as usize).min(19);
     let band = char::from(BANDS.get(band_idx).copied().unwrap_or(b'X'));
 
@@ -177,6 +190,10 @@ mod tests {
             .parse()
             .unwrap();
         let northing: i64 = utm_n.strip_suffix('N').unwrap().parse().unwrap();
+        // ±1 m is the display's rounding to whole metres, not an allowance for
+        // the projection: the series error inside a zone is far below that.
+        // The expected values come from an independent UTM implementation for
+        // the same WGS84 input, not from this code.
         assert!((easting - 388_436).abs() <= 1, "easting {easting}");
         assert!((northing - 3_949_294).abs() <= 1, "northing {northing}");
     }
@@ -194,6 +211,9 @@ mod tests {
         assert_eq!(lon_dms, "W 70°15'00.000\"");
 
         // (-35.5, -70.25) -> zone 19, band H, southern hemisphere false northing (~6.07M m).
+        // This expectation is this implementation's own output, not a value
+        // checked against an external calculator; the zone/band and the
+        // hemisphere offset are what the assertion is really about.
         let (utm_e, utm_n) = format_coordinate(-35.5, -70.25, CoordFormat::Utm).expect("utm sw");
         assert!(utm_e.starts_with("19H "), "got {utm_e}");
         let northing: i64 = utm_n.strip_suffix('N').unwrap().parse().unwrap();
@@ -209,6 +229,28 @@ mod tests {
         let near_boundary = 35.0 + 59.0 / 60.0 + 59.999_9 / 3600.0;
         let (lat_dms, _) = format_coordinate(near_boundary, 0.0, CoordFormat::Dms).expect("carry");
         assert_eq!(lat_dms, "N 36°00'00.000\"");
+    }
+
+    #[test]
+    fn the_norway_and_svalbard_zone_exceptions_are_applied() {
+        // Norway: 56-64 N, 3-12 E belongs to zone 32 even where the plain
+        // 6-degree rule would put it in 31 (5 E) or 33 (11 E).
+        let (east, _) = format_coordinate(60.0, 5.0, CoordFormat::Utm).expect("norway");
+        assert_eq!(east, "32V 276980E", "Norway's 5 E is band 32, not 31");
+        let (east, _) = format_coordinate(60.0, 11.0, CoordFormat::Utm).expect("norway east");
+        assert!(east.starts_with("32V "), "Norway's 11 E is also 32: {east}");
+
+        // Svalbard: above 72 N the zones are widened, so 10 E is 33 and 22 E
+        // is 35 rather than 32 and 34.
+        let (east, _) = format_coordinate(78.0, 10.0, CoordFormat::Utm).expect("svalbard");
+        assert!(east.starts_with("33X "), "Svalbard's 10 E is 33: {east}");
+        let (east, _) = format_coordinate(78.0, 22.0, CoordFormat::Utm).expect("svalbard east");
+        assert!(east.starts_with("35X "), "Svalbard's 22 E is 35: {east}");
+
+        // The 276980 easting for (60 N, 5 E) is an independent calculation; it
+        // pins the projection at the edge of its own widened zone.
+        let (_, north) = format_coordinate(60.0, 5.0, CoordFormat::Utm).expect("norway");
+        assert_eq!(north, "6658157N");
     }
 
     #[test]

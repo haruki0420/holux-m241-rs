@@ -2,14 +2,30 @@
 //!
 //! A KMZ archive is a standard PKZIP container with `doc.kml` at its root and
 //! referenced photos under `photo/`. Using uncompressed Store (`method = 0`)
-//! keeps this crate free of external compression dependencies while producing
-//! valid archives accepted by Google Earth and standard ZIP tools.
+//! keeps this crate free of external compression dependencies. The archive is
+//! checked here by a reader written against the PKZIP field layout and by a CRC
+//! check; **Google Earth and `unzip` have never been run on the output**, so
+//! "a standard tool opens this" is unverified.
+//!
+//! # Photo size
+//!
+//! `07-eztour-spec.ja.md` §6.3 asks for a long-edge limit (`kmzMaxPhotoEdgeSize`)
+//! on the embedded photos. Reducing a JPEG means decoding and re-encoding it,
+//! which this crate cannot do without an image codec, so this module does not
+//! perform the reduction. Instead [`KmzPhoto::max_edge_pixels`] records the
+//! limit the caller asked for, and [`export_kmz`] **fails** when an image is
+//! larger than it rather than silently shipping the wrong size: a request that
+//! cannot be honoured is reported, not dropped. At the time of writing the
+//! export path therefore cannot produce a reduced photo at all, and callers
+//! that need one have to reduce it before handing the bytes over.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
 
 use crate::error::{Error, Result};
+use crate::log::exif::{JPEG_MARKER_EOI, JPEG_MARKER_SOI};
 use crate::log::export::{DOCUMENT_NAME, escape_xml, utc_date, utc_iso};
+use crate::log::geotag::CaptureTime;
 use crate::types::Track;
 
 /// ZIP local file header signature (`PK\x03\x04`).
@@ -25,27 +41,76 @@ const ZIP_VERSION_20: u16 = 20;
 /// General purpose bit 11: filename and comment are UTF-8 encoded.
 const FLAG_UTF8: u16 = 0x0800;
 
-/// Default track style colour (`aabbggrr`): opacity `0.7` (`0xB3`) over purple,
-/// matching the ezTour 10-colour palette and opacity (`07-eztour-spec.ja.md` §5).
+/// Default track style colour as KML's `<color>` string: `aabbggrr`.
+///
+/// Read right to left in byte pairs: `ff` is red, `80` green, `00` blue — a
+/// purple — and the leading `b3` is alpha, 179/255 ≈ 0.7 opacity. Width 5 and
+/// this alpha come from `07-eztour-spec.ja.md` §5, which records what ezTour's
+/// map drew (purple, 5 px, 0.7 opacity).
+///
+/// The hex value is **this project's choice**, not ezTour's: the spec names the
+/// colours in words and says they were carried as `#rrggbb` strings, and
+/// nothing in this repository records the exact bytes ezTour emitted. So this
+/// matches the *description*, and a side-by-side against real ezTour output is
+/// unverified. A single colour is all one track needs; the ten-colour palette is
+/// a multi-track feature (§5) that this exporter has no caller for yet, so
+/// adding the other nine now would be untested colour data.
 const DEFAULT_LINE_COLOR: &str = "b3ff0080";
-/// Default track polyline width in pixels (`07-eztour-spec.ja.md` §5).
+/// Default track polyline width in pixels, from the same §5 measurement.
 const DEFAULT_LINE_WIDTH: u8 = 5;
 
 /// A photo to embed in a KMZ archive under `photo/`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KmzPhoto {
-    /// Original filename (sanitised before being placed in `photo/`).
+    /// Filename to use in the archive and as the Placemark label (sanitised
+    /// before being placed in `photo/`).
     pub name: String,
     /// Latitude in signed decimal degrees.
     pub lat: f64,
     /// Longitude in signed decimal degrees.
     pub lon: f64,
-    /// Optional altitude in metres.
+    /// Altitude in metres. `None` is written as `0` in the KML because the
+    /// `<coordinates>` triple has no "unknown" value; see [`export_kmz`].
     pub altitude_m: Option<f32>,
-    /// Optional capture time as UTC Unix seconds.
-    pub utc: Option<u32>,
+    /// Capture time and where it came from; `None` writes no `<TimeStamp>`.
+    ///
+    /// The provenance is kept rather than flattened to a second count so a
+    /// reader can tell a shutter time from a file's modification time. See
+    /// [`crate::log::geotag::GeotagPlan::to_kmz_photo`] for the conversion
+    /// from a geotag plan.
+    pub utc: Option<CaptureTime>,
+    /// Largest long edge the caller will accept for this photo, in pixels
+    /// (`kmzMaxPhotoEdgeSize`). `None` accepts the bytes as they are.
+    ///
+    /// This module cannot reduce a JPEG (see the module doc), so a value that
+    /// [`jpeg_dimensions`] reports as exceeded is an [`Error::State`], not a
+    /// silent full-size embed.
+    pub max_edge_pixels: Option<u32>,
     /// Raw JPEG bytes to store in the archive.
     pub jpeg_bytes: Vec<u8>,
+}
+
+impl KmzPhoto {
+    /// The ZIP and `<TimeStamp>` timestamp: Unix seconds when the capture time
+    /// came from the camera, `None` when it came from the file system.
+    ///
+    /// A modification time says when the file was written, and putting it in
+    /// the KML would place the photo on the map at a moment it was not taken.
+    /// The ZIP entry keeps it, because a ZIP entry always has *some* timestamp
+    /// and the file's own is the honest one there.
+    #[must_use]
+    fn exif_capture_utc(&self) -> Option<u32> {
+        match self.utc {
+            Some(CaptureTime::Exif(utc)) => Some(utc),
+            Some(CaptureTime::FileModified(_)) | None => None,
+        }
+    }
+
+    /// The ZIP entry timestamp: either capture time's seconds.
+    #[must_use]
+    fn zip_utc(&self) -> Option<u32> {
+        self.utc.map(CaptureTime::utc)
+    }
 }
 
 /// Bundle `track` and `photos` into an uncompressed (Store) KMZ archive.
@@ -54,10 +119,17 @@ pub struct KmzPhoto {
 /// a `<Folder><name>Photos</name>` of photo `<Placemark>` entries) and each
 /// photo under `photo/<sanitised_name>`.
 ///
+/// A photo with no altitude is written with altitude `0`, because KML's
+/// `<coordinates>` has no "unknown" value and a two-value pair would clamp to
+/// the ground; the Placemark already carries `<Point>` so the horizontal
+/// position is right, and only the height is a placeholder.
+///
 /// # Errors
 ///
 /// Returns [`Error::State`] if a photo coordinate or altitude is non-finite or
-/// out of range, or [`Error::Log`] if the archive exceeds ZIP32 limits.
+/// out of range, or if a photo's long edge exceeds [`KmzPhoto::max_edge_pixels`]
+/// (see the module doc for why that is reported rather than reduced), and
+/// [`Error::Log`] if the archive exceeds ZIP32 limits.
 pub fn export_kmz(track: &Track, photos: &[KmzPhoto]) -> Result<Vec<u8>> {
     let mut used_names = HashSet::with_capacity(photos.len());
     let mut resolved: Vec<(String, &KmzPhoto)> = Vec::with_capacity(photos.len());
@@ -82,7 +154,7 @@ pub fn export_kmz(track: &Track, photos: &[KmzPhoto]) -> Result<Vec<u8>> {
         entries.push(ZipInput {
             path: format!("photo/{name}"),
             data: &photo.jpeg_bytes,
-            utc: photo.utc,
+            utc: photo.zip_utc(),
         });
     }
 
@@ -108,7 +180,69 @@ fn validate_photo(photo: &KmzPhoto) -> Result<()> {
             photo.name
         )));
     }
+    if let Some(max_edge) = photo.max_edge_pixels
+        && let Some((width, height)) = jpeg_dimensions(&photo.jpeg_bytes)
+    {
+        let long_edge = width.max(height);
+        if long_edge > max_edge {
+            return Err(Error::State(format!(
+                "photo {:?} is {width} pixels wide and {height} high, and its long edge \
+                 {long_edge} exceeds the {max_edge} pixel limit; this build cannot resize a \
+                 JPEG, so reduce the photo first",
+                photo.name
+            )));
+        }
+    }
     Ok(())
+}
+
+/// Read a JPEG's pixel dimensions from its first Start-Of-Frame segment.
+///
+/// Returns `None` when the bytes are not a JPEG, or are a JPEG whose headers do
+/// not hold a frame size this function recognises (the arithmetic-coded and
+/// lossless SOF variants, or a truncated header). JPEG has no other place the
+/// size is recorded, so `None` is "unknown", not "small".
+///
+/// Only the size matters here, so the walk stops at the first frame header and
+/// never looks at the entropy-coded data, where `FF` bytes are stuffed and a
+/// marker scan would be meaningless.
+#[must_use]
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    // Segments after SOI are `FF <marker> <len hi> <len lo> <payload>`, where
+    // `len` includes its own two bytes. `FF` padding before a marker is legal.
+    let mut cursor = bytes.strip_prefix(&[0xFF, 0xD8])?;
+    loop {
+        // Skip any `FF` fill bytes before the marker, then consume the marker.
+        let marker = loop {
+            let next = *cursor.first()?;
+            cursor = cursor.get(1..)?;
+            if next != 0xFF {
+                break next;
+            }
+        };
+        match marker {
+            // SOF0..SOF15 except DHT (C4), JPG (C8) and DAC (CC) are frame
+            // headers; after the length comes precision, height, then width.
+            0xC0..=0xCF if !matches!(marker, 0xC4 | 0xC8 | 0xCC) => {
+                let height = u32::from(u16::from_be_bytes([*cursor.get(3)?, *cursor.get(4)?]));
+                let width = u32::from(u16::from_be_bytes([*cursor.get(5)?, *cursor.get(6)?]));
+                return (width > 0 && height > 0).then_some((width, height));
+            }
+            // Start of scan or end of image: no frame header came before, so
+            // the size is not where it should be. The EOI byte is named by its
+            // JPEG meaning, not by its MTK meaning (see exif.rs).
+            0xDA | JPEG_MARKER_EOI => return None,
+            // Restart markers and TEM stand alone, without a length.
+            0xD0..=JPEG_MARKER_SOI | 0x01 => {}
+            _ => {
+                let len = usize::from(u16::from_be_bytes([*cursor.first()?, *cursor.get(1)?]));
+                // `cursor` is at the length field: `len` counts the two length
+                // bytes plus the payload, so skip the payload after them.
+                cursor = cursor.get(2..)?;
+                cursor = cursor.get(len.checked_sub(2)?..)?;
+            }
+        }
+    }
 }
 
 /// Sanitise a photo filename so it cannot escape `photo/` or break XML/ZIP.
@@ -196,7 +330,7 @@ fn build_kml(track: &Track, photos: &[(String, &KmzPhoto)]) -> String {
     for (archive_name, photo) in photos {
         out.push_str("      <Placemark>\n");
         let _ = writeln!(out, "        <name>{}</name>", escape_xml(archive_name));
-        if let Some(utc) = photo.utc {
+        if let Some(utc) = photo.exif_capture_utc() {
             let _ = writeln!(
                 out,
                 "        <TimeStamp><when>{}</when></TimeStamp>",
@@ -207,6 +341,10 @@ fn build_kml(track: &Track, photos: &[(String, &KmzPhoto)]) -> String {
             out,
             "        <description><![CDATA[<img src=\"photo/{archive_name}\"/>]]></description>"
         );
+        // A `<coordinates>` triple has no "unknown", and a two-value pair is
+        // read as terrain-altitude (clamped to the ground). 0 is the honest
+        // placeholder for "no altitude was measured"; the `<Point>` still
+        // carries the horizontal position, which is what the photo claims.
         let alt = photo.altitude_m.unwrap_or(0.0);
         let _ = writeln!(
             out,
@@ -240,8 +378,12 @@ struct CentralEntry<'a> {
 }
 
 /// Compute the IEEE 802.3 / PKZIP CRC-32 of `bytes`.
+///
+/// `pub(crate)`: the ZIP writer here and the tests are the only users, and a
+/// public CRC would be a promise to keep a general checksum tool that the crate
+/// does not otherwise need.
 #[must_use]
-pub fn crc32_ieee(bytes: &[u8]) -> u32 {
+pub(crate) fn crc32_ieee(bytes: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in bytes {
         crc ^= u32::from(byte);
@@ -407,89 +549,169 @@ mod tests {
         }
     }
 
+    /// A photo at the example coordinate, with everything optional left out.
+    fn photo(name: &str) -> KmzPhoto {
+        KmzPhoto {
+            name: String::from(name),
+            lat: TOKYO_LAT,
+            lon: TOKYO_LON,
+            altitude_m: None,
+            utc: None,
+            max_edge_pixels: None,
+            jpeg_bytes: vec![0xFF, 0xD8, 0xFF, 0xE1],
+        }
+    }
+
+    /// A JPEG-shaped byte stream whose SOF0 declares `width` x `height`.
+    ///
+    /// Every segment carries the length it declares: an APP0 with a one-byte
+    /// payload, then SOF0 with precision, height, width and one component.
+    fn jpeg_with_size(width: u16, height: u16) -> Vec<u8> {
+        let mut out = vec![0xFF, 0xD8];
+        // APP0, length 6: the two length bytes plus four payload bytes.
+        out.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00]);
+        // SOF0: length 12 = 2 + precision(1) + height(2) + width(2) + count(1)
+        // + 4 bytes for one component (id, sampling, quant-table).
+        out.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0C, 0x08]);
+        out.extend_from_slice(&height.to_be_bytes());
+        out.extend_from_slice(&width.to_be_bytes());
+        out.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+        out.extend_from_slice(&[0xFF, JPEG_MARKER_EOI]);
+        out
+    }
+
     struct ParsedZipEntry {
         name: String,
         method: u16,
         crc: u32,
+        /// MS-DOS `(date, time)` fields the writer stored for the entry.
+        dos_date: u16,
+        dos_time: u16,
         data: Vec<u8>,
     }
 
     fn parse_zip_and_verify(bytes: &[u8]) -> Vec<ParsedZipEntry> {
-        assert!(bytes.len() >= 22, "ZIP shorter than EOCD");
-        let eocd_pos = bytes.len() - 22;
-        assert_eq!(
-            u32::from_le_bytes(bytes[eocd_pos..eocd_pos + 4].try_into().unwrap()),
-            EOCD_SIGNATURE
-        );
-        let entry_count =
-            u16::from_le_bytes(bytes[eocd_pos + 8..eocd_pos + 10].try_into().unwrap());
-        let total_entries =
-            u16::from_le_bytes(bytes[eocd_pos + 10..eocd_pos + 12].try_into().unwrap());
-        assert_eq!(entry_count, total_entries);
-        let cd_size = u32::from_le_bytes(bytes[eocd_pos + 12..eocd_pos + 16].try_into().unwrap());
-        let cd_offset = u32::from_le_bytes(bytes[eocd_pos + 16..eocd_pos + 20].try_into().unwrap());
-        assert_eq!(cd_offset as usize + cd_size as usize, eocd_pos);
+        let eocd = read_eocd(bytes);
+        assert_eq!(eocd.entry_count as usize, eocd.total_entries as usize);
 
         let mut entries = Vec::new();
-        let mut cursor = cd_offset as usize;
-        for _ in 0..entry_count {
-            assert_eq!(
-                u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()),
-                CDFH_SIGNATURE
-            );
-            let method = u16::from_le_bytes(bytes[cursor + 10..cursor + 12].try_into().unwrap());
-            let cd_crc = u32::from_le_bytes(bytes[cursor + 16..cursor + 20].try_into().unwrap());
-            let comp_size =
-                u32::from_le_bytes(bytes[cursor + 20..cursor + 24].try_into().unwrap()) as usize;
-            let uncomp_size =
-                u32::from_le_bytes(bytes[cursor + 24..cursor + 28].try_into().unwrap()) as usize;
-            assert_eq!(comp_size, uncomp_size);
-            let name_len =
-                u16::from_le_bytes(bytes[cursor + 28..cursor + 30].try_into().unwrap()) as usize;
-            let extra_len =
-                u16::from_le_bytes(bytes[cursor + 30..cursor + 32].try_into().unwrap()) as usize;
-            let comment_len =
-                u16::from_le_bytes(bytes[cursor + 32..cursor + 34].try_into().unwrap()) as usize;
-            let lfh_offset =
-                u32::from_le_bytes(bytes[cursor + 42..cursor + 46].try_into().unwrap()) as usize;
-            let cd_name = std::str::from_utf8(&bytes[cursor + 46..cursor + 46 + name_len])
-                .expect("UTF-8 name")
-                .to_owned();
-            cursor += 46 + name_len + extra_len + comment_len;
-
-            assert_eq!(
-                u32::from_le_bytes(bytes[lfh_offset..lfh_offset + 4].try_into().unwrap()),
-                LFH_SIGNATURE
-            );
-            let lfh_method =
-                u16::from_le_bytes(bytes[lfh_offset + 8..lfh_offset + 10].try_into().unwrap());
-            assert_eq!(lfh_method, method);
-            let lfh_crc =
-                u32::from_le_bytes(bytes[lfh_offset + 14..lfh_offset + 18].try_into().unwrap());
-            assert_eq!(lfh_crc, cd_crc);
-            let lfh_name_len =
-                u16::from_le_bytes(bytes[lfh_offset + 26..lfh_offset + 28].try_into().unwrap())
-                    as usize;
-            let lfh_extra_len =
-                u16::from_le_bytes(bytes[lfh_offset + 28..lfh_offset + 30].try_into().unwrap())
-                    as usize;
-            let lfh_name =
-                std::str::from_utf8(&bytes[lfh_offset + 30..lfh_offset + 30 + lfh_name_len])
-                    .expect("UTF-8 LFH name");
-            assert_eq!(lfh_name, cd_name);
-            let data_start = lfh_offset + 30 + lfh_name_len + lfh_extra_len;
-            let data = bytes[data_start..data_start + comp_size].to_vec();
-            assert_eq!(crc32_ieee(&data), cd_crc, "CRC-32 mismatch for {cd_name}");
-
-            entries.push(ParsedZipEntry {
-                name: cd_name,
-                method,
-                crc: cd_crc,
-                data,
-            });
+        let mut cursor = eocd.cd_offset;
+        for _ in 0..eocd.entry_count {
+            let entry = read_central_entry(bytes, cursor);
+            cursor += entry.record_len;
+            entries.push(entry.into_parsed(bytes));
         }
-        assert_eq!(cursor, eocd_pos);
+        assert_eq!(cursor, eocd.position);
         entries
+    }
+
+    struct Eocd {
+        position: usize,
+        entry_count: u16,
+        total_entries: u16,
+        cd_offset: usize,
+    }
+
+    fn read_eocd(bytes: &[u8]) -> Eocd {
+        assert!(bytes.len() >= 22, "ZIP shorter than EOCD");
+        let position = bytes.len() - 22;
+        let u16_at = |at: usize| u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
+        let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        assert_eq!(u32_at(position), EOCD_SIGNATURE);
+        let entry_count = u16_at(position + 8);
+        let total_entries = u16_at(position + 10);
+        let cd_size = u32_at(position + 12) as usize;
+        let cd_offset = u32_at(position + 16) as usize;
+        assert_eq!(cd_offset + cd_size, position);
+        Eocd {
+            position,
+            entry_count,
+            total_entries,
+            cd_offset,
+        }
+    }
+
+    struct CentralRecord {
+        name: String,
+        method: u16,
+        crc: u32,
+        size: usize,
+        dos_date: u16,
+        dos_time: u16,
+        lfh_offset: usize,
+        record_len: usize,
+    }
+
+    fn read_central_entry(bytes: &[u8], cursor: usize) -> CentralRecord {
+        let u16_at = |at: usize| u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
+        let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        assert_eq!(u32_at(cursor), CDFH_SIGNATURE);
+        let method = u16_at(cursor + 10);
+        let dos_time = u16_at(cursor + 12);
+        let dos_date = u16_at(cursor + 14);
+        let crc = u32_at(cursor + 16);
+        let comp_size = u32_at(cursor + 20) as usize;
+        let uncomp_size = u32_at(cursor + 24) as usize;
+        assert_eq!(comp_size, uncomp_size);
+        let name_len = u16_at(cursor + 28) as usize;
+        let extra_len = u16_at(cursor + 30) as usize;
+        let comment_len = u16_at(cursor + 32) as usize;
+        let lfh_offset = u32_at(cursor + 42) as usize;
+        let name = std::str::from_utf8(&bytes[cursor + 46..cursor + 46 + name_len])
+            .expect("UTF-8 name")
+            .to_owned();
+        CentralRecord {
+            name,
+            method,
+            crc,
+            size: comp_size,
+            dos_date,
+            dos_time,
+            lfh_offset,
+            record_len: 46 + name_len + extra_len + comment_len,
+        }
+    }
+
+    impl CentralRecord {
+        fn into_parsed(self, bytes: &[u8]) -> ParsedZipEntry {
+            let offset = self.lfh_offset;
+            let u16_at = |at: usize| u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
+            let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            assert_eq!(u32_at(offset), LFH_SIGNATURE);
+            let lfh_method = u16_at(offset + 8);
+            let lfh_crc = u32_at(offset + 14);
+            let name_len = u16_at(offset + 26) as usize;
+            let extra_len = u16_at(offset + 28) as usize;
+            let name = std::str::from_utf8(&bytes[offset + 30..offset + 30 + name_len])
+                .expect("UTF-8 LFH name");
+            assert_eq!(name, self.name, "the two headers must name one entry");
+            assert_eq!(lfh_method, self.method);
+            assert_eq!(lfh_crc, self.crc);
+            let data_start = offset + 30 + name_len + extra_len;
+            let data = bytes[data_start..data_start + self.size].to_vec();
+            assert_eq!(
+                crc32_ieee(&data),
+                self.crc,
+                "CRC-32 mismatch for {}",
+                self.name
+            );
+            ParsedZipEntry {
+                name: self.name,
+                method: self.method,
+                crc: self.crc,
+                dos_date: self.dos_date,
+                dos_time: self.dos_time,
+                data,
+            }
+        }
+    }
+
+    /// `doc.kml` out of an archive built by `export_kmz`.
+    fn kml_of(photos: &[KmzPhoto]) -> String {
+        let kmz = export_kmz(&sample_track(), photos).expect("export kmz");
+        let entries = parse_zip_and_verify(&kmz);
+        assert_eq!(entries[0].name, "doc.kml");
+        String::from_utf8(entries[0].data.clone()).expect("UTF-8 KML")
     }
 
     #[test]
@@ -499,17 +721,16 @@ mod tests {
     }
 
     #[test]
-    fn export_kmz_produces_valid_zip_and_styled_kml_with_photos() {
-        let photos = vec![KmzPhoto {
-            name: String::from("tokyo.jpg"),
-            lat: TOKYO_LAT,
-            lon: TOKYO_LON,
-            altitude_m: Some(40.0),
-            utc: Some(TOKYO_UTC),
-            jpeg_bytes: vec![0xFF, 0xD8, 0xFF, 0xD8 + 1],
-        }];
+    fn export_kmz_produces_a_store_archive_this_reader_accepts() {
+        // "Valid" here means: PKZIP field layout as this test reads it, and the
+        // standard CRC-32 of every entry. `unzip -t` and Google Earth have not
+        // been run on the output; see the module doc.
+        let mut photo = photo("tokyo.jpg");
+        photo.altitude_m = Some(40.0);
+        photo.utc = Some(CaptureTime::Exif(TOKYO_UTC));
+        photo.jpeg_bytes = vec![0xFF, JPEG_MARKER_SOI, 0xFF, JPEG_MARKER_EOI];
 
-        let kmz = export_kmz(&sample_track(), &photos).expect("export kmz");
+        let kmz = export_kmz(&sample_track(), &[photo.clone()]).expect("export kmz");
         let entries = parse_zip_and_verify(&kmz);
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "doc.kml");
@@ -519,54 +740,180 @@ mod tests {
         let kml = std::str::from_utf8(&entries[0].data).expect("UTF-8 KML");
         assert!(kml.contains("http://earth.google.com/kml/2.0"));
         assert!(kml.contains("<Document>"));
-        assert!(kml.contains("<LineStyle>"));
-        assert!(kml.contains("<width>5</width>"));
         assert!(kml.contains("<LineString>"));
+        assert!(kml.contains("<tessellate>1</tessellate>"));
         assert!(kml.contains("139.76712500,35.68123600,40.00"));
-        assert!(kml.contains("<Folder>\n      <name>Photos</name>"));
-        assert!(kml.contains("<img src=\"photo/tokyo.jpg\"/>"));
 
         assert_eq!(entries[1].name, "photo/tokyo.jpg");
         assert_eq!(entries[1].method, METHOD_STORE);
-        assert_eq!(entries[1].data, photos[0].jpeg_bytes);
+        assert_eq!(entries[1].data, photo.jpeg_bytes);
+    }
+
+    #[test]
+    fn the_track_style_carries_the_ez_tour_colour_and_width() {
+        let kml = kml_of(&[]);
+        assert!(kml.contains("<Style id=\"trackStyle\">"));
+        // aabbggrr: 0.7 opacity over purple, width 5 (spec §5).
+        assert!(
+            kml.contains("<color>b3ff0080</color>"),
+            "the KML must carry the colour as aabbggrr: {kml}"
+        );
+        assert!(kml.contains("<width>5</width>"));
+        assert!(kml.contains("<styleUrl>#trackStyle</styleUrl>"));
+    }
+
+    #[test]
+    fn a_photo_placemark_is_a_point_at_its_coordinates() {
+        let mut photo = photo("point.jpg");
+        photo.lat = 34.693_7;
+        photo.lon = 135.502_3;
+        photo.altitude_m = Some(25.5);
+        let kml = kml_of(&[photo]);
+        assert!(kml.contains("<Placemark>"));
+        assert!(
+            kml.contains(
+                "<Point><coordinates>135.50230000,34.69370000,25.50</coordinates></Point>"
+            ),
+            "lon,lat,alt in one <Point>: {kml}"
+        );
+        assert!(
+            !kml.contains(",0.00</coordinates></Point>"),
+            "the measured altitude must not be replaced by the placeholder"
+        );
+    }
+
+    #[test]
+    fn a_photo_without_an_altitude_is_written_at_zero_metres() {
+        // The three-value triple has no "unknown"; a two-value pair would be
+        // read as terrain height. The placeholder is fixed by this test so a
+        // change to it is a decision, not a drift.
+        let kml = kml_of(&[photo("no-alt.jpg")]);
+        assert!(
+            kml.contains("<Point><coordinates>139.76712500,35.68123600,0.00</coordinates></Point>"),
+            "a missing altitude is 0.00 m: {kml}"
+        );
+    }
+
+    #[test]
+    fn only_a_camera_time_becomes_a_timestamp_in_the_kml() {
+        let mut from_camera = photo("camera.jpg");
+        from_camera.utc = Some(CaptureTime::Exif(TOKYO_UTC));
+        let kml = kml_of(&[from_camera]);
+        assert!(
+            kml.contains("<TimeStamp><when>2023-11-14T22:13:20Z</when></TimeStamp>"),
+            "an Exif capture time must be written: {kml}"
+        );
+
+        let mut from_mtime = photo("mtime.jpg");
+        from_mtime.utc = Some(CaptureTime::FileModified(TOKYO_UTC));
+        let kml = kml_of(&[from_mtime]);
+        assert!(
+            !kml.contains("<TimeStamp>"),
+            "a modification time is not when the photo was taken: {kml}"
+        );
+
+        let kml = kml_of(&[photo("untimed.jpg")]);
+        assert!(!kml.contains("<TimeStamp>"));
+    }
+
+    #[test]
+    fn a_file_modified_time_still_stamps_the_zip_entry() {
+        // The ZIP entry needs some time; the file's own is the honest one even
+        // though the KML must not present it as a capture time.
+        let mut from_mtime = photo("mtime.jpg");
+        from_mtime.utc = Some(CaptureTime::FileModified(TOKYO_UTC));
+        let kmz = export_kmz(&sample_track(), &[from_mtime]).expect("export kmz");
+        let entries = parse_zip_and_verify(&kmz);
+        let photo_entry = entries.get(1).expect("the photo entry");
+        // 2023-11-14 -> DOS date: (2023-1980) << 9 | 11 << 5 | 14.
+        assert_eq!(photo_entry.dos_date, (43 << 9) | (11 << 5) | 14);
+        assert_ne!(photo_entry.dos_time, 0, "22:13:20 is not midnight");
+    }
+
+    #[test]
+    fn a_photo_longer_than_the_size_limit_is_refused_not_embedded_in_full() {
+        // kmzMaxPhotoEdgeSize (spec §6.3). This build has no JPEG codec, so the
+        // limit cannot be met by reducing the image; it is met by saying so.
+        let mut big = photo("big.jpg");
+        big.jpeg_bytes = jpeg_with_size(4000, 3000);
+        big.max_edge_pixels = Some(1024);
+        let err = export_kmz(&sample_track(), &[big]).expect_err("an oversized photo must fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("4000 pixels wide and 3000 high") && message.contains("1024"),
+            "the error must name the size and the limit: {message}"
+        );
+        assert!(
+            matches!(err, Error::State(_)),
+            "a refused photo is a State error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_photo_within_the_size_limit_is_embedded_unchanged() {
+        let mut fits = photo("fits.jpg");
+        fits.jpeg_bytes = jpeg_with_size(1280, 960);
+        fits.max_edge_pixels = Some(1600);
+        let kmz = export_kmz(&sample_track(), &[fits.clone()]).expect("export kmz");
+        let entries = parse_zip_and_verify(&kmz);
+        assert_eq!(
+            entries.get(1).map(|entry| entry.data.clone()),
+            Some(fits.jpeg_bytes),
+            "a photo under the limit keeps its exact bytes"
+        );
+    }
+
+    #[test]
+    fn a_long_edge_exactly_at_the_limit_is_accepted() {
+        // The limit is a maximum, not an exclusive bound: 1024 is allowed.
+        let mut exact = photo("exact.jpg");
+        exact.jpeg_bytes = jpeg_with_size(1024, 768);
+        exact.max_edge_pixels = Some(1024);
+        assert!(export_kmz(&sample_track(), &[exact]).is_ok());
+    }
+
+    #[test]
+    fn a_photo_of_unknown_size_is_checked_but_not_refused() {
+        // Bytes without a frame header cannot be measured. Refusing them would
+        // reject every non-JPEG merely because a limit was set; the bytes are
+        // embedded and the caller's limit simply does not apply.
+        let mut unknown = photo("unknown.jpg");
+        unknown.jpeg_bytes = vec![0x00, 0x01, 0x02];
+        unknown.max_edge_pixels = Some(1024);
+        assert!(export_kmz(&sample_track(), &[unknown]).is_ok());
+    }
+
+    #[test]
+    fn jpeg_dimensions_read_the_frame_header() {
+        assert_eq!(
+            jpeg_dimensions(&jpeg_with_size(4000, 3000)),
+            Some((4000, 3000))
+        );
+        assert_eq!(jpeg_dimensions(&jpeg_with_size(1, 1)), Some((1, 1)));
+        // Not a JPEG: no SOI.
+        assert_eq!(jpeg_dimensions(&[0x00, 0xFF, 0xD8]), None);
+        // SOI immediately followed by EOI: no frame header.
+        assert_eq!(
+            jpeg_dimensions(&[0xFF, JPEG_MARKER_SOI, 0xFF, JPEG_MARKER_EOI]),
+            None
+        );
+        // Truncated inside the APP0 segment.
+        assert_eq!(jpeg_dimensions(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00]), None);
+        // A DHT segment is not a frame header; the SOF0 after it is.
+        let mut with_dht = vec![0xFF, 0xD8, 0xFF, 0xC4, 0x00, 0x04, 0x00, 0x00];
+        with_dht.extend_from_slice(&jpeg_with_size(640, 480)[2..]);
+        assert_eq!(jpeg_dimensions(&with_dht), Some((640, 480)));
     }
 
     #[test]
     fn export_kmz_sanitises_traversal_and_deduplicates_names() {
-        let photos = vec![
-            KmzPhoto {
-                name: String::from("../../etc/passwd.jpg"),
-                lat: TOKYO_LAT,
-                lon: TOKYO_LON,
-                altitude_m: None,
-                utc: None,
-                jpeg_bytes: vec![1, 2, 3],
-            },
-            KmzPhoto {
-                name: String::from("sub\\dir\\passwd.jpg"),
-                lat: TOKYO_LAT,
-                lon: TOKYO_LON,
-                altitude_m: None,
-                utc: None,
-                jpeg_bytes: vec![4, 5, 6],
-            },
-            KmzPhoto {
-                name: String::from("PASSWD.JPG"),
-                lat: TOKYO_LAT,
-                lon: TOKYO_LON,
-                altitude_m: None,
-                utc: None,
-                jpeg_bytes: vec![7, 8, 9],
-            },
-            KmzPhoto {
-                name: String::from(".."),
-                lat: TOKYO_LAT,
-                lon: TOKYO_LON,
-                altitude_m: None,
-                utc: None,
-                jpeg_bytes: vec![10],
-            },
+        let names = [
+            "../../etc/passwd.jpg",
+            "sub\\dir\\passwd.jpg",
+            "PASSWD.JPG",
+            "..",
         ];
+        let photos: Vec<KmzPhoto> = names.iter().map(|name| photo(name)).collect();
 
         let kmz = export_kmz(&sample_track(), &photos).expect("export kmz");
         let entries = parse_zip_and_verify(&kmz);
@@ -593,16 +940,42 @@ mod tests {
     }
 
     #[test]
+    fn a_bracket_in_a_photo_name_cannot_close_the_description_cdata() {
+        // `]]>` inside a CDATA section would end it early and make the KML
+        // ill-formed. `sanitize_photo_name` replaces every `]` before the name
+        // reaches the document, so no filename can close the section; this test
+        // is what keeps that true. `[` and `>` survive the sanitiser on their
+        // own, which is why `]>` alone is not a terminator and this input uses
+        // no `!` either.
+        let kml = kml_of(&[photo("a]]>b[c>.jpg")]);
+        let start = kml.find("<![CDATA[").expect("a CDATA section") + "<![CDATA[".len();
+        let close = kml[start..]
+            .find("]]>")
+            .expect("the description must close its CDATA")
+            + start;
+        let inside = &kml[start..close];
+        assert!(
+            !inside.contains("]]>"),
+            "the section must not be closable from a filename: {inside}"
+        );
+        assert!(
+            inside.contains("src=\"photo/a___b[c_.jpg\""),
+            "every ] is replaced and the rest of the name is kept: {inside}"
+        );
+    }
+
+    #[test]
     fn export_kmz_rejects_invalid_photo_coordinates() {
-        let bad = KmzPhoto {
-            name: String::from("bad.jpg"),
-            lat: 95.0,
-            lon: TOKYO_LON,
-            altitude_m: None,
-            utc: None,
-            jpeg_bytes: vec![1, 2],
-        };
+        let mut bad = photo("bad.jpg");
+        bad.lat = 95.0;
         let err = export_kmz(&sample_track(), &[bad]).expect_err("invalid lat must fail");
         assert!(matches!(err, Error::State(_)));
+
+        let mut bad_alt = photo("bad-alt.jpg");
+        bad_alt.altitude_m = Some(f32::NAN);
+        assert!(matches!(
+            export_kmz(&sample_track(), &[bad_alt]),
+            Err(Error::State(_))
+        ));
     }
 }

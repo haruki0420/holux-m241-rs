@@ -1,8 +1,18 @@
 //! Importing GPX 1.0/1.1 and NMEA 0183 logs back into [`Track`].
 //!
-//! Together with [`crate::log::export`], this gives the toolkit round-trip
-//! interoperability with standard GPS files and ezTour exports without adding
-//! any external XML parser crate.
+//! Reads `<trkpt>` elements (with `<ele>`, `<time>`, `<speed>`) and `$GPRMC` /
+//! `$GPGGA` sentences, and nothing else. `<wpt>` waypoints are **skipped**: they
+//! are a different kind of object (a saved place, not a recorded position), and
+//! [`crate::log::export::to_gpx`] writing them is a one-way export until
+//! something decides what a waypoint should become in a track. No external XML
+//! parser is used, so the GPX reader is a string walk over the tags it needs.
+//!
+//! `<speed_kmh>` is this toolkit's own extension — [`crate::log::export::to_gpx`]
+//! writes it beside the standard `<speed>` so a round trip does not lose the
+//! km/h value it stores. It is read first, before the standard `<speed>` (GPX
+//! 1.0, m/s), so a file that carries both keeps the exact value rather than a
+//! converted one. A GPX 1.1 `<speed>` has no unit in the specification; it is
+//! read as m/s, which is what GPX 1.0 defines and what most writers emit.
 
 use crate::error::{Error, Result};
 use crate::log::exif::days_from_civil;
@@ -17,12 +27,18 @@ use crate::types::{Track, TrackPoint};
 /// (GPX 1.0 m/s, converted to km/h), and `<speed_kmh>` (written by
 /// [`crate::log::export::to_gpx`]).
 ///
+/// `<wpt>` waypoints and `<name>` elements are ignored; comments are removed
+/// before anything is read.
+///
 /// # Errors
 ///
 /// Returns [`Error::Log`] when the text does not contain a `<gpx` root element,
-/// has an unclosed `<trkpt>` tag, or carries invalid coordinates.
+/// has an unclosed `<trkpt>` tag, has an `<!--` that is never closed, or carries
+/// invalid coordinates. An unclosed comment is an error rather than "the rest
+/// of the file is gone": the points after it would otherwise vanish silently
+/// and the result would look like a track that simply ended.
 pub fn import_gpx(text: &str) -> Result<Track> {
-    let cleaned = strip_xml_comments(text);
+    let cleaned = strip_xml_comments(text)?;
     if !cleaned.contains("<gpx") {
         return Err(Error::Log {
             message: String::from("input is not a GPX document (missing <gpx element)"),
@@ -126,7 +142,12 @@ pub fn import_gpx(text: &str) -> Result<Track> {
 /// lines, broken checksums, unsupported sentence kinds, and no-fix sentences
 /// (`V` in RMC, quality `0` in GGA) are skipped cleanly. Consecutive `$GPRMC`
 /// and `$GPGGA` sentences sharing the same `HHMMSS` timestamp are merged so
-/// both date/speed (RMC) and altitude (GGA) survive together.
+/// both date/speed (RMC) and altitude (GGA) survive together, in either order.
+///
+/// Skipped lines are **not counted or reported**: a file whose every checksum is
+/// broken returns a track with no points, and the caller cannot tell that apart
+/// from a file that held no sentences. The input is checkable before the call if
+/// that distinction matters; the return type has nowhere to put a count.
 ///
 /// # Errors
 ///
@@ -134,7 +155,7 @@ pub fn import_gpx(text: &str) -> Result<Track> {
 /// for symmetry with [`import_gpx`].
 pub fn import_nmea(text: &str) -> Result<Track> {
     let mut points: Vec<TrackPoint> = Vec::new();
-    let mut last_hhmmss: Option<String> = None;
+    let mut last_bucket: Option<String> = None;
 
     for raw_line in text.lines() {
         let line = raw_line.trim();
@@ -144,48 +165,85 @@ pub fn import_nmea(text: &str) -> Result<Track> {
         let Ok(sentence) = parse_sentence(line) else {
             continue;
         };
-        match sentence.kind.as_str() {
-            "GPRMC" => {
-                let Some((hhmmss, parsed)) = parse_gprmc(&sentence.fields) else {
-                    continue;
-                };
-                if last_hhmmss.as_deref() == Some(hhmmss.as_str())
-                    && let Some(prev) = points.last_mut()
-                {
-                    if prev.utc.is_none() {
-                        prev.utc = parsed.utc;
-                    }
-                    if prev.speed_kmh.is_none() {
-                        prev.speed_kmh = parsed.speed_kmh;
-                    }
-                    continue;
-                }
-                last_hhmmss = Some(hhmmss);
-                points.push(parsed);
-            }
-            "GPGGA" => {
-                let Some((hhmmss, parsed)) = parse_gpgga(&sentence.fields) else {
-                    continue;
-                };
-                if last_hhmmss.as_deref() == Some(hhmmss.as_str())
-                    && let Some(prev) = points.last_mut()
-                {
-                    if prev.height_m.is_none() {
-                        prev.height_m = parsed.height_m;
-                    }
-                    continue;
-                }
-                last_hhmmss = Some(hhmmss);
-                points.push(parsed);
-            }
-            _ => {}
-        }
+        let parsed = match sentence.kind.as_str() {
+            // A refused sentence (no fix, bad fields) is dropped by the merge
+            // and, deliberately, does not touch `last_bucket`: a `V` line
+            // between two good ones must not break their pairing.
+            "GPRMC" => parse_gprmc(&sentence.fields)
+                .map(|(bucket, point)| Merged::Rmc(Rmc { bucket, point })),
+            "GPGGA" => parse_gpgga(&sentence.fields)
+                .map(|(bucket, point)| Merged::Gga(Gga { bucket, point })),
+            _ => None,
+        };
+        merge_sentence(&mut points, &mut last_bucket, parsed);
     }
 
     Ok(Track {
         points,
         damaged_blocks: Vec::new(),
     })
+}
+
+/// One parsed RMC sentence: its `HHMMSS` bucket and the point it carries.
+struct Rmc {
+    bucket: String,
+    point: TrackPoint,
+}
+
+/// One parsed GGA sentence.
+struct Gga {
+    bucket: String,
+    point: TrackPoint,
+}
+
+/// A sentence that parsed, of either kind.
+enum Merged {
+    Rmc(Rmc),
+    Gga(Gga),
+}
+
+/// Add `sentence` to `points`, merging it into the previous point when both
+/// share the `HHMMSS` bucket.
+///
+/// `last_bucket` is the bucket of the point at the end of `points`, and it is
+/// the whole key: the RMC date is not part of it, so two sentences with the
+/// same `HHMMSS` on different days (a log that spans midnight) would merge. NMEA
+/// writes `HHMMSS` for both sentence kinds and the date only in RMC, so this is
+/// the finest key the two kinds share.
+///
+/// Only the tags each kind owns are copied — `utc` and `speed_kmh` from RMC,
+/// `height_m` from GGA — so the order the kinds arrive in does not decide which
+/// fields survive.
+fn merge_sentence(
+    points: &mut Vec<TrackPoint>,
+    last_bucket: &mut Option<String>,
+    parsed: Option<Merged>,
+) {
+    let Some(merged) = parsed else {
+        return;
+    };
+    let (bucket, point, height_only) = match merged {
+        Merged::Rmc(rmc) => (rmc.bucket, rmc.point, false),
+        Merged::Gga(gga) => (gga.bucket, gga.point, true),
+    };
+    let same_bucket = last_bucket.as_deref() == Some(bucket.as_str());
+    if same_bucket && let Some(prev) = points.last_mut() {
+        if height_only {
+            if prev.height_m.is_none() {
+                prev.height_m = point.height_m;
+            }
+        } else {
+            if prev.utc.is_none() {
+                prev.utc = point.utc;
+            }
+            if prev.speed_kmh.is_none() {
+                prev.speed_kmh = point.speed_kmh;
+            }
+        }
+        return;
+    }
+    *last_bucket = Some(bucket);
+    points.push(point);
 }
 
 fn parse_gprmc(fields: &[String]) -> Option<(String, TrackPoint)> {
@@ -287,6 +345,8 @@ fn parse_nmea_ddmmyy(text: &str) -> Option<(u32, u32, i64)> {
     let day: u32 = text.get(0..2)?.parse().ok()?;
     let month: u32 = text.get(2..4)?.parse().ok()?;
     let yy: i64 = text.get(4..6)?.parse().ok()?;
+    // NMEA keeps two digits of year; it has no century of its own. 80 is where
+    // the century rolls, so a logger's log stays in 1980-2079.
     let year = if yy >= 80 { 1900 + yy } else { 2000 + yy };
     Some((day, month, year))
 }
@@ -301,10 +361,16 @@ fn parse_nmea_coord(
     if raw.is_empty() {
         return None;
     }
-    let sign = if hemi == pos_hemi.encode_utf8(&mut [0u8; 4]) {
-        1.0
-    } else if hemi == neg_hemi.encode_utf8(&mut [0u8; 4]) {
-        -1.0
+    // The hemisphere is a one-character string; anything else (empty, two
+    // letters, lower case) is a sentence this parser cannot sign and is refused.
+    let mut letters = hemi.chars();
+    let first = letters.next();
+    let sign = if first.is_some() && letters.next().is_none() {
+        match first {
+            Some(f) if f == pos_hemi => 1.0,
+            Some(f) if f == neg_hemi => -1.0,
+            _ => return None,
+        }
     } else {
         return None;
     };
@@ -324,24 +390,32 @@ fn parse_nmea_coord(
 }
 
 // ---------------------------------------------------------------------------
-// Lightweight GPX XML helpers
+// String-based GPX search (no XML parser is pulled in; see the module doc)
 // ---------------------------------------------------------------------------
 
-fn strip_xml_comments(text: &str) -> String {
+/// Remove `<!-- ... -->` comments, keeping everything else as it was.
+///
+/// # Errors
+///
+/// [`Error::Log`] when an `<!--` is never closed. Cutting the input there would
+/// drop every point after it and return a short track that looks complete, so
+/// the malformed document is refused instead.
+fn strip_xml_comments(text: &str) -> Result<String> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find("<!--") {
         out.push_str(rest.get(..start).unwrap_or_default());
         let after = rest.get(start + 4..).unwrap_or_default();
-        if let Some(end) = after.find("-->") {
-            rest = after.get(end + 3..).unwrap_or_default();
-        } else {
-            rest = "";
-            break;
-        }
+        let Some(end) = after.find("-->") else {
+            return Err(Error::Log {
+                message: String::from("a <!-- comment is never closed with -->"),
+                offset: Some(out.len() + start),
+            });
+        };
+        rest = after.get(end + 3..).unwrap_or_default();
     }
     out.push_str(rest);
-    out
+    Ok(out)
 }
 
 fn find_tag_start(haystack: &str, tag: &str) -> Option<usize> {
@@ -585,6 +659,65 @@ mod tests {
     }
 
     #[test]
+    fn a_gpx10_speed_in_metres_per_second_arrives_as_km_per_hour() {
+        // The conversion is the whole of the GPX 1.0 `<speed>` contract, so it
+        // gets its own assertion (and its own test): a file with a single point
+        // leaves nothing else for a survivor to hide behind.
+        let gpx = r#"<gpx version="1.0"><trk><trkseg>
+            <trkpt lat="35.681236" lon="139.767125"><speed>10.0</speed></trkpt>
+        </trkseg></trk></gpx>"#;
+        let track = import_gpx(gpx).expect("import gpx 1.0");
+        let speed = track.points[0].speed_kmh.expect("a speed");
+        assert!(
+            (speed - 36.0).abs() < 1e-4,
+            "10 m/s is 36 km/h, got {speed}"
+        );
+    }
+
+    #[test]
+    fn the_speed_kmh_extension_wins_over_the_standard_speed() {
+        // `to_gpx` writes both; reading the extension first keeps the km/h
+        // value exact instead of converting the m/s one back.
+        let gpx = r#"<gpx version="1.1"><trk><trkseg>
+            <trkpt lat="0.0" lon="0.0"><speed>1.0</speed><speed_kmh>42.5</speed_kmh></trkpt>
+        </trkseg></trk></gpx>"#;
+        let track = import_gpx(gpx).expect("import");
+        assert_eq!(track.points[0].speed_kmh, Some(42.5));
+    }
+
+    #[test]
+    fn an_unclosed_xml_comment_is_an_error_not_a_truncated_track() {
+        let doc = r#"<gpx><trk><trkseg>
+            <trkpt lat="35.0" lon="139.0"/><!-- never closed
+        </trkseg></trk></gpx>"#;
+        let err = import_gpx(doc).expect_err("an unclosed comment is malformed");
+        assert!(matches!(err, Error::Log { .. }), "got {err:?}");
+        assert!(err.to_string().contains("never closed"), "got {err}");
+    }
+
+    #[test]
+    fn a_closed_comment_is_removed_without_touching_the_points() {
+        let doc = r#"<gpx><!-- <trkpt lat="91.0" lon="0.0"/> --><trk><trkseg>
+            <trkpt lat="35.0" lon="139.0"/>
+        </trkseg></trk></gpx>"#;
+        let track = import_gpx(doc).expect("import");
+        assert_eq!(track.points.len(), 1, "a commented-out point is not read");
+        assert!((track.points[0].latitude.unwrap() - 35.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn waypoints_are_not_read_as_track_points() {
+        // to_gpx writes `<wpt>` for saved places; import reads `<trkpt>` only.
+        // This test pins that choice so a change to either side is visible.
+        let doc = r#"<gpx><wpt lat="35.0" lon="139.0"/><trk><trkseg>
+            <trkpt lat="35.1" lon="139.1"/>
+        </trkseg></trk></gpx>"#;
+        let track = import_gpx(doc).expect("import");
+        assert_eq!(track.points.len(), 1);
+        assert!((track.points[0].latitude.unwrap() - 35.1).abs() < 1e-9);
+    }
+
+    #[test]
     fn import_gpx_rejects_malformed_input() {
         assert!(matches!(import_gpx("hello"), Err(Error::Log { .. })));
         let bad_lat = r#"<gpx><trk><trkseg><trkpt lat="91.0" lon="0.0"/></trkseg></trk></gpx>"#;
@@ -643,5 +776,95 @@ mod tests {
         assert!((p.speed_kmh.unwrap() - 18.52).abs() < 0.01);
         assert!((p.latitude.unwrap() - 35.681_236).abs() < 1e-4);
         assert!((p.longitude.unwrap() - 139.767_125).abs() < 1e-4);
+    }
+
+    #[test]
+    fn an_rmc_before_its_gga_still_gets_the_altitude() {
+        use crate::protocol::pmtk::sentence;
+        // NMEA order is not fixed; a receiver that emits RMC first must still
+        // yield a point with the date, the speed and the altitude.
+        let text = [
+            sentence("GPRMC,221320.00,A,3540.8742,N,13946.0275,E,10.00,,141123,,"),
+            sentence("GPGGA,221320.00,3540.8742,N,13946.0275,E,1,08,0.9,80.5,M,0.0,M,,"),
+        ]
+        .join("\r\n");
+        let track = import_nmea(&text).expect("import nmea");
+        assert_eq!(track.points.len(), 1);
+        let p = track.points[0];
+        assert_eq!(p.utc, Some(1_700_000_000), "the RMC supplies the date");
+        assert_eq!(
+            p.height_m,
+            Some(80.5),
+            "the later GGA supplies the altitude"
+        );
+        assert!((p.speed_kmh.unwrap() - 18.52).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_void_rmc_between_two_good_ones_changes_nothing() {
+        use crate::protocol::pmtk::sentence;
+        // The `V` sentence repeats the same `HHMMSS` as the good RMC around it
+        // and carries different coordinates. If it were read, the merge would
+        // patch nothing (a void RMC has no position) and, more importantly, it
+        // must not reset the pairing key for the GGA that follows.
+        let text = [
+            sentence("GPRMC,221320.00,A,3540.8742,N,13946.0275,E,10.00,,141123,,"),
+            sentence("GPRMC,221320.00,V,0000.0000,N,00000.0000,E,0.00,,141123,,"),
+            sentence("GPGGA,221320.00,3540.8742,N,13946.0275,E,1,08,0.9,80.5,M,0.0,M,,"),
+        ]
+        .join("\r\n");
+        let track = import_nmea(&text).expect("import nmea");
+        assert_eq!(
+            track.points.len(),
+            1,
+            "one place, not a phantom record for the void fix"
+        );
+        let p = track.points[0];
+        assert!((p.latitude.unwrap() - 35.681_236).abs() < 1e-4);
+        assert_eq!(p.height_m, Some(80.5));
+        assert_eq!(p.utc, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn a_void_rmc_with_no_following_sentence_is_not_a_point() {
+        use crate::protocol::pmtk::sentence;
+        let text = sentence("GPRMC,221320.00,V,3540.8742,N,13946.0275,E,10.00,,141123,,");
+        let track = import_nmea(&text).expect("import nmea");
+        assert!(
+            track.points.is_empty(),
+            "a no-fix RMC must be dropped, not kept and overwritten: {:?}",
+            track.points
+        );
+    }
+
+    #[test]
+    fn a_gga_of_quality_zero_is_not_a_point() {
+        use crate::protocol::pmtk::sentence;
+        let text = sentence("GPGGA,221320.00,3540.8742,N,13946.0275,E,0,00,99.9,80.0,M,0.0,M,,");
+        assert!(import_nmea(&text).expect("import").points.is_empty());
+    }
+
+    #[test]
+    fn nmea_hemispheres_must_be_one_of_the_four_letters() {
+        // A two-letter or missing hemisphere cannot be signed; the sentence is
+        // dropped rather than read as the northern/eastern hemisphere.
+        let bad = [
+            "$GPRMC,120000.00,A,3540.8742,NN,13946.0275,E,0.00,,141123,,",
+            "$GPRMC,120000.00,A,3540.8742,x,13946.0275,E,0.00,,141123,,",
+            "$GPRMC,120000.00,A,3540.8742,a,13946.0275,E,0.00,,141123,,",
+        ];
+        for body in bad {
+            let line = crate::protocol::pmtk::sentence(body);
+            assert!(
+                import_nmea(&line).expect("import").points.is_empty(),
+                "an unreadable hemisphere must drop the sentence: {body}"
+            );
+        }
+        let south = crate::protocol::pmtk::sentence(
+            "GPRMC,120000.00,A,3540.8742,S,13946.0275,W,0.00,,141123,,",
+        );
+        let track = import_nmea(&south).expect("import");
+        assert!(track.points[0].latitude.unwrap() < 0.0);
+        assert!(track.points[0].longitude.unwrap() < 0.0);
     }
 }

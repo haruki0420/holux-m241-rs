@@ -28,15 +28,18 @@ pub fn split_track(track: &Track, split_at: usize) -> Result<(Track, Track)> {
             offset: None,
         });
     }
-    let Some((left, right)) = track.points.split_at_checked(split_at) else {
-        return Err(Error::Log {
-            message: format!("split index {split_at} is out of bounds for {len} point(s)"),
-            offset: None,
-        });
-    };
+    // The bounds are checked above, so `split_at` is a valid index; this cannot
+    // panic.
+    let (left, right) = track.points.split_at(split_at);
     Ok((
         Track {
             points: left.to_vec(),
+            // Both halves carry the original's damaged-block list. A block
+            // number does not say which point it covers, so the split cannot
+            // divide the list; copying it to both halves means neither half
+            // looks clean, and `merge_tracks` removes the duplicate if they are
+            // joined again. Reporting a half as undamaged when the dump it came
+            // from was damaged would be the worse error.
             damaged_blocks: track.damaged_blocks.clone(),
         },
         Track {
@@ -152,16 +155,8 @@ impl TrackEditor {
     ///
     /// Returns [`Error::Log`] if `track_index` or `split_at` is out of bounds.
     pub fn split(&mut self, track_index: usize, split_at: usize) -> Result<()> {
-        let Some(track) = self.tracks.get(track_index) else {
-            return Err(Error::Log {
-                message: format!(
-                    "track index {track_index} is out of bounds (have {} track(s))",
-                    self.tracks.len()
-                ),
-                offset: None,
-            });
-        };
-        let (left, right) = split_track(track, split_at)?;
+        let track = self.checked_track(track_index)?.clone();
+        let (left, right) = split_track(&track, split_at)?;
 
         let mut next = Vec::with_capacity(self.tracks.len() + 1);
         for (idx, existing) in self.tracks.iter().enumerate() {
@@ -176,8 +171,13 @@ impl TrackEditor {
         Ok(())
     }
 
-    /// Merge the tracks at `track_indices` (in the order listed) into one track,
-    /// placed at the lowest selected index while removing the remaining ones.
+    /// Merge the tracks at `track_indices` into one track, placed at the lowest
+    /// selected index while removing the remaining ones.
+    ///
+    /// Points are concatenated in the order the indices are *listed*, not in
+    /// index order: `merge(&[3, 1])` puts track 3's points before track 1's,
+    /// in the slot where track 1 was. A caller that wants log order passes the
+    /// indices in order.
     ///
     /// # Errors
     ///
@@ -195,15 +195,7 @@ impl TrackEditor {
         let mut selected = Vec::with_capacity(track_indices.len());
         let mut min_index = usize::MAX;
         for &idx in track_indices {
-            let Some(track) = self.tracks.get(idx) else {
-                return Err(Error::Log {
-                    message: format!(
-                        "track index {idx} is out of bounds (have {} track(s))",
-                        self.tracks.len()
-                    ),
-                    offset: None,
-                });
-            };
+            self.checked_track(idx)?;
             if !seen.insert(idx) {
                 return Err(Error::Log {
                     message: format!("duplicate track index {idx} in merge"),
@@ -213,7 +205,13 @@ impl TrackEditor {
             if idx < min_index {
                 min_index = idx;
             }
-            selected.push(track.clone());
+        }
+        // The indices are known to be in bounds, so this reconstructs the list
+        // in the caller's order without a second error path.
+        for &idx in track_indices {
+            if let Some(track) = self.tracks.get(idx) {
+                selected.push(track.clone());
+            }
         }
 
         let merged = merge_tracks(&selected);
@@ -237,17 +235,9 @@ impl TrackEditor {
     ///
     /// Returns [`Error::Log`] if `track_index` is out of bounds.
     pub fn delete_points(&mut self, track_index: usize, point_indices: &[usize]) -> Result<()> {
-        let Some(track) = self.tracks.get(track_index) else {
-            return Err(Error::Log {
-                message: format!(
-                    "track index {track_index} is out of bounds (have {} track(s))",
-                    self.tracks.len()
-                ),
-                offset: None,
-            });
-        };
-        let updated = delete_points(track, point_indices);
-        if updated == *track {
+        let track = self.checked_track(track_index)?.clone();
+        let updated = delete_points(&track, point_indices);
+        if updated == track {
             return Ok(());
         }
 
@@ -257,6 +247,18 @@ impl TrackEditor {
         }
         self.commit(next);
         Ok(())
+    }
+
+    /// The track at `index`, or the error every editing method reports for one
+    /// that is not there.
+    fn checked_track(&self, index: usize) -> Result<&Track> {
+        self.tracks.get(index).ok_or_else(|| Error::Log {
+            message: format!(
+                "track index {index} is out of bounds (have {} track(s))",
+                self.tracks.len()
+            ),
+            offset: None,
+        })
     }
 
     /// Revert the most recent edit, returning `false` when nothing can be undone.
@@ -292,7 +294,7 @@ mod tests {
     use super::*;
     use crate::types::LogSummary;
 
-    fn pt(utc: u32, lat: f64, lon: f64) -> TrackPoint {
+    fn point(utc: u32, lat: f64, lon: f64) -> TrackPoint {
         TrackPoint {
             utc: Some(utc),
             latitude: Some(lat),
@@ -307,7 +309,7 @@ mod tests {
         Track {
             points: (0..count)
                 .map(|i| {
-                    pt(
+                    point(
                         1_700_000_000 + i * 10,
                         35.681_236 + f64::from(i) * 0.001,
                         139.767_125 + f64::from(i) * 0.001,
@@ -416,6 +418,46 @@ mod tests {
         editor.delete_points(0, &[0]).expect("branching edit");
         assert!(!editor.can_redo(), "new edit must clear redo stack");
         assert!(!editor.redo());
+    }
+
+    #[test]
+    fn merge_keeps_the_listed_point_order_in_the_lowest_slot() {
+        // `[2, 0]`: track 2's point comes first and the result takes the slot
+        // track 0 held. `sample_track` is time-shifted so the points can be
+        // told apart after the merge.
+        let mut editor = TrackEditor::new(vec![
+            sample_track(1),
+            sample_track(1),
+            Track {
+                points: vec![point(1_700_000_100, 1.0, 2.0)],
+                damaged_blocks: Vec::new(),
+            },
+        ]);
+        editor.merge(&[2, 0]).expect("merge 2 then 0");
+        assert_eq!(editor.tracks().len(), 2, "two of three tracks became one");
+        let merged = &editor.tracks()[0];
+        assert_eq!(merged.points.len(), 2);
+        assert_eq!(
+            merged.points[0].utc,
+            Some(1_700_000_100),
+            "track 2's point is first because it was listed first"
+        );
+        assert_eq!(merged.points[1].utc, Some(1_700_000_000));
+        // The unselected track kept its place.
+        assert_eq!(editor.tracks()[1].points[0].utc, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn splitting_gives_both_halves_the_damaged_blocks() {
+        // A block number does not say which point it covers, so the split
+        // copies the list rather than guessing; joining the halves again must
+        // not double it.
+        let mut track = sample_track(4);
+        track.damaged_blocks = vec![2, 5];
+        let (left, right) = split_track(&track, 2).expect("split");
+        assert_eq!(left.damaged_blocks, vec![2, 5]);
+        assert_eq!(right.damaged_blocks, vec![2, 5]);
+        assert_eq!(merge_tracks(&[left, right]).damaged_blocks, vec![2, 5]);
     }
 
     #[test]

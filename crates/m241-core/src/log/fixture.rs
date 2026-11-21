@@ -87,6 +87,12 @@ impl Entry {
             payload,
         }
     }
+
+    /// `GPSVersionID` with a type other than BYTE, to exercise the reader's
+    /// "not the shape the spec allows" path.
+    pub(crate) fn undefined_version_id(payload: Vec<u8>) -> Self {
+        Self::undefined(crate::log::exif::tag::GPS_VERSION_ID, payload)
+    }
 }
 
 /// A JPEG with no Exif at all: SOI, a JFIF APP0, a dummy DQT and EOI.
