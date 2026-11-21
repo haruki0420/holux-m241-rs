@@ -1347,9 +1347,10 @@ mod tests {
     fn the_file_write_keeps_the_backup_and_names_the_copy() {
         // The source is the only way back; the patched image must land beside it
         // under a different name.
+        // Compare paths, not strings: Windows joins with `\` and POSIX with `/`.
         assert_eq!(
-            default_patched_name("backup/stock.bin"),
-            "backup/stock.fixed.bin"
+            Path::new(&default_patched_name("backup/stock.bin")),
+            Path::new("backup/stock.fixed.bin")
         );
         assert_eq!(default_patched_name("stock.bin"), "stock.fixed.bin");
         assert_eq!(default_patched_name("dump"), "dump.fixed.bin");
