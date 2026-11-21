@@ -435,8 +435,15 @@ mod tests {
         ]);
         editor.merge(&[2, 0]).expect("merge 2 then 0");
         assert_eq!(editor.tracks().len(), 2, "two of three tracks became one");
+        // The merged track sits where track 0 was — the lowest of the two
+        // indices, not the last one listed — and track 1 keeps its own slot.
         let merged = &editor.tracks()[0];
-        assert_eq!(merged.points.len(), 2);
+        assert_eq!(
+            merged.points.len(),
+            2,
+            "the merged track must occupy the slot of track 0: {:?}",
+            editor.tracks()
+        );
         assert_eq!(
             merged.points[0].utc,
             Some(1_700_000_100),
