@@ -776,7 +776,12 @@ fn replace_from_temp(temp: &Path, path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn replace_from_temp(temp: &Path, path: &Path) -> Result<()> {
-    replace_with_remove_fallback(temp, path, std::fs::rename)
+    // The closure is not cosmetic: passing `std::fs::rename` directly makes
+    // rustc 1.100 on Windows fail with "implementation of FnMut is not general
+    // enough" (the higher-ranked lifetimes of the function item are not
+    // inferred through the generic parameter). Wrapping it fixes the inference
+    // without weakening the helper's contract.
+    replace_with_remove_fallback(temp, path, |from, to| std::fs::rename(from, to))
 }
 
 #[cfg(any(windows, test))]
