@@ -274,6 +274,14 @@ the same instructions does not.
 
 Every stage ends with `./tools/check.sh` at 6/6.
 
+Before a PR is merged — after Stage 3, immediately before the merge — the
+independent reviewer posts the `review-gate` status on the reviewed head SHA.
+**The author's session does not post it; only an independent reviewer does.**
+Branch protection requires it in every tier, and the status is per-commit: a new
+push needs a new review. The tier table and the command are in
+[`docs/dev/09-review-protocol.md`](docs/dev/09-review-protocol.md); that document
+is authoritative and this paragraph is a summary.
+
 ## 9. What went wrong here
 
 2026-11-20, the review-and-fix round. This section records failures that
