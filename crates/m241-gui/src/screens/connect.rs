@@ -11,21 +11,60 @@
 //! marked 「見本」 on the same screen (PRODUCT.md: unverified is a first-class state,
 //! and invented data is not a state at all).
 
-use egui::{RichText, Ui};
+use std::sync::mpsc;
+use std::time::Duration;
+
+use egui::{RichText, Ui, Vec2};
 use m241_core::protocol::Port;
-use m241_core::{DeviceInfo, LogSummary};
+use m241_core::protocol::pmtk::{NMEA_BAUD, PmtkClient};
+use m241_core::protocol::port::Transport;
+use m241_core::{DeviceInfo, Error as CoreError, LogSummary};
 
 use crate::screens::common::{self, Status};
-use crate::theme::{self, size, space};
+use crate::theme::{self, metric, size, space};
+
+/// Read-only identity and log-usage snapshot returned by probing a port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceProbe {
+    /// Device identity from `$PMTK605` → `$PMTK705`.
+    pub info: DeviceInfo,
+    /// Bytes currently used in the device log (`$PMTK182,2,8`).
+    pub log_used_bytes: usize,
+    /// Whether recording is currently enabled (`$PMTK182,2,1`), when answered.
+    pub log_enabled: Option<bool>,
+}
+
+/// Structured failure from probing a device: device message first, recovery hint second.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeError {
+    /// Verbatim error from the OS or protocol layer.
+    pub message: String,
+    /// Actionable recovery hint in Japanese.
+    pub hint: String,
+}
+
+/// Current state of the non-blocking device probe.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ProbeState {
+    #[default]
+    Idle,
+    Probing {
+        port: String,
+    },
+    Connected(DeviceProbe),
+    Failed(ProbeError),
+}
 
 /// The Connect screen's own state.
 ///
 /// Held here rather than in [`crate::App`] so the screen can be tested on its own,
-/// and so a future background task can own exactly one screen's data.
+/// and so a background probe owns only this screen's data.
 #[derive(Debug, Default)]
 pub struct ConnectScreen {
     ports: Listing,
     selected: Option<String>,
+    probe: ProbeState,
+    probe_rx: Option<mpsc::Receiver<std::result::Result<DeviceProbe, ProbeError>>>,
     sample: bool,
 }
 
@@ -48,6 +87,10 @@ enum Listing {
 impl ConnectScreen {
     /// Draw the screen body. The rail is drawn by the shell, not here.
     pub fn ui(&mut self, ui: &mut Ui) {
+        if self.poll_probe() {
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        }
+
         // At 1024×640 the body is taller than the window, and the review found the
         // "next step" block ending at its first line — below the fold, and therefore
         // unreachable rather than merely cropped.
@@ -89,6 +132,63 @@ impl ConnectScreen {
         });
     }
 
+    /// Current probe state, for callers and tests.
+    #[must_use]
+    pub fn probe_state(&self) -> &ProbeState {
+        &self.probe
+    }
+
+    /// Poll the background probe channel, returning `true` while a probe is still running.
+    pub fn poll_probe(&mut self) -> bool {
+        let Some(rx) = self.probe_rx.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Ok(result)) => {
+                self.probe = ProbeState::Connected(result);
+                self.probe_rx = None;
+                self.sample = false;
+                false
+            }
+            Ok(Err(err)) => {
+                self.probe = ProbeState::Failed(err);
+                self.probe_rx = None;
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.probe = ProbeState::Failed(ProbeError {
+                    message: String::from("確認処理が結果を返さずに終了しました"),
+                    hint: String::from(
+                        "USB ケーブルの接続を確認し、再度「接続して確認」を押してください。",
+                    ),
+                });
+                self.probe_rx = None;
+                false
+            }
+        }
+    }
+
+    /// Start a non-blocking read-only probe of the selected serial port.
+    pub fn start_probe(&mut self, port: String) {
+        self.start_probe_with(port, probe_serial_port);
+    }
+
+    /// Start a non-blocking probe using a supplied worker closure (used by tests).
+    pub fn start_probe_with<F>(&mut self, port: String, task: F)
+    where
+        F: FnOnce(&str) -> std::result::Result<DeviceProbe, ProbeError> + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        self.probe = ProbeState::Probing { port: port.clone() };
+        self.probe_rx = Some(rx);
+        self.sample = false;
+        std::thread::spawn(move || {
+            let result = task(&port);
+            let _ignored = tx.send(result);
+        });
+    }
+
     /// Fill the panels with the sample unit's figures.
     ///
     /// Public because the headless render tests need every screen state to be
@@ -100,7 +200,7 @@ impl ConnectScreen {
     }
 
     /// Re-enumerate the serial ports.
-    fn refresh(&mut self) {
+    pub fn refresh(&mut self) {
         self.ports = match Port::list() {
             Ok(ports) => {
                 // Keep a selection only if that port still exists: a stale
@@ -122,14 +222,15 @@ impl ConnectScreen {
 
     fn port_panel(&mut self, ui: &mut Ui) {
         common::panel(ui, "ポート", |ui| {
-            ui.horizontal(|ui| {
+            let probing = matches!(self.probe, ProbeState::Probing { .. });
+            ui.horizontal_wrapped(|ui| {
                 let selected = self
                     .selected
                     .clone()
                     .unwrap_or_else(|| String::from("ポートを選択"));
                 egui::ComboBox::from_id_salt("m241-port")
                     .selected_text(RichText::new(selected).size(size::UI).monospace())
-                    .width(ui.available_width() * 0.45)
+                    .width((ui.available_width() * 0.35).max(metric::RAIL_BLOCK))
                     .show_ui(ui, |ui| {
                         if let Listing::Read(ports) = &self.ports {
                             for port in ports {
@@ -139,14 +240,42 @@ impl ConnectScreen {
                     });
 
                 if ui
-                    .button(RichText::new("再読み込み").size(size::UI))
+                    .add(
+                        egui::Button::new(RichText::new("再読込").size(size::UI))
+                            .corner_radius(theme::RADIUS),
+                    )
                     .clicked()
                 {
                     self.refresh();
                 }
 
+                let can_probe = self.selected.is_some() && !probing;
+                if ui
+                    .add_enabled(
+                        can_probe,
+                        egui::Button::new(RichText::new("接続して確認").size(size::UI))
+                            .corner_radius(theme::RADIUS)
+                            .min_size(Vec2::new(metric::ACTION_WIDTH, 0.0)),
+                    )
+                    .clicked()
+                    && let Some(port) = self.selected.clone()
+                {
+                    self.start_probe(port);
+                }
+
                 self.port_status(ui);
             });
+
+            if matches!(&self.ports, Listing::Read(ports) if ports.is_empty()) {
+                ui.add_space(space::S);
+                ui.label(
+                    RichText::new(
+                        "シリアルポートが見つかりません。USB ケーブルの接続と端末の電源を確認し、「再読込」を押してください。",
+                    )
+                    .size(size::UI)
+                    .color(theme::MUTE),
+                );
+            }
 
             // Diagnostics, as one caption line rather than a third panel: the
             // question "why is my logger not listed" is answered by a driver name,
@@ -162,8 +291,12 @@ impl ConnectScreen {
         });
     }
 
-    /// The state line: what enumeration actually returned.
+    /// The state line: what enumeration or probe actually returned.
     fn port_status(&self, ui: &mut Ui) {
+        if let ProbeState::Probing { port } = &self.probe {
+            common::status_line(ui, Status::Info, &format!("{port} を確認中…"));
+            return;
+        }
         match &self.ports {
             Listing::Unread => common::status_line(ui, Status::Info, "ポートを調べています"),
             Listing::Failed(reason) => {
@@ -200,22 +333,56 @@ impl ConnectScreen {
                 ] {
                     common::figure_line(ui, label, &value);
                 }
-            } else {
-                // No device: say what is missing, in the order to check it
-                // (DESIGN.md §6, "No port found").
-                common::status_line(ui, Status::Info, "未接続 — 端末の情報はまだ読んでいません");
-                ui.add_space(space::S);
-                for (index, line) in [
-                    "1. USB ケーブルを挿す",
-                    "2. 端末の電源を入れる",
-                    "3. 上の「再読み込み」を押す",
-                ]
-                .iter()
-                .enumerate()
-                {
-                    ui.push_id(index, |ui| {
-                        ui.label(RichText::new(*line).size(size::UI).color(theme::MUTE));
-                    });
+                return;
+            }
+
+            match &self.probe {
+                ProbeState::Connected(probe) => {
+                    common::status_line(ui, Status::Ok, "接続済み（読み取り専用）");
+                    ui.add_space(space::S);
+                    common::figure_line(ui, "firmware", &probe.info.release);
+                    common::figure_line(ui, "build", &probe.info.build);
+                    common::figure_line(ui, "model", &probe.info.model);
+                    if let Some(sdk) = &probe.info.sdk {
+                        common::figure_line(ui, "SDK", sdk);
+                    }
+                    let release_note = if probe.info.is_known_release() {
+                        "既知リリース（日付修正対象）"
+                    } else {
+                        "未知のリリース（吸い出して確認）"
+                    };
+                    common::figure_line(ui, "状態", release_note);
+                }
+                ProbeState::Probing { port } => {
+                    common::status_line(ui, Status::Info, &format!("{port} から端末情報を取得中…"));
+                }
+                ProbeState::Failed(err) => {
+                    // DESIGN.md §6: the device's own words first, the hint second.
+                    common::status_line(ui, Status::Err, &err.message);
+                    ui.add_space(space::S);
+                    ui.label(RichText::new(&err.hint).size(size::UI).color(theme::MUTE));
+                }
+                ProbeState::Idle => {
+                    // No device: say what is missing, in the order to check it
+                    // (DESIGN.md §6, "No port found").
+                    common::status_line(
+                        ui,
+                        Status::Info,
+                        "未接続 — 端末の情報はまだ読んでいません",
+                    );
+                    ui.add_space(space::S);
+                    for (index, line) in [
+                        "1. USB ケーブルを挿す",
+                        "2. 端末の電源を入れる",
+                        "3. 上の「再読込」を押し、「接続して確認」を実行する",
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        ui.push_id(index, |ui| {
+                            ui.label(RichText::new(*line).size(size::UI).color(theme::MUTE));
+                        });
+                    }
                 }
             }
         });
@@ -237,14 +404,38 @@ impl ConnectScreen {
                 ] {
                     common::figure_line(ui, label, &value);
                 }
-            } else {
-                common::status_line(ui, Status::Info, "未取得 — ログはまだ読んでいません");
-                ui.add_space(space::S);
-                ui.label(
-                    RichText::new("ログの読み出しは「ログ」画面から行います。")
+                return;
+            }
+
+            match &self.probe {
+                ProbeState::Connected(probe) => {
+                    common::status_line(ui, Status::Ok, "ログ使用量を取得しました");
+                    ui.add_space(space::S);
+                    common::figure_line(ui, "使用量", &common::bytes(probe.log_used_bytes));
+                    let enabled_label = match probe.log_enabled {
+                        Some(true) => "有効",
+                        Some(false) => "停止中",
+                        None => "未取得",
+                    };
+                    common::figure_line(ui, "記録", enabled_label);
+                }
+                ProbeState::Probing { .. } => {
+                    common::status_line(ui, Status::Info, "ログ使用量を確認中…");
+                }
+                ProbeState::Failed(_) => {
+                    common::status_line(ui, Status::Info, "未取得 — 接続確認に失敗しました");
+                }
+                ProbeState::Idle => {
+                    common::status_line(ui, Status::Info, "未取得 — ログはまだ読んでいません");
+                    ui.add_space(space::S);
+                    ui.label(
+                        RichText::new(
+                            "端末をつないで「接続して確認」を押すとログ使用量を表示します。",
+                        )
                         .size(size::UI)
                         .color(theme::MUTE),
-                );
+                    );
+                }
             }
         });
     }
@@ -289,6 +480,49 @@ impl ConnectScreen {
                 .color(theme::MUTE),
         );
     }
+}
+
+/// Open `port_name` at 38400 bps and perform a read-only device & log-usage probe.
+fn probe_serial_port(port_name: &str) -> std::result::Result<DeviceProbe, ProbeError> {
+    let port = Port::open(port_name, NMEA_BAUD).map_err(probe_error_for)?;
+    let mut client = PmtkClient::new(port);
+    probe_client(&mut client)
+}
+
+/// Query `$PMTK605` (`request_identity`) and `$PMTK182,2,8` (`log_used_bytes`)
+/// through an open [`PmtkClient`], without issuing any write or erase commands.
+pub fn probe_client<T: Transport>(
+    client: &mut PmtkClient<T>,
+) -> std::result::Result<DeviceProbe, ProbeError> {
+    let info = client.request_identity().map_err(probe_error_for)?;
+    let log_used_bytes = client.log_used_bytes().map_err(probe_error_for)?;
+    let log_enabled = client.log_enabled().ok();
+    Ok(DeviceProbe {
+        info,
+        log_used_bytes,
+        log_enabled,
+    })
+}
+
+/// Format a [`CoreError`] into the device/OS message first and an actionable hint second.
+#[must_use]
+fn probe_error_for(err: CoreError) -> ProbeError {
+    let message = err.to_string();
+    let hint = match err {
+        CoreError::Port { .. } => String::from(
+            "USB ケーブルの接続とシリアルポートへのアクセス権（Linux では dialout / uucp グループ等）を確認し、「再読込」後にやり直してください。",
+        ),
+        CoreError::Timeout { .. } => String::from(
+            "端末の電源が入っているか、他のアプリがポートを開いていないか確認してください。起動直後は数秒待ってから再試行してください。",
+        ),
+        CoreError::Nmea { .. } | CoreError::Framing { .. } => String::from(
+            "38400 bps の通信が不安定です。USB ケーブルの接触を確認し、端末の電源を入れ直してから再試行してください。",
+        ),
+        _ => String::from(
+            "接続と端末の状態を確認してから、もう一度「接続して確認」を押してください。",
+        ),
+    };
+    ProbeError { message, hint }
 }
 
 /// The device the manual's figure shows, for looking at the layout.
@@ -364,5 +598,110 @@ mod tests {
         let summary = sample_summary();
         assert_eq!(summary.damaged_block_count, 0);
         assert!(summary.fixes <= summary.records);
+    }
+
+    #[derive(Debug, Default)]
+    struct FakePmtkTransport {
+        tx_log: Vec<u8>,
+        rx: std::collections::VecDeque<u8>,
+    }
+
+    impl FakePmtkTransport {
+        fn enqueue(&mut self, body: &str) {
+            let line = m241_core::protocol::pmtk::line(body);
+            self.rx.extend(line.as_bytes());
+        }
+    }
+
+    impl Transport for FakePmtkTransport {
+        fn read(&mut self, buf: &mut [u8]) -> m241_core::Result<usize> {
+            let mut n = 0;
+            for slot in buf.iter_mut() {
+                if let Some(byte) = self.rx.pop_front() {
+                    *slot = byte;
+                    n += 1;
+                } else {
+                    break;
+                }
+            }
+            Ok(n)
+        }
+
+        fn write_all(&mut self, buf: &[u8]) -> m241_core::Result<()> {
+            self.tx_log.extend_from_slice(buf);
+            let text = String::from_utf8_lossy(buf);
+            if text.contains("PMTK605") {
+                self.enqueue("PMTK705,B-core_1.20,0043,01017-00F,1.0");
+            } else if text.contains("PMTK182,2,8") {
+                self.enqueue("PMTK182,3,8,00033F7C");
+            } else if text.contains("PMTK182,2,1") {
+                self.enqueue("PMTK182,3,1,1");
+            }
+            Ok(())
+        }
+
+        fn flush(&mut self) -> m241_core::Result<()> {
+            Ok(())
+        }
+
+        fn clear_input(&mut self) -> m241_core::Result<()> {
+            self.rx.clear();
+            Ok(())
+        }
+
+        fn set_baud(&mut self, _baud: u32) -> m241_core::Result<()> {
+            Ok(())
+        }
+
+        fn set_control_lines(&mut self, _asserted: bool) -> m241_core::Result<()> {
+            panic!("Connect probe must never pulse DTR/RTS");
+        }
+    }
+
+    #[test]
+    fn probe_client_queries_identity_and_log_usage_without_pulsing_control_lines() {
+        let mut client = PmtkClient::new(FakePmtkTransport::default())
+            .with_reply_timeout(Duration::from_millis(200));
+        let probe = probe_client(&mut client).expect("fake probe succeeds");
+        assert_eq!(probe.info.release, "B-core_1.20");
+        assert_eq!(probe.info.build, "0043");
+        assert_eq!(probe.info.model, "01017-00F");
+        assert_eq!(probe.log_used_bytes, 0x0003_3F7C);
+        assert_eq!(probe.log_enabled, Some(true));
+    }
+
+    #[test]
+    fn non_blocking_background_probe_transitions_to_connected() {
+        let mut screen = screen();
+        screen.start_probe_with(String::from("/dev/ttyFake0"), |_port| {
+            let mut client = PmtkClient::new(FakePmtkTransport::default())
+                .with_reply_timeout(Duration::from_millis(200));
+            probe_client(&mut client)
+        });
+        assert!(matches!(screen.probe_state(), ProbeState::Probing { .. }));
+
+        for _ in 0..50 {
+            if !screen.poll_probe() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(
+            screen.probe_state(),
+            ProbeState::Connected(DeviceProbe {
+                log_used_bytes: 0x0003_3F7C,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn probe_error_keeps_device_message_first_and_provides_japanese_hint() {
+        let err = probe_error_for(CoreError::Timeout {
+            what: String::from("$PMTK705 identity reply"),
+            timeout: Duration::from_secs(5).into(),
+        });
+        assert!(err.message.contains("$PMTK705"));
+        assert!(err.hint.contains("電源"));
     }
 }

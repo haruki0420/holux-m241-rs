@@ -691,3 +691,114 @@ fn the_connect_panels_align_their_figures_to_the_right_edge() {
         );
     }
 }
+
+#[test]
+fn connect_screen_renders_connected_and_failed_probes_without_blocking() {
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Connect);
+
+    app.connect_mut()
+        .start_probe_with(String::from("/dev/ttyFake0"), |_port| {
+            Ok(m241_gui::screens::connect::DeviceProbe {
+                info: m241_core::DeviceInfo {
+                    release: String::from("B-core_1.20"),
+                    build: String::from("0043"),
+                    model: String::from("01017-00F"),
+                    sdk: None,
+                },
+                log_used_bytes: 212_860,
+                log_enabled: Some(true),
+            })
+        });
+    for _ in 0..50 {
+        if !app.connect_mut().poll_probe() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    let mut flat = Vec::new();
+    flatten_shapes(&shapes, &mut flat);
+    assert!(
+        flat.iter()
+            .any(|s| matches!(s, egui::Shape::Text(t) if t.galley.job.text == "212,860 B")),
+        "connected probe log usage did not render"
+    );
+
+    app.connect_mut()
+        .start_probe_with(String::from("/dev/ttyFake1"), |_port| {
+            Err(m241_gui::screens::connect::ProbeError {
+                message: String::from("serial port: permission denied"),
+                hint: String::from("ポート権限を確認してください"),
+            })
+        });
+    for _ in 0..50 {
+        if !app.connect_mut().poll_probe() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    flat.clear();
+    flatten_shapes(&shapes, &mut flat);
+    assert!(
+        flat.iter().any(
+            |s| matches!(s, egui::Shape::Text(t) if t.galley.job.text.contains("permission denied"))
+        ),
+        "failed probe device error did not render"
+    );
+}
+
+#[test]
+fn log_screen_renders_playback_follow_mode_and_imperial_units() {
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Log);
+    app.settings_mut().units = m241_gui::screens::settings::UnitSystem::Imperial;
+    app.settings_mut().reduced_motion = true;
+    app.log_mut()
+        .set_track(mixed_track(), ParseReport::default());
+    app.log_mut().set_zoom(5.0);
+    app.log_mut().set_follow(true);
+    let _ = app.log_mut().step_next();
+
+    assert!(app.log_mut().map_zoom() >= 12.0);
+
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    let mut flat = Vec::new();
+    flatten_shapes(&shapes, &mut flat);
+    let has_mph = flat.iter().any(|shape| match shape {
+        egui::Shape::Text(text) => text.galley.job.text.contains("mph"),
+        _ => false,
+    });
+    assert!(has_mph, "imperial unit mph did not render on Log screen");
+    let has_follow_zoom = flat.iter().any(|shape| match shape {
+        egui::Shape::Text(text) => text.galley.job.text.contains("追従 zoom 12"),
+        _ => false,
+    });
+    assert!(
+        has_follow_zoom,
+        "follow mode zoom >= 12 status did not render on Log screen"
+    );
+}
+
+#[test]
+fn settings_screen_renders_live_controls_and_applies_reduced_motion_to_rail() {
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Settings);
+    app.settings_mut().reduced_motion = true;
+    app.settings_mut().units = m241_gui::screens::settings::UnitSystem::Imperial;
+
+    assert!((app.settings().rail_transition_secs() - 0.0).abs() < f32::EPSILON);
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    let mut flat = Vec::new();
+    flatten_shapes(&shapes, &mut flat);
+    let has_zero_ms = flat.iter().any(|shape| match shape {
+        egui::Shape::Text(text) => text.galley.job.text.contains("0 ms"),
+        _ => false,
+    });
+    assert!(has_zero_ms, "reduced motion 0 ms note did not render");
+}

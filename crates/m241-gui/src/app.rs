@@ -12,14 +12,16 @@
 use crate::screens::connect::ConnectScreen;
 use crate::screens::firmware::FirmwareScreen;
 use crate::screens::log::LogScreen;
+use crate::screens::settings::AppSettings;
 use crate::screens::{self, Screen};
 use crate::theme::{self, size, space};
 use crate::widgets::rail;
 
-/// Application state: the selected screen and the three screens' own state.
+/// Application state: the selected screen, preferences, and the screens' own state.
 #[derive(Debug, Default)]
 pub struct App {
     current: Screen,
+    settings: AppSettings,
     connect: ConnectScreen,
     log: LogScreen,
     firmware: FirmwareScreen,
@@ -33,9 +35,21 @@ impl App {
     }
 
     /// Select a screen. Tests use this; the rail uses the return of
-    /// [`crate::widgets::rail::rail`].
+    /// [`crate::widgets::rail::rail_with_transition`].
     pub fn select(&mut self, screen: Screen) {
         self.current = screen;
+    }
+
+    /// Application display and motion preferences.
+    #[must_use]
+    pub fn settings(&self) -> &AppSettings {
+        &self.settings
+    }
+
+    /// Mutable access to application display and motion preferences.
+    #[must_use]
+    pub fn settings_mut(&mut self) -> &mut AppSettings {
+        &mut self.settings
     }
 
     /// The Connect screen's state, for a caller that has just read a device.
@@ -90,12 +104,13 @@ impl App {
         // because the staircase is not a widget egui has. The width is pinned
         // rather than content-sized: otherwise the current screen's deepest tab
         // decides the rail width, and the heading shifts sideways when you navigate.
+        let transition_secs = self.settings.rail_transition_secs();
         egui::Panel::left("rail")
             .exact_size(rail::WIDTH)
             .show_separator_line(false)
             .frame(egui::Frame::new().fill(theme::RAIL))
             .show(ui, |ui| {
-                if let Some(next) = rail::rail(ui, self.current) {
+                if let Some(next) = rail::rail_with_transition(ui, self.current, transition_secs) {
                     self.current = next;
                 }
             });
@@ -103,6 +118,7 @@ impl App {
         // Copied out of `self` before the closure: a `&mut` to one screen field and
         // a borrow of `self.current` cannot coexist inside it.
         let current = self.current;
+        let settings = &mut self.settings;
         let connect = &mut self.connect;
         let log = &mut self.log;
         let firmware = &mut self.firmware;
@@ -113,9 +129,9 @@ impl App {
                 .inner_margin(space::XL)
                 .show(ui, |ui| match current {
                     Screen::Connect => connect.ui(ui),
-                    Screen::Log => log.ui(ui),
+                    Screen::Log => log.ui_with_settings(ui, settings),
                     Screen::Firmware => firmware.ui(ui),
-                    Screen::Settings => screens::settings::ui(ui),
+                    Screen::Settings => screens::settings::ui(ui, settings),
                 });
         });
     }

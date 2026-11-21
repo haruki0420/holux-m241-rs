@@ -43,11 +43,20 @@ pub fn tab_left(screen: Screen) -> f32 {
 /// frame, so the caller can cancel in-flight work for the screen it left.
 #[must_use]
 pub fn rail(ui: &mut Ui, current: Screen) -> Option<Screen> {
+    rail_with_transition(ui, current, 0.15)
+}
+
+/// Draw the rail with an explicit tab transition duration in seconds.
+///
+/// Pass `0.0` when reduced motion is enabled so the active tab steps out
+/// immediately without animation (DESIGN.md §3).
+#[must_use]
+pub fn rail_with_transition(ui: &mut Ui, current: Screen, transition_secs: f32) -> Option<Screen> {
     let mut selected = None;
     ui.add_space(space::XL);
     ui.vertical(|ui| {
         for screen in Screen::ALL {
-            if tab(ui, screen, screen == current).clicked() && screen != current {
+            if tab(ui, screen, screen == current, transition_secs).clicked() && screen != current {
                 selected = Some(screen);
             }
         }
@@ -55,14 +64,20 @@ pub fn rail(ui: &mut Ui, current: Screen) -> Option<Screen> {
     selected
 }
 
-fn tab(ui: &mut Ui, screen: Screen, active: bool) -> Response {
+fn tab(ui: &mut Ui, screen: Screen, active: bool, transition_secs: f32) -> Response {
     // The row claims the rail's full width so every tab ends on the same right
     // edge; the tab is painted and hit-tested from its stepped left edge to that
     // right edge inside the row.
     let (row, _row) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), TAB_HEIGHT), Sense::hover());
+    let progress = ui.ctx().animate_bool_with_time(
+        ui.scope_id().with(("m241-rail-active", screen.index())),
+        active,
+        transition_secs.max(0.0),
+    );
+    let step_out = (space::XS * progress).round();
     let rect = Rect::from_min_max(
-        pos2(row.left() + tab_left(screen), row.top()),
+        pos2(row.left() + tab_left(screen) - step_out, row.top()),
         row.right_bottom(),
     );
     let response = ui.interact(
@@ -71,8 +86,10 @@ fn tab(ui: &mut Ui, screen: Screen, active: bool) -> Response {
         Sense::click(),
     );
 
-    let fill = if active {
+    let fill = if active && progress >= 0.99 {
         PANEL
+    } else if progress > 0.0 {
+        PANEL.gamma_multiply(progress)
     } else if response.hovered() {
         theme::PANEL.gamma_multiply(0.6)
     } else {
