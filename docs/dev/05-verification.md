@@ -27,6 +27,23 @@ The measured dump's SHA-256 differs per unit because the image contains
 per-unit runtime fields; compare against your own backup, never against a
 figure on this page.
 
+A **settlement row** for the DA-side firmware base is the only row that may
+justify emptying `UNRESOLVED_STARTS`. It must contain at least:
+
+* the exact `fw probe-da` command line that ran, including the resolved
+  `--port` and the `--da` path;
+* what `0xD6` returned at **both** candidates, `0` and `0x00200000` — a failed
+  read is recorded as "not read", never as a mismatch;
+* whether the first four bytes at the adopted base are `18 F0 9F E5`;
+* the base adopted, and why the other candidate was excluded;
+* the date;
+* an explicit statement that the run wrote no flash (DA load into RAM only).
+
+The `Flash write through the DA … ✅` row above is the earlier manual flash.
+It is **not** a settlement row: it records no `fw probe-da` run and says
+nothing about which base the DA uses, so it cannot justify emptying
+`UNRESOLVED_STARTS`.
+
 ## 1a. The Linux log-erase hardware session (2026-11-21)
 
 Device: retail Holux M-241 (MT3318) over USB serial (CP210x bridge).
@@ -58,7 +75,7 @@ nothing on this page makes the final head verified.
 | 4 MiB units and GR-245 variants | geometry maths is implemented and unit-tested; no device was available |
 | V1.11 and V1.12 on hardware | no V1.11 image to profile, V1.12 was never flashed |
 | Any timing figure | nothing in this repository is a stopwatch measurement |
-| The DA-side firmware base (`0` or `0x00200000`) | `fw probe-da` reads both and reports; no run has been recorded here, so `FLASH_WRITE_START` stays refused |
+| The DA-side firmware base (`0` or `0x00200000`) | `fw probe-da` reads both and reports; no settlement row has been recorded in §1 (which defines what that row must contain), so `FLASH_WRITE_START` stays refused |
 | The DA's `0xD6` read itself | page length it emits for a given page-length argument, whether it sends anything before the first page, and whether the host's advance after the **last** page is sent or omitted (`docs/reference/01-da-protocol.md` §5.5, §7 item 4); the client sends one advance per page including the last |
 | The firmware vector `18 F0 9F E5` through the DA | measured in the BootROM's view only; `fw probe-da`'s test of the first four bytes has never been run against a unit, so its `Settled` verdict is unverified |
 | `fw probe-da` on a stock V1.13 and on a V1.14 unit | neither has been run: the image measured so far is a patched (V1.14-reporting) unit, and the probe's output is what a unit run has to fill in |
