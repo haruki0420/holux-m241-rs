@@ -30,7 +30,8 @@
 //!    public constructor, [`Confirmation::granted`], and [`DownloadAgent::write`]
 //!    takes one as its first argument and refuses a token that is not given.
 //!    That makes the prompt a step every caller goes through; it is a convention
-//!    of the call site, not a type-level proof that a person was asked.
+//!    of the call site, not a type-level proof that an approval was recorded
+//!    (`AGENTS.md` §2.5 names who may give it).
 //! 3. **The device must still hold the image the write was planned from.**
 //!    [`DownloadAgent::verify_device`] compares the whole span, read back by
 //!    `m241_core`'s BootROM reader, with the user's own backup, so a backup from
@@ -479,7 +480,7 @@ pub const PROBE_PAGE_SIZE: usize = 64;
 /// short enough that a wrong cable is reported instead of hammered.
 pub const READ_RETRIES: usize = 3;
 
-/// The evidence that a person asked for this write.
+/// The evidence that an approval was recorded for this write.
 ///
 /// No `Default`, no public field: the only way to obtain one is
 /// [`Confirmation::granted`] — the token [`Confirmation::of_command_line`]

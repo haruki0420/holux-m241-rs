@@ -108,7 +108,8 @@ Rules:
 * the range must be a hard-coded constant, not a value derived from user input;
 * refuse to run if that constant is anything unexpected;
 * verify a known-intact marker before erasing;
-* require an explicit confirmation: type `WRITE` at the prompt, or pass `--yes`.
+* require an explicit confirmation: type `WRITE` at the prompt, or pass `--yes`;
+* an agent may pass `--yes` only through the reviewer gate in §2.5.
 
 ### 2.3 Take a dump before writing anything
 
@@ -119,6 +120,35 @@ that check.
 ### 2.4 Never commit personal data
 
 See §6.
+
+### 2.5 Who may approve a flash write
+
+The user delegated the approval of a firmware write: instead of asking the user
+each time, the agent that prepared the write asks a **different** subagent —
+one that did not prepare it — whether the exact write may run, and passes
+`--yes` only when that reviewer answers "approved".
+
+The request must contain, and the reviewer must check against the artifacts:
+
+* the unit's identity read in this session: `B-core_1.20`, model `01017-00F`,
+  flash `00C2:22BA`, and the port;
+* the image path, its SHA-256, and its provenance: an official V1.12 / V1.13
+  vendor package, or the user's own backup plus the recorded patch offsets;
+* the backup path and SHA-256, taken in this session, whose differing bytes fall
+  only at the patch offsets;
+* the write range: `FLASH_WRITE_START` (measured as `0` on 2026-11-21) and the
+  image length, covering the firmware and nothing else;
+* the read-back plan (whole-image compare) and the recovery step (power cycle);
+* the exact command line, including `--yes`, the image path and the backup path.
+
+A missing item, a hash that does not match, or a reviewer that is the preparing
+session is a refusal. The approval, the hashes and the reviewer's session id are
+written to `docs/dev/05-verification.md` (or the write's PR) **before** `--yes`
+is passed. The reviewer does not open the port and does not edit the branch.
+
+`log erase` is not covered: it destroys the user's track data, which a reviewer
+cannot consent to on the user's behalf. It still needs the user's own
+instruction.
 
 ## 3. Verified hardware facts — do not re-derive
 
