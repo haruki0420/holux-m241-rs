@@ -38,7 +38,7 @@
 | 項目 | 値 |
 |---|---|
 | クレート構成 | 4 クレート（`m241-core` 読取専用 / `m241-flash` 書込専用 / `m241-cli` / `m241-gui`） |
-| テスト | **480 件全緑**（`cargo test --workspace`） |
+| テスト | **483 件全緑**（`cargo test --workspace`） |
 | ゲート | **6/6 PASS**（`./tools/check.sh`: fmt / clippy / test / docs / design / safety） |
 | CI | Linux / Windows / macOS |
 | **実機検証** | **ゼロ（未検証）** |
@@ -104,7 +104,7 @@ m241 fw patch backup/stock.bin --dry-run
 
 ```bash
 ./tools/check.sh              # 6 ゲート（fmt / clippy / test / docs / design / safety）
-cargo test --workspace        # 全テスト（現在 480 件）
+cargo test --workspace        # 全テスト（現在 483 件）
 cargo build --release
 cargo run -q -p m241-gui -- --screenshot
 ```
