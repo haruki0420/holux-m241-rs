@@ -185,6 +185,12 @@ impl FakeRepo {
         let output: Output = Command::new(python())
             .arg(self.root.join("tools").join("check_safety.py"))
             .current_dir(&self.root)
+            // The gate's violations quote `AGENTS.md §2.3`. A pipe on Windows
+            // uses the ANSI code page, so `§` reached the test as `?` and an
+            // assertion on the exact message failed for an encoding reason, not
+            // because the rule stopped firing. Pin the child's output to UTF-8.
+            .env("PYTHONIOENCODING", "utf-8")
+            .env("PYTHONUTF8", "1")
             .output()
             .unwrap();
         let mut report = String::from_utf8_lossy(&output.stdout).into_owned();
