@@ -35,12 +35,19 @@ use m241_core::protocol::port::Transport;
 /// The subcommand that erases the log.
 pub const ERASE_SUBCOMMAND: u8 = 6;
 
-/// How long to wait for the acknowledgement of `$PMTK182,6`.
+/// The action field that wipes the whole log (`$PMTK182,6,1*3E`).
 ///
-/// The same five seconds the read path uses for a direct reply: the erase is
-/// acknowledged as soon as the command is accepted, not when the flash has
-/// finished, so a longer wait would only make a dead cable slower to report.
-pub const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// The official `HoluxLoggerUtility.exe` sends `$PMTK182,6,1` (not bare
+/// `$PMTK182,6`) and expects `$PMTK001,182,6`. Bare `$PMTK182,6` left a real
+/// M-241's log untouched on the wire.
+pub const ERASE_ALL_ACTION: u8 = 1;
+
+/// How long to wait for the acknowledgement of `$PMTK182,6,1`.
+///
+/// Erasing the log flash sectors on the MT3318 takes several seconds before the
+/// firmware emits `$PMTK001,182,6,3`, so five seconds is too tight for a full
+/// log; thirty seconds covers the flash wipe while still failing a dead cable.
+pub const DEFAULT_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The command number PMTK uses for the log family.
 const PMTK_LOG_COMMAND: u16 = 182;
@@ -132,7 +139,7 @@ impl<T: Transport> LogEraser<T> {
                 ),
             });
         }
-        let body = format!("PMTK182,{ERASE_SUBCOMMAND}");
+        let body = format!("PMTK182,{ERASE_SUBCOMMAND},{ERASE_ALL_ACTION}");
         // Wait for the first `$PMTK001,` reply and verify both the command
         // number (182) and the subcommand (6). Checking only `command == 182`
         // would accept a stale `$PMTK001,182,5,3` (log-stop ACK) as if the
@@ -309,8 +316,8 @@ mod tests {
             .expect("accepted");
         assert_eq!(
             eraser.into_transport().written,
-            b"$PMTK182,6*23\r\n",
-            "the erase command and its XOR checksum"
+            b"$PMTK182,6,1*3E\r\n",
+            "the erase-all command and its XOR checksum"
         );
     }
 
