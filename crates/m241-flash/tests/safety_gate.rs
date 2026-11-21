@@ -7,8 +7,8 @@
 //! touching the real repository), asserting:
 //!
 //! * each forbidden command, escape form, write-shaped identifier, misplaced
-//!   `set_control_lines` reference, and reversed dependency fails and names
-//!   the violated rule;
+//!   `set_control_lines` reference, reversed dependency, and digest-based image
+//!   acceptance fails and names the violated rule;
 //! * valid exclusions (comments, trailing inline comments, `erased`, SHA-256
 //!   constants like `0xd5a7_9147`, and `set_control_lines` inside its exact
 //!   allowlisted files) pass;
@@ -78,6 +78,21 @@ edition = \"2024\"
 m241-core = { path = \"../m241-core\" }
 ";
 
+/// The write crate's acceptance path, without a digest. The doc comment names
+/// the forbidden tokens on purpose: prose must stay allowed.
+const CLEAN_FLASH_DA: &str = "\
+//! Acceptance is the backup diff; this comment may name sha256 and firmware::digest.
+pub fn check_image(backup: &[u8], image: &[u8]) -> bool {
+    // A trailing comment may also name profile.sha256.
+    backup == image
+}
+
+// W2a may hash the DA file here; only the firmware acceptance is forbidden a digest.
+pub fn check_da_image(image: &[u8]) -> bool {
+    m241_core::firmware::sha256_hex(image).len() == 64
+}
+";
+
 /// A temporary workspace holding the real `tools/check_safety.py` plus the
 /// `m241-core`, `m241-flash`, and `m241-gui` layouts a test wants to inspect.
 /// Uses zero external dependencies so `cargo tree` runs offline and fast.
@@ -109,6 +124,7 @@ impl FakeRepo {
         std::fs::create_dir_all(flash.join("src")).unwrap();
         std::fs::write(flash.join("Cargo.toml"), CLEAN_FLASH_TOML).unwrap();
         std::fs::write(flash.join("src").join("lib.rs"), "pub fn write_path() {}\n").unwrap();
+        std::fs::write(flash.join("src").join("da.rs"), CLEAN_FLASH_DA).unwrap();
 
         let gui = root.join("crates").join("m241-gui");
         std::fs::create_dir_all(gui.join("src")).unwrap();
@@ -125,6 +141,13 @@ impl FakeRepo {
     /// Write a file under `crates/m241-core/` (e.g. `src/foo.rs` or `tests/bar.rs`).
     fn write_core_file(&self, relative: &str, content: &str) {
         let path = self.root.join("crates").join("m241-core").join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// Write a file under `crates/m241-flash/` (e.g. `src/da.rs`).
+    fn write_flash_file(&self, relative: &str, content: &str) {
+        let path = self.root.join("crates").join("m241-flash").join(relative);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
     }
@@ -229,6 +252,60 @@ fn compliant_sources_and_valid_exclusions_pass() {
         report.contains("no write path in m241-core or m241-gui"),
         "the gate passed without its expected summary:\n{report}"
     );
+}
+
+#[test]
+fn digest_based_image_acceptance_in_flash_is_reported() {
+    // This is the mutation the review found: put the old vendor branch back in
+    // `check_image`, and the Rust tests still pass because no synthetic fixture
+    // hashes to the real vendor digest. The safety gate reads the source, so it
+    // must fail even when the runtime branch would never fire in a test.
+    let fully_qualified = "\
+pub fn check_image(backup: &[u8], image: &[u8]) -> bool {
+    if m241_core::firmware::digest::matches(image, PROFILE.sha256) {
+        return true;
+    }
+    backup == image
+}
+";
+    let imported = "\
+use m241_core::firmware::digest::matches;
+
+pub fn check_image(backup: &[u8], image: &[u8], profile: &Profile) -> bool {
+    if matches(image, profile.sha256) {
+        return true;
+    }
+    backup == image
+}
+";
+    let hash_comparison = "\
+pub fn check_image(backup: &[u8], image: &[u8], profile: &Profile) -> bool {
+    let digest = m241_core::firmware::sha256_hex(image);
+    if digest == profile.sha256 {
+        return true;
+    }
+    backup == image
+}
+";
+    for (label, source) in [
+        ("digest-fully-qualified", fully_qualified),
+        ("digest-imported", imported),
+        ("digest-hash-comparison", hash_comparison),
+    ] {
+        let repo = FakeRepo::new(label, &[]);
+        repo.write_flash_file("src/da.rs", source);
+        repo.assert_reports("digest-based image acceptance");
+        let (passed, report) = repo.run();
+        assert!(!passed, "{label} was accepted:\n{report}");
+        assert!(
+            report.contains("crates/m241-flash/src/da.rs"),
+            "{label} did not name the file:\n{report}"
+        );
+        assert!(
+            report.contains("AGENTS.md §2.3"),
+            "{label} did not name the rule:\n{report}"
+        );
+    }
 }
 
 #[test]

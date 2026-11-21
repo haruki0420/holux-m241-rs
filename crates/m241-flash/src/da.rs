@@ -3400,6 +3400,14 @@ mod tests {
         assert!(text.contains("0x1000"), "got {text}");
         assert!(text.contains("0xD9 (restart) was sent"), "got {text}");
         assert!(text.contains("backup"), "got {text}");
+        assert!(
+            text.contains("the read-back did not confirm it"),
+            "a mismatch must be reported as the read-back disagreeing: {text}"
+        );
+        assert!(
+            !text.contains("could not be reached"),
+            "the read-back ran, so it was not unreachable: {text}"
+        );
     }
 
     #[test]

@@ -295,8 +295,25 @@ pub struct FakeDa {
     /// `false` models a unit whose firmware never starts, for the test that a
     /// failed re-entry is not reported as a read-back mismatch.
     nmea_after_restart: bool,
+    /// The line a running firmware emits when asked.
+    ///
+    /// The default is a valid-looking NMEA sentence; a test can replace it with
+    /// a complete line that does not start with `$` to model the probe's
+    /// `StreamState::Unknown` branch.
+    firmware_sentence: &'static [u8],
     /// Whether `$PMTK180*3B` was seen and handed the chip back to the BootROM.
     pmtk180: bool,
+    /// Every baud rate the host set, in order.
+    ///
+    /// A history, not the current value: the read-back's correctness depends on
+    /// switching to NMEA baud and back, and a no-op setter would hide a missing
+    /// switch.
+    bauds: Vec<u32>,
+    /// Every `set_control_lines` argument, in order.
+    ///
+    /// The safe sequence never asserts DTR/RTS. Recording the calls lets a test
+    /// prove that, rather than trusting a no-op setter.
+    control_lines: Vec<bool>,
 }
 
 impl FakeDa {
@@ -349,7 +366,10 @@ impl FakeDa {
             firmware_line: Vec::new(),
             firmware_served: false,
             nmea_after_restart: true,
+            firmware_sentence: FIRMWARE_NMEA_LINE,
             pmtk180: false,
+            bauds: Vec::new(),
+            control_lines: Vec::new(),
         }
     }
 
@@ -654,6 +674,18 @@ impl FakeDa {
         self.pmtk180
     }
 
+    /// Every baud rate the host set, in order.
+    #[must_use]
+    pub fn bauds(&self) -> &[u32] {
+        &self.bauds
+    }
+
+    /// Every `set_control_lines` argument, in order.
+    #[must_use]
+    pub fn control_lines(&self) -> &[bool] {
+        &self.control_lines
+    }
+
     /// Model a restarted firmware that never streams NMEA.
     ///
     /// The write still completes; only the read-back's re-entry fails. A test
@@ -662,6 +694,16 @@ impl FakeDa {
     #[must_use]
     pub fn without_nmea_stream(mut self) -> Self {
         self.nmea_after_restart = false;
+        self
+    }
+
+    /// Model a firmware that emits a complete line which is not an NMEA sentence.
+    ///
+    /// The probe reports `StreamState::Unknown` for this, and the CLI must
+    /// refuse to send `$PMTK180` blind rather than treating the line as silence.
+    #[must_use]
+    pub fn with_garbled_stream(mut self) -> Self {
+        self.firmware_sentence = b"this is not an NMEA sentence\r\n";
         self
     }
 
@@ -716,9 +758,11 @@ impl FakeDa {
 
     /// Assemble the host's bytes into a line while the firmware is running.
     ///
-    /// The only line that changes state is `$PMTK180*3B`: a real unit hands the
-    /// BootROM over when it sees it, and the read-back depends on that. Other
-    /// lines are ignored, as the firmware ignores them.
+    /// The only line that changes state is exactly `$PMTK180*3B`: a real unit
+    /// hands the BootROM over when it sees that sentence, and the read-back
+    /// depends on it. A longer or different sentence is ignored, as the firmware
+    /// ignores it; accepting a prefix would hide a client that sent the wrong
+    /// hand-over.
     fn process_firmware(&mut self, byte: u8) {
         if self.firmware_line.is_empty() && byte != b'$' {
             return;
@@ -727,8 +771,14 @@ impl FakeDa {
         if byte != b'\n' {
             return;
         }
-        let line = std::mem::take(&mut self.firmware_line);
-        if line.starts_with(b"$PMTK180") {
+        let mut line = std::mem::take(&mut self.firmware_line);
+        if line.ends_with(b"\n") {
+            line.pop();
+        }
+        if line.ends_with(b"\r") {
+            line.pop();
+        }
+        if line == b"$PMTK180*3B" {
             self.pmtk180 = true;
             self.mode = Mode::BootRom;
             // Whatever the firmware had queued is not a BootROM reply.
@@ -1369,7 +1419,7 @@ impl Transport for FakeDa {
         if self.mode == Mode::Firmware && self.output.is_empty() && !self.firmware_served {
             self.firmware_served = true;
             if self.nmea_after_restart {
-                self.queue_bytes(FIRMWARE_NMEA_LINE);
+                self.queue_bytes(self.firmware_sentence);
             }
         }
         Ok(self.take_output(buf))
@@ -1404,11 +1454,13 @@ impl Transport for FakeDa {
         Ok(())
     }
 
-    fn set_baud(&mut self, _baud: u32) -> Result<()> {
+    fn set_baud(&mut self, baud: u32) -> Result<()> {
+        self.bauds.push(baud);
         Ok(())
     }
 
-    fn set_control_lines(&mut self, _asserted: bool) -> Result<()> {
+    fn set_control_lines(&mut self, asserted: bool) -> Result<()> {
+        self.control_lines.push(asserted);
         Ok(())
     }
 }
@@ -1768,6 +1820,25 @@ mod tests {
             .write_all(b"$PMTK180*3B\r\n")
             .expect("the hand-over sentence");
         assert!(device.pmtk180(), "the sentence must be what switched it");
+        assert_eq!(device.mode(), Mode::BootRom);
+    }
+
+    #[test]
+    fn a_pmtk180_with_a_foreign_suffix_does_not_switch() {
+        // The hand-over is an exact sentence. A client that sent `$PMTK180`
+        // with the wrong checksum or an extra digit must not be treated as
+        // having switched the chip.
+        let mut device = download_agent(&[0xFFu8; 16]);
+        device.write_all(&[OPCODE_RESTART]).expect("restart");
+        device
+            .write_all(b"$PMTK1800*00\r\n")
+            .expect("a look-alike sentence");
+        assert!(!device.pmtk180(), "a suffix must not be accepted");
+        assert_eq!(device.mode(), Mode::Firmware);
+        device
+            .write_all(b"$PMTK180*3B\r\n")
+            .expect("the exact sentence");
+        assert!(device.pmtk180());
         assert_eq!(device.mode(), Mode::BootRom);
     }
 

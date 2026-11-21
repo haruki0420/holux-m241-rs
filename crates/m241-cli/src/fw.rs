@@ -540,7 +540,8 @@ fn plan_document(report: &PatchReport, written: Option<&std::path::Path>) -> ser
 /// # Errors
 ///
 /// * [`Error::Io`] when a file cannot be read.
-/// * [`Error::Profile`] when the image or the backup matches no known profile.
+/// * [`Error::Profile`] when the image matches no known profile. The backup is
+///   not identified; it is checked by length and the byte-for-byte diff.
 /// * [`Error::Firmware`] when the image is too short to hold a header.
 /// * [`Error::Safety`] when the image is not acceptable ([`write_plan`] /
 ///   [`check_image`]), when `--yes` was not given, from [`check_layout`], or
@@ -554,9 +555,9 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
     let backup = fileio::read(&options.backup)?;
     let image = fileio::read(&options.image)?;
 
-    // Identify both. The image decides the profile a plan is made against; the
-    // backup is identified only for the message, because a backup of another
-    // length is refused by the plan with a precise reason.
+    // Identify the image; it decides the profile a plan is made against. The
+    // backup is not identified: `write_plan` checks its length against that
+    // profile and compares it with the image byte for byte.
     let image_view = FirmwareImage::new(&image)?;
     let profile = identify(&image_view)?.profile;
     let plan = write_plan(profile, &backup, &image)?;
@@ -724,9 +725,10 @@ const BOOTROM_REENTRY_SETTLE: std::time::Duration = std::time::Duration::from_mi
 /// the backup is a local file and this command never touched it.
 fn note_write_failure(console: &dyn Console, backup: &std::path::Path) {
     console.note(&format!(
-        "the write did not complete. The backup at {} was not modified by this command; follow \
-         the recovery steps in the error above. A power-cycle followed by `m241 fw dump` shows \
-         what the unit actually holds — do not treat the write as successful without that check.",
+        "the run did not finish, so do not assume the write succeeded. The backup at {} was not \
+         modified by this command; follow the recovery steps in the error above. A power-cycle \
+         followed by `m241 fw dump` shows what the unit actually holds — do not treat the run as \
+         successful without that check.",
         backup.display()
     ));
 }
@@ -2529,7 +2531,7 @@ mod tests {
     }
 
     #[test]
-    fn flash_dry_run_refuses_an_image_that_is_neither_the_backup_nor_the_vendor_release() {
+    fn flash_dry_run_refuses_an_image_that_is_neither_the_backup_nor_the_patch_offsets() {
         let scratch = crate::testing::Scratch::new("flash-dry-refuse");
         let backup = flash_image(&PROFILE_V1_13, false);
         let mut image = flash_image(&PROFILE_V1_13, true);
@@ -2763,6 +2765,16 @@ mod tests {
                 chip.pmtk180(),
                 "the read-back required the hand-over sentence, not a set_baud shim"
             );
+            assert!(
+                chip.bauds().ends_with(&[NMEA_BAUD, DEFAULT_BOOTROM_BAUD]),
+                "the re-entry must switch to NMEA baud and back to the BootROM rate: {:?}",
+                chip.bauds()
+            );
+            assert!(
+                chip.control_lines().is_empty(),
+                "the re-entry must never assert DTR/RTS: {:?}",
+                chip.control_lines()
+            );
             assert_eq!(
                 &chip.memory()[..FLASH_WRITE_LENGTH],
                 &image[..],
@@ -2858,11 +2870,57 @@ mod tests {
                 "no re-entry happened"
             );
             assert!(!chip.pmtk180(), "no $PMTK180 was sent");
+            assert!(
+                chip.control_lines().is_empty(),
+                "the re-entry must never assert DTR/RTS: {:?}",
+                chip.control_lines()
+            );
         }
         assert!(
-            console.stderr().contains("the write did not complete"),
+            console.stderr().contains("the run did not finish"),
             "the CLI still tells the user the backup was not modified: {}",
             console.stderr()
+        );
+        assert!(
+            !console.stderr().contains("the write did not complete"),
+            "the write completed; only the read-back did not run: {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
+    fn flash_reports_an_unusable_line_after_the_restart() {
+        // Bytes arrive but never a complete NMEA sentence. Sending $PMTK180
+        // blind is refused (AGENTS.md §2.2/§4.6), so the read-back must not run.
+        let scratch = crate::testing::Scratch::new("flash-real-garbled-reentry");
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let image = flash_image(&PROFILE_V1_13, true);
+        let case = flash_case(&scratch, &image, &backup);
+        let chip = m241_flash::FakeDa::with_firmware(&backup).with_garbled_stream();
+        let links = da_write::DaWritePorts::new(chip);
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.yes = true;
+        options.da = Some(da_file(scratch.path()));
+
+        let err = flash(&options, session).expect_err("the line is not an NMEA sentence");
+        assert!(matches!(err, Error::State(_)), "got {err}");
+        let text = format!("{err}");
+        assert!(
+            text.contains("no complete NMEA sentence"),
+            "the unusable line is named: {text}"
+        );
+        assert!(
+            text.contains("read-back was not performed"),
+            "the read-back did not run: {text}"
+        );
+        assert!(!text.contains("did not confirm"));
+        assert!(
+            !chip.borrow().pmtk180(),
+            "no hand-over may be sent at an unclassified line"
         );
     }
 

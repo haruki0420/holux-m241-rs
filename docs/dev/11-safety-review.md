@@ -223,6 +223,11 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
    無いこと。例外は `erased` — 空ブロックを読むときに使う語で、書き込みではない。
    静的検査で拾えない表現（算術組み立てや `format!` による動的組み立て、生
    `Transport::write_all` への直接書き込み）が無いことは `👁` で確認する。
+   同じゲートは `crates/m241-flash/src/da.rs` の `check_image` 本体に
+   `firmware::digest` / `digest::matches` / `sha256`（`sha256_hex` を含む）が
+   戻らないことも検査する。`AGENTS.md` §2.3 のバックアップ差分だけが受理規則で
+   あり、ベンダーイメージの digest で通す経路は削除済みである（`check_da_image`
+   の W2a 用 SHA-256 は対象外）。
 3. **ポートを開いたまま落ちたとき、装置が recording 停止のままにならないか。** 👁
    `log_stop` の後は必ず `log_resume` が走ること。`download_log` は失敗経路でも
    resume する（`pmtk.rs` のテスト `logging_is_resumed_even_when_the_transfer_fails`
@@ -246,6 +251,7 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
 | `cargo tree -p m241-flash --edges normal,build,dev` に `m241-core` がある | 正しい向きの依存が消えていない |
 | `crates/m241-core/Cargo.toml` と `crates/m241-gui/Cargo.toml` が `m241-flash` を名指ししない | 解決結果に出ない形の依存（dev 依存など）も塞ぐ |
 | `set_control_lines` が `crates/m241-core/src/protocol/brom.rs` / `crates/m241-core/src/protocol/port.rs` / `crates/m241-core/src/protocol/simulator.rs` 以外に無い | DTR/RTS を触る場所が増えていない（同名別パスのすり抜けも防ぐ） |
+| `crates/m241-flash/src/da.rs` の `check_image` 本体に `firmware::digest` / `digest::matches` / `sha256(_hex)` が無い | ベンダー digest による第二の受理経路が戻らない（`check_da_image` の W2a 用 SHA-256 は対象外） |
 
 すべての検査と `tools/check.sh` への配線は
 `crates/m241-flash/tests/safety_gate.rs` で自動検証している。違反を植えた一時

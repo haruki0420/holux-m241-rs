@@ -37,7 +37,8 @@ follow:
   disagreement is recorded in `docs/dev/04-prior-art.md` so it is not re-litigated.
 
 Do not "simplify" a safety gate. The three that exist each stopped a real
-failure: the NMEA pre-probe, the backup diff check, and the typed `WRITE`.
+failure: the NMEA pre-probe, the backup diff check, and the `--yes`
+confirmation.
 
 ## Safety gates
 
@@ -45,7 +46,7 @@ failure: the NMEA pre-probe, the backup diff check, and the typed `WRITE`.
 |---|---|---|
 | NMEA pre-probe | `protocol::brom` | Pulsing DTR/RTS at a streaming firmware leaves the unit unresponsive until the battery is removed |
 | Backup diff check | `firmware::patch` | Any image whose differing bytes fall outside the patch offsets is refused |
-| Typed `WRITE` | `cli`, `gui` | A confirmation dialogue is clicked by reflex; typing is not |
+| `--yes` confirmation | `cli`, `gui` | A confirmation dialogue is clicked by reflex; the flag must be deliberate, and `AGENTS.md` §2.5 governs who may pass it |
 
 ## Adding a firmware profile
 

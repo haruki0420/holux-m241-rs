@@ -810,6 +810,28 @@ mod tests {
     }
 
     #[test]
+    fn fw_flash_no_longer_accepts_allow_cross_model() {
+        // The vendor/cross-model route was removed (`AGENTS.md` §2.3). If the
+        // flag is put back without the rule that made it reachable, this fails
+        // before a user can believe the bypass exists again.
+        let err = Cli::try_parse_from([
+            "m241",
+            "fw",
+            "flash",
+            "image.bin",
+            "--backup",
+            "backup.bin",
+            "--allow-cross-model",
+        ])
+        .expect_err("--allow-cross-model must be an unknown argument");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        assert!(
+            err.to_string().contains("--allow-cross-model"),
+            "the usage error must name the removed flag: {err}"
+        );
+    }
+
+    #[test]
     fn fw_flash_without_a_backup_is_a_usage_error() {
         // `AGENTS.md` §2.3: no write is planned without the user's own dump, so
         // a command line that names no backup is a usage error (exit 2), not a

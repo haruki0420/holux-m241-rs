@@ -7,7 +7,7 @@ m241 device ports                      # 1. find the cable
 m241 fw dump -o backup/stock.bin       # 2. save your firmware (read-only)
 m241 fw patch backup/stock.bin -o backup/fixed.bin --dry-run
 m241 fw patch backup/stock.bin -o backup/fixed.bin
-m241 fw flash backup/fixed.bin --da vendor/DA_v3.8.4.bin --backup backup/stock.bin
+m241 fw flash backup/fixed.bin --da vendor/DA_v3.8.4.bin --backup backup/stock.bin --yes
 ```
 
 ## Step 2 asks you to power-cycle
