@@ -6,10 +6,15 @@
 //! The work runs on a thread and reports through a channel because a download is
 //! about a hundred round trips and an immediate-mode UI must keep drawing.
 //!
+//! **The GUI download is unverified on hardware.** The CLI has run this path on a
+//! unit (`docs/dev/05-verification.md`); this screen has not, and the note the
+//! download panel shows says so. The core calls are the same, which makes the
+//! risk small, not zero.
+//!
 //! Nothing here writes to the device except the core's stop/resume pair.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 use m241_core::Track;
 use m241_core::log::{ParseReport, parse_dump};
@@ -38,18 +43,33 @@ pub enum DownloadPurpose {
 /// A running download.
 #[derive(Debug)]
 pub struct DownloadJob {
-    /// Which action started it.
-    pub purpose: DownloadPurpose,
-    /// Messages from the worker.
-    pub receiver: Receiver<DownloadMsg>,
+    purpose: DownloadPurpose,
+    receiver: Receiver<DownloadMsg>,
 }
 
-/// Start a download on its own thread.
-pub fn start_download(port: String, sender: Sender<DownloadMsg>) {
+impl DownloadJob {
+    /// Which action started it.
+    pub fn purpose(&self) -> DownloadPurpose {
+        self.purpose
+    }
+
+    /// Take the next message, if any.
+    ///
+    /// The `Receiver` stays private so the state the screen exposes is "a job"
+    /// rather than "a channel"; the console is the only reader.
+    pub fn try_recv(&self) -> Result<DownloadMsg, TryRecvError> {
+        self.receiver.try_recv()
+    }
+}
+
+/// Start a download on its own thread and return the job the screen polls.
+pub fn start_download(port: String, purpose: DownloadPurpose) -> DownloadJob {
+    let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let result = download_from(&port, &sender);
         let _sent = sender.send(DownloadMsg::Done(result));
     });
+    DownloadJob { purpose, receiver }
 }
 
 /// Open `port` and transfer the whole log, reporting each chunk.
@@ -68,26 +88,78 @@ fn download_from(port: &str, sender: &Sender<DownloadMsg>) -> Result<Vec<u8>, St
 /// Turn `auto` (or an empty field) into the one plausible port, or name what was
 /// found instead.
 ///
+/// The CLI resolves `--port auto` by USB ids and description
+/// (`crates/m241-cli/src/link.rs::identify`): a port is `likely` when its
+/// bridge is a CP210x / PL2303 / FTDI / CH340, or when the description names a
+/// USB-serial adapter. `m241-core` exposes port **names** only, so this mirrors
+/// the filter with the OS's naming conventions ([`looks_like_cable`]) rather
+/// than claiming the USB-id classification. An explicitly typed name bypasses
+/// the filter, exactly as it does in the CLI. The intended end state is one
+/// classification used by both front ends, in core.
+///
 /// # Errors
 ///
-/// No port, several ports, or an enumeration failure. A refusal names the ports
-/// so the user can type one rather than guess.
+/// No cable-shaped port, several of them, or an enumeration failure. A refusal
+/// lists every port the OS did report, so the user can type one rather than
+/// guess.
 pub fn resolve_port_name(text: &str) -> Result<String, String> {
     let trimmed = text.trim();
     if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("auto") {
         return Ok(trimmed.to_owned());
     }
     let ports = Port::list().map_err(|err| format!("ポートを列挙できません: {err}"))?;
-    match ports.as_slice() {
-        [only] => Ok(only.clone()),
-        [] => Err(String::from(
-            "ポートが見つかりません。端末を USB でつなぎ、「一覧」で更新してください",
+    let candidates: Vec<&String> = ports.iter().filter(|name| looks_like_cable(name)).collect();
+    match candidates.as_slice() {
+        [only] => Ok((*only).clone()),
+        [] => Err(format!(
+            "M-241 のケーブルらしいポートが見つかりません（見つかったポート: {}）。\
+             端末を USB でつなぎ、電源を入れて「一覧」で更新するか、使うポート名を入力してください",
+            if ports.is_empty() {
+                String::from("なし")
+            } else {
+                ports.join("、")
+            }
         )),
         many => Err(format!(
-            "ポートが複数あります（{}）。使うポートを入力してください",
-            many.join("、")
+            "ケーブルらしいポートが複数あります（{}）。使うポートを入力してください",
+            many.iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join("、")
         )),
     }
+}
+
+/// Whether an OS port name looks like a USB-serial adapter the logger can be on.
+///
+/// These are naming conventions, not identification: the genuine Holux cable is a
+/// CP210x bridge and appears as `ttyUSB*` / `cu.SLAB_USBtoUART` / a `COM`
+/// port, and a Bluetooth or pseudo-terminal port never does. A platform whose
+/// convention is not listed here gets a refusal that lists the ports, which is
+/// the CLI's behaviour when no port is `likely`.
+fn looks_like_cable(name: &str) -> bool {
+    let name = name.trim();
+    // Linux: USB serial bridges are ttyUSBn / ttyACMn. Bluetooth is rfcommN and
+    // a pseudo terminal is pts/N, neither of which matches.
+    if name.starts_with("/dev/ttyUSB") || name.starts_with("/dev/ttyACM") {
+        return true;
+    }
+    // macOS: a USB-serial bridge is a `cu.*` device whose name carries the
+    // adapter (SLAB = Silicon Labs, wchusbserial = CH34x, usbserial / FTDI /
+    // usbmodem). `cu.Bluetooth-Incoming-Port` and `cu.debug-console` do not.
+    if let Some(stem) = name.strip_prefix("/dev/cu.") {
+        let stem = stem.to_ascii_lowercase();
+        return ["usbserial", "slab", "wchusbserial", "usbmodem", "ftdi"]
+            .iter()
+            .any(|marker| stem.contains(marker));
+    }
+    // Windows: a COM port is the only shape a serial adapter takes, and the name
+    // carries no chip information, so every COM port is a candidate — the CLI
+    // reaches the same result when the description is all the OS gives.
+    let upper = name.to_ascii_uppercase();
+    upper
+        .strip_prefix("COM")
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// A dump that was saved and parsed.
@@ -179,6 +251,37 @@ mod tests {
             resolve_port_name(" /dev/ttyUSB0 "),
             Ok(String::from("/dev/ttyUSB0"))
         );
+    }
+
+    #[test]
+    fn auto_only_considers_a_cable_shaped_port() {
+        // `--port auto` is "the only plausible cable" in the CLI too; core gives
+        // names only, so this pins the naming conventions that stand in for the
+        // USB-id classification.
+        for name in [
+            "/dev/ttyUSB0",
+            "/dev/ttyACM1",
+            "/dev/cu.SLAB_USBtoUART",
+            "/dev/cu.usbserial-1420",
+            "/dev/cu.wchusbserial1420",
+            "/dev/cu.usbmodem14201",
+            "COM3",
+            "com12",
+        ] {
+            assert!(looks_like_cable(name), "{name} should be a cable candidate");
+        }
+        for name in [
+            "/dev/ttyS0",
+            "/dev/rfcomm0",
+            "/dev/pts/3",
+            "/dev/cu.Bluetooth-Incoming-Port",
+            "/dev/cu.debug-console",
+            "LPT1",
+            "COM",
+            "COMx",
+        ] {
+            assert!(!looks_like_cable(name), "{name} is not a cable candidate");
+        }
     }
 
     #[test]

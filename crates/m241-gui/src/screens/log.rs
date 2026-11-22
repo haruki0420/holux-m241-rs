@@ -6,20 +6,40 @@
 //! the projection is forty lines and is what makes the shape of the trip visible,
 //! which is the job on this screen.
 //!
-//! This module owns the offline half of the screen: reading a `.bin` dump from
-//! disk, scanning a photo folder, writing EXIF tags into the photos a person
-//! confirmed, and exporting GPX/KML/CSV. Nothing here talks to a device — the
-//! download that fills [`LogScreen::track`] is the Firmware screen's twin
-//! unsolved problem (both need the session layer) — and a track arrived at from
-//! disk can only be written back into the photos and the export file, never the
-//! logger.
+//! # What this module and its submodules do
 //!
-//! Limits of the wiring this module holds: the map selects a point by clicking
-//! it, with no drag range selection; the CLI's `log kmz --utc-offset-days` and
-//! `--tz-offset-minutes` have no control here, so an uncorrected dump must be
-//! corrected with the CLI before the photo match means anything; and the KMZ
-//! icon option is not exposed because the core module records its spec as
-//! unconfirmed.
+//! The page, the map, the point table, the photo block and the export bar are
+//! here. The submodules own the work behind the controls:
+//!
+//! * `ops` is the ログ操作 console — the CLI's `log` and `nmea` commands as
+//!   panels. It **does talk to a device**: download and the erase backup call
+//!   `device`'s PMTK182 worker on a thread (`Port::open` +
+//!   `PmtkClient::download_log`), and the NMEA relay opens the port too. Those
+//!   paths are unverified on hardware from this screen, and the panels say so.
+//!   The erase itself cannot run: `m241-gui` does not link `m241-flash`, so the
+//!   confirmed action stops at a refusal that names the crate boundary.
+//! * `project` is the CLI-compatible JSON project document and the `log read`
+//!   conversion; `nmea` is the date repair and day arithmetic; `proxy` is the
+//!   relay thread; `device` is the transfer worker.
+//!
+//! A track arrived at from disk can only be written back into the photos and the
+//! export file, never the logger, unless the person uses the download panel —
+//! the screen never writes a track to the unit.
+//!
+//! # Controls that exist, and the ones that do not
+//!
+//! The CLI's `log kmz --utc-offset-days` and `--tz-offset-minutes` have a control
+//! here for KMZ (`kmz_tz_offset_minutes`); `--utc-offset-days` is the 「読み書き」
+//! panel's 日付補正 or a project's stored correction, applied before matching, so
+//! an uncorrected dump must go through one of those before a photo match means
+//! anything. The `icon/` thumbnails are an **opt-in** checkbox
+//! (`kmz_icons`, default off): the core records the `icon/` semantics as
+//! unconfirmed (`crates/m241-core/src/log/kmz.rs`), so the default output stays
+//! the shape the CLI's `log kmz` writes and the thumbnails are a decision the
+//! person makes, not one this screen makes for them. Enabling it marks the KMZ
+//! row 未検証, as the writer already does for Google Earth.
+//!
+//! The map selects a point by clicking it, with no drag range selection.
 
 // The write token lives one level down, where this module cannot construct it:
 // see `geotag_gate` for why the privacy below `log.rs` is what closes M2.
@@ -60,6 +80,7 @@ use self::editing::TrackEditState;
 use self::geotag_gate::GeotagConfirmation;
 use self::ops::LogOps;
 use self::photo_shift::{PhotoShiftSettings, ScopeKind};
+use self::project::ReadFacts;
 
 /// Rows the point list shows before it scrolls.
 ///
@@ -175,6 +196,14 @@ fn photo_entry(track: &Track, plan: GeotagPlan) -> PhotoEntry {
 pub struct LogScreen {
     track: Track,
     report: ParseReport,
+    /// The facts the current track was read with, for a `--format json` export:
+    /// the applied day shift and, for an NMEA capture, the line counts.
+    ///
+    /// Reset by [`Self::set_track`]: a track from another source has other
+    /// facts, and carrying the previous read's `nmea` counts onto a dump export
+    /// would describe the wrong input. The read panel and a project load set it
+    /// right after they replace the track.
+    read_facts: Option<ReadFacts>,
     /// Path input for opening an offline `.bin` log dump.
     log_path: String,
     /// Inline result of the most recent `.bin` load attempt.
@@ -210,6 +239,13 @@ pub struct LogScreen {
     /// the originals are embedded untouched.
     kmz_max_edge: String,
     /// Bundle an `icon/` thumbnail with each photo in the KMZ.
+    ///
+    /// **Default off.** The core records the `icon/` semantics (thumbnail size,
+    /// what `kmzMaxPhotoEdgeSize` bounds, how the KML would refer to them) as
+    /// unconfirmed, and its plain `export_kmz` — the function the CLI calls —
+    /// writes no `icon/` entry. A default-on checkbox would make the GUI's KMZ
+    /// differ from the CLI's with no decision by the person, so the thumbnails are
+    /// opt-in and the KMZ row carries 未検証 while they are on.
     kmz_icons: bool,
     /// Camera clock offset from UTC in minutes for KMZ photo matching
     /// (`log kmz --tz-offset-minutes`); empty or zero means UTC.
@@ -236,6 +272,7 @@ impl Default for LogScreen {
         Self {
             track: Track::default(),
             report: ParseReport::default(),
+            read_facts: None,
             log_path: String::new(),
             load_status: None,
             selected: None,
@@ -253,7 +290,7 @@ impl Default for LogScreen {
             format: ExportFormat::Gpx,
             kmz: false,
             kmz_max_edge: String::new(),
-            kmz_icons: true,
+            kmz_icons: false,
             kmz_tz_offset_minutes: String::from("0"),
             photo_shift: PhotoShiftSettings::default(),
             photo_group_distance: String::new(),
@@ -281,6 +318,7 @@ impl LogScreen {
         // track that could still undo into the old one would be a lie.
         self.edit.reset(&track);
         self.photo_shift.status = None;
+        self.read_facts = None;
         self.track = track;
         self.report = report;
         self.playing = false;
@@ -292,6 +330,17 @@ impl LogScreen {
         self.close_geotag_confirmation();
         self.outcome = None;
         self.relink_photos();
+    }
+
+    /// Record the facts the new track was read with, for a JSON export.
+    ///
+    /// Called right after [`Self::set_track`] by the two paths that read a file
+    /// rather than receive a dump (`log read` and `log project load`). It is a
+    /// separate call because those paths know the counts the parser returned,
+    /// and a `set_track` that guessed them would be inventing facts for the
+    /// download path.
+    pub fn set_read_facts(&mut self, facts: ReadFacts) {
+        self.read_facts = Some(facts);
     }
 
     /// Fill the screen with the sample track.
@@ -2168,7 +2217,7 @@ impl LogScreen {
                 kmz_export::max_edge_field(ui, &mut self.kmz_max_edge);
                 ui.checkbox(&mut self.kmz_icons, RichText::new("icon").size(size::CAPTION))
                     .on_hover_text(
-                        "写真ごとに長辺 320 px のサムネイルを icon/ に同梱します",
+                        "写真ごとに長辺 320 px のサムネイルを icon/ に同梱します（既定 OFF。icon/ の仕様は core で未確定のため、CLI と同じ出力を既定にしています）",
                     );
                 // Google Earth / `unzip` are not part of this build's checks, so
                 // the writer wears the word DESIGN.md §6 requires rather than
@@ -2297,6 +2346,12 @@ impl LogScreen {
         let dest_path = self.checked_destination()?;
         let dest_trimmed = self.destination.trim().to_owned();
         let document = log::export(&self.track, self.format);
+        // Same fields as `log read --format json`: the NMEA counts and the day
+        // shift are facts about how this track was read, so they ride along
+        // when that read's output is JSON. `None` (a download, the sample)
+        // writes the exporter's object untouched.
+        let document =
+            project::attach_read_report(document, self.format, self.read_facts.unwrap_or_default());
         match std::fs::write(&dest_path, document) {
             Ok(()) => {
                 self.outcome = Some((
@@ -3194,58 +3249,12 @@ mod tests {
     }
 
     /// Every text run the screen tessellated at 1280×800, with its position.
-    ///
-    /// Two passes settle the immediate-mode layout; the collection ignores clip
-    /// rectangles, so a line the body would let a person scroll to still counts
-    /// as drawn. That is the right question for "is the refusal on screen rather
-    /// than only in a field nobody sees".
     fn screen_text_runs(screen: &mut LogScreen) -> Vec<(String, egui::Pos2)> {
-        let ctx = egui::Context::default();
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                Vec2::new(1280.0, 800.0),
-            )),
-            ..egui::RawInput::default()
-        };
-        let mut runs = Vec::new();
-        for _pass in 0..2 {
-            let output = ctx.run_ui(input.clone(), |ui| {
-                screen.ui_with_settings(ui, &AppSettings::default());
-            });
-            runs.clear();
-            collect_text_runs(&output.shapes, &mut runs);
-            output.drop_without_applying_deltas();
-        }
-        runs
+        test_support::screen_text_runs(screen)
     }
 
     fn screen_texts(screen: &mut LogScreen) -> Vec<String> {
-        screen_text_runs(screen)
-            .into_iter()
-            .map(|(text, _pos)| text)
-            .collect()
-    }
-
-    fn collect_text_runs(
-        shapes: &[egui::epaint::ClippedShape],
-        out: &mut Vec<(String, egui::Pos2)>,
-    ) {
-        for clipped in shapes {
-            collect_shape_texts(&clipped.shape, out);
-        }
-    }
-
-    fn collect_shape_texts(shape: &egui::Shape, out: &mut Vec<(String, egui::Pos2)>) {
-        match shape {
-            egui::Shape::Text(text) => out.push((text.galley.job.text.clone(), text.pos)),
-            egui::Shape::Vec(children) => {
-                for child in children {
-                    collect_shape_texts(child, out);
-                }
-            }
-            _ => {}
-        }
+        test_support::screen_texts(screen)
     }
 
     #[test]
@@ -4597,8 +4606,15 @@ mod tests {
         let mut screen = sample();
         screen.load_photos_from_path(&dir.0).expect("load photos");
         screen.set_kmz_export();
+        // The core records the icon/ semantics as unconfirmed and the CLI writes
+        // no icon/ entry, so thumbnails are a decision the person makes.
+        assert!(
+            !screen.kmz_icons,
+            "the icon/ writer must be opt-in, not the default"
+        );
         let output_dir = dir.0.join("out");
         std::fs::create_dir_all(&output_dir).expect("create the output directory");
+        screen.kmz_icons = true;
         let with_icons = output_dir.join("with-icons.kmz");
         screen.set_destination(with_icons.display().to_string());
         screen.export().expect("export with icons");

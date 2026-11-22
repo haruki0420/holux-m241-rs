@@ -8,8 +8,9 @@
 //! make explicitly.
 //!
 //! The relay runs on a thread and publishes a snapshot through a mutex. A serial
-//! port has no end of stream, so the relay stops when the screen asks it to; a
-//! file source ends at EOF, which makes the same code testable without a unit.
+//! port has no end of stream, so the relay stops when the screen asks it to, when
+//! the optional line limit is reached (`--max-lines`), or when a file source
+//! reaches EOF, which makes the same code testable without a unit.
 
 use std::collections::VecDeque;
 use std::io::{Read as _, Write as _};
@@ -62,6 +63,9 @@ pub struct ProxyConfig {
     pub bind: Option<String>,
     /// Allow a non-loopback bind.
     pub allow_non_loopback: bool,
+    /// Stop after relaying this many lines (`nmea proxy --max-lines`); `None`
+    /// runs until stopped or the source ends.
+    pub max_lines: Option<usize>,
 }
 
 /// What the screen reads from a running relay.
@@ -236,8 +240,9 @@ fn relay(
     let mut clients: Vec<TcpStream> = Vec::new();
     let mut pending: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 256];
+    let mut relayed = 0usize;
 
-    let ending: String = loop {
+    let ending: String = 'relay: loop {
         if stop.load(Ordering::Relaxed) {
             break String::from("停止しました");
         }
@@ -276,7 +281,16 @@ fn relay(
                     .push_back(repaired.trim_end_matches(['\r', '\n']).to_owned());
                 state.clients = clients.len();
             }
+            relayed += 1;
             broadcast(&mut clients, repaired.as_bytes());
+            // `--max-lines` ends the relay from inside the line loop: the limit
+            // is a property of the relayed stream, not of a read chunk, so it
+            // cannot be checked between reads without overshooting.
+            if let Some(max) = config.max_lines
+                && relayed >= max
+            {
+                break 'relay format!("指定の {max} 行に達しました");
+            }
         }
         if pending.len() >= MAX_LINE_BYTES {
             pending.clear();
@@ -381,6 +395,7 @@ mod tests {
             offset: OffsetSpec::Auto,
             bind: None,
             allow_non_loopback: false,
+            max_lines: None,
         })
         .expect("start the relay");
         let snapshot = wait_until_finished(&handle);
@@ -406,11 +421,35 @@ mod tests {
             offset: OffsetSpec::Auto,
             bind: None,
             allow_non_loopback: false,
+            max_lines: None,
         })
         .expect("start the relay");
         let snapshot = wait_until_finished(&handle);
         assert_eq!(snapshot.lines, 2);
         assert_eq!(snapshot.log.get(1).map(String::as_str), Some(gga));
+    }
+
+    #[test]
+    fn a_line_limit_ends_the_relay_after_that_many_lines() {
+        // `nmea proxy --max-lines` is the CLI's termination condition; the GUI
+        // has the stop button, and the limit is the same stated end.
+        let (_scratch, path) = scratch_with(
+            "capture.nmea",
+            "$GPGGA,022127.54,3540.87416,N,13946.02750,E,1,08,0.9,80.0,M,0.0,M,,*00\r\n\
+             $GPGGA,022128.54,3540.87416,N,13946.02750,E,1,08,0.9,80.0,M,0.0,M,,*00\r\n\
+             $GPGGA,022129.54,3540.87416,N,13946.02750,E,1,08,0.9,80.0,M,0.0,M,,*00\r\n",
+        );
+        let handle = ProxyHandle::start(ProxyConfig {
+            source: ProxySource::File(path),
+            offset: OffsetSpec::Auto,
+            bind: None,
+            allow_non_loopback: false,
+            max_lines: Some(2),
+        })
+        .expect("start the relay");
+        let snapshot = wait_until_finished(&handle);
+        assert_eq!(snapshot.lines, 2, "the relay stopped at the limit");
+        assert_eq!(snapshot.ended.as_deref(), Some("指定の 2 行に達しました"));
     }
 
     #[test]
@@ -420,6 +459,7 @@ mod tests {
             offset: OffsetSpec::Auto,
             bind: Some(String::from("0.0.0.0:0")),
             allow_non_loopback: false,
+            max_lines: None,
         })
         .expect_err("the default bind is loopback only");
         assert!(error.contains("ループバック以外"), "got {error}");
@@ -433,6 +473,7 @@ mod tests {
             offset: OffsetSpec::Auto,
             bind: Some(String::from("127.0.0.1:0")),
             allow_non_loopback: false,
+            max_lines: None,
         })
         .expect("start the relay");
         let snapshot = handle.snapshot();

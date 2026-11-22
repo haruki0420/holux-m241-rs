@@ -633,3 +633,35 @@ baud mismatch or noise rather than a sentence.
 Flags: `--port <PORT|auto>` (default `auto`), `--baud <BAUD>` (default `38400`),
 `--offset-days <DAYS|auto>` (default `auto`), `--stdout`,
 `--bind <HOST:PORT>`, `--allow-non-loopback`, `--max-lines <N>`.
+
+## The GUI's ログ操作 console
+
+`m241-gui`'s Log screen carries a console with six panels, one per group of
+commands below. The panel names the command it replaces, and the shared core
+functions are the same, so the two front ends are meant to be checkable against
+each other rather than two implementations of one idea.
+
+| GUI panel | CLI command | Notes |
+|---|---|---|
+| 吸い出し | `log download --port auto -o … --force` | Same PMTK182 path (`PmtkClient::download_log`), so logging is paused and resumed by core. An empty log writes no file; the CLI writes the 0-byte file. |
+| 消去 | `log erase --port auto -o … --force --yes` | Saves the mandatory backup and takes the confirmation, then **stops at a refusal**: `m241-gui` does not link `m241-flash`, so the erase itself runs only from the CLI with its own approval. |
+| プロジェクト | `log project save`, `log project load` | Same eight-key JSON schema, same path rule: a relative `log` / `photos` / `output` is resolved against the cwd once and stored relative to the project file's directory with `/` separators. A KMZ project with an NMEA input or `photos: null` is refused here too. |
+| NMEA 修復 | `nmea repair` | Same algorithm and checksum rewrite; input and output are files (the GUI has no stdin/stdout). |
+| NMEA 中継 | `nmea proxy` | Same relay and loopback-only bind rule; the screen log replaces stdout, and `--max-lines` has a field (empty means until 停止). The GUI fills the bind with `127.0.0.1:10110` by default where an omitted CLI `--bind` means no TCP listener; emptying the field gives the CLI's behaviour. |
+| 読み書き | `log read` | Same formats and `--utc-offset-days`; `--format json` carries the same `"nmea"` and `"offset_days"` fields, from this panel and from the project-load path. The GUI refuses an existing output unless 上書き is ticked, where the CLI replaces it. |
+
+`--port auto` means "the one plausible M-241 cable" in both. The CLI classifies
+by USB ids and description (`m241-cli/src/link.rs::identify`); the GUI has only
+`m241-core`'s port **names**, so it accepts the USB-serial naming conventions
+(`/dev/ttyUSB*`, `/dev/ttyACM*`, macOS `cu.*USB*`/`SLAB`/`wchusbserial`,
+Windows `COM*`) and refuses when none or several match, listing what the OS
+reported. An explicit port name is used as typed in both.
+
+GUI-only controls: the KMZ `icon/` thumbnails (opt-in, default off, because the
+core records their semantics as unconfirmed), the photo group distance and the
+`_original` backup (both default-on additions for the GUI), the display-only
+coordinate format on Settings, and the relay's file source.
+
+Hardware is still unverified from the GUI: the download and the relay call the
+same core code the CLI has run on a unit, but this screen's path has not been
+run on hardware and the panels say 未検証.

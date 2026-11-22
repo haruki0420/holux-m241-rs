@@ -7,9 +7,19 @@
 //! the CLI must agree byte-for-byte on a repaired sentence, which the tests pin
 //! with the same measured examples the CLI uses.
 //!
+//! **This is a copy, and the pair has to move together.** The CLI's half is
+//! `crates/m241-cli/src/nmea.rs` (`repair_line` and the sentence parsers) and
+//! `crates/m241-cli/src/cal.rs` (the day arithmetic). A change to either half
+//! without the other makes `m241 nmea repair` and this screen write different
+//! dates from the same line. The intended end state is one implementation in
+//! `m241-core`, which both crates depend on; that move is a separate change
+//! because this screen may not edit core.
+//!
 //! One GPS week-number-rollover cycle is [`WNRO_DAYS`]: the 2006 firmware
 //! converts GPS time with the 1980 epoch constant and never accounts for the
 //! second rollover (2019-04-06), so every date it emits is that far in the past.
+
+use std::path::Path;
 
 use m241_core::Track;
 
@@ -138,6 +148,83 @@ pub fn repair_line(line: &str, offset: OffsetSpec) -> (String, bool) {
         format!("${rebuilt}*{:02X}{ending}", xor_checksum(&rebuilt)),
         true,
     )
+}
+
+/// What one repair pass changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepairSummary {
+    /// Lines read (an empty file has none).
+    pub lines: usize,
+    /// Lines whose date changed.
+    pub changed: usize,
+}
+
+/// `nmea repair` in one call: read `input`, repair every date-bearing sentence,
+/// write `output`.
+///
+/// This is the file boundary of the repair panel. It lives here rather than in
+/// the console beside `device`'s and `project`'s file work, so the panel only
+/// formats the summary and every file-writing operation in the console goes
+/// through the module that owns its algorithm.
+///
+/// # Errors
+///
+/// An empty path, the same file as input and output (that would truncate the
+/// capture it is reading), an unreadable input, or a failed write.
+pub fn repair_file(
+    input: &Path,
+    output: &Path,
+    offset: OffsetSpec,
+) -> Result<RepairSummary, String> {
+    if input.as_os_str().is_empty() {
+        return Err(String::from("入力ファイルを指定してください"));
+    }
+    if output.as_os_str().is_empty() {
+        return Err(String::from("出力ファイルを指定してください"));
+    }
+    if same_file(input, output) {
+        return Err(String::from(
+            "入力と出力が同じファイルです。別の名前にしてください",
+        ));
+    }
+    let text = std::fs::read_to_string(input)
+        .map_err(|err| format!("{} を読めません: {err}", input.display()))?;
+    let mut summary = RepairSummary {
+        lines: 0,
+        changed: 0,
+    };
+    let mut repaired_text = String::with_capacity(text.len() + 64);
+    for line in text.split_inclusive('\n') {
+        summary.lines += 1;
+        let (repaired, did_change) = repair_line(line, offset);
+        if did_change {
+            summary.changed += 1;
+        }
+        repaired_text.push_str(&repaired);
+    }
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("{} を作れません: {err}", parent.display()))?;
+    }
+    std::fs::write(output, repaired_text.as_bytes())
+        .map_err(|err| format!("{} に書けません: {err}", output.display()))?;
+    Ok(summary)
+}
+
+/// Whether two paths name the same file, resolving relative spellings.
+///
+/// `std::path::absolute` is lexical: it does not follow a symlink, so two
+/// spellings of one file are refused while a symlink and its target are not
+/// (writing through the link would still truncate the target, but a person who
+/// typed two names asked for two files).
+fn same_file(left: &Path, right: &Path) -> bool {
+    match (std::path::absolute(left), std::path::absolute(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
 }
 
 /// Replace the `ddmmyy` field of an RMC sentence.

@@ -4,9 +4,18 @@
 //! cannot reuse them. [`synthetic_dump`] builds the smallest valid 64 KiB block
 //! `m241_core::log::parse_dump` reads; the points are arithmetic, never a
 //! recording.
+//!
+//! [`screen_texts`] renders one frame of a [`super::LogScreen`] and returns the
+//! text it laid out, so a test can check that a control a sentence names is
+//! actually drawn — a property an image colour count cannot answer.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use egui::Vec2;
+
+use super::LogScreen;
+use crate::screens::settings::AppSettings;
 
 /// A 64 KiB dump holding `points` as `(utc, latitude, longitude, speed)`.
 pub fn synthetic_dump(points: &[(u32, f32, f32, f32)]) -> Vec<u8> {
@@ -73,5 +82,58 @@ impl ScratchDir {
 impl Drop for ScratchDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Every text run the screen tessellated at 1280×800, with its position.
+///
+/// Two passes settle the immediate-mode layout; the collection ignores clip
+/// rectangles, so a line the body would let a person scroll to still counts
+/// as drawn. That is the right question for "is the refusal on screen rather
+/// than only in a field nobody sees".
+pub fn screen_text_runs(screen: &mut LogScreen) -> Vec<(String, egui::Pos2)> {
+    let ctx = egui::Context::default();
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            Vec2::new(1280.0, 800.0),
+        )),
+        ..egui::RawInput::default()
+    };
+    let mut runs = Vec::new();
+    for _pass in 0..2 {
+        let output = ctx.run_ui(input.clone(), |ui| {
+            screen.ui_with_settings(ui, &AppSettings::default());
+        });
+        runs.clear();
+        collect_text_runs(&output.shapes, &mut runs);
+        output.drop_without_applying_deltas();
+    }
+    runs
+}
+
+/// Every text run the screen laid out, without positions.
+pub fn screen_texts(screen: &mut LogScreen) -> Vec<String> {
+    screen_text_runs(screen)
+        .into_iter()
+        .map(|(text, _pos)| text)
+        .collect()
+}
+
+fn collect_text_runs(shapes: &[egui::epaint::ClippedShape], out: &mut Vec<(String, egui::Pos2)>) {
+    for clipped in shapes {
+        collect_shape_texts(&clipped.shape, out);
+    }
+}
+
+fn collect_shape_texts(shape: &egui::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+    match shape {
+        egui::Shape::Text(text) => out.push((text.galley.job.text.clone(), text.pos)),
+        egui::Shape::Vec(children) => {
+            for child in children {
+                collect_shape_texts(child, out);
+            }
+        }
+        _ => {}
     }
 }
