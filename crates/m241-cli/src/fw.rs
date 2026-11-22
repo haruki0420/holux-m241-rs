@@ -584,6 +584,15 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
     let confirmation = Confirmation::of_command_line(options.yes)?;
     check_layout()?;
     writable?;
+    if options.recover && image != backup {
+        return Err(Error::Safety {
+            reason: String::from(
+                "--recover writes the backup itself back over a unit a failed write left \
+                 different, so the image must be byte-identical to --backup. This image differs; \
+                 use the normal path if it is a WNRO-patched backup",
+            ),
+        });
+    }
 
     // clap requires `--da` unless `--dry-run`, but the handler does not lean on
     // the grammar: a missing file must not fall through to "load nothing".
@@ -615,14 +624,25 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
     let transport = enter_bootrom(options.assume_brom, session, &port)?;
     let mut rom = MtkBootRom::new(transport);
     rom.sync()?;
-    session
-        .console
-        .note("BootROM sync answered; comparing the whole unit with the backup before any erase");
-    DownloadAgent::verify_device(&mut rom, &backup)?;
-
-    session.console.note(
-        "the unit matches the backup; loading the DA into the chip's RAM (no flash write yet)",
-    );
+    if options.recover {
+        session.console.note(
+            "recovery mode: the unit may differ from the backup by design, so the whole-unit \
+             comparison is skipped; checking only the M-241 vector and family markers",
+        );
+        DownloadAgent::verify_unit_markers(&mut rom)?;
+        session.console.note(
+            "the unit's markers identify an M-241; loading the DA into the chip's RAM (no flash \
+             write yet)",
+        );
+    } else {
+        session.console.note(
+            "BootROM sync answered; comparing the whole unit with the backup before any erase",
+        );
+        DownloadAgent::verify_device(&mut rom, &backup)?;
+        session.console.note(
+            "the unit matches the backup; loading the DA into the chip's RAM (no flash write yet)",
+        );
+    }
     let mut loader = DaLoader::new(rom.transport_mut());
     let id = loader.load(confirmation, &da)?;
     session.console.note(&format!(
@@ -701,7 +721,7 @@ fn reenter_bootrom<T: Transport>(transport: T, session: Session<'_>) -> Result<T
             "the unit did not stream NMEA after the restart, so the BootROM could not be \
              re-entered and the read-back was not performed. The write itself finished; do not \
              assume it failed. Power-cycle the unit and run `m241 fw dump` to see what it holds, \
-             then write your own backup back if needed",
+             then write your own backup back with `--recover` if needed",
         ))),
         StreamState::Unknown => Err(Error::State(String::from(
             "the line carried bytes but no complete NMEA sentence after the restart, so the \
@@ -733,6 +753,19 @@ fn note_write_failure(console: &dyn Console, backup: &std::path::Path) {
     ));
 }
 
+/// The label for `plan`'s image against its backup.
+///
+/// A zero-diff image is the backup itself, which is a distinct case from a WNRO
+/// patch: `--recover` requires exactly this, and a user should not be told a
+/// patch was applied when none was.
+fn acceptance_label(plan: &WritePlan) -> &'static str {
+    match plan.differing_bytes {
+        Some(0) => "identical to the backup",
+        Some(_) => "patched backup",
+        None => "backup diff",
+    }
+}
+
 /// Show the completed write: the range, the packets and the read-back count.
 ///
 /// # Errors
@@ -752,13 +785,14 @@ fn print_write_report(
             "image": options.image.display().to_string(),
             "backup": options.backup.display().to_string(),
             "profile": plan.profile.name,
-            "acceptance": "patched backup",
+            "acceptance": acceptance_label(plan),
             "start": format!("0x{:08X}", report.start),
             "length": report.length,
             "packets": report.packets,
             "verified": report.verified,
             "verified_matches_image": true,
             "flash_write": true,
+            "power_cycle_required": true,
         }));
     }
     console.result(&format!("{:<12}: {port}", "port"));
@@ -776,6 +810,11 @@ fn print_write_report(
         "verified", report.verified
     ));
     console.result(&format!("{:<12}: yes", "flash write"));
+    console.result(&format!(
+        "{:<12}: remove the battery for about ten seconds, put it back, and switch the unit on; \
+         the read-back left it in the BootROM",
+        "next"
+    ));
     Ok(())
 }
 
@@ -839,7 +878,7 @@ fn print_write_plan(
             "image": options.image.display().to_string(),
             "backup": options.backup.display().to_string(),
             "profile": plan.profile.name,
-            "acceptance": "patched backup",
+            "acceptance": acceptance_label(plan),
             "size": plan.size,
             "device_type": plan.device_type,
             "write_length": plan.write_length,
@@ -864,7 +903,11 @@ fn print_write_plan(
         "{:<12}: {} ({}, {} bytes)",
         "profile", plan.profile.name, plan.profile.device_type, plan.size
     ));
-    console.result(&format!("{:<12}: {}", "accepted as", "patched backup"));
+    console.result(&format!(
+        "{:<12}: {}",
+        "accepted as",
+        acceptance_label(plan)
+    ));
     console.result(&format!("{:<12}: {}", "device", plan.device_type));
     console.result(&format!(
         "{:<12}: {} bytes ({} packets of {} bytes)",
@@ -2406,6 +2449,7 @@ mod tests {
             backup: case.1.clone(),
             da: None,
             dry_run: true,
+            recover: false,
             yes: false,
             assume_brom: false,
             port: String::from("auto"),
@@ -2503,6 +2547,27 @@ mod tests {
             "V1.14 is planned as V1.13's size and device: {stdout}"
         );
         assert!(stdout.contains("patched backup"), "got {stdout}");
+    }
+
+    #[test]
+    fn flash_dry_run_calls_a_zero_diff_image_identical_to_the_backup() {
+        let scratch = crate::testing::Scratch::new("flash-dry-identical");
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let image = backup.clone();
+        let case = flash_case(&scratch, &image, &backup);
+        let console = RecordingConsole::default();
+        let links = FakePorts::empty();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        flash(&flash_options(&case), session).expect("an identical image is accepted");
+        let stdout = console.stdout();
+        assert!(
+            stdout.contains("identical to the backup"),
+            "a zero-diff image is not a patched backup: {stdout}"
+        );
+        assert!(
+            !stdout.contains("patched backup"),
+            "the label must not claim a patch was applied: {stdout}"
+        );
     }
 
     #[test]
@@ -2604,6 +2669,7 @@ mod tests {
         let case = flash_case(&scratch, &image, &backup);
         let chip = m241_flash::FakeDa::with_firmware(&backup);
         let links = da_write::DaWritePorts::new(chip);
+        let ports = links.clone();
         let chip = links.chip();
         let console = RecordingConsole::default();
         let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
@@ -2620,6 +2686,11 @@ mod tests {
         );
         assert_eq!(
             chip.borrow().read_bytes(),
+            0,
+            "no port may be opened before the confirmation"
+        );
+        assert_eq!(
+            ports.opens(),
             0,
             "no port may be opened before the confirmation"
         );
@@ -2729,6 +2800,91 @@ mod tests {
     }
 
     #[test]
+    fn flash_recover_writes_the_backup_without_the_whole_unit_comparison() {
+        // The unit is a partial write: one byte differs from the backup. The
+        // normal path refuses it before the DA; recovery must still proceed,
+        // because writing the backup back is exactly the repair.
+        let scratch = crate::testing::Scratch::new("flash-recover-success");
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let image = backup.clone();
+        let case = flash_case(&scratch, &image, &backup);
+        let mut unit = backup.clone();
+        unit[0x1000] ^= 0xFF;
+        let chip = m241_flash::FakeDa::with_firmware(&unit);
+        let links = da_write::DaWritePorts::new(chip);
+        let ports = links.clone();
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.recover = true;
+        options.yes = true;
+        options.da = Some(da_file(scratch.path()));
+
+        flash(&options, session).expect("recovery skips verify_device");
+        assert!(ports.opens() > 0, "the recovery run must reach the port");
+        let chip = chip.borrow();
+        assert!(chip.started(), "the DA was loaded and jumped to");
+        assert!(chip.restarted(), "the read-back sent 0xD9");
+        assert_eq!(
+            &chip.memory()[..FLASH_WRITE_LENGTH],
+            &backup[..],
+            "the backup was written over the partial unit"
+        );
+        assert!(
+            !chip
+                .read16_requests()
+                .iter()
+                .any(|(_, bytes)| *bytes == FLASH_WRITE_LENGTH),
+            "no single whole-span read may be issued: {:?}",
+            chip.read16_requests()
+        );
+        assert!(
+            chip.read16_requests()
+                .iter()
+                .all(|(_, bytes)| *bytes <= DUMP_CHUNK),
+            "every BootROM frame stays within the chunk limit: {:?}",
+            chip.read16_requests()
+        );
+    }
+
+    #[test]
+    fn flash_recover_refuses_an_image_that_is_not_the_backup() {
+        // A WNRO-patched image is not the recovery payload: recovery writes the
+        // user's own dump back, so the image must be byte-identical to it.
+        let scratch = crate::testing::Scratch::new("flash-recover-patched");
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let image = flash_image(&PROFILE_V1_13, true);
+        let case = flash_case(&scratch, &image, &backup);
+        let chip = m241_flash::FakeDa::with_firmware(&backup);
+        let links = da_write::DaWritePorts::new(chip);
+        let ports = links.clone();
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.recover = true;
+        options.yes = true;
+        options.da = Some(scratch.join("absent.bin"));
+
+        let err = flash(&options, session).expect_err("not the backup");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        let text = format!("{err}");
+        assert!(
+            text.contains("--recover"),
+            "the refusal names the mode: {text}"
+        );
+        assert!(
+            text.contains("byte-identical"),
+            "the refusal says what recovery requires: {text}"
+        );
+        assert_eq!(ports.opens(), 0, "nothing may be opened for this refusal");
+        assert_eq!(chip.borrow().read_bytes(), 0);
+    }
+
+    #[test]
     fn flash_writes_through_the_da_and_reports_the_verified_read_back() {
         // The end-to-end path against the write crate's own fake DA: entry,
         // `verify_device`, the RAM load, `0xD3` + `0xD5`, `0xD9`, the BootROM
@@ -2812,6 +2968,10 @@ mod tests {
         assert!(
             stdout.contains("verified    : 406620 bytes read back and identical"),
             "success is the read-back, not the write: {stdout}"
+        );
+        assert!(
+            stdout.contains("remove the battery for about ten seconds"),
+            "the unit is left in the BootROM; the success output must say to power-cycle: {stdout}"
         );
         assert!(stdout.contains("flash write : yes"), "got {stdout}");
         let stderr = console.stderr();
@@ -2945,6 +3105,7 @@ mod tests {
             backup: PathBuf::from("backup.bin"),
             da: None,
             dry_run: false,
+            recover: false,
             yes: true,
             assume_brom: false,
             port: String::from("auto"),
@@ -2960,6 +3121,7 @@ mod tests {
         assert_eq!(document["verified"], 406_620);
         assert_eq!(document["verified_matches_image"], true);
         assert_eq!(document["flash_write"], true);
+        assert_eq!(document["power_cycle_required"], true);
         assert_eq!(document["port"], "SIM0");
     }
 

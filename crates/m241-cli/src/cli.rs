@@ -211,6 +211,13 @@ pub struct FlashOptions {
     #[arg(long)]
     pub dry_run: bool,
 
+    /// Recovery mode: write `--backup` itself back over a unit a failed write
+    /// left different. Requires the image to be byte-identical to the backup
+    /// and skips the whole-unit comparison, which a partial unit cannot pass.
+    /// `AGENTS.md` §2.5 covers this write-capable run.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub recover: bool,
+
     /// Confirm the write. There is no typed prompt in this build, so this is
     /// the only confirmation input; `AGENTS.md` §2.5 governs who may pass it.
     #[arg(long)]
@@ -765,6 +772,7 @@ mod tests {
         assert_eq!(flash.backup, PathBuf::from("backup.bin"));
         assert_eq!(flash.da, None, "a dry run needs no DA file");
         assert!(flash.dry_run);
+        assert!(!flash.recover);
         assert!(!flash.yes);
         assert!(!flash.assume_brom);
         assert_eq!(flash.port, "auto");
@@ -779,6 +787,7 @@ mod tests {
             "backup.bin",
             "--da",
             "DA_v3.8.4.bin",
+            "--recover",
             "--yes",
             "--assume-brom",
             "--port",
@@ -793,6 +802,7 @@ mod tests {
             panic!("expected fw flash");
         };
         assert!(!flash.dry_run);
+        assert!(flash.recover);
         assert_eq!(
             flash.da,
             Some(PathBuf::from("DA_v3.8.4.bin")),
@@ -855,6 +865,24 @@ mod tests {
             err.to_string().contains("--allow-cross-model"),
             "the usage error must name the removed flag: {err}"
         );
+    }
+
+    #[test]
+    fn fw_flash_recover_conflicts_with_dry_run() {
+        // `--recover` is a write-capable mode; a dry run cannot preview it
+        // because the normal plan would not skip `verify_device`.
+        let err = Cli::try_parse_from([
+            "m241",
+            "fw",
+            "flash",
+            "image.bin",
+            "--backup",
+            "backup.bin",
+            "--dry-run",
+            "--recover",
+        ])
+        .expect_err("--recover and --dry-run must conflict");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

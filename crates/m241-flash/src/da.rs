@@ -215,7 +215,8 @@ use m241_core::firmware::image::{
 };
 use m241_core::firmware::profiles::{PROFILE_V1_12, PROFILE_V1_13, patched_marker};
 use m241_core::protocol::brom::{
-    BASE_ADDR_DA, BASE_ADDR_FIRMWARE, Frame, MtkBootRom, OPCODE_JUMP, OPCODE_READ32, OPCODE_WRITE16,
+    BASE_ADDR_DA, BASE_ADDR_FIRMWARE, DUMP_CHUNK, Frame, MtkBootRom, OPCODE_JUMP, OPCODE_READ32,
+    OPCODE_WRITE16,
 };
 use m241_core::protocol::frame::swap_pairs;
 use m241_core::protocol::port::Transport;
@@ -363,13 +364,16 @@ pub const PATCH_OFFSETS: [usize; 3] = [0x402F6, 0x402F7, 0x59C2C];
 ///
 /// The epoch bytes are the same address in both releases (`0x402F4` does not
 /// move between them); only the version marker does — `V1.12` sits at
-/// `0x59B14`, so its final digit is `0x59B18`. Measured on the vendor image
-/// `01017-01B …V1.12….bin`: the two bytes at `0x402F6` / `0x402F7` carry the
-/// stock constant and `0x59B18` carries `b'2'`.
+/// `0x59B14`, so its final digit is `0x59B18`. Derived from the V1.12 vendor
+/// package's layout (`docs/dev/03-hardware-facts.md`, "Firmware image"): the
+/// two bytes at `0x402F6` / `0x402F7` carry the stock constant and `0x59B18`
+/// carries `b'2'`. **Not measured on a V1.12 unit** — no V1.12 was dumped or
+/// flashed here (`docs/dev/05-verification.md` §2).
 ///
 /// Pinned the same way as [`PATCH_OFFSETS`]: [`profile_patch_offsets`] derives it
 /// from `m241_core`'s reader and planner, and
-/// `the_v1_12_patch_table_is_the_measured_three_bytes` compares the two.
+/// `a_v1_12_patched_backup_is_accepted_against_the_v1_12_table` compares the
+/// two.
 pub const PATCH_OFFSETS_V1_12: [usize; 3] = [0x402F6, 0x402F7, 0x59B18];
 
 /// The V1.13 write length, spelled out as the literal [`check_layout`] pins.
@@ -1174,9 +1178,9 @@ impl PartialWrite {
         format!(
             "{mapped}; {state}. Next: {restart} re-enter the BootROM with --assume-brom (or \
              power-cycle the unit and retry the four-probe sync) and write your own backup image \
-             back. After a power-cycle, `m241 fw dump` shows what the unit actually holds; use \
-             it to confirm the read-back before retrying. Do not download the log from a partly \
-             written unit"
+             back with `m241 fw flash --recover ... --yes`. After a power-cycle, `m241 fw dump` \
+             shows what the unit actually holds; use it to confirm the read-back before retrying. \
+             Do not download the log from a partly written unit"
         )
     }
 }
@@ -1209,6 +1213,43 @@ pub struct WriteReport {
     /// Bytes read back through the BootROM and compared; the same value as
     /// `length`, which [`PendingWrite::verify_written`] checks separately.
     pub verified: usize,
+}
+
+/// Read `length` bytes through the BootROM in frames no larger than [`DUMP_CHUNK`].
+///
+/// `MtkBootRom` gives one `0xA2` frame a single five-second deadline for the
+/// whole payload. At 115,200 8N1 the 406,620-byte span takes about 35 seconds,
+/// so one frame cannot work on a unit even though the fake answers at once.
+/// The chunk size is [`DUMP_CHUNK`], the same size `fw dump` uses, well inside
+/// the deadline (about 0.4 s at that baud).
+///
+/// The address arithmetic is checked: the caller has already bounded the
+/// firmware range, but a size change must fail as a state error rather than
+/// wrap to a low BootROM address.
+fn read_bootrom_chunked<T: Transport>(
+    rom: &mut MtkBootRom<T>,
+    address: u32,
+    length: usize,
+) -> Result<Vec<u8>> {
+    let mut data = Vec::with_capacity(length);
+    while data.len() < length {
+        let want = DUMP_CHUNK.min(length - data.len());
+        let offset = u32::try_from(data.len()).map_err(|_| {
+            Error::State(format!(
+                "read offset {} does not fit the 32-bit BootROM address space",
+                data.len()
+            ))
+        })?;
+        let chunk_address = address.checked_add(offset).ok_or_else(|| {
+            Error::State(format!(
+                "BootROM read of {length} bytes at 0x{address:08X} runs past the 32-bit \
+                 address space"
+            ))
+        })?;
+        let chunk = rom.read16(chunk_address, want)?;
+        data.extend_from_slice(&chunk);
+    }
+    Ok(data)
 }
 
 impl PendingWrite {
@@ -1251,22 +1292,26 @@ impl PendingWrite {
             progress: self.progress,
             start: self.start,
             length: self.length,
-            restart_sent: true,
+            restart_sent: false,
             reached_read_back: false,
         };
         let mut da = da;
         // §4.5 and §8 item 4: `0xD9` never returns and sends no reply, so any
-        // read after it would block until the timeout at best.
-        da.restart()?;
-        let transport = prepare(da.into_transport()).map_err(|err| after_write(err, unfinished))?;
-        let mut rom = MtkBootRom::new(transport);
-        rom.sync().map_err(|err| after_write(err, unfinished))?;
-        let read_back = PartialWrite {
-            reached_read_back: true,
+        // read after it would block until the timeout at best. A failed send is
+        // still a partial write and carries the recovery paragraph.
+        da.restart().map_err(|err| after_write(err, unfinished))?;
+        let restarted = PartialWrite {
+            restart_sent: true,
             ..unfinished
         };
-        let read = rom
-            .read16(BASE_ADDR_FIRMWARE + da_start, self.length)
+        let transport = prepare(da.into_transport()).map_err(|err| after_write(err, restarted))?;
+        let mut rom = MtkBootRom::new(transport);
+        rom.sync().map_err(|err| after_write(err, restarted))?;
+        let read_back = PartialWrite {
+            reached_read_back: true,
+            ..restarted
+        };
+        let read = read_bootrom_chunked(&mut rom, BASE_ADDR_FIRMWARE + da_start, self.length)
             .map_err(|err| after_write(err, read_back))?;
 
         let mismatch = read
@@ -1542,18 +1587,28 @@ impl<T: Transport> DownloadAgent<T> {
         Self::verify_device_at(rom, backup, FLASH_WRITE_START)
     }
 
-    /// [`Self::verify_device`] with an explicit DA address for the span.
+    /// Check only the unit's known-intact markers: the vector table and family.
     ///
-    /// The BootROM addresses flash at [`BASE_ADDR_FIRMWARE`]; a DA address is
-    /// the same flash as seen from zero, so the read adds the BootROM base back.
-    /// The 2026-11-21 read settled that mapping: DA address `0` returned the
-    /// vector `18 F0 9F E5` and the vendor image's first 64 bytes, which is the
-    /// image the BootROM reads at `0x0020_0000` (see [`FLASH_WRITE_START`]).
+    /// This is the part of [`Self::verify_device`] that recovery mode keeps.
+    /// `--recover` writes the user's backup back over a unit that a failed write
+    /// left different, so the whole-span comparison would refuse the very state
+    /// recovery exists for. The vector and family still prove the BootROM is
+    /// talking to an M-241 rather than to an unrelated flash image.
     ///
     /// # Errors
     ///
-    /// As [`Self::verify_device`].
-    pub fn verify_device_at(rom: &mut MtkBootRom<T>, backup: &[u8], da_start: u32) -> Result<()> {
+    /// [`Error::Safety`] when the vector table is not `18 F0 9F E5`, or the
+    /// family field does not start `HOLUX_M-241`. Nothing is written.
+    pub fn verify_unit_markers(rom: &mut MtkBootRom<T>) -> Result<()> {
+        Self::verify_unit_markers_at(rom, FLASH_WRITE_START)
+    }
+
+    /// [`Self::verify_unit_markers`] with an explicit DA address.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::verify_unit_markers`].
+    pub fn verify_unit_markers_at(rom: &mut MtkBootRom<T>, da_start: u32) -> Result<()> {
         let address = BASE_ADDR_FIRMWARE + da_start;
         let vector = rom.read16(address, VECTOR.len())?;
         if vector != VECTOR {
@@ -1575,11 +1630,29 @@ impl<T: Transport> DownloadAgent<T> {
                 ),
             });
         }
+        Ok(())
+    }
+
+    /// [`Self::verify_device`] with an explicit DA address for the span.
+    ///
+    /// The BootROM addresses flash at [`BASE_ADDR_FIRMWARE`]; a DA address is
+    /// the same flash as seen from zero, so the read adds the BootROM base back.
+    /// The 2026-11-21 read settled that mapping: DA address `0` returned the
+    /// vector `18 F0 9F E5` and the vendor image's first 64 bytes, which is the
+    /// image the BootROM reads at `0x0020_0000` (see [`FLASH_WRITE_START`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::verify_device`].
+    pub fn verify_device_at(rom: &mut MtkBootRom<T>, backup: &[u8], da_start: u32) -> Result<()> {
+        Self::verify_unit_markers_at(rom, da_start)?;
+        let address = BASE_ADDR_FIRMWARE + da_start;
         // The span is the backup's own length, not the V1.13 constant: a V1.12
         // unit's dump is 308 bytes shorter, and reading V1.13's length there
         // would compare 308 bytes of whatever follows the image and refuse a
-        // correct backup.
-        let device = rom.read16(address, backup.len())?;
+        // correct backup. The read is chunked so no single `0xA2` frame carries
+        // 406,620 bytes past `MtkBootRom`'s five-second deadline.
+        let device = read_bootrom_chunked(rom, address, backup.len())?;
         if device != backup {
             let offset = device
                 .iter()
@@ -2315,6 +2388,8 @@ mod tests {
         GPS_EPOCH_UNIX_WNRO,
     };
     use m241_core::firmware::profiles::VERSION_MARKER_LEN;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     use crate::simulator::{FakeDa, Modelled, enter_download_agent};
 
@@ -2404,6 +2479,36 @@ mod tests {
     fn in_bootrom(mut device: FakeDa) -> FakeDa {
         device.set_modelled(Modelled::BootRom);
         device
+    }
+
+    /// A transport whose fake can be inspected after `verify_written` consumes it.
+    #[derive(Debug)]
+    struct SharedFake(Rc<RefCell<FakeDa>>);
+
+    impl Transport for SharedFake {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+            self.0.borrow_mut().read(buf)
+        }
+
+        fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+            self.0.borrow_mut().write_all(buf)
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            self.0.borrow_mut().flush()
+        }
+
+        fn clear_input(&mut self) -> Result<()> {
+            self.0.borrow_mut().clear_input()
+        }
+
+        fn set_baud(&mut self, baud: u32) -> Result<()> {
+            self.0.borrow_mut().set_baud(baud)
+        }
+
+        fn set_control_lines(&mut self, asserted: bool) -> Result<()> {
+            self.0.borrow_mut().set_control_lines(asserted)
+        }
     }
 
     /// The fake's flash window at `WIRE_START`.
@@ -3132,17 +3237,20 @@ mod tests {
         let backup = stock_image();
         let mut rom = MtkBootRom::new(in_bootrom(fake_in_da(&backup)));
         rom.sync().expect("sync");
-        let read = rom
-            .read16(BASE_ADDR_FIRMWARE + WIRE_START, FLASH_WRITE_LENGTH)
-            .expect("read the span");
+        let read = read_bootrom_chunked(
+            &mut rom,
+            BASE_ADDR_FIRMWARE + WIRE_START,
+            FLASH_WRITE_LENGTH,
+        )
+        .expect("read the span");
         assert!(
             read == backup,
             "the BootROM view of the DA address holds the same bytes"
         );
         assert_eq!(
-            rom.transport_mut().last_read_address(),
-            Some(BASE_ADDR_FIRMWARE + WIRE_START),
-            "the read must carry the BootROM base"
+            rom.transport_mut().read16_requests().first().copied(),
+            Some((BASE_ADDR_FIRMWARE + WIRE_START, DUMP_CHUNK)),
+            "the first read must carry the BootROM base and the chunk size"
         );
         assert_ne!(BASE_ADDR_FIRMWARE + WIRE_START, WIRE_START);
     }
@@ -3444,12 +3552,20 @@ mod tests {
             DownloadAgent::verify_device_at(&mut rom, &other, WIRE_START).expect_err("wrong unit");
         assert!(matches!(err, Error::Safety { .. }), "got {err}");
         assert!(format!("{err}").contains("0x1000"), "got {err}");
+        let before = rom.transport_mut().read16_requests().len();
         DownloadAgent::verify_device_at(&mut rom, &backup, WIRE_START).expect("the right unit");
-        // The whole-span comparison read the BootROM view of the DA address.
+        // The whole-span comparison starts at the BootROM view of the DA address
+        // and then advances one DUMP_CHUNK at a time.
+        let requests = rom.transport_mut().read16_requests();
+        let second = &requests[before..];
+        assert_eq!(second[0].1, VECTOR.len(), "vector first");
+        assert_eq!(second[1].1, FAMILY_SIZE, "family second");
         assert_eq!(
-            rom.transport_mut().last_read_address(),
-            Some(BASE_ADDR_FIRMWARE + WIRE_START)
+            second[2].0,
+            BASE_ADDR_FIRMWARE + WIRE_START,
+            "the span starts at the BootROM view of the DA address"
         );
+        assert_eq!(second[2].1, DUMP_CHUNK, "the first span frame is chunked");
     }
 
     #[test]
@@ -3471,6 +3587,70 @@ mod tests {
             rom.transport_mut().read_bytes(),
             0,
             "the length guard runs before any 0xA2 frame"
+        );
+    }
+
+    #[test]
+    fn the_device_check_reads_the_span_in_chunked_bootrom_frames() {
+        // A single 0xA2 for 406,620 bytes takes about 35 seconds at 115,200,
+        // past MtkBootRom's five-second deadline. The fake answers instantly,
+        // so the test pins the frame count and each frame's byte count instead
+        // of measuring time.
+        let backup = stock_image();
+        let mut rom = MtkBootRom::new(FakeDa::with_firmware(&backup));
+        DownloadAgent::verify_device(&mut rom, &backup).expect("the unit matches");
+        let requests = rom.transport_mut().read16_requests().to_vec();
+        let span = &requests[2..]; // vector, then family, then the span
+        let expected = FLASH_WRITE_LENGTH.div_ceil(DUMP_CHUNK);
+        assert!(expected > 1, "the span must need more than one frame");
+        assert_eq!(span.len(), expected, "one frame per chunk: {requests:?}");
+        assert!(
+            span.iter().all(|(_, bytes)| *bytes <= DUMP_CHUNK),
+            "no frame may exceed DUMP_CHUNK: {span:?}"
+        );
+        assert_eq!(
+            span.iter().map(|(_, bytes)| *bytes).sum::<usize>(),
+            FLASH_WRITE_LENGTH,
+            "the chunks together cover the whole span"
+        );
+    }
+
+    #[test]
+    fn the_read_back_reads_the_span_in_chunked_bootrom_frames() {
+        let backup = stock_image();
+        let image = patched_image();
+        let mut device = FakeDa::with_firmware(&backup);
+        assert_eq!(
+            enter_download_agent(&mut device).first().copied(),
+            Some(0xC0)
+        );
+        let shared = Rc::new(RefCell::new(device));
+        let mut da = DownloadAgent::new(SharedFake(Rc::clone(&shared)));
+        let pending = da
+            .write(Confirmation::granted(), &backup, &image)
+            .expect("the write");
+        let report = pending
+            .verify_written(da, &image, FLASH_WRITE_START, |transport| {
+                transport.0.borrow_mut().set_modelled(Modelled::BootRom);
+                Ok(transport)
+            })
+            .expect("the read-back");
+        assert_eq!(report.verified, FLASH_WRITE_LENGTH);
+        let requests = shared.borrow().read16_requests().to_vec();
+        let expected = FLASH_WRITE_LENGTH.div_ceil(DUMP_CHUNK);
+        assert!(expected > 1, "the span must need more than one frame");
+        assert_eq!(
+            requests.len(),
+            expected,
+            "one frame per chunk: {requests:?}"
+        );
+        assert!(
+            requests.iter().all(|(_, bytes)| *bytes <= DUMP_CHUNK),
+            "no frame may exceed DUMP_CHUNK: {requests:?}"
+        );
+        assert_eq!(
+            requests.iter().map(|(_, bytes)| *bytes).sum::<usize>(),
+            FLASH_WRITE_LENGTH
         );
     }
 

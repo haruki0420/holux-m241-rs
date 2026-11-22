@@ -93,6 +93,10 @@ pub fn check_image(backup: &[u8], image: &[u8]) -> bool {
     backup == image
 }
 
+pub fn all_within(backup: &[u8], image: &[u8]) -> bool {
+    backup == image
+}
+
 // W2a may hash the DA file here; only the firmware acceptance is forbidden a digest.
 pub fn check_da_image(image: &[u8]) -> bool {
     m241_core::firmware::sha256_hex(image).len() == 64
@@ -326,13 +330,44 @@ pub fn check_image(backup: &[u8], image: &[u8], profile: &Profile) -> bool {
     backup == image
 }
 ";
+    let all_within_bypass = "\
+pub fn check_image(backup: &[u8], image: &[u8]) -> bool {
+    backup == image
+}
+
+pub fn all_within(backup: &[u8], image: &[u8], profile: &Profile) -> bool {
+    let digest = m241_core::firmware::sha256_hex(image);
+    digest == profile.sha256 || backup == image
+}
+
+pub fn write(backup: &[u8], image: &[u8]) -> Result<()> {
+    check_layout()?;
+    write_range(backup, image)
+}
+";
+    let support = "\
+pub fn all_within(backup: &[u8], image: &[u8]) -> bool {
+    backup == image
+}
+
+pub fn write(backup: &[u8], image: &[u8]) -> Result<()> {
+    check_layout()?;
+    write_range(backup, image)
+}
+";
     for (label, source) in [
         ("digest-fully-qualified", fully_qualified),
         ("digest-imported", imported),
         ("digest-hash-comparison", hash_comparison),
+        ("digest-all-within", all_within_bypass),
     ] {
         let repo = FakeRepo::new(label, &[]);
-        repo.write_flash_file("src/da.rs", source);
+        let source = if label == "digest-all-within" {
+            source.to_owned()
+        } else {
+            format!("{source}\n{support}")
+        };
+        repo.write_flash_file("src/da.rs", &source);
         repo.assert_reports("digest-based image acceptance");
         let (passed, report) = repo.run();
         assert!(!passed, "{label} was accepted:\n{report}");

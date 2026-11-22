@@ -59,6 +59,10 @@ never reports success. Confirm the live NMEA date in Step 5 as well.
 
 ## Step 5: check the date
 
+The read-back leaves the unit in the BootROM. Remove the battery for about ten
+seconds, put it back, switch the unit on, and reconnect before the commands
+below; otherwise `device info` and the NMEA proxy will find no firmware.
+
 ```bash
 m241 device info
 m241 nmea proxy --stdout

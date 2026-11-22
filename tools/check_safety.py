@@ -126,11 +126,13 @@ CONTROL_LINE_ALLOWED = {
     "src/protocol/simulator.rs",
 }
 
-#: `m241-flash`'s only image-acceptance rule lives in this file. A digest
+#: `m241-flash`'s only image-acceptance rule lives in these functions. A digest
 #: comparison here is the vendor bypass `AGENTS.md` §2.3 forbids: the code may
 #: name the file's digest in prose elsewhere, but the acceptance path must not
-#: read `profile.sha256` or call `firmware::digest::matches`.
-FLASH_DA = FLASH / "src" / "da.rs"
+#: read `profile.sha256` or call `firmware::digest::matches`. `all_within` is
+#: included because moving the bypass into the byte-diff helper would otherwise
+#: escape a check that only looked at `check_image`.
+ACCEPTANCE_FUNCTIONS = ("check_image", "all_within")
 DIGEST_ACCEPTANCE = re.compile(
     r"(?i)(?:firmware\s*::\s*digest|digest\s*::\s*matches|sha256(?:_hex)?\b)"
 )
@@ -467,8 +469,8 @@ def function_body_range(text: str, name: str) -> tuple[int, int] | None:
 
     `check_safety.py` runs on a rustfmt-formatted tree, so a top-level function
     closes with a `}` in column zero. This is deliberately a range rather than a
-    brace counter over strings and comments: the only thing the caller needs is
-    "inside `check_image`", and a parser would be a second thing to keep right.
+    brace counter over strings and comments: the caller only needs "inside this
+    function", and a parser would be a second thing to keep right.
     """
     lines = text.splitlines()
     start = None
@@ -485,7 +487,7 @@ def function_body_range(text: str, name: str) -> tuple[int, int] | None:
 
 
 def check_flash_acceptance() -> list[str]:
-    """`check_image` must accept images only by the backup diff.
+    """`check_image` and `all_within` must accept images only by the backup diff.
 
     `check_image` is the one place a write is allowed to decide that an image is
     acceptable. It must compare the image with the user's backup and permit only
@@ -495,23 +497,25 @@ def check_flash_acceptance() -> list[str]:
     the function source. Comments and doc comments are stripped first: the file
     explains why there is no digest route, and that prose must remain allowed.
 
-    The range is the `check_image` body, not all of `da.rs`: `check_da_image`
-    is the DA file's own length/head check, and follow-up W2a will legitimately
-    add its SHA-256 there.
+    The ranges are the `check_image`/`all_within` bodies, not all of `da.rs`:
+    `check_da_image` is the DA file's own length/head check, and follow-up W2a
+    will legitimately add its SHA-256 there.
     """
     if not FLASH_DA.is_file():
         return [f"{relative(FLASH_DA)} is missing; cannot verify the image acceptance rule"]
     text = FLASH_DA.read_text(encoding="utf-8")
-    body = function_body_range(text, "check_image")
-    if body is None:
-        return [
-            f"{relative(FLASH_DA)}: check_image is missing; cannot verify the image "
-            "acceptance rule"
-        ]
-    start, end = body
+    ranges = []
+    for name in ACCEPTANCE_FUNCTIONS:
+        body = function_body_range(text, name)
+        if body is None:
+            return [
+                f"{relative(FLASH_DA)}: {name} is missing; cannot verify the image "
+                "acceptance rule"
+            ]
+        ranges.append(body)
     problems = []
     for number, line in code_lines(text):
-        if not start <= number <= end:
+        if not any(start <= number <= end for start, end in ranges):
             continue
         for match in DIGEST_ACCEPTANCE.finditer(line):
             problems.append(

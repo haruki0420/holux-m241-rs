@@ -269,6 +269,11 @@ pub struct FakeDa {
     /// How many sync probes have been answered since the last complete sync,
     /// or `0` when no sync is in progress.
     bootrom_sync: usize,
+    /// The address and byte count of every `0xA2` read, in order.
+    ///
+    /// The length is in bytes, not the wire's 16-bit units, so a test can state
+    /// the chunk limit directly instead of converting it.
+    read16_requests: Vec<(u32, usize)>,
     /// Bytes the host has taken off the wire, in total.
     ///
     /// A read returns what is buffered and `Ok(0)` once it is empty, so an extra
@@ -360,6 +365,7 @@ impl FakeDa {
             last_read_address: None,
             echo_frame: true,
             bootrom_sync: 0,
+            read16_requests: Vec::new(),
             read_bytes: 0,
             read_polls: 0,
             clear_input_fails: false,
@@ -454,6 +460,12 @@ impl FakeDa {
     #[must_use]
     pub fn last_read_address(&self) -> Option<u32> {
         self.last_read_address
+    }
+
+    /// The address and byte count of every `0xA2` read, in order.
+    #[must_use]
+    pub fn read16_requests(&self) -> &[(u32, usize)] {
+        &self.read16_requests
     }
 
     /// How many bytes the host has taken off the wire since the fixture was
@@ -898,6 +910,7 @@ impl FakeDa {
             // "Count units"); the wire order swaps each pair (§4.4).
             OPCODE_READ16 => {
                 self.last_read_address = Some(address);
+                self.read16_requests.push((address, count as usize * 2));
                 let data = self.read_flash(address, count as usize * 2);
                 let wire = swap_pairs(&data);
                 self.queue_bytes(&wire);

@@ -1234,7 +1234,7 @@ pub mod fake_da {
 /// The feature is enabled in this crate's dev-dependencies only; the shipped
 /// binary does not link the model.
 pub mod da_write {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     use m241_core::Result;
@@ -1286,6 +1286,7 @@ pub mod da_write {
     #[derive(Debug, Clone)]
     pub struct DaWritePorts {
         chip: Rc<RefCell<FakeDa>>,
+        opens: Rc<Cell<usize>>,
     }
 
     impl DaWritePorts {
@@ -1294,6 +1295,7 @@ pub mod da_write {
         pub fn new(device: FakeDa) -> Self {
             Self {
                 chip: Rc::new(RefCell::new(device)),
+                opens: Rc::new(Cell::new(0)),
             }
         }
 
@@ -1301,6 +1303,12 @@ pub mod da_write {
         #[must_use]
         pub fn chip(&self) -> Rc<RefCell<FakeDa>> {
             Rc::clone(&self.chip)
+        }
+
+        /// How many times the handler opened the port.
+        #[must_use]
+        pub fn opens(&self) -> usize {
+            self.opens.get()
         }
     }
 
@@ -1315,6 +1323,7 @@ pub mod da_write {
         }
 
         fn open(&self, _name: &str, baud: u32) -> Result<Opened> {
+            self.opens.set(self.opens.get() + 1);
             let mut transport = SharedFakeDa(Rc::clone(&self.chip));
             transport.set_baud(baud)?;
             Ok(Opened::new(Box::new(transport)))

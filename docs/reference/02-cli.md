@@ -100,6 +100,12 @@ Before writing, `fw flash` compares the unit's whole firmware span with
 `DownloadAgent::write` does not call that check itself — it compares the image
 with `backup`, not with the unit.
 
+`--recover` is the explicit exception for a unit that a failed write left
+different: it requires the image to be **byte-identical** to `--backup`, skips
+the whole-unit comparison, and keeps the vector/family marker check so the
+BootROM is still talking to an M-241. It is the only supported route for a
+partial unit and is covered by `AGENTS.md` §2.5.
+
 Before writing it checks, and refuses on any failure:
 
 1. the image matches a known profile, and is either identical to `--backup` or
@@ -119,21 +125,26 @@ Before writing it checks, and refuses on any failure:
 
 A real run then enters the BootROM, compares the whole backup span with the
 unit's flash (**before any erase**), loads the DA into the chip's RAM, sends
-`0xD3` + `0xD5`, and sends `0xD9`. The restart boots the firmware, so the read
-back **re-enters the BootROM**: it sets NMEA baud, waits for one `$…` sentence,
+`0xD3` + `0xD5`, and sends `0xD9`. Under `--recover` the whole-unit comparison
+is replaced by the vector/family marker check; the write and read-back are the
+same. The restart boots the firmware, so the read-back **re-enters the
+BootROM**: it sets NMEA baud, waits for one `$…` sentence,
 sends `$PMTK180*3B`, returns to 115200, and reads the range. Success is reported
 only when the read-back equals the image; `WriteReport` prints the start,
-length, packet count and verified byte count. A failed read-back keeps its error
-and names the power-cycle and `fw dump` checks, and it distinguishes three
-states: the write stopped part-way, the range was written but the read-back
-could not be reached, or the read-back ran and disagreed. None is reported as a
-success. The backup file is never modified.
+length, packet count and verified byte count. A successful write leaves the
+unit in the BootROM, so power-cycle it before using it. A failed read-back keeps
+its error and names the power-cycle and `fw dump` checks, and it distinguishes
+three states: the write stopped part-way, the range was written but the
+read-back could not be reached, or the read-back ran and disagreed. None is
+reported as a success. The backup file is never modified.
 
 Flags: `--backup <FILE>` (required), `--da <FILE>` (required unless
-`--dry-run`), `--port <PORT|auto>`, `--yes`, `--assume-brom` (the chip is
-already in the BootROM), `--dry-run` (plan only; opens no port and sends
-nothing), `--json`. An approval under `AGENTS.md` §2.5 requires an explicit
-resolved port; `--port auto` is not approvable for a write-capable run.
+`--dry-run`), `--port <PORT|auto>`, `--yes`, `--recover` (write the backup back
+over a partial unit; image must equal `--backup`, conflicts with `--dry-run`),
+`--assume-brom` (the chip is already in the BootROM), `--dry-run` (plan only;
+opens no port and sends nothing), `--json`. An approval under `AGENTS.md` §2.5
+requires an explicit resolved port; `--port auto` is not approvable for a
+write-capable run, and `--recover --yes` is inside the same approval rule.
 
 🧪 The whole write path, including the post-`0xD9` NMEA re-entry and read-back,
 has been exercised only against the fake Download Agent. No unit has been
