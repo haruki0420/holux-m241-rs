@@ -429,6 +429,18 @@ the firmware version.
 Lat/lon are 4-byte floats, height is a 3-byte `u24`, and the per-record checksum
 is one byte with no `'*'` separator.
 
+A block is not only a header and a run of records: the unit interleaves a
+settings / state journal between record runs — 16-byte entries (`AA`×7, a type
+byte, a little-endian `u32` value, `BB`×4) and 20-byte `HOLUXGR241LOGGER` name
+separators. Those bytes are not records; `crates/m241-core/src/log/journal.rs`
+has the observed shapes, and their type meanings are inference, not
+firmware-confirmed.
+
+The header mask can be stale for a block: the real record length is decided by
+the checksum chain (an unbroken run of matching trailers), while the mask
+supplies the field meanings. A block that holds only the journal has no points
+at all and is not an erased log.
+
 ## 6. Personal data
 
 This repository is public. Before any commit that touches docs, tests or

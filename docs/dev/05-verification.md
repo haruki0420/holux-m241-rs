@@ -288,32 +288,42 @@ apart; nothing was erased or written.
 
 | Step | Result | Status |
 |---|---|---|
-| first download | 3,228 bytes, no framing error; the client counted 135 "records" | ✅ |
-| second download | 3,260 bytes; the client counted 137 "records" | ✅ |
+| first download | 3,228 bytes, no framing error; the parser then in the tree counted 135 "records" | ✅ |
+| second download | 3,260 bytes; the parser then in the tree counted 137 "records" | ✅ |
 | what the bytes are | no track point at all: a settings / state journal (141 × 16-byte entries of `AA`×7 + a type + a `u32` value + `BB`×4, and 23 × 20-byte `HOLUXGR241LOGGER` strings; 141 × 16 + 23 × 20 = 2,716 = 3,228 − `0x200`) | ✅ (offline analysis) |
-| block / record checksums | the client printed `1 of 1 blocks failed their header checksum` in both; every record checksum failed (`bad checksums: 135`, then `137`) | ✅ |
-| decoded span | `2060-09-25T04:18:50Z`–`2015-05-08T05:53:12Z`, then `1974-01-28T17:15:22Z` | ⚠️ not trustworthy |
+| re-parse of both dumps with the parser from PR #34 | 0 points, `journal_only: true`, 164 and 166 journal items (3,228 / 3,260 bytes) | ✅ (offline analysis) |
+| block / record checksums as the 2026-11-22 binary printed them | `1 of 1 blocks failed their header checksum` in both, and every record checksum failed (`bad checksums: 135`, then `137`) | ✅ (what that binary printed; the wording was replaced by PR #34) |
 | log usage through the GUI minutes later | `3,292 B`, recording 「有効」 | ✅ |
 
 * The transport was clean: neither run hit a framing error, and the unit's log
   usage grew between them (3,228 → 3,260 bytes), so the log was written between
   the two reads. The GUI then reported `3,292 B`.
 * **The downloads contain no track points.** The block holds the unit's
-  settings / state journal, not position records. The parser takes a 20-byte
-  record from the block header's mask and reads the journal as 135 / 137
-  points, which is why every per-record checksum fails. The same misread
-  reproduces on a log downloaded before the write (2026-11-21, 225,028 bytes;
-  4,481 of 11,088 record checksums failed, and block 1 had none — blocks 0, 2
-  and 3 mix in the journal and lose record sync), so the data does not support
-  "the write damaged the log area". The parser fix is in a separate PR; nothing
-  here moves the post-write timestamp to ✅.
-* **The warning wording is wrong.** The code has no header checksum: the
-  message `N of M blocks failed their header checksum` counts the blocks that
-  contain record-checksum mismatches. A fix is in progress in a separate PR.
+  settings / state journal, not position records. The parser that ran that day
+  took a 20-byte record from the block header's mask and read the journal as
+  135 / 137 points, which is why every per-record checksum failed. The same
+  misread reproduces on a log downloaded before the write (2026-11-21, 225,028
+  bytes; 4,481 of 11,088 record checksums failed, and block 1 had none — blocks
+  0, 2 and 3 mix in the journal and lose record sync), so the data does not
+  support "the write damaged the log area".
+* **The parser was fixed in PR #34 (merged, `fix-log-journal`).** It recognises
+  the journal shapes and skips them, so re-parsing the saved 2026-11-22 dumps
+  yields 0 points with `journal_only: true` (164 and 166 journal items), and the
+  2026-11-21 dump yields 10,942 points with 0 record-checksum mismatches and 248
+  journal items — the old 11,088 points included 4,481 fabricated ones. This is
+  an offline re-parse of the saved dumps, not a run of the fixed binary against
+  the unit.
+* **The warning wording the 2026-11-22 binary printed was wrong.** The code has
+  no header checksum: `N of M blocks failed their header checksum` counted the
+  blocks holding record-checksum mismatches. PR #34 replaced it with
+  `N of M blocks contain records whose checksum did not match; those records
+  were skipped`, and a journal-only dump now prints `no track points (settings
+  journal only)`. The new wording is pinned by the CLI tests (🧪); no hardware
+  run has printed it.
 * **The download still cannot be used as evidence of a post-flash timestamp.**
-  The decoded dates are nonsense and are not used anywhere. Whether the unit
-  records track points after the write — with or without a fix — remains
-  **未検証**.
+  The old parser's decoded dates were nonsense and are not used anywhere; with
+  the fixed parser the dumps hold no timestamp at all. Whether the unit records
+  track points after the write — with or without a fix — remains **未検証**.
 * The raw dump is not committed: it is the user's track data (`AGENTS.md` §6).
 
 #### The GUI on a real unit (2026-11-22)
@@ -330,6 +340,7 @@ it was built from was not recorded.
 | open a downloaded log in the Log screen | not exercised: its file-path field needs keyboard input, and no keyboard could be injected into the X11 window in this session | ⚠️ |
 | 追従 render on a real track | not exercised (it needs a log loaded in the previous row) | ⚠️ |
 | photo geotag / JPEG write through the GUI | not exercised: needs a real camera JPEG and a photo folder; that path is still covered by synthetic JPEGs only | ⚠️ |
+| KMZ writer, photo clock shift and track editing in the Log screen | not exercised: wired into the Log screen by PR #31, after this session; each needs a log loaded there, the shift and photo write need real camera JPEGs, and a KMZ has not been opened in Google Earth or `unzip` | ⚠️ |
 
 * The connect probe **reads** only: the screen says 読み取り専用, and the probe
   path never pulses DTR/RTS (`AGENTS.md` §2.1). It opened the port, read
@@ -347,6 +358,13 @@ it was built from was not recorded.
   under the clicked point and dispatched its `click` action, and the screen then
   changed as shown. This records how the screen was driven, not that the GUI is
   operable by keyboard or screen reader.
+* **Three Log-screen wirings landed after this session (PR #31).** The same
+  screen now writes a KMZ (photo folder and maximum long edge), shifts a
+  photo's clock by days / hours / minutes / seconds with the all-photos /
+  selected / camera scope, and edits the track (split, merge, delete with
+  undo/redo). None of them was exercised against the unit or with real camera
+  photos, and no KMZ output was opened in Google Earth or `unzip`; the screens
+  are covered by the GUI tests only (🧪).
 * The screenshots were taken but are not committed: they show this host's port
   list (`AGENTS.md` §6).
 
@@ -412,9 +430,9 @@ nothing on this page makes the final head verified.
 | Claim | Why it is still open |
 |---|---|
 | The OLED after flashing | never observed; the display was not photographed |
-| The binary log's timestamps after flashing | ⚠️ a post-flash log **was** downloaded on 2026-11-22 (§1.5), but it holds only the settings / state journal and no track point; the parser reads the journal as 20-byte records, which is why every record checksum failed, and the decoded dates are nonsense (offline analysis; the parser fix is in a separate PR). The download therefore does not verify a timestamp, and whether the unit records track points after the write — with or without a fix — is still 未検証 |
+| The binary log's timestamps after flashing | ⚠️ a post-flash log **was** downloaded on 2026-11-22 (§1.5), but it holds only the settings / state journal and no track point. The parser that ran then read the journal as 20-byte records, so every record checksum failed and the decoded dates were nonsense; PR #34 recognises and skips the journal, and re-parsing the same dumps gives 0 points / journal-only. The download therefore does not verify a timestamp, and whether the unit records track points after the write — with or without a fix — is still 未検証 |
 | The NMEA date from a live GPS fix after patching | ⚠️ with no fix the unit reported the then-current UTC date on 2026-11-22 (§1.5), but that is a clock value, not a fix-derived one; the patched default with a zero clock is `22-08-99` (epoch `935280000`). No fix was available indoors, so a GPS-derived date after patching is still unobserved |
-| The GUI's Log screen, 追従 render and photo write on a real unit | ⚠️ not exercised. The Connect screen and 「接続して確認」 did run against the unit on 2026-11-22 (§1.5); the Log screen needs a log opened through its keyboard-driven path field (no keyboard could be injected into the X11 window) and the photo write needs a real camera JPEG |
+| The GUI's Log screen, 追従 render and photo write on a real unit | ⚠️ not exercised. The Connect screen and 「接続して確認」 did run against the unit on 2026-11-22 (§1.5); the Log screen needs a log opened through its keyboard-driven path field (no keyboard could be injected into the X11 window) and the photo write needs a real camera JPEG. The KMZ writer, the photo clock shift (day / hour / minute / second, all-photos / selected / camera scope) and track editing (split / merge / delete / undo) that PR #31 wired into the Log screen are unexercised too; no KMZ output has been opened in Google Earth or `unzip` |
 | `m241 device doctor` against a unit | the command and its tests exist, but no hardware session in §1 ran the port probe, the drop scan or the DA extraction on a unit |
 | `m241 log geotag` on a real camera JPEG | only synthetic JPEGs are written by the tests; no file from a real camera has been geotagged, and a real camera's IFD0 layout has not been read |
 | `m241 nmea proxy` on a live stream | ✅ stdout relay on 2026-11-22 and TCP `--bind` relay on 2026-11-22/23 (§1.5): 9 sentences over `tcp://127.0.0.1:10110`, checksums valid on 9 of 9, date `221126` = 2026-11-22, and `--offset-days 1` corrected it to `231126`. Long runs, multiple clients, a non-loopback bind and a stream carrying a fix are 未検証 |
