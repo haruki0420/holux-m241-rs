@@ -153,14 +153,62 @@ pub mod metric {
     /// Width of a screen's subordinate rail block (DESIGN.md §5, ログ).
     pub const RAIL_BLOCK: f32 = 220.0;
     /// Height of the track canvas.
-    pub const PLOT: f32 = 240.0;
-    /// Height of the speed chart.
-    pub const CHART: f32 = 120.0;
+    ///
+    /// The design's 1280×800 page has to hold the map, the speed chart and the
+    /// selected-point block above the export footer. At 240 the speed chart and
+    /// the selected point both fell below the fold; 160 is the landscape
+    /// proportion DESIGN.md §5 draws, and the page ends where the design ends.
+    pub const PLOT: f32 = 160.0;
+    /// Height of the speed chart (a subordinate series, one step under the map).
+    pub const CHART: f32 = 80.0;
     /// Minimum width of a dialog's primary action, so two buttons line up.
     pub const ACTION_WIDTH: f32 = 128.0;
     /// Below this content width the Log screen stacks instead of splitting
     /// (DESIGN.md §9 leaves the breakpoint open; this is the one it names).
     pub const NARROW: f32 = 1_100.0;
+}
+
+/// The system font provider, shared by every context.
+///
+/// One provider per process rather than per [`egui::Context`]: enumerating the
+/// installed fonts costs hundreds of milliseconds, and the test suite installs
+/// the theme on dozens of headless contexts. The provider itself is
+/// `Send + Sync` and caches the OS font list after the first query.
+fn system_fonts() -> &'static std::sync::Arc<egui_system_font_provider::SystemFontProvider> {
+    use std::sync::{Arc, OnceLock};
+    static PROVIDER: OnceLock<Arc<egui_system_font_provider::SystemFontProvider>> = OnceLock::new();
+    PROVIDER.get_or_init(|| {
+        // The UI's copy is Japanese (DESIGN.md §3, Noto Sans JP). Asking for
+        // `ja` makes the OS fallback pick a Japanese face for Han characters
+        // instead of whichever Chinese face fontconfig lists first.
+        Arc::new(egui_system_font_provider::SystemFontProvider::new().with_locale(Some("ja")))
+    })
+}
+
+/// Put the OS's own face at the head of `family`.
+///
+/// DESIGN.md asks for Barlow (Latin) and Noto Sans JP (Japanese). Neither file
+/// lives in this repository and the build must not fetch one, so the
+/// approximation is: the first face the OS offers for the family, promoted to
+/// primary, with [`system_fonts`] still installed underneath as the fallback
+/// for every glyph it lacks (Japanese, symbols). See `DESIGN.md` §10 for what
+/// exactly is approximated.
+fn promote_system_face(ctx: &egui::Context, cluster: &str, family: egui::FontFamily) {
+    use egui::epaint::text::{FallbackRequest, FontPriority, FontProvider, InsertFontFamily};
+    let request = FallbackRequest {
+        cluster,
+        family: &family,
+    };
+    let Some(mut insert) = system_fonts().font_for(&request) else {
+        // A machine with no fonts at all keeps egui's bundled defaults; the
+        // labels are then Latin-only, which is still better than not starting.
+        return;
+    };
+    insert.families = vec![InsertFontFamily {
+        family,
+        priority: FontPriority::Highest,
+    }];
+    ctx.add_font(insert);
 }
 
 /// Type scale (DESIGN.md §3): 11 / 13 / 16 / 20 / 24.
@@ -185,6 +233,11 @@ pub fn text_styles() -> Vec<(TextStyle, FontId)> {
 /// only, and a light OS theme must not produce a light widget set.
 pub fn install(ctx: &egui::Context) {
     ctx.set_theme(egui::ThemePreference::Dark);
+    // Fonts first: `add_font` must arrive before the first pass lays out text,
+    // or the frame is shaped with the bundled Latin-only defaults.
+    ctx.add_font_provider(system_fonts().clone());
+    promote_system_face(ctx, "a", egui::FontFamily::Proportional);
+    promote_system_face(ctx, "0", egui::FontFamily::Monospace);
     ctx.all_styles_mut(apply);
 }
 

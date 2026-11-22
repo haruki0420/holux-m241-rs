@@ -135,12 +135,15 @@ impl StepMarker {
     }
 
     /// The colour of the marker.
+    ///
+    /// An unreached step is `mute`, not `rule`: the rule colour is a hairline and
+    /// clears about 1.4:1, so a ring in it is invisible on the ground.
     #[must_use]
     fn colour(self) -> Color32 {
         match self {
             Self::Current => theme::INK,
             Self::Done => theme::DATA,
-            Self::Ahead => theme::RULE,
+            Self::Ahead => theme::MUTE,
         }
     }
 
@@ -308,6 +311,28 @@ impl FirmwareScreen {
         self.load_sample()
     }
 
+    /// Fill the sample at the write step, with the patched image in memory and
+    /// the confirmation armed.
+    ///
+    /// Screenshot-side state: it never writes the patched file to disk, and the
+    /// screen still labels every figure 見本. It exists so the review image shows
+    /// the write step as designed — file, size, digest, diff offsets and the
+    /// armed button — instead of a column of em dashes.
+    pub(crate) fn show_sample_write(&mut self) -> Result<(), String> {
+        self.show_sample()?;
+        let patched = {
+            let (Some(plan), Some(image)) = (self.plan.as_ref(), self.image.as_ref()) else {
+                return Err(String::from("見本の差分を用意できません"));
+            };
+            plan.apply(image).map_err(|err| err.to_string())?
+        };
+        self.patched_path = default_patched_name(&self.source);
+        self.patched = Some(patched);
+        self.confirmation = String::from(Self::CONFIRMATION);
+        self.step = Step::Flash;
+        Ok(())
+    }
+
     /// Report dump progress to the screen. Called by whatever runs the read.
     ///
     /// `read` and `total` are bytes; the progress bar is indeterminate when `total`
@@ -460,6 +485,18 @@ impl FirmwareScreen {
     /// window height.
     fn action_bar(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
+            // The step the footer's actions belong to. Without it the buttons
+            // float under a scrolling body with no statement of which step they
+            // advance (DESIGN.md §5: the footer belongs to the step, not the page).
+            ui.label(
+                RichText::new(format!(
+                    "ステップ {} / 3　{}",
+                    self.step.index() + 1,
+                    self.step.label()
+                ))
+                .size(size::CAPTION)
+                .color(theme::MUTE),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.step == Step::Flash {
                     let response = self.write_button(ui);
@@ -468,24 +505,11 @@ impl FirmwareScreen {
                         self.message = Some((Status::Err, refusal));
                     }
                 } else if let Some(next) = self.step.next()
-                    && ui
-                        .add(
-                            egui::Button::new(RichText::new("続行").size(size::UI))
-                                .corner_radius(theme::RADIUS)
-                                .min_size(Vec2::new(metric::ACTION_WIDTH, 0.0)),
-                        )
-                        .clicked()
+                    && common::primary_button(ui, "続行", true).clicked()
                 {
                     self.step = next;
                 }
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("中止").size(size::UI))
-                            .corner_radius(theme::RADIUS)
-                            .min_size(Vec2::new(metric::ACTION_WIDTH * 0.7, 0.0)),
-                    )
-                    .clicked()
-                {
+                if common::secondary_button(ui, "中止", true).clicked() {
                     self.step = Step::Dump;
                     self.confirmation.clear();
                     self.undefined = false;
@@ -498,19 +522,19 @@ impl FirmwareScreen {
     ///
     /// The step row is the only place a horizontal transition is allowed
     /// (DESIGN.md §3, motion thesis): it says where you are in a sequence. Ink for
-    /// the current step, data for a finished one, rule for one not started — never
-    /// amber, which is not a progress colour.
+    /// the reached stretch, rule for the one ahead, and three marker shapes so the
+    /// row still reads in monochrome — never amber, which is not a progress colour.
     fn step_row(&self, ui: &mut Ui) {
         let width = ui.available_width();
-        // Two rows tall: the dots sit on the line and the labels hang below it, so a
-        // one-row allocation clips exactly the words that say which step is which.
+        // Two rows tall: the markers and their track sit on the first row and the
+        // labels hang below it, so a one-row allocation clips exactly the words
+        // that say which step is which.
         let (rect, _response) =
             ui.allocate_exact_size(Vec2::new(width, metric::ROW * 2.0), Sense::hover());
         let painter = ui.painter_at(rect);
         let padding = space::L;
         let count = Step::ALL.len();
         let span = rect.width() - padding * 2.0;
-        // The line sits one row down, leaving the second row for the labels.
         let line_y = rect.top() + metric::ROW;
         let step_width = span / (count - 1) as f32;
 
@@ -518,7 +542,15 @@ impl FirmwareScreen {
             .map(|index| egui::pos2(rect.left() + padding + step_width * index as f32, line_y))
             .collect();
         if let (Some(first), Some(last)) = (positions.first(), positions.last()) {
+            // The whole track, then the reached stretch painted over it: progress
+            // is a length, not a colour, so the row survives a monochrome frame.
             painter.line_segment([*first, *last], Stroke::new(metric::HAIRLINE, theme::RULE));
+            if let Some(current) = positions.get(self.step.index()) {
+                painter.line_segment(
+                    [*first, *current],
+                    Stroke::new(metric::TRACK_LINE, theme::INK),
+                );
+            }
         }
 
         for step in Step::ALL {
@@ -538,9 +570,16 @@ impl FirmwareScreen {
                     Stroke::new(metric::HAIRLINE, marker.colour()),
                 );
             }
+            // The first and last labels anchor to their edge instead of centring:
+            // a centred label on the last marker runs off the content width.
+            let anchor = match step.index() {
+                0 => egui::Align2::LEFT_TOP,
+                index if index + 1 == count => egui::Align2::RIGHT_TOP,
+                _ => egui::Align2::CENTER_TOP,
+            };
             painter.text(
                 center + Vec2::new(0.0, space::M),
-                egui::Align2::CENTER_TOP,
+                anchor,
                 format!("{} {}", step.index() + 1, step.label()),
                 egui::FontId::proportional(size::CAPTION),
                 marker.label_colour(),
@@ -632,14 +671,14 @@ impl FirmwareScreen {
                 DumpState::Verified { bytes, digest } => {
                     common::status_line(ui, Status::Ok, "2 回の読み取りが一致しました");
                     ui.add_space(space::S);
-                    common::figure_line(ui, "サイズ", &common::bytes(*bytes));
-                    common::figure_line(ui, "SHA-256", digest);
+                    common::figure_row(ui, "サイズ", &common::bytes(*bytes));
+                    common::figure_row(ui, "SHA-256", digest);
                 }
                 DumpState::Mismatch { first, second } => {
                     common::status_line(ui, Status::Err, "2 回の読み取りが一致しません");
                     ui.add_space(space::S);
-                    common::figure_line(ui, "1 回目", first);
-                    common::figure_line(ui, "2 回目", second);
+                    common::figure_row(ui, "1 回目", first);
+                    common::figure_row(ui, "2 回目", second);
                     ui.label(
                         RichText::new("このイメージは使いません。読み直してください。")
                             .size(size::UI)
@@ -759,34 +798,33 @@ impl FirmwareScreen {
         );
         ui.add_space(space::S);
 
-        // Ruled table: header in caption, figures in mono, a hairline per row. The
-        // offsets must align, which is why this column is monospace and right-aligned.
-        ui.label(
-            RichText::new("オフセット          変更前  変更後")
-                .size(size::CAPTION)
-                .color(theme::MUTE)
-                .monospace(),
+        // Ruled table: 28pt caption header, 32pt mono rows, a hairline per row.
+        // The offsets must align, which is why every cell is monospace on the
+        // same column fractions (DESIGN.md §3: `0x402F6` and `0x402F7`).
+        common::table_header(
+            ui,
+            &[
+                ("オフセット", 0.4, egui::Align::Min),
+                ("変更前", 0.3, egui::Align::Min),
+                ("変更後", 0.3, egui::Align::Min),
+            ],
         );
-        common::hairline(ui);
         for edit in &plan.edits {
-            ui.label(
-                RichText::new(format!(
-                    "0x{:05X}          0x{:02X}    0x{:02X}",
-                    edit.offset, edit.before, edit.after
-                ))
-                .size(size::UI)
-                .color(theme::INK)
-                .monospace(),
+            common::table_row(
+                ui,
+                &[
+                    (&format!("0x{:05X}", edit.offset), 0.4),
+                    (&format!("0x{:02X}", edit.before), 0.3),
+                    (&format!("0x{:02X}", edit.after), 0.3),
+                ],
             );
-            common::hairline(ui);
         }
 
-        if let Some(profile) = plan.profile.as_ref() {
-            ui.add_space(space::S);
-            common::figure_line(ui, "プロファイル", &profile.to_string());
-        }
         ui.add_space(space::S);
-        common::figure_line(
+        if let Some(profile) = plan.profile.as_ref() {
+            common::figure_row(ui, "プロファイル", &profile.to_string());
+        }
+        common::figure_row(
             ui,
             "ずれの量",
             &m241_core::firmware::patch::shift_description(),
@@ -864,13 +902,30 @@ impl FirmwareScreen {
                     )
                 })
                 .unwrap_or_else(|| String::from("—"));
-            common::figure_line(ui, "firmware", &format!("{file}  {size}  {digest}"));
-            table_row(ui, "DA", "未取得", "未検証 — 端末から読んでいません");
+            common::figure_row(ui, "ファーム", &format!("{file}  {size}  {digest}"));
+            // DA is not read by this crate: the write path lives in `m241-flash`,
+            // which the GUI must not link (AGENTS.md §2, check_safety). The row
+            // says 未検証 rather than inventing the version the manual's figure
+            // shows.
+            let _da = common::figure_row_open(ui, "DA", "未取得");
+            ui.label(
+                RichText::new("未検証 — 端末から読んでいません")
+                    .size(size::CAPTION)
+                    .color(theme::MUTE),
+            );
+            common::hairline(ui);
             let diff = self.plan.as_ref().map_or_else(
                 || String::from("—"),
-                |plan| format!("{} バイト", plan.edits.len()),
+                |plan| {
+                    let offsets: Vec<String> = plan
+                        .edits
+                        .iter()
+                        .map(|edit| format!("0x{:05X}", edit.offset))
+                        .collect();
+                    format!("{} バイト（{}）", plan.edits.len(), offsets.join(", "))
+                },
             );
-            common::figure_line(ui, "差分", &diff);
+            common::figure_row(ui, "差分", &diff);
 
             ui.add_space(space::M);
             ui.horizontal(|ui| {
@@ -879,11 +934,11 @@ impl FirmwareScreen {
                         .size(size::UI)
                         .color(theme::INK),
                 );
-                let _response = ui.add(
+                let _response = ui.add_sized(
+                    Vec2::new(metric::ACTION_WIDTH * 2.0, metric::ROW),
                     egui::TextEdit::singleline(&mut self.confirmation)
                         .hint_text(Self::CONFIRMATION)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(metric::ACTION_WIDTH * 2.0),
+                        .font(egui::TextStyle::Monospace),
                 );
             });
 
@@ -1011,7 +1066,7 @@ impl FirmwareScreen {
     /// Load a synthetic stock V1.13 image and plan it.
     fn load_sample(&mut self) -> Result<(), String> {
         let bytes = sample_image();
-        self.source = String::from("backup/stock.bin（見本）");
+        self.source = String::from("backup/stock.bin");
         self.dump_path = String::from("backup/stock.bin");
         self.load_image(bytes)
     }
@@ -1124,22 +1179,6 @@ fn confirm_button_colours(amber: Color32, armed: bool) -> (Color32, Color32) {
     } else {
         (theme::GROUND, theme::INK)
     }
-}
-
-/// A label/value row that takes a whole line, for a long figure.
-fn table_row(ui: &mut Ui, label: &str, value: &str, note: &str) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).size(size::CAPTION).color(theme::MUTE));
-        ui.add_space(space::S);
-        ui.label(
-            RichText::new(value)
-                .size(size::UI)
-                .color(theme::INK)
-                .monospace(),
-        );
-        ui.add_space(space::S);
-        ui.label(RichText::new(note).size(size::CAPTION).color(theme::MUTE));
-    });
 }
 
 /// Version string for the footer figure; kept here so the shell does not have to

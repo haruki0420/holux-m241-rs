@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use egui::{Align2, FontId, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2};
 use m241_core::log::geotag::{self, GeotagOptions, GeotagPlan};
 use m241_core::log::{self, ParseReport};
-use m241_core::{ExportFormat, LogSummary, Track, TrackPoint};
+use m241_core::{ExportFormat, Track, TrackPoint};
 
 use crate::screens::common::{self, Status};
 use crate::screens::settings::AppSettings;
@@ -667,14 +667,9 @@ impl LogScreen {
                 "ログ",
                 "吸い出したログや .bin ファイルを地図に描き、写真の時刻と突き合わせて書き出します。",
             );
-            // Sample coordinates and sample speeds with no marking were a real
-            // defect on this screen: a person reading the table cannot tell an
-            // invented loop from their own trip. The band is under the heading and
-            // above every figure, so it cannot be scrolled or cropped away from them.
-            if self.sample {
-                ui.add_space(space::S);
-                common::sample_marker(ui);
-            }
+            // Every panel and block on this screen carries 「見本」 in its own
+            // caption when the figures are sample data, so a separate band would
+            // spend height the 1280×800 page needs for the speed chart.
             ui.add_space(space::L);
 
             if self.track.points.is_empty() {
@@ -782,38 +777,32 @@ impl LogScreen {
     }
 
     fn file_loader_bar(&mut self, ui: &mut Ui) {
-        common::panel(ui, "ログファイル (.bin)", |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("ファイル")
-                        .size(size::CAPTION)
-                        .color(theme::MUTE),
-                );
-                let _response = ui.add(
-                    egui::TextEdit::singleline(&mut self.log_path)
-                        .hint_text(RichText::new("path/to/log.bin").size(size::CAPTION))
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(
-                            (ui.available_width() - metric::ACTION_WIDTH - space::XL).max(120.0),
-                        ),
-                );
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("ログを開く").size(size::UI))
-                            .corner_radius(theme::RADIUS)
-                            .min_size(Vec2::new(metric::ACTION_WIDTH, 0.0)),
-                    )
-                    .clicked()
-                {
-                    let target = PathBuf::from(self.log_path.trim());
-                    let _res = self.load_bin_file(&target);
-                }
-            });
-            if let Some((status, message)) = &self.load_status {
-                ui.add_space(space::XS);
-                common::status_line(ui, *status, message);
+        // One compact row rather than a panel: opening another dump is the
+        // screen's secondary action, and the reference-manual page has to keep
+        // the map and the speed chart above the fold at 1280×800.
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("ログファイル")
+                    .size(size::CAPTION)
+                    .color(theme::MUTE),
+            );
+            let _response = ui.add_sized(
+                Vec2::new(
+                    (ui.available_width() - metric::ACTION_WIDTH - space::L).max(120.0),
+                    metric::ROW,
+                ),
+                egui::TextEdit::singleline(&mut self.log_path)
+                    .hint_text(RichText::new("ログファイルのパス").size(size::CAPTION))
+                    .font(egui::TextStyle::Monospace),
+            );
+            if common::primary_button(ui, "ログを開く", true).clicked() {
+                let target = PathBuf::from(self.log_path.trim());
+                let _res = self.load_bin_file(&target);
             }
         });
+        if let Some((status, message)) = &self.load_status {
+            common::status_line(ui, *status, message);
+        }
     }
 
     /// Empty log: the action that fills it, not a shrug (DESIGN.md §6).
@@ -829,49 +818,38 @@ impl LogScreen {
                 .color(theme::MUTE),
             );
             ui.add_space(space::M);
+            // The action that works today is the screen's one primary control.
+            // The path belongs to the action, so it sits on the same line.
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new("ログファイル")
-                        .size(size::CAPTION)
-                        .color(theme::MUTE),
-                );
-                let _response = ui.add(
+                let _response = ui.add_sized(
+                    Vec2::new(
+                        (ui.available_width() - metric::ACTION_WIDTH - space::L).max(120.0),
+                        metric::ROW,
+                    ),
                     egui::TextEdit::singleline(&mut self.log_path)
-                        .hint_text(RichText::new("path/to/log.bin").size(size::CAPTION))
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(
-                            (ui.available_width() - metric::ACTION_WIDTH - space::XXL).max(120.0),
-                        ),
+                        .hint_text(RichText::new("ログファイルのパス").size(size::CAPTION))
+                        .font(egui::TextStyle::Monospace),
                 );
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("ログを開く").size(size::UI))
-                            .corner_radius(theme::RADIUS)
-                            .min_size(Vec2::new(metric::ACTION_WIDTH, 0.0)),
-                    )
-                    .clicked()
-                {
+                if common::primary_button(ui, "ログを開く", true).clicked() {
                     let target = PathBuf::from(self.log_path.trim());
                     let _res = self.load_bin_file(&target);
                 }
             });
             if let Some((status, message)) = &self.load_status {
-                ui.add_space(space::S);
+                ui.add_space(space::XS);
                 common::status_line(ui, *status, message);
             }
-            ui.add_space(space::M);
-            ui.horizontal(|ui| {
-                let _ignored = ui.add_enabled(
-                    false,
-                    egui::Button::new(RichText::new("ログを吸い出す").size(size::UI))
-                        .corner_radius(theme::RADIUS),
-                );
-                ui.label(
-                    RichText::new("未検証 — 端末からの直接吸い出しは CLI の `m241 log dump` を利用してください")
-                        .size(size::CAPTION)
-                        .color(theme::MUTE),
-                );
-            });
+            ui.add_space(space::S);
+            // The action that needs the session layer: disabled, and it says
+            // 未検証 in words rather than looking like a button that works.
+            let _download = common::secondary_button(ui, "ログを吸い出す", false);
+            ui.label(
+                RichText::new(
+                    "未検証 — 端末からの直接吸い出しは CLI の `m241 log dump` を利用してください",
+                )
+                .size(size::CAPTION)
+                .color(theme::MUTE),
+            );
         });
 
         ui.add_space(space::M);
@@ -889,8 +867,11 @@ impl LogScreen {
     }
 
     /// The 集計 figures: distance, duration, average speed.
+    ///
+    /// Three rows, the ones DESIGN.md §5's rail block names. 点数 and 位置 used to
+    /// be repeated here; the point table below is the place a count belongs, and
+    /// the rail block has to stay subordinate to it.
     fn summary_block(&self, ui: &mut Ui, settings: &AppSettings) {
-        let summary = LogSummary::of(&self.track);
         common::block_title(ui, "集計", self.sample);
         common::hairline(ui);
         ui.add_space(space::XS);
@@ -898,20 +879,8 @@ impl LogScreen {
             ("距離", self.total_distance_with_settings(settings)),
             ("時間", self.elapsed()),
             ("平均", self.average_speed_with_settings(settings)),
-            ("点数", common::grouped(summary.records)),
-            ("位置", common::grouped(summary.fixes)),
         ] {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(label).size(size::CAPTION).color(theme::MUTE));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(value)
-                            .size(size::UI)
-                            .color(theme::INK)
-                            .monospace(),
-                    );
-                });
-            });
+            common::figure_row_compact(ui, label, &value);
         }
         if self.report.damaged_blocks > 0 {
             common::status_line(
@@ -1005,7 +974,7 @@ impl LogScreen {
             .id_salt("m241-log-photos")
             .max_height(metric::ROW * 5.0)
             .auto_shrink([false, true])
-            .show_rows(ui, metric::ROW, entries_len, |ui, range| {
+            .show_rows(ui, metric::TABLE_HEADER, entries_len, |ui, range| {
                 for index in range {
                     let Some(entry) = self.photo_entries.get(index) else {
                         continue;
@@ -1159,9 +1128,9 @@ impl LogScreen {
             }
 
             let mode_note = if self.follow {
-                format!("追従 zoom {:.0}（地図タイルなし）", self.map_zoom)
+                format!("追従 zoom {:.0}（地図タイルなし・軌跡のみ）", self.map_zoom)
             } else {
-                format!("zoom {:.0}（地図タイルなし）", self.map_zoom)
+                format!("zoom {:.0}（地図タイルなし・軌跡のみ）", self.map_zoom)
             };
             painter.text(
                 rect.right_bottom() + Vec2::new(-space::S, -space::S),
@@ -1544,15 +1513,12 @@ impl LogScreen {
 
     /// The export row: a format, a destination, one button that says what it does.
     fn export_bar(&mut self, ui: &mut Ui) {
-        ui.label(
-            RichText::new("書き出し")
-                .size(size::CAPTION)
-                .color(theme::MUTE),
-        );
-        common::hairline(ui);
-        ui.add_space(space::S);
-
         ui.horizontal_wrapped(|ui| {
+            ui.label(
+                RichText::new("書き出し")
+                    .size(size::CAPTION)
+                    .color(theme::MUTE),
+            );
             for format in ExportFormat::ALL {
                 let label = format.extension().to_uppercase();
                 let selected = self.format == format;
@@ -1585,22 +1551,27 @@ impl LogScreen {
             } else {
                 String::from("写真に位置")
             };
-            if ui
-                .add_enabled(
-                    matched > 0,
-                    egui::Button::new(RichText::new(photo_button_label).size(size::UI))
-                        .corner_radius(theme::RADIUS),
-                )
-                .clicked()
-            {
+            if common::secondary_button(ui, &photo_button_label, matched > 0).clicked() {
                 self.open_geotag_confirmation();
             }
-            if matched == 0 {
-                ui.label(
-                    RichText::new("写真読込後にプレビュー可能")
-                        .size(size::CAPTION)
-                        .color(theme::MUTE),
-                );
+        });
+
+        // The destination and the one export action sit on their own line: a
+        // fixed-width field cannot share a wrapping row with a min-size button
+        // without the button being clipped at the panel edge.
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("保存先")
+                    .size(size::CAPTION)
+                    .color(theme::MUTE),
+            );
+            let field_width = (ui.available_width() - metric::ACTION_WIDTH - space::S).max(120.0);
+            let _response = ui.add_sized(
+                Vec2::new(field_width, metric::ROW),
+                egui::TextEdit::singleline(&mut self.destination).font(egui::TextStyle::Monospace),
+            );
+            if common::primary_button(ui, "書き出す", true).clicked() {
+                let _res = self.export();
             }
         });
 
@@ -1650,30 +1621,6 @@ impl LogScreen {
                 }
             });
         }
-
-        ui.add_space(space::S);
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("保存先")
-                    .size(size::CAPTION)
-                    .color(theme::MUTE),
-            );
-            let _response = ui.add(
-                egui::TextEdit::singleline(&mut self.destination)
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(ui.available_width() - metric::ACTION_WIDTH - space::L),
-            );
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("書き出す").size(size::UI))
-                        .corner_radius(theme::RADIUS)
-                        .min_size(Vec2::new(metric::ACTION_WIDTH, 0.0)),
-                )
-                .clicked()
-            {
-                let _res = self.export();
-            }
-        });
 
         if let Some((status, message)) = &self.outcome {
             common::status_line(ui, *status, message);

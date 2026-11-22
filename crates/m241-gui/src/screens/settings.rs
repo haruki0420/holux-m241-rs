@@ -6,8 +6,9 @@
 //! changed yet (DESIGN.md §7).
 
 use egui::{RichText, Ui};
+use m241_core::firmware::PROFILE_V1_13;
 
-use crate::screens::common::{self, Status};
+use crate::screens::common;
 use crate::theme::{self, size, space};
 
 /// Display unit system for speed, distance, and altitude on the Log screen.
@@ -150,6 +151,29 @@ const FIXED_ROWS: [Row; 4] = [ROW_CACHE, ROW_UNITS, ROW_THEME, ROW_LANG];
 
 /// Draw the screen body. The rail is drawn by the shell, not here.
 pub fn ui(ui: &mut Ui, settings: &mut AppSettings) {
+    // Version and the session-scope sentence are pinned to the bottom: they say
+    // what this screen cannot promise, and a footnote that scrolls away is not a
+    // footnote (DESIGN.md §5, §6).
+    common::footer(ui, "m241-settings-footer", |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!(
+                    "アプリのバージョン　{}",
+                    crate::screens::firmware::version()
+                ))
+                .size(size::CAPTION)
+                .color(theme::MUTE),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new("変更はこのセッション内だけ有効です")
+                        .size(size::CAPTION)
+                        .color(theme::MUTE),
+                );
+            });
+        });
+    });
+
     common::scrolling(ui, "m241-settings-body", |ui| {
         common::heading(
             ui,
@@ -158,100 +182,107 @@ pub fn ui(ui: &mut Ui, settings: &mut AppSettings) {
         );
         ui.add_space(space::L);
 
-        common::panel(ui, "表示と単位", |ui| {
-            // 1. 地図キャッシュ (fixed)
-            common::figure_line(ui, ROW_CACHE.label, ROW_CACHE.value);
-            note_label(ui, ROW_CACHE.note);
-            ui.add_space(space::S);
-
-            // 2. 単位 (interactive)
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(ROW_UNITS.label)
-                        .size(size::CAPTION)
-                        .color(theme::MUTE),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    for candidate in [UnitSystem::Imperial, UnitSystem::Metric] {
-                        let selected = settings.units == candidate;
-                        if ui
-                            .add(egui::Button::selectable(
-                                selected,
-                                RichText::new(candidate.label()).size(size::UI),
-                            ))
-                            .clicked()
-                        {
-                            settings.units = candidate;
-                        }
-                    }
-                });
-            });
-            note_label(ui, ROW_UNITS.note);
-            ui.add_space(space::S);
-
-            // 3. テーマ (fixed)
-            common::figure_line(ui, ROW_THEME.label, ROW_THEME.value);
-            note_label(ui, ROW_THEME.note);
-            ui.add_space(space::S);
-
-            // 4. 言語 (fixed)
-            common::figure_line(ui, ROW_LANG.label, ROW_LANG.value);
-            note_label(ui, ROW_LANG.note);
-            ui.add_space(space::S);
-
-            // 5. 視差低減 (interactive)
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(ROW_MOTION_LABEL)
-                        .size(size::CAPTION)
-                        .color(theme::MUTE),
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    for (value, label) in [(true, "オン"), (false, "オフ")] {
-                        let selected = settings.reduced_motion == value;
-                        if ui
-                            .add(egui::Button::selectable(
-                                selected,
-                                RichText::new(label).size(size::UI),
-                            ))
-                            .clicked()
-                        {
-                            settings.reduced_motion = value;
-                        }
-                    }
-                });
-            });
-            let motion_note = if settings.reduced_motion {
-                "オン（0 ms — タブ切替の移動アニメーションを無効化中）".to_owned()
-            } else {
-                format!(
-                    "オフ（{} ms — 選択タブが 4px 飛び出します）",
-                    (AppSettings::DEFAULT_RAIL_TRANSITION_SECS * 1000.0).round() as u32
-                )
-            };
-            note_label(ui, &motion_note);
-            ui.add_space(space::S);
-        });
-
-        ui.add_space(space::M);
-        common::status_line(
+        // Plain rows, no rail block (DESIGN.md §5): a ruled settings table with
+        // 32pt rows, a 28pt caption header, and the note under the row it
+        // explains.
+        common::table_header(
             ui,
-            Status::Info,
-            "単位と視差低減の変更はこのセッション内にすぐ反映されます",
+            &[
+                ("項目", 0.5, egui::Align::Min),
+                ("値", 0.5, egui::Align::Max),
+            ],
+        );
+        fixed_row(ui, ROW_CACHE);
+        option_row(
+            ui,
+            ROW_UNITS.label,
+            ROW_UNITS.note,
+            settings,
+            |ui, settings| {
+                for candidate in [UnitSystem::Imperial, UnitSystem::Metric] {
+                    if common::choice_button(ui, candidate.label(), settings.units == candidate)
+                        .clicked()
+                    {
+                        settings.units = candidate;
+                    }
+                }
+            },
+        );
+        fixed_row(ui, ROW_THEME);
+        fixed_row(ui, ROW_LANG);
+        let motion_note = if settings.reduced_motion {
+            "オン（0 ms — タブ切替の移動アニメーションを無効化中）".to_owned()
+        } else {
+            format!(
+                "オフ（{} ms — 選択タブが 4px 飛び出します）",
+                (AppSettings::DEFAULT_RAIL_TRANSITION_SECS * 1000.0).round() as u32
+            )
+        };
+        option_row(
+            ui,
+            ROW_MOTION_LABEL,
+            &motion_note,
+            settings,
+            |ui, settings| {
+                for (value, label) in [(true, "オン"), (false, "オフ")] {
+                    if common::choice_button(ui, label, settings.reduced_motion == value).clicked()
+                    {
+                        settings.reduced_motion = value;
+                    }
+                }
+            },
         );
 
-        ui.add_space(space::L);
-        common::hairline(ui);
-        ui.add_space(space::S);
+        // The colophon of a reference manual: the facts a person needs when the
+        // box and the release note are long gone. All figures come from
+        // `m241-core`, so a changed profile changes this page.
+        //
+        // The session-scope sentence lives in the heading and the footer, so it
+        // is not repeated here as a status line: that line cost the last row of
+        // this block at 1280×800.
+        ui.add_space(space::M);
         ui.label(
-            RichText::new(format!(
-                "アプリのバージョン　{}",
-                crate::screens::firmware::version()
-            ))
-            .size(size::CAPTION)
-            .color(theme::MUTE),
+            RichText::new("このアプリについて")
+                .size(size::TITLE)
+                .color(theme::INK),
         );
+        ui.add_space(space::S);
+        common::hairline(ui);
+        for (label, value) in [
+            ("対応ファーム", PROFILE_V1_13.name),
+            ("修正する位置", "0x402F4（3 バイトが変わります）"),
+        ] {
+            common::figure_row_compact(ui, label, value);
+        }
     });
+}
+
+/// A fixed settings row: the value on the right, the explanation underneath,
+/// one hairline under the pair (DESIGN.md §3, row height 32).
+fn fixed_row(ui: &mut Ui, row: Row) {
+    let _row = common::figure_row_open(ui, row.label, row.value);
+    note_label(ui, row.note);
+    common::hairline(ui);
+    ui.add_space(space::XS);
+}
+
+/// A settings row whose value is a pair of live controls rather than a figure.
+fn option_row(
+    ui: &mut Ui,
+    label: &str,
+    note: &str,
+    settings: &mut AppSettings,
+    controls: impl FnOnce(&mut Ui, &mut AppSettings),
+) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(label).size(size::CAPTION).color(theme::MUTE));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            controls(ui, settings);
+        });
+    });
+    note_label(ui, note);
+    common::hairline(ui);
+    ui.add_space(space::XS);
 }
 
 fn note_label(ui: &mut Ui, text: &str) {

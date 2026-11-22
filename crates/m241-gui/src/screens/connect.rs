@@ -14,7 +14,7 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use egui::{RichText, Ui, Vec2};
+use egui::{Align2, FontId, RichText, Sense, Ui, Vec2};
 use m241_core::protocol::Port;
 use m241_core::protocol::pmtk::{NMEA_BAUD, PmtkClient};
 use m241_core::protocol::port::Transport;
@@ -94,6 +94,12 @@ impl ConnectScreen {
             ui.ctx().request_repaint_after(Duration::from_millis(50));
         }
 
+        // The port actions are the reason this screen exists, so they are pinned
+        // below the scrolling body instead of sitting at the bottom of it: at
+        // 1024×640 the old in-panel row could be scrolled away from the panel it
+        // acts on (DESIGN.md §5 — the action belongs to the screen, not the list).
+        common::footer(ui, "m241-connect-actions", |ui| self.action_footer(ui));
+
         // At 1024×640 the body is taller than the window, and the "next step" block
         // used to end at its first line — below the fold, and therefore unreachable
         // rather than merely cropped. Scrolling the body keeps it reachable.
@@ -106,31 +112,26 @@ impl ConnectScreen {
                 "接続",
                 "ファームの日付が 19.6 年ずれています。端末をつなぎ、まずファームを吸い出してください。",
             );
-            // The sample band sits under the heading, above every figure: it cannot
-            // be scrolled away from the numbers it qualifies, and a crop that keeps
-            // the figures keeps the word too.
-            if self.sample {
-                ui.add_space(space::S);
-                common::sample_marker(ui);
-            }
-
+            // The panels' captions carry 「見本」 themselves, so this screen does
+            // not spend a second band on it: the design's 1280×800 page has to
+            // reach the "next step" list without scrolling (DESIGN.md §5).
             // Lazy first enumeration: asking the OS for ports every frame would spin a
             // udev walk at 60 Hz for a list that changes when a cable moves.
             if matches!(&self.ports, Listing::Unread) {
                 self.refresh();
             }
 
-            ui.add_space(space::XL);
+            ui.add_space(space::L);
             self.port_panel(ui);
 
-            ui.add_space(space::L);
+            ui.add_space(space::M);
             ui.columns_const::<2, _>(|columns| {
                 let [left, right] = columns;
                 self.device_panel(left);
                 self.log_panel(right);
             });
 
-            ui.add_space(space::L);
+            ui.add_space(space::M);
             self.next_steps(ui);
         });
     }
@@ -234,7 +235,6 @@ impl ConnectScreen {
 
     fn port_panel(&mut self, ui: &mut Ui) {
         common::panel(ui, "ポート", |ui| {
-            let probing = matches!(self.probe, ProbeState::Probing { .. });
             ui.horizontal_wrapped(|ui| {
                 let selected = self
                     .selected
@@ -242,7 +242,7 @@ impl ConnectScreen {
                     .unwrap_or_else(|| String::from("ポートを選択"));
                 egui::ComboBox::from_id_salt("m241-port")
                     .selected_text(RichText::new(selected).size(size::UI).monospace())
-                    .width((ui.available_width() * 0.35).max(metric::RAIL_BLOCK))
+                    .width((ui.available_width() * 0.45).max(metric::RAIL_BLOCK))
                     .show_ui(ui, |ui| {
                         if let Listing::Read(ports) = &self.ports {
                             for port in ports {
@@ -250,35 +250,22 @@ impl ConnectScreen {
                             }
                         }
                     });
-
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("再読込").size(size::UI))
-                            .corner_radius(theme::RADIUS),
-                    )
-                    .clicked()
-                {
-                    self.refresh();
-                }
-
-                let can_probe = self.selected.is_some() && !probing;
-                if ui
-                    .add_enabled(
-                        can_probe,
-                        egui::Button::new(RichText::new("接続して確認").size(size::UI))
-                            .corner_radius(theme::RADIUS)
-                            .min_size(Vec2::new(metric::ACTION_WIDTH, 0.0)),
-                    )
-                    .clicked()
-                    && let Some(port) = self.selected.clone()
-                {
-                    self.start_probe(port);
-                }
-
-                self.port_status(ui);
+                // The device's link settings, so the panel states the protocol it
+                // expects instead of leaving the row half empty (DESIGN.md §5).
+                ui.label(
+                    RichText::new("38400 bps・8N1")
+                        .size(size::CAPTION)
+                        .color(theme::MUTE),
+                );
             });
 
-            if matches!(&self.ports, Listing::Read(ports) if ports.is_empty()) {
+            // Guidance and the driver diagnostics appear together, and only when
+            // the list is empty or unreadable: with a port present the question
+            // "why is my logger not listed" is not the one being asked, and the
+            // 1280×800 page needs that height for the next-step list.
+            let needs_help = matches!(&self.ports, Listing::Read(ports) if ports.is_empty())
+                || matches!(&self.ports, Listing::Failed(_));
+            if needs_help {
                 ui.add_space(space::S);
                 ui.label(
                     RichText::new(
@@ -287,19 +274,35 @@ impl ConnectScreen {
                     .size(size::UI)
                     .color(theme::MUTE),
                 );
+                ui.add_space(space::S);
+                ui.label(
+                    RichText::new(
+                        "診断: CP210x / PL2303 / FTDI / CH340 のいずれかとして見えていれば接続できます",
+                    )
+                    .size(size::CAPTION)
+                    .color(theme::MUTE),
+                );
             }
+        });
+    }
 
-            // Diagnostics, as one caption line rather than a third panel: the
-            // question "why is my logger not listed" is answered by a driver name,
-            // not by a table.
-            ui.add_space(space::S);
-            ui.label(
-                RichText::new(
-                    "診断: CP210x / PL2303 / FTDI / CH340 のいずれかとして見えていれば接続できます",
-                )
-                .size(size::CAPTION)
-                .color(theme::MUTE),
-            );
+    /// The pinned action row: the probe state on the left, the two port actions
+    /// on the right, in the design's secondary-then-primary order.
+    fn action_footer(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            self.port_status(ui);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let probing = matches!(self.probe, ProbeState::Probing { .. });
+                let can_probe = self.selected.is_some() && !probing;
+                if common::primary_button(ui, "接続して確認", can_probe).clicked()
+                    && let Some(port) = self.selected.clone()
+                {
+                    self.start_probe(port);
+                }
+                if common::secondary_button(ui, "再読込", !probing).clicked() {
+                    self.refresh();
+                }
+            });
         });
     }
 
@@ -337,13 +340,13 @@ impl ConnectScreen {
                 // matching `log_panel` beside it (DESIGN.md §2, §5: right-aligned
                 // figures).
                 for (label, value) in [
-                    ("firmware", info.release),
-                    ("build", info.build),
-                    ("model", info.model),
-                    ("flash", String::from("512 KiB")),
+                    ("ファーム", info.release),
+                    ("ビルド", info.build),
+                    ("モデル", info.model),
+                    ("フラッシュ", String::from("512 KiB")),
                     ("日付", format!("{} 日ずれ", 7168)),
                 ] {
-                    common::figure_line(ui, label, &value);
+                    common::figure_row(ui, label, &value);
                 }
                 return;
             }
@@ -352,18 +355,18 @@ impl ConnectScreen {
                 ProbeState::Connected(probe) => {
                     common::status_line(ui, Status::Ok, "接続済み（読み取り専用）");
                     ui.add_space(space::S);
-                    common::figure_line(ui, "firmware", &probe.info.release);
-                    common::figure_line(ui, "build", &probe.info.build);
-                    common::figure_line(ui, "model", &probe.info.model);
+                    common::figure_row(ui, "ファーム", &probe.info.release);
+                    common::figure_row(ui, "ビルド", &probe.info.build);
+                    common::figure_row(ui, "モデル", &probe.info.model);
                     if let Some(sdk) = &probe.info.sdk {
-                        common::figure_line(ui, "SDK", sdk);
+                        common::figure_row(ui, "SDK", sdk);
                     }
                     let release_note = if probe.info.is_known_release() {
                         "既知リリース（日付修正対象）"
                     } else {
                         "未知のリリース（吸い出して確認）"
                     };
-                    common::figure_line(ui, "状態", release_note);
+                    common::figure_row(ui, "状態", release_note);
                 }
                 ProbeState::Probing { port } => {
                     common::status_line(ui, Status::Info, &format!("{port} から端末情報を取得中…"));
@@ -411,10 +414,11 @@ impl ConnectScreen {
                 for (label, value) in [
                     ("使用量", common::bytes(212_860)),
                     ("点数", summary.records.to_string()),
+                    ("位置", summary.fixes.to_string()),
                     ("期間", String::from("11/14 → 11/15")),
                     ("記録", String::from("有効")),
                 ] {
-                    common::figure_line(ui, label, &value);
+                    common::figure_row(ui, label, &value);
                 }
                 return;
             }
@@ -423,13 +427,13 @@ impl ConnectScreen {
                 ProbeState::Connected(probe) => {
                     common::status_line(ui, Status::Ok, "ログ使用量を取得しました");
                     ui.add_space(space::S);
-                    common::figure_line(ui, "使用量", &common::bytes(probe.log_used_bytes));
+                    common::figure_row(ui, "使用量", &common::bytes(probe.log_used_bytes));
                     let enabled_label = match probe.log_enabled {
                         Some(true) => "有効",
                         Some(false) => "停止中",
                         None => "未取得",
                     };
-                    common::figure_line(ui, "記録", enabled_label);
+                    common::figure_row(ui, "記録", enabled_label);
                 }
                 ProbeState::Probing { .. } => {
                     common::status_line(ui, Status::Info, "ログ使用量を確認中…");
@@ -453,35 +457,63 @@ impl ConnectScreen {
     }
 
     fn next_steps(&mut self, ui: &mut Ui) {
-        ui.add_space(space::XS);
+        ui.add_space(space::M);
         ui.label(
             RichText::new("次にすること")
                 .size(size::TITLE)
                 .color(theme::INK),
         );
-        common::hairline(ui);
         ui.add_space(space::S);
 
+        // A ruled list, not cards: the manual's numbered next steps (DESIGN.md §5,
+        // density rule). Row height 32, a hairline between rows, the arrow at the
+        // right edge so the list has a direction.
+        let width = ui.available_width();
         for (label, note, unverified) in [
             ("ファームを吸い出す", "読み取りのみ・安全", false),
             ("日付定数を書き換える", "PC 内で完結", false),
             ("書き戻す", "本体を書き換える", true),
         ] {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(label).size(size::UI).color(theme::INK));
-                if unverified {
-                    // DESIGN.md §6: an unverified feature wears the word, in mute,
-                    // never amber. Amber is for danger, not for doubt.
-                    ui.label(
-                        RichText::new("未検証")
-                            .size(size::CAPTION)
-                            .color(theme::MUTE),
-                    );
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new(note).size(size::CAPTION).color(theme::MUTE));
-                });
-            });
+            let (rect, _response) =
+                ui.allocate_exact_size(Vec2::new(width, metric::ROW), Sense::hover());
+            let painter = ui.painter_at(rect);
+            let label_rect = painter.text(
+                rect.left_center(),
+                Align2::LEFT_CENTER,
+                label,
+                FontId::proportional(size::UI),
+                theme::INK,
+            );
+            if unverified {
+                // DESIGN.md §6: an unverified feature wears the word, in mute,
+                // never amber. Amber is for danger, not for doubt.
+                let _marker = painter.text(
+                    label_rect.right_center() + Vec2::new(space::S, 0.0),
+                    Align2::LEFT_CENTER,
+                    "未検証",
+                    FontId::proportional(size::CAPTION),
+                    theme::MUTE,
+                );
+            }
+            let arrow = painter.text(
+                rect.right_center(),
+                Align2::RIGHT_CENTER,
+                "→",
+                FontId::proportional(size::UI),
+                theme::MUTE,
+            );
+            let _note = painter.text(
+                egui::pos2(arrow.left() - space::S, rect.center().y),
+                Align2::RIGHT_CENTER,
+                note,
+                FontId::proportional(size::CAPTION),
+                theme::MUTE,
+            );
+            painter.hline(
+                rect.x_range(),
+                rect.bottom(),
+                egui::Stroke::new(metric::HAIRLINE, theme::RULE),
+            );
         }
 
         ui.add_space(space::M);

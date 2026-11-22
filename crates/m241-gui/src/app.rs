@@ -98,6 +98,10 @@ impl App {
                             .color(theme::MUTE),
                     );
                 });
+                // The one elevation the product declares: a `rule` hairline
+                // under the title bar (DESIGN.md §3 — no shadows).
+                ui.add_space(space::S);
+                screens::common::hairline(ui);
             });
 
         // The rail is a fixed-width left panel whose contents are custom painted,

@@ -224,24 +224,198 @@ pub fn status_line(ui: &mut Ui, status: Status, text: &str) {
     });
 }
 
-/// A label/value line: label in mute, value right-aligned in monospace.
+/// A ruled figure row: caption label on the left, tabular figure on the right,
+/// a hairline underneath.
 ///
-/// The manual's figure line (DESIGN.md §3). Kept here rather than in the rail
-/// widget because it is screen furniture, not navigation, and it is used by two
-/// screens with the same rhythm.
-pub fn figure_line(ui: &mut Ui, label: &str, value: &str) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).size(size::CAPTION).color(theme::MUTE));
-        ui.add_space(space::S);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                RichText::new(value)
-                    .size(size::UI)
-                    .color(theme::INK)
-                    .monospace(),
-            );
-        });
-    });
+/// Row height 32, one step of the reference-manual rhythm (DESIGN.md §3). The
+/// value is always monospace so `0x402F6` and `0x402F7` line up whether or not
+/// the surrounding face has tabular digits.
+pub fn figure_row(ui: &mut Ui, label: &str, value: &str) {
+    let (rect, _response) = figure_row_sized(ui, label, value, metric::ROW);
+    ui.painter().hline(
+        rect.x_range(),
+        rect.bottom(),
+        Stroke::new(metric::HAIRLINE, theme::RULE),
+    );
+}
+
+/// A compact figure row (28), for a subordinate rail block.
+///
+/// DESIGN.md §5 makes the Log screen's left column a rail block rather than a
+/// second table: its rows are one step tighter than the content tables.
+pub fn figure_row_compact(ui: &mut Ui, label: &str, value: &str) {
+    let (rect, _response) = figure_row_sized(ui, label, value, metric::TABLE_HEADER);
+    ui.painter().hline(
+        rect.x_range(),
+        rect.bottom(),
+        Stroke::new(metric::HAIRLINE, theme::RULE),
+    );
+}
+
+/// The two ends of a figure row, without the hairline.
+///
+/// For a row that carries an explanation underneath: the caller hangs the note
+/// below the pair and draws one rule under both, so the note belongs to the
+/// figure instead of sitting across a rule from it.
+pub fn figure_row_open(ui: &mut Ui, label: &str, value: &str) -> (egui::Rect, egui::Response) {
+    figure_row_sized(ui, label, value, metric::ROW)
+}
+
+/// The label/value pair at a chosen row height.
+fn figure_row_sized(
+    ui: &mut Ui,
+    label: &str,
+    value: &str,
+    height: f32,
+) -> (egui::Rect, egui::Response) {
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.text(
+        rect.left_center(),
+        egui::Align2::LEFT_CENTER,
+        label,
+        egui::FontId::proportional(size::CAPTION),
+        theme::MUTE,
+    );
+    painter.text(
+        rect.right_center(),
+        egui::Align2::RIGHT_CENTER,
+        value,
+        egui::FontId::monospace(size::UI),
+        theme::INK,
+    );
+    (rect, response)
+}
+
+/// The header of a ruled table: caption columns at the given fractions of the
+/// width, one table-header high (28), with the same hairline as a body row.
+pub fn table_header(ui: &mut Ui, columns: &[(&str, f32, egui::Align)]) {
+    let width = ui.available_width();
+    let (rect, _response) =
+        ui.allocate_exact_size(Vec2::new(width, metric::TABLE_HEADER), Sense::hover());
+    let painter = ui.painter_at(rect);
+    let mut left = rect.left();
+    for (name, fraction, align) in columns {
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(left, rect.top()),
+            Vec2::new(width * fraction, rect.height()),
+        );
+        let (anchor, text_anchor) = match align {
+            egui::Align::Min => (cell.left_center(), egui::Align2::LEFT_CENTER),
+            egui::Align::Center => (cell.center(), egui::Align2::CENTER_CENTER),
+            egui::Align::Max => (cell.right_center(), egui::Align2::RIGHT_CENTER),
+        };
+        painter.text(
+            anchor,
+            text_anchor,
+            *name,
+            egui::FontId::monospace(size::CAPTION),
+            theme::MUTE,
+        );
+        left += cell.width();
+    }
+    painter.hline(
+        rect.x_range(),
+        rect.bottom(),
+        Stroke::new(metric::HAIRLINE, theme::RULE),
+    );
+}
+
+/// One ruled table body row: monospace cells on the same fractions as
+/// [`table_header`], a hairline underneath.
+///
+/// Every cell is monospace, which is the point of the table: a column of
+/// offsets is a column because the glyphs have one width (DESIGN.md §3).
+pub fn table_row(ui: &mut Ui, cells: &[(&str, f32)]) {
+    let width = ui.available_width();
+    let (rect, _response) = ui.allocate_exact_size(Vec2::new(width, metric::ROW), Sense::hover());
+    let painter = ui.painter_at(rect);
+    let mut left = rect.left();
+    for (text, fraction) in cells {
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(left, rect.top()),
+            Vec2::new(width * fraction, rect.height()),
+        );
+        painter.text(
+            cell.left_center(),
+            egui::Align2::LEFT_CENTER,
+            *text,
+            egui::FontId::monospace(size::UI),
+            theme::INK,
+        );
+        left += cell.width();
+    }
+    painter.hline(
+        rect.x_range(),
+        rect.bottom(),
+        Stroke::new(metric::HAIRLINE, theme::RULE),
+    );
+}
+
+/// The primary action: a bone (`ink`) face with a `ground` word.
+///
+/// This is the safe action the screen recommends. When it cannot be taken it
+/// becomes an outline with a mute word rather than a dimmed bone face: dimming
+/// a 14:1 pair with egui's `disabled_alpha` lands under 4.5:1, which is exactly
+/// the defect the review found on the destructive button.
+pub fn primary_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
+    let (fill, ink, border) = if enabled {
+        (theme::INK, theme::GROUND, theme::INK)
+    } else {
+        (theme::GROUND, theme::MUTE, theme::RULE)
+    };
+    ui.scope(|ui| {
+        ui.style_mut().visuals.disabled_alpha = 1.0;
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(RichText::new(label).size(size::UI).color(ink))
+                .fill(fill)
+                .stroke(Stroke::new(metric::HAIRLINE, border))
+                .corner_radius(theme::RADIUS)
+                .min_size(Vec2::new(metric::ACTION_WIDTH, metric::ROW)),
+        )
+    })
+    .inner
+}
+
+/// One option of a segmented control: ink outline when selected, rule when not.
+///
+/// Selected is a bone outline, not a fill and not a status colour: selection in
+/// this product is never amber (DESIGN.md §3, §7).
+pub fn choice_button(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
+    let (ink, border) = if selected {
+        (theme::INK, theme::INK)
+    } else {
+        (theme::MUTE, theme::RULE)
+    };
+    ui.add(
+        egui::Button::new(RichText::new(label).size(size::UI).color(ink))
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::new(metric::HAIRLINE, border))
+            .corner_radius(theme::RADIUS)
+            .min_size(Vec2::new(metric::ACTION_WIDTH * 0.75, metric::ROW)),
+    )
+}
+
+/// A secondary action: an outline on the ground, no fill.
+///
+/// The same control at a narrower width, so 中止 / 参照 / 再読込 read as a
+/// quieter class than the one primary action a screen offers.
+pub fn secondary_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
+    let ink = if enabled { theme::INK } else { theme::MUTE };
+    ui.scope(|ui| {
+        ui.style_mut().visuals.disabled_alpha = 1.0;
+        ui.add_enabled(
+            enabled,
+            egui::Button::new(RichText::new(label).size(size::UI).color(ink))
+                .fill(Color32::TRANSPARENT)
+                .stroke(Stroke::new(metric::HAIRLINE, theme::RULE))
+                .corner_radius(theme::RADIUS)
+                .min_size(Vec2::new(metric::ACTION_WIDTH * 0.7, metric::ROW)),
+        )
+    })
+    .inner
 }
 
 /// The 「見本」 marker, for any value that did not come from a device.

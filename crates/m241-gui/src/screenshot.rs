@@ -156,13 +156,11 @@ impl Texture {
 #[must_use]
 pub fn render(app: &mut App, screen: Screen, size: Vec2) -> Image {
     let ctx = Context::default();
+    // Installs both the palette and the font stack (system faces promoted to
+    // primary, system fallback behind them). A headless render would otherwise
+    // lay out Japanese as empty boxes; that is now the theme's job so the window
+    // and the screenshots cannot drift apart.
     theme::install(&ctx);
-    // The window path gets this from `eframe`'s `system_fonts` feature; a headless
-    // render gets it nowhere, and without it every Japanese label is an empty box.
-    // An image of tofu boxes would misrepresent the interface worse than no image.
-    ctx.add_font_provider(std::sync::Arc::new(
-        egui_system_font_provider::SystemFontProvider::new(),
-    ));
     // The shell's chosen screen, without a click: the screenshot flag is not a
     // pointer, and a rail that only responds to a click would render the Connect
     // screen four times.
@@ -497,9 +495,10 @@ fn prepare(app: &mut App, screen: Screen) {
         Screen::Connect => app.connect_mut().show_sample(),
         Screen::Log => app.log_mut().show_sample(),
         Screen::Firmware => {
-            let _loaded = app.firmware_mut().show_sample();
-            app.firmware_mut()
-                .set_step(crate::screens::firmware::Step::Flash);
+            // The write step is what the design review is for, so the screenshot
+            // shows it with the patched sample image already in memory and the
+            // confirmation armed. Nothing is written to disk.
+            let _loaded = app.firmware_mut().show_sample_write();
         }
         Screen::Settings => {}
     }

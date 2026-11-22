@@ -337,3 +337,72 @@ A comp round needs image generation. Two ways to unblock, in preference order:
   warranted; not designed yet.
 - Table density on a 1024-wide window: the Log screen's three-zone layout needs a
   collapse rule below 1100px.
+
+## 10. As built — where the implementation approximates this document
+
+This section records every place the build departs from the world above. It adds
+no token and changes none; it exists so a reviewer can tell a deliberate
+approximation from a mistake.
+
+### Type
+
+- **No font file is committed or fetched.** `theme::install` promotes the OS's
+  own sans face to primary for `Proportional` and the OS's monospace face for
+  `Monospace`, and keeps `egui_system_font_provider` (locale `ja`) underneath
+  for glyphs those faces lack. On the reference Linux machine that resolves to
+  **LINE Seed JP** (Latin and Japanese) and **UDEV Gothic NF** (numbers).
+  Barlow and Noto Sans JP are therefore approximated, not shipped.
+- **Weights.** The OS faces are installed at one weight and `egui` does not
+  synthesise a bold, so Barlow's 600 / 500 / 400 are approximated with size and
+  the `ink` / `mute` pair: 24 and 20 are `ink`; 16, 13 and 11 choose by role.
+  The five sizes are exact; the weight step between them is not.
+- **Tabular figures.** `0x402F6` and `0x402F7` line up because every figure is
+  monospace on the header's own column fractions (`common::table_header`,
+  `common::table_row`), not because the proportional face happens to have
+  tabular digits.
+
+### Density and composition
+
+- `common::figure_row` (height 32) and `common::figure_row_compact` (height 28)
+  draw the caption at the left edge, the figure at the right edge and one `rule`
+  hairline underneath; `common::table_header` is 28.
+- The Log page's map is 160pt and its speed chart 80pt (`metric::PLOT`,
+  `metric::CHART`). That is smaller than a first draft and is what lets the
+  1280×800 page hold the map, the speed chart and the pinned export strip; the
+  selected-point block and the point list remain in the scrolling body, as
+  §9 already accepts at 1024×640.
+- Footers are pinned, because the action is the reason the screen exists:
+  Connect carries 再読込 (secondary) / 接続して確認 (primary); Log carries the
+  export strip; Firmware carries 中止 / 続行・書き込む plus the step they belong
+  to; Settings carries the version and the session-scope sentence.
+
+### Buttons
+
+- primary = `ink` face with a `ground` word; secondary = `rule` outline, no
+  fill; destructive = the amber 書き込む, still the only amber-filled control.
+  A disabled primary becomes an outline with a `mute` word instead of a dimmed
+  bone face, so its label keeps the contrast pair it was designed for.
+- Focus is the theme's 2pt `ink` outline. Selection uses the `data` tint
+  (export-format chips) or an `ink` outline (segmented settings choices), never
+  amber.
+
+### Copy and states
+
+- Device-panel row labels are Japanese: ファーム / ビルド / モデル / フラッシュ /
+  日付. The values are unchanged; the English labels in §5's figure were the
+  implementation's mixed-language leftover.
+- The log-file input's placeholder is `ログファイルのパス`, not a
+  `path/to/log.bin` sample.
+- Empty log: 「まだログがありません」, the path with the ログを開く primary
+  action, and a disabled ログを吸い出す marked 未検証.
+- The map says 「地図タイルなし・軌跡のみ」. No tile fetcher is linked, so the
+  canvas draws the track itself rather than claiming a map it does not have.
+- The screenshots show the firmware write step with the sample image applied in
+  memory and the confirmation armed — it is never written to disk, and the
+  panel and screen still carry 「見本」. That is why the amber button appears in
+  its armed state in the review images.
+- Settings ends with a colophon of facts read from `m241-core` (supported
+  firmware, patch offset). It is reference material, not a sixth setting.
+- A machine with no usable system font keeps egui's bundled Latin-only faces;
+  Japanese labels render as boxes there. This is the cost of not committing a
+  font file, and is preferable to shipping one nobody has licensed.
