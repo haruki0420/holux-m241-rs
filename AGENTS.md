@@ -236,12 +236,13 @@ the reviewer independently verifies:
   `--allow-vendor` when used. `fw flash` implements these flags; re-check the
   command against `m241 fw flash --help` before approving.
 
-**Approval is per execution.** A previous approval covers one `fw flash`
-invocation only. Before every invocation the preparer asks an independent
-reviewer for the exact command, image, backup, DA, port, flags and retry
-behaviour, and passes `--yes` only after that reviewer records `"approved"`. A
-changed image, backup, DA, port, flag, range or retry policy needs a fresh
-approval.
+**Approval is per execution.** A previous approval covers one invocation of
+the command in this section (`fw flash`, including `--recover` / `--allow-vendor`,
+or `fw probe-da`) only. Before every invocation the preparer asks an independent
+reviewer, as in the delegation paragraph above, for the exact command, image,
+backup, DA, unit, port, flags and retry behaviour, and passes `--yes` only after
+that reviewer records `"approved"`. A changed image, backup, DA, unit, port,
+flag, range or retry policy needs a fresh approval.
 
 **The reviewer must independently show that the write cannot leave the pinned
 range.** Each of these is a refusal condition:
@@ -250,11 +251,12 @@ range.** Each of these is a refusal condition:
   `FLASH_WRITE_LENGTH = 0x6345C`; no image, backup, flag, environment variable
   or user input may change it;
 * `0xD3` records exactly `0` .. `0x6345B` (`end = start + length - 1`) and
-  `0xD5` programs only that range;
-* an automatic retry re-enters the BootROM and re-runs the same command and the
-  same range; it may not extend, shift or recompute the range;
-* the image length equals `FLASH_WRITE_LENGTH`; a V1.12 or any shorter image is
-  refused;
+  `0xD5` programs only that range (sector erase granularity is §2.2);
+* if the implementation retries automatically, the retry re-enters the BootROM
+  and re-runs the same command and the same range; it may not extend, shift or
+  recompute the range;
+* the image length equals `FLASH_WRITE_LENGTH`; a shorter or longer image (V1.12
+  or any other profile) is refused;
 * `check_layout` and `check_image` (or the vendor token) run before the first
   `0xD3`, and the reviewer has seen the call path.
 
