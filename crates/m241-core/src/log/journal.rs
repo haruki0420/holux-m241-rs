@@ -28,8 +28,9 @@
 //!
 //! Reading journal bytes as records is what used to invent points. The earlier
 //! parser exported every record whatever its checksum: on the 2026-11-21 dump
-//! 11,088 points, 4,481 of them checksum-failing (3,244 from the stale 16-byte
-//! mask on block 0 alone), and the two 2026-11-22 journal-only dumps became 135
+//! 11,088 points, 4,481 of them checksum-failing (3,235 of block 0's 3,244
+//! records failed the stale 16-byte grid; nine matched it by chance), and the two
+//! 2026-11-22 journal-only dumps became 135
 //! and 137 points built from configuration bytes. Skipping the journal keeps the
 //! read aligned with the records on either side.
 

@@ -17,8 +17,9 @@
 //!
 //! * **A failed checksum no longer keeps the point.** The previous parser
 //!   exported every record and only counted the failure. On the 2026-11-21 dump
-//!   that was 11,088 exported points, 4,481 of them checksum-failing (3,244 from
-//!   the stale 16-byte mask on block 0 alone); the two 2026-11-22 dumps, which
+//!   that was 11,088 exported points, 4,481 of them checksum-failing (3,235 of
+//!   block 0's 3,244 records failed the stale 16-byte grid; nine matched it by
+//!   chance); the two 2026-11-22 dumps, which
 //!   hold only the settings journal, became 135 and 137 points whose coordinates
 //!   came from configuration bytes. The cost is real but small: the checksum is
 //!   one XOR byte, so a genuinely damaged record is now lost instead of exported
@@ -1037,6 +1038,28 @@ mod tests {
         assert_eq!(report.records, 0);
         assert_eq!(report.empty_records, 1);
         assert!(!report.is_journal_only());
+    }
+
+    #[test]
+    fn a_journal_with_only_empty_records_is_not_journal_only() {
+        // A cluster plus a record that decodes but carries neither a time nor a
+        // position: the dump is not "only the journal". This is the one fixture
+        // that fails if the `empty_records` part of `is_journal_only` is removed,
+        // so the clause cannot quietly become dead weight.
+        let mut body = Vec::new();
+        push_journal_cluster(&mut body);
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.push(xor_checksum(&[0u8; 4]));
+        let (track, report) = parse_body(0x0000_0001, COUNT_NOT_FULL, &body);
+        assert!(track.is_empty());
+        assert_eq!(report.records, 0);
+        assert_eq!(report.empty_records, 1);
+        assert_eq!(report.journal_items, 7);
+        assert_eq!(report.bad_checksums, 0);
+        assert!(
+            !report.is_journal_only(),
+            "an empty track record is not the journal, so the dump is not journal-only"
+        );
     }
 
     /// Deterministic pseudo-random bytes: a 64-bit LCG, so the fixture is the

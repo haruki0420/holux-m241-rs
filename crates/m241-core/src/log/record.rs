@@ -56,7 +56,7 @@ pub fn decode(record: &[u8], bitmask: u32) -> Result<TrackPoint> {
 /// Decode a record whose boundary came from the data rather than the mask.
 ///
 /// A stale mask can declare fields the detected record has no room for: the
-/// measured 16-byte mask over 20-byte records is two bytes short, and a 20-byte
+/// measured 16-byte mask over 20-byte records is four bytes short, and a 20-byte
 /// mask over 16-byte records declares a speed field that does not exist. The mask
 /// still says what each field means, so the fields whose bytes fit before the
 /// trailer are decoded and the rest are dropped. [`decode`] is this function with
@@ -256,7 +256,7 @@ mod tests {
         assert_eq!(decoded.speed_kmh, None);
         assert!(
             decode(&record, 0x8000_003D).is_err(),
-            "the mask alone cannot decode a record two bytes shorter than it claims"
+            "the mask alone cannot decode a record four bytes shorter than it claims"
         );
     }
 
