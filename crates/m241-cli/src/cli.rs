@@ -441,6 +441,19 @@ pub struct LogKmzOptions {
         default_value = "auto"
     )]
     pub utc_offset_days: OffsetSpec,
+
+    /// Camera clock offset from UTC in minutes (for example `540` for UTC+9)
+    /// when EXIF `DateTimeOriginal` is in local time.
+    ///
+    /// Matching moves a copy of the track into the camera's clock; the archive
+    /// itself stays UTC, including the time recorded for each photo.
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        default_value_t = 0,
+        value_name = "MINUTES"
+    )]
+    pub tz_offset_minutes: i32,
 }
 
 #[derive(Debug, Args)]
@@ -547,7 +560,8 @@ pub struct LogEditOptions {
     #[arg(long, value_name = "N")]
     pub split_at: Option<usize>,
 
-    /// Another log dump to join, in capture-time order. Repeat for several.
+    /// Another log dump to join. Repeat the flag for several dumps; they are
+    /// ordered by their earliest point, not by the order they are listed.
     #[arg(long, value_name = "FILE")]
     pub merge: Vec<PathBuf>,
 
@@ -1228,6 +1242,10 @@ mod tests {
         );
         assert_eq!(kmz.max_gap, m241_core::log::geotag::DEFAULT_MAX_GAP_SECONDS);
         assert_eq!(kmz.utc_offset_days, OffsetSpec::Auto);
+        assert_eq!(
+            kmz.tz_offset_minutes, 0,
+            "the camera clock is UTC unless the user says otherwise"
+        );
 
         let cli = Cli::try_parse_from([
             "m241",
@@ -1244,6 +1262,8 @@ mod tests {
             "120",
             "--utc-offset-days",
             "7168",
+            "--tz-offset-minutes",
+            "540",
         ])
         .expect("log kmz with every flag");
         let Command::Log {
@@ -1259,6 +1279,7 @@ mod tests {
         assert_eq!(kmz.max_photo_edge, Some(1600));
         assert_eq!(kmz.max_gap, 120);
         assert_eq!(kmz.utc_offset_days, OffsetSpec::Days(7_168));
+        assert_eq!(kmz.tz_offset_minutes, 540);
 
         let err = Cli::try_parse_from([
             "m241",
@@ -1297,6 +1318,36 @@ mod tests {
         ])
         .expect_err("two operations");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert_eq!(
+            crate::exit::exit_code_for_parse_error(&err),
+            2,
+            "two operations are a usage error"
+        );
+
+        // `log edit` works on the timestamps as recorded, so the timer flags
+        // `log read` has are not silently accepted here.
+        let err = Cli::try_parse_from([
+            "m241",
+            "log",
+            "edit",
+            "track.bin",
+            "--split-at",
+            "2",
+            "--utc-offset-days",
+            "-7168",
+            "-o",
+            "out.gpx",
+        ])
+        .expect_err("edit has no --utc-offset-days");
+        assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
+
+        // `-o` is required: a split writes two files, so there is no default.
+        let err = Cli::try_parse_from(["m241", "log", "edit", "track.bin", "--split-at", "2"])
+            .expect_err("edit without -o");
+        assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
+        let err =
+            Cli::try_parse_from(["m241", "log", "kmz", "track.bin"]).expect_err("kmz without -o");
+        assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
 
         let cli = Cli::try_parse_from([
             "m241",

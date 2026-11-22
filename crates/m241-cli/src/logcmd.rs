@@ -1,3 +1,5 @@
+//! Convert, edit and bundle a downloaded track log.
+//!
 //! `m241 log download`, `m241 log info`, `m241 log read`, `m241 log edit`,
 //! `m241 log erase`, `m241 log geotag` and `m241 log kmz`.
 //!
@@ -14,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use m241_core::log::edit::TrackEditor;
 use m241_core::log::geotag::{self, CaptureTime, GeotagOptions, GeotagPlan};
-use m241_core::log::kmz::export_kmz;
+use m241_core::log::kmz::{KmzPhoto, export_kmz};
 use m241_core::log::{ParseReport, export, parse_dump};
 use m241_core::protocol::PmtkClient;
 use m241_core::protocol::port::Transport;
@@ -72,7 +74,7 @@ pub fn download(options: &DownloadOptions, session: Session<'_>) -> Result<()> {
         }
     };
     let summary = report.summary(&track);
-    warn_about_damage(session.console, &summary, &report);
+    warn_about_damage(session.console, &summary, &report, None);
 
     if options.json {
         return session.console.json(&serde_json::json!({
@@ -245,7 +247,7 @@ pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
     let bytes = fileio::read(&options.file)?;
     let (mut track, report) = parse_dump(&bytes)?;
     let summary = report.summary(&track);
-    warn_about_damage(session.console, &summary, &report);
+    warn_about_damage(session.console, &summary, &report, None);
 
     let shift = apply_utc_offset(&mut track, options.utc_offset_days, session.console);
 
@@ -271,7 +273,7 @@ pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
             fileio::write_text(path, &exported)?;
             session.console.note(&format!(
                 "wrote {} to {}",
-                points_label(track.points.len()),
+                count_label(track.points.len(), "point"),
                 path.display()
             ));
         }
@@ -280,9 +282,10 @@ pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
     Ok(())
 }
 
-/// `1 point`, `2 points` — the count as it reads in a sentence.
-fn points_label(count: usize) -> String {
-    format!("{count} {}", if count == 1 { "point" } else { "points" })
+/// `1 point`, `2 points`, `1 photo`, `2 photos` — a count as it reads in a
+/// sentence.
+fn count_label(count: usize, singular: &str) -> String {
+    format!("{count} {singular}{}", if count == 1 { "" } else { "s" })
 }
 
 /// Which day, in days since the Unix epoch, the log's newest record falls on.
@@ -333,44 +336,104 @@ fn apply_utc_offset(track: &mut Track, spec: OffsetSpec, console: &dyn Console) 
 ///
 /// The output keeps `read`'s formats. A split leaves two tracks, so the first
 /// half goes to `-o` and the second to a sibling named from it
-/// (`track-2.gpx`); merge and delete leave one track and write only `-o`.
+/// (`track-2.gpx`); merge and delete leave one track and write only `-o`. The
+/// input dump is read, never written.
 ///
 /// # Errors
 ///
-/// [`Error::Io`] when a log cannot be read or an output written, [`Error::Log`]
-/// when an input is not a dump or a named point does not exist.
+/// [`Error::Io`] when a log cannot be read or an output written; [`Error::Log`]
+/// when an input is not a dump, a named point does not exist, or a split would
+/// leave a half empty; [`Error::State`] when the edit does not leave one or two
+/// tracks; [`Error::Safety`] when the split's sibling path already exists,
+/// because that file is not one the user named.
 pub fn edit(options: &LogEditOptions, session: Session<'_>) -> Result<()> {
     let bytes = fileio::read(&options.log)?;
-    let (track, _report) = parse_dump(&bytes)?;
+    let (track, report) = parse_dump(&bytes)?;
+    warn_about_damage(session.console, &report.summary(&track), &report, None);
     let mut editor = TrackEditor::from_track(track);
 
-    // The grammar makes exactly one of these flags reachable (`cli.rs`).
-    if let Some(split_at) = options.split_at {
-        editor.split(0, split_at)?;
-    } else if options.merge.is_empty() {
-        delete_named_points(&mut editor, &options.delete)?;
-    } else {
-        editor = merge_in_time_order(editor.tracks(), &options.merge)?;
+    match requested_edit(options) {
+        Some(LogEdit::Split(split_at)) => editor.split(FIRST_TRACK, split_at)?,
+        Some(LogEdit::Merge(paths)) => {
+            editor = merge_in_time_order(editor.tracks(), &paths, session.console)?;
+        }
+        Some(LogEdit::Delete(indices)) => delete_named_points(&mut editor, &indices)?,
+        // `cli.rs`'s `ArgGroup` requires one operation, so this arm is
+        // unreachable from a parsed command line. It is an error rather than a
+        // panic because a library caller can build `LogEditOptions` without
+        // going through clap.
+        None => {
+            return Err(Error::State(String::from(
+                "no edit was selected; the argument grammar requires exactly one",
+            )));
+        }
     }
 
+    write_edited(&editor, options, session.console)
+}
+
+/// The index of the only track an editor built from one dump holds.
+const FIRST_TRACK: usize = 0;
+
+/// The one edit `cli.rs`'s `ArgGroup` lets a command line ask for.
+///
+/// Spelled out instead of inferred from "`--merge` is empty, so this must be
+/// `--delete`": the exclusivity is a fact about the grammar in another file, and
+/// a reader of this handler should not have to reconstruct it.
+enum LogEdit {
+    Split(usize),
+    Merge(Vec<PathBuf>),
+    Delete(Vec<usize>),
+}
+
+/// The operation `options` asks for, when the grammar has admitted one.
+fn requested_edit(options: &LogEditOptions) -> Option<LogEdit> {
+    if let Some(split_at) = options.split_at {
+        Some(LogEdit::Split(split_at))
+    } else if !options.merge.is_empty() {
+        Some(LogEdit::Merge(options.merge.clone()))
+    } else if !options.delete.is_empty() {
+        Some(LogEdit::Delete(options.delete.clone()))
+    } else {
+        None
+    }
+}
+
+/// Write the edited tracks and report where they went.
+fn write_edited(
+    editor: &TrackEditor,
+    options: &LogEditOptions,
+    console: &dyn Console,
+) -> Result<()> {
     match editor.tracks() {
         [only] => {
             write_track(&options.output, only, options.format)?;
-            session.console.note(&format!(
+            console.note(&format!(
                 "wrote {} to {}",
-                points_label(only.points.len()),
+                count_label(only.points.len(), "point"),
                 options.output.display()
             ));
         }
         [first, second] => {
-            let second_path = numbered_sibling(&options.output, 2);
+            let second_path = second_sibling(&options.output);
+            // The sibling is a path the user did not name, so replacing a file
+            // that is already there would destroy something this command was
+            // never asked about. Checked before either half is written, so a
+            // refusal leaves no part of the edit on disk.
+            fileio::ensure_free(&second_path, false)?;
             write_track(&options.output, first, options.format)?;
-            write_track(&second_path, second, options.format)?;
-            session.console.note(&format!(
+            if let Err(err) = write_track(&second_path, second, options.format) {
+                console.warn(&format!(
+                    "{} was written before the failure",
+                    options.output.display()
+                ));
+                return Err(err);
+            }
+            console.note(&format!(
                 "wrote {} to {} and {} to {}",
-                points_label(first.points.len()),
+                count_label(first.points.len(), "point"),
                 options.output.display(),
-                points_label(second.points.len()),
+                count_label(second.points.len(), "point"),
                 second_path.display()
             ));
         }
@@ -394,36 +457,47 @@ fn write_track(path: &Path, track: &Track, format: ExportFormat) -> Result<()> {
 /// `TrackEditor::delete_points` ignores out-of-range indices. That is right for
 /// a UI deleting a stale selection but wrong for a typed command, where a typo
 /// would silently delete nothing; here it is an error naming the index and the
-/// count.
+/// valid range.
 fn delete_named_points(editor: &mut TrackEditor, indices: &[usize]) -> Result<()> {
     let points = editor
         .tracks()
         .first()
         .map_or(0, |track| track.points.len());
+    // The range is inclusive (`0..=2` holds three indices, and `0..=0` holds
+    // one): an exclusive `0..3` would read as though 3 were valid, and with no
+    // points `0..0` would read as though index 0 existed.
+    let range = if points == 0 {
+        String::from("the log has no points")
+    } else {
+        format!("{points} point(s) are indexed 0..={}", points - 1)
+    };
     for &index in indices {
         if index >= points {
             return Err(Error::Log {
-                message: format!(
-                    "point index {index} does not exist: {points} point(s) are indexed 0..{}",
-                    points.saturating_sub(1)
-                ),
+                message: format!("point index {index} does not exist: {range}"),
                 offset: None,
             });
         }
     }
-    editor.delete_points(0, indices)
+    editor.delete_points(FIRST_TRACK, indices)
 }
 
 /// Read the `--merge` dumps and join them with `tracks` in capture-time order.
 ///
 /// [`TrackEditor::merge`] concatenates in the order the indices are listed, so
 /// they are sorted by each track's earliest timestamp first. A track with no
-/// timestamp sorts after the timed ones rather than in front of them.
-fn merge_in_time_order(tracks: &[Track], merge_paths: &[PathBuf]) -> Result<TrackEditor> {
+/// timestamp sorts after the timed ones rather than in front of them: it cannot
+/// claim a place among dumps that carry one.
+fn merge_in_time_order(
+    tracks: &[Track],
+    merge_paths: &[PathBuf],
+    console: &dyn Console,
+) -> Result<TrackEditor> {
     let mut all = tracks.to_vec();
     for path in merge_paths {
         let bytes = fileio::read(path)?;
-        let (track, _report) = parse_dump(&bytes)?;
+        let (track, report) = parse_dump(&bytes)?;
+        warn_about_damage(console, &report.summary(&track), &report, Some(path));
         all.push(track);
     }
     let mut indices: Vec<usize> = (0..all.len()).collect();
@@ -438,16 +512,17 @@ fn merge_in_time_order(tracks: &[Track], merge_paths: &[PathBuf]) -> Result<Trac
 }
 
 /// `track.gpx` -> `track-2.gpx`, `track` -> `track-2`.
-fn numbered_sibling(path: &Path, suffix: u32) -> PathBuf {
+fn second_sibling(path: &Path) -> PathBuf {
+    const SECOND: u32 = 2;
     let stem = path.file_stem().map_or_else(
         || String::from("track"),
         |stem| stem.to_string_lossy().into_owned(),
     );
     match path.extension() {
         Some(extension) => {
-            path.with_file_name(format!("{stem}-{suffix}.{}", extension.to_string_lossy()))
+            path.with_file_name(format!("{stem}-{SECOND}.{}", extension.to_string_lossy()))
         }
-        None => path.with_file_name(format!("{stem}-{suffix}")),
+        None => path.with_file_name(format!("{stem}-{SECOND}")),
     }
 }
 
@@ -455,57 +530,116 @@ fn numbered_sibling(path: &Path, suffix: u32) -> PathBuf {
 ///
 /// Photos are matched to track points by capture time through [`geotag::plan`],
 /// so `--utc-offset-days auto` matters here as much as it does in `log geotag`:
-/// nothing lines up with a log that is still 7168 days in the past. A photo with
-/// no point inside `--max-gap` is left out with a warning rather than placed at
-/// a coordinate it cannot support.
+/// nothing lines up with a log that is still 7168 days in the past. A photo the
+/// planner leaves out is left out with the planner's own reason rather than a
+/// guess, because "no point inside `--max-gap`" is only one of them — a non-JPEG,
+/// an unreadable capture time and an undecodable EXIF block are others — and the
+/// reason is what tells the user which next step would help.
+///
+/// The archive's layout is checked by this project's own ZIP reader in
+/// `m241-core`; Google Earth and `unzip` have not been run on the output, so it
+/// is not claimed to open in an external viewer.
 ///
 /// # Errors
 ///
-/// [`Error::Io`] when the log, a photo or the output cannot be read or written,
-/// [`Error::Log`] when the log is not a dump, and [`Error::State`] when a photo
-/// over `--max-photo-edge` cannot be decoded to be reduced.
+/// [`Error::Io`] when the log, a photo or the output cannot be read or written;
+/// [`Error::Log`] when the log is not a dump, or when the archive would exceed
+/// the ZIP32 limits; [`Error::State`] when a photo over `--max-photo-edge`
+/// cannot be decoded to be reduced.
 pub fn kmz(options: &LogKmzOptions, session: Session<'_>) -> Result<()> {
     let bytes = fileio::read(&options.log)?;
     let (mut track, report) = parse_dump(&bytes)?;
-    warn_about_damage(session.console, &report.summary(&track), &report);
+    warn_about_damage(session.console, &report.summary(&track), &report, None);
     apply_utc_offset(&mut track, options.utc_offset_days, session.console);
 
     let photo_paths = expand_photo_inputs(&options.photos)?;
     let geotag_options = GeotagOptions {
         max_gap_seconds: options.max_gap,
-        max_photo_edge_pixels: options.max_photo_edge,
         ..GeotagOptions::default()
     };
-    let plans = geotag::plan(&photo_paths, &track, &geotag_options)?;
+    let plans = plan_kmz_photos(
+        &photo_paths,
+        &track,
+        &geotag_options,
+        options.tz_offset_minutes,
+    )?;
+    let photos = materialize_kmz_photos(&plans, options.max_photo_edge, session.console)?;
 
-    let mut photos = Vec::new();
-    for plan in &plans {
-        let Some(mut photo) = plan.to_kmz_photo(options.max_photo_edge) else {
-            session.console.warn(&format!(
-                "{} has no track point within {} s of its capture time; it was not bundled",
-                plan.photo.display(),
-                options.max_gap
+    let archive = export_kmz(&track, &photos)?;
+    fileio::write(&options.output, &archive)?;
+    session.console.note(&format!(
+        "wrote {} and {} to {}",
+        count_label(track.points.len(), "point"),
+        count_label(photos.len(), "photo"),
+        options.output.display()
+    ));
+    Ok(())
+}
+
+/// Match `photos` to `track` in the camera's clock, then put the capture times
+/// back on UTC for the archive.
+///
+/// `tz_offset_minutes` is the camera's offset from UTC, for the same reason
+/// `log geotag` has the flag: `DateTimeOriginal` is the camera's local time, so a
+/// camera set to UTC+9 would otherwise look nine hours away from every point.
+/// Matching happens on a shifted copy of the track; the archive's track stays
+/// UTC, and so do the times recorded for the photos, because a `<TimeStamp>` in
+/// local time would sit at a different moment from the track it is drawn on.
+fn plan_kmz_photos(
+    photos: &[PathBuf],
+    track: &Track,
+    options: &GeotagOptions,
+    tz_offset_minutes: i32,
+) -> Result<Vec<GeotagPlan>> {
+    let tz_delta_seconds = i64::from(tz_offset_minutes) * 60;
+    let mut matching_track = track.clone();
+    if tz_delta_seconds != 0 {
+        shift_track_seconds(&mut matching_track, tz_delta_seconds);
+    }
+    let mut plans = geotag::plan(photos, &matching_track, options)?;
+    if tz_delta_seconds != 0 {
+        for plan in &mut plans {
+            plan.capture_time = plan
+                .capture_time
+                .map(|capture| shift_capture_time(capture, -tz_delta_seconds));
+        }
+    }
+    Ok(plans)
+}
+
+/// `capture` moved by `delta_seconds`, clamped like every other time shift here.
+fn shift_capture_time(capture: CaptureTime, delta_seconds: i64) -> CaptureTime {
+    match capture {
+        CaptureTime::Exif(utc) => CaptureTime::Exif(shift_timestamp_seconds(utc, delta_seconds)),
+        CaptureTime::FileModified(utc) => {
+            CaptureTime::FileModified(shift_timestamp_seconds(utc, delta_seconds))
+        }
+    }
+}
+
+/// Turn the plans into archive entries, reading each accepted photo's bytes.
+fn materialize_kmz_photos(
+    plans: &[GeotagPlan],
+    max_edge: Option<u32>,
+    console: &dyn Console,
+) -> Result<Vec<KmzPhoto>> {
+    let mut photos = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let Some(mut photo) = plan.to_kmz_photo(max_edge) else {
+            // `to_kmz_photo` is `None` for every reason the planner rejected the
+            // photo, not only a gap over the limit; the plan carries that reason,
+            // and it names the next step where a guess here would mislead.
+            let reason = plan.skipped.as_deref().unwrap_or("skipped");
+            console.warn(&format!(
+                "{} ({reason}); it was not bundled",
+                plan.photo.display()
             ));
             continue;
         };
         photo.jpeg_bytes = fileio::read(&plan.photo)?;
         photos.push(photo);
     }
-
-    let archive = export_kmz(&track, &photos)?;
-    fileio::write(&options.output, &archive)?;
-    session.console.note(&format!(
-        "wrote {} and {} to {}",
-        points_label(track.points.len()),
-        photos_label(photos.len()),
-        options.output.display()
-    ));
-    Ok(())
-}
-
-/// `1 photo`, `2 photos` — the count as it reads in a sentence.
-fn photos_label(count: usize) -> String {
-    format!("{count} {}", if count == 1 { "photo" } else { "photos" })
+    Ok(photos)
 }
 
 /// Summarise a dumped track log.
@@ -518,7 +652,7 @@ pub fn info(options: &LogInfoOptions, session: Session<'_>) -> Result<()> {
     let bytes = fileio::read(&options.file)?;
     let (track, report) = parse_dump(&bytes)?;
     let summary = report.summary(&track);
-    warn_about_damage(session.console, &summary, &report);
+    warn_about_damage(session.console, &summary, &report, None);
 
     if options.json {
         return session.console.json(&serde_json::json!({
@@ -599,7 +733,7 @@ pub fn geotag(options: &LogGeotagOptions, session: Session<'_>) -> Result<()> {
     let bytes = fileio::read(&options.log)?;
     let (mut track, report) = parse_dump(&bytes)?;
     let summary = report.summary(&track);
-    warn_about_damage(session.console, &summary, &report);
+    warn_about_damage(session.console, &summary, &report, None);
 
     let offset_days = apply_utc_offset(&mut track, options.utc_offset_days, session.console);
     let photo_paths = expand_photo_inputs(&options.photos)?;
@@ -818,23 +952,29 @@ fn timestamp(utc: Option<u32>) -> String {
 ///
 /// A warning, never an error: one damaged block is a track worth keeping, and
 /// refusing the whole dump would throw the trip away.
-fn warn_about_damage(console: &dyn Console, summary: &LogSummary, report: &ParseReport) {
+fn warn_about_damage(
+    console: &dyn Console,
+    summary: &LogSummary,
+    report: &ParseReport,
+    source: Option<&Path>,
+) {
+    let source = source.map_or_else(String::new, |path| format!("{}: ", path.display()));
     if summary.damaged_block_count > 0 {
         console.warn(&format!(
-            "{} of {} blocks failed their header checksum; their records are still exported",
+            "{source}{} of {} blocks failed their header checksum; their records are still exported",
             summary.damaged_block_count, report.blocks
         ));
     }
     if report.truncated_records > 0 {
         console.warn(&format!(
-            "{} records were cut short (the log was probably still being written); they were \
-             skipped",
+            "{source}{} records were cut short (the log was probably still being written); they \
+             were skipped",
             report.truncated_records
         ));
     }
     if report.bad_checksums > 0 {
         console.warn(&format!(
-            "{} records failed their per-record checksum; they are exported and marked",
+            "{source}{} records failed their per-record checksum; they are exported and marked",
             report.bad_checksums
         ));
     }
@@ -1269,6 +1409,39 @@ mod tests {
         for &utc in timestamps {
             let mut record = Vec::new();
             record.extend_from_slice(&utc.to_le_bytes());
+            record.extend_from_slice(&LAT.to_le_bytes());
+            record.extend_from_slice(&LON.to_le_bytes());
+            record.extend_from_slice(&[0x00, 0xA0, 0x42]);
+            let checksum = xor_checksum(&record);
+            record.push(checksum);
+            block[cursor..cursor + record.len()].copy_from_slice(&record);
+            cursor += record.len();
+        }
+        block
+    }
+
+    /// Build a one-block dump whose records carry a position but no timestamp.
+    ///
+    /// The same fields as [`dump_with_timestamps`] minus bit 0 (UTC): the block
+    /// mask is per block, so an untimed dump cannot be mixed into a timed one.
+    fn dump_without_timestamps(records: usize) -> Vec<u8> {
+        use m241_core::log::block::{
+            BLOCK_HEADER_SIZE, BLOCK_SIZE, POLICY_LOG_ENABLED, xor_checksum,
+        };
+
+        const MASK: u32 = 0x8000_001C;
+        const LAT: f32 = 35.681_236;
+        const LON: f32 = 139.767_13;
+
+        let mut block = vec![0xFFu8; BLOCK_SIZE];
+        block[0..2].copy_from_slice(&(records as u16).to_le_bytes());
+        block[2..6].copy_from_slice(&MASK.to_le_bytes());
+        block[6..8].copy_from_slice(&POLICY_LOG_ENABLED.to_le_bytes());
+        block[8..12].copy_from_slice(&10u32.to_le_bytes());
+
+        let mut cursor = BLOCK_HEADER_SIZE;
+        for _ in 0..records {
+            let mut record = Vec::new();
             record.extend_from_slice(&LAT.to_le_bytes());
             record.extend_from_slice(&LON.to_le_bytes());
             record.extend_from_slice(&[0x00, 0xA0, 0x42]);
@@ -2222,15 +2395,28 @@ mod tests {
         assert_eq!(nested_gps.longitude, None);
     }
 
-    /// The UTC values of a JSON export, in file order.
-    fn exported_utcs(path: &Path) -> Vec<u32> {
+    /// The UTC values of a JSON export, in file order, with `None` for a point
+    /// the dump recorded without a timestamp.
+    fn exported_utc_options(path: &Path) -> Vec<Option<u32>> {
         let text = fileio::read_text(path).expect("read export");
         let document: serde_json::Value = serde_json::from_str(&text).expect("JSON export");
         document["points"]
             .as_array()
             .expect("points array")
             .iter()
-            .map(|point| u32::try_from(point["utc"].as_u64().expect("utc")).expect("u32"))
+            .map(|point| {
+                point["utc"]
+                    .as_u64()
+                    .map(|utc| u32::try_from(utc).expect("u32"))
+            })
+            .collect()
+    }
+
+    /// The UTC values of a JSON export whose every point is timed, in file order.
+    fn exported_utcs(path: &Path) -> Vec<u32> {
+        exported_utc_options(path)
+            .into_iter()
+            .map(|utc| utc.expect("every point in this export has a timestamp"))
             .collect()
     }
 
@@ -2257,6 +2443,7 @@ mod tests {
             max_photo_edge: None,
             max_gap: m241_core::log::geotag::DEFAULT_MAX_GAP_SECONDS,
             utc_offset_days: OffsetSpec::Days(0),
+            tz_offset_minutes: 0,
         }
     }
 
@@ -2324,13 +2511,185 @@ mod tests {
 
         let archive = fileio::read(&output).expect("archive");
         assert!(
-            !archive.windows(6).any(|window| window == b"photo/"),
+            !archive
+                .windows(b"photo/".len())
+                .any(|window| window == b"photo/"),
             "a photo with no point in the gap must not be bundled"
         );
         assert!(
             console.stderr().contains("not bundled"),
             "the skip must be said on stderr: {}",
             console.stderr()
+        );
+    }
+
+    #[test]
+    fn kmz_reports_the_planners_reason_for_a_photo_it_leaves_out() {
+        // A non-JPEG is skipped long before any track point is looked at, so the
+        // warning must say that instead of blaming the gap: "no track point
+        // within N s" would send the user to `--max-gap`, which cannot help.
+        let scratch = Scratch::new("kmz-reason");
+        let log = write_dump(&scratch, "track.bin", 2);
+        let photo = scratch.join("notes.png");
+        fileio::write(&photo, b"\x89PNG\r\n\x1a\n").expect("write png");
+        let output = scratch.join("track.kmz");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        kmz(
+            &kmz_options(log, vec![photo], &output),
+            fast(&links, &console, &confirm),
+        )
+        .expect("kmz");
+
+        let stderr = console.stderr();
+        assert!(
+            stderr.contains("not a JPEG"),
+            "the warning must carry the planner's reason: {stderr}"
+        );
+        assert!(
+            !stderr.contains("no track point within"),
+            "the gap must not be blamed for a non-JPEG: {stderr}"
+        );
+    }
+
+    #[test]
+    fn kmz_applies_the_utc_offset_before_matching_photos() {
+        // A log from an unpatched unit is 7168 days behind the photo's real
+        // capture time. The match can only be found when the shift is applied
+        // before `geotag::plan`, not to the track the archive is built from
+        // afterwards.
+        let scratch = Scratch::new("kmz-offset");
+        let stale_utc = (crate::cal::days_from_civil(2006, 9, 17) * 86_400 + 3600) as u32;
+        let real_utc = crate::cal::shift_seconds(stale_utc, crate::cal::WNRO_DAYS);
+        let log = scratch.join("stale.bin");
+        fileio::write(&log, &dump_with_timestamps(&[stale_utc])).expect("write dump");
+        let photo = scratch.join("shot.jpg");
+        fileio::write(
+            &photo,
+            &synthetic_jpeg_with_datetime(&format_exif_utc(real_utc)),
+        )
+        .expect("write photo");
+        let output = scratch.join("track.kmz");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        let mut options = kmz_options(log, vec![photo], &output);
+        options.utc_offset_days = OffsetSpec::Auto;
+
+        kmz(&options, fast(&links, &console, &confirm)).expect("kmz");
+
+        let archive = fileio::read(&output).expect("archive");
+        assert!(
+            archive
+                .windows(b"photo/shot.jpg".len())
+                .any(|window| window == b"photo/shot.jpg"),
+            "the photo must match the shifted track"
+        );
+        assert!(
+            console.stderr().contains("1 photo"),
+            "the note must say the photo was bundled: {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
+    fn kmz_matches_a_photo_from_a_local_time_camera_with_the_tz_offset() {
+        // `DateTimeOriginal` is the camera's local clock. A camera set to UTC+9
+        // records a capture nine hours after the real moment, so matching only
+        // works when the track is moved into the camera's clock first.
+        let scratch = Scratch::new("kmz-tz");
+        let track_utc = 1_700_000_000u32;
+        let log = write_dump(&scratch, "track.bin", 2);
+        let photo = scratch.join("local.jpg");
+        let camera_utc = track_utc + 540 * 60;
+        fileio::write(
+            &photo,
+            &synthetic_jpeg_with_datetime(&format_exif_utc(camera_utc)),
+        )
+        .expect("write photo");
+        let output = scratch.join("track.kmz");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        let mut options = kmz_options(log, vec![photo], &output);
+        options.tz_offset_minutes = 540;
+
+        kmz(&options, fast(&links, &console, &confirm)).expect("kmz");
+
+        let archive = fileio::read(&output).expect("archive");
+        assert!(
+            archive
+                .windows(b"photo/local.jpg".len())
+                .any(|window| window == b"photo/local.jpg"),
+            "the photo must match the camera-clock track"
+        );
+        assert!(
+            console.stderr().contains("1 photo"),
+            "the note must say the photo was bundled: {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
+    fn kmz_bundles_a_track_when_no_photos_are_given() {
+        let scratch = Scratch::new("kmz-track-only");
+        let log = write_dump(&scratch, "track.bin", 2);
+        let output = scratch.join("track.kmz");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        kmz(
+            &kmz_options(log, Vec::new(), &output),
+            fast(&links, &console, &confirm),
+        )
+        .expect("kmz without photos");
+
+        let archive = fileio::read(&output).expect("archive");
+        assert!(
+            archive
+                .windows(b"doc.kml".len())
+                .any(|window| window == b"doc.kml"),
+            "the track-only archive must still carry the KML"
+        );
+        assert!(
+            !archive
+                .windows(b"photo/".len())
+                .any(|window| window == b"photo/"),
+            "no photos means no photo entries"
+        );
+        assert!(
+            console.stderr().contains("0 photos"),
+            "the note must say no photo was bundled: {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
+    fn kmz_keeps_a_photo_within_the_edge_limit_byte_for_byte() {
+        // A frame header within the limit is never decoded, so bytes with no
+        // scan data pass through untouched; that is only true when the limit is
+        // compared rather than applied.
+        let scratch = Scratch::new("kmz-edge-keep");
+        let log = write_dump(&scratch, "track.bin", 2);
+        let photo = scratch.join("small.jpg");
+        let bytes = jpeg_with_frame_size(800, 600, 1_700_000_000);
+        fileio::write(&photo, &bytes).expect("write photo");
+        let output = scratch.join("track.kmz");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        let mut options = kmz_options(log, vec![photo], &output);
+        options.max_photo_edge = Some(1024);
+
+        kmz(&options, fast(&links, &console, &confirm)).expect("kmz");
+
+        let archive = fileio::read(&output).expect("archive");
+        assert!(
+            archive.windows(bytes.len()).any(|window| window == bytes),
+            "a photo under the limit must keep its exact bytes"
         );
     }
 
@@ -2459,9 +2818,186 @@ mod tests {
         assert_eq!(crate::exit::exit_code_for(&err), 1, "got {err}");
         let message = err.to_string();
         assert!(
-            message.contains('7') && message.contains("3 point(s)"),
-            "the error must name the index and the count: {message}"
+            message.contains('7') && message.contains("3 point(s)") && message.contains("0..=2"),
+            "the error must name the index and the inclusive range: {message}"
         );
         assert!(!output.exists(), "nothing is written on a refused edit");
+    }
+
+    #[test]
+    fn edit_does_not_modify_the_input_dump() {
+        // `docs/reference/02-cli.md` promises the input dump is never modified.
+        // Both operations read it, so both are checked against the original
+        // bytes; a merge input is checked too, because a write there would be
+        // just as destructive.
+        let scratch = Scratch::new("edit-input");
+        let log = write_dump(&scratch, "track.bin", 4);
+        let original = fileio::read(&log).expect("read dump");
+        let earlier = scratch.join("earlier.bin");
+        fileio::write(&earlier, &dump_with_timestamps(&[1_600_000_000])).expect("write dump");
+        let earlier_original = fileio::read(&earlier).expect("read dump");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        let mut split = edit_options(&scratch.join("split.json"));
+        split.log = log.clone();
+        split.split_at = Some(2);
+        edit(&split, fast(&links, &console, &confirm)).expect("split");
+        assert_eq!(
+            fileio::read(&log).expect("read dump"),
+            original,
+            "a split must not touch the input dump"
+        );
+
+        let mut merge = edit_options(&scratch.join("merged.json"));
+        merge.log = log.clone();
+        merge.merge = vec![earlier.clone()];
+        edit(&merge, fast(&links, &console, &confirm)).expect("merge");
+        assert_eq!(
+            fileio::read(&log).expect("read dump"),
+            original,
+            "a merge must not touch its own dump"
+        );
+        assert_eq!(
+            fileio::read(&earlier).expect("read dump"),
+            earlier_original,
+            "a merge must not touch the dump it joins"
+        );
+    }
+
+    #[test]
+    fn edit_merge_puts_a_dump_without_timestamps_last() {
+        // A dump with no time cannot claim a place among dumps that carry one,
+        // so it goes last; `--merge` repeated twice also joins both dumps.
+        let scratch = Scratch::new("edit-merge-untimed");
+        let log = write_dump(&scratch, "track.bin", 2);
+        let earlier = scratch.join("earlier.bin");
+        fileio::write(&earlier, &dump_with_timestamps(&[1_600_000_000])).expect("write dump");
+        let untimed = scratch.join("untimed.bin");
+        fileio::write(&untimed, &dump_without_timestamps(1)).expect("write dump");
+        let output = scratch.join("merged.json");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        let mut options = edit_options(&output);
+        options.log = log;
+        options.merge = vec![untimed, earlier];
+
+        edit(&options, fast(&links, &console, &confirm)).expect("edit merge");
+
+        assert_eq!(
+            exported_utc_options(&output),
+            vec![
+                Some(1_600_000_000),
+                Some(1_700_000_000),
+                Some(1_700_000_001),
+                None
+            ],
+            "timed dumps keep capture-time order and the untimed dump comes last"
+        );
+    }
+
+    #[test]
+    fn edit_refuses_a_split_that_would_leave_an_empty_half() {
+        let scratch = Scratch::new("edit-bad-split");
+        let log = write_dump(&scratch, "track.bin", 4);
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        for split_at in [0, 4, 9] {
+            let output = scratch.join(&format!("split-{split_at}.json"));
+            let mut options = edit_options(&output);
+            options.log = log.clone();
+            options.split_at = Some(split_at);
+
+            let err = edit(&options, fast(&links, &console, &confirm)).expect_err("empty half");
+            assert_eq!(
+                crate::exit::exit_code_for(&err),
+                1,
+                "split at {split_at}: {err}"
+            );
+            assert!(
+                err.to_string().contains("cannot split"),
+                "split at {split_at}: {err}"
+            );
+            assert!(
+                !output.exists(),
+                "split at {split_at} must not write an output"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_split_refuses_to_overwrite_a_sibling_it_was_not_given() {
+        let scratch = Scratch::new("edit-sibling");
+        let log = write_dump(&scratch, "track.bin", 4);
+        let output = scratch.join("first.json");
+        let sibling = scratch.join("first-2.json");
+        let existing = b"a file the user already had";
+        fileio::write(&sibling, existing).expect("write sibling");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        let mut options = edit_options(&output);
+        options.log = log;
+        options.split_at = Some(2);
+
+        let err = edit(&options, fast(&links, &console, &confirm)).expect_err("sibling exists");
+        assert_eq!(crate::exit::exit_code_for(&err), 5, "got {err}");
+        assert!(
+            err.to_string().contains("first-2.json"),
+            "the refusal must name the path it will not replace: {err}"
+        );
+        assert!(
+            !output.exists(),
+            "a refused split must not write the first half"
+        );
+        assert_eq!(
+            fileio::read(&sibling).expect("sibling"),
+            existing,
+            "the existing sibling must be untouched"
+        );
+    }
+
+    #[test]
+    fn edit_warns_about_a_damaged_dump() {
+        let scratch = Scratch::new("edit-damage");
+        // Corrupt one record's checksum byte inside the block.
+        let mut damaged = synthetic_dump(2);
+        if let Some(byte) = damaged.get_mut(0x200 + 15) {
+            *byte ^= 0xFF;
+        }
+        let log = scratch.join("damaged.bin");
+        fileio::write(&log, &damaged).expect("write dump");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        let mut options = edit_options(&scratch.join("trimmed.json"));
+        options.log = log.clone();
+        options.delete = vec![0];
+
+        edit(&options, fast(&links, &console, &confirm)).expect("edit");
+        assert!(
+            console.stderr().contains("checksum"),
+            "a damaged input must be announced, as `log read` does: {}",
+            console.stderr()
+        );
+
+        // A damaged `--merge` input names its path, because with more than one
+        // input the message has to say which one it is about.
+        let clean = write_dump(&scratch, "clean.bin", 2);
+        let merge_input = scratch.join("merge-damaged.bin");
+        fileio::write(&merge_input, &damaged).expect("write dump");
+        let mut merge = edit_options(&scratch.join("merged.json"));
+        merge.log = clean;
+        merge.merge = vec![merge_input];
+        edit(&merge, fast(&links, &console, &confirm)).expect("edit merge");
+        let stderr = console.stderr();
+        assert!(
+            stderr.contains("merge-damaged.bin") && stderr.contains("checksum"),
+            "the warning must name the damaged merge input: {stderr}"
+        );
     }
 }
