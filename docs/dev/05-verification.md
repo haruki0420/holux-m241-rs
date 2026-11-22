@@ -260,6 +260,26 @@ Host: Linux, the unit over USB serial. The host clock stood at
   outside the repository and are not committed (`AGENTS.md` §6); the sentences
   above are verbatim.
 
+#### The nmea proxy over TCP (2026-11-22/23)
+
+Device: the same unit. The proxy ran with `--bind` on `127.0.0.1:10110`; the
+client's note line read `relaying repaired NMEA on tcp://127.0.0.1:10110`.
+
+| Step | Result | Status |
+|---|---|---|
+| TCP relay | 9 sentences reached a TCP client at `tcp://127.0.0.1:10110` | ✅ |
+| checksums | 9 of 9 valid after the repair | ✅ |
+| date | `221126` (2026-11-22), the unit's no-fix clock | ✅ |
+| `--offset-days 1` | the date became `231126` | ✅ |
+
+* The TCP path relays the same repaired lines as stdout. The listener refuses a
+  non-loopback address unless `--allow-non-loopback` is passed
+  (`bind_checked_listener` in `crates/m241-cli/src/nmea.rs`).
+* **未検証**: a long-running relay, more than one client at a time, a
+  non-loopback bind, and a stream that carries a real fix. The date above comes
+  from the unit's no-fix clock, not from a fix.
+* The raw capture is not committed (`AGENTS.md` §6).
+
 #### The log read back after the writes (2026-11-22)
 
 Device: the same unit, still recording. The read is
@@ -268,23 +288,32 @@ apart; nothing was erased or written.
 
 | Step | Result | Status |
 |---|---|---|
-| first download | 3,228 bytes, 135 records, no framing error | ✅ |
-| second download | 3,260 bytes, 137 records | ✅ |
-| block header | `1 of 1 blocks failed their header checksum` in both | ✅ |
-| record checksums | every record failed (`bad checksums: 135`, then `137`) | ✅ |
+| first download | 3,228 bytes, no framing error; the client counted 135 "records" | ✅ |
+| second download | 3,260 bytes; the client counted 137 "records" | ✅ |
+| what the bytes are | no track point at all: a settings / state journal (141 × 16-byte entries of `AA`×7 + a type + a `u32` value + `BB`×4, and 23 × 20-byte `HOLUXGR241LOGGER` strings; 141 × 16 + 23 × 20 = 2,716 = 3,228 − `0x200`) | ✅ (offline analysis) |
+| block / record checksums | the client printed `1 of 1 blocks failed their header checksum` in both; every record checksum failed (`bad checksums: 135`, then `137`) | ✅ |
 | decoded span | `2060-09-25T04:18:50Z`–`2015-05-08T05:53:12Z`, then `1974-01-28T17:15:22Z` | ⚠️ not trustworthy |
 | log usage through the GUI minutes later | `3,292 B`, recording 「有効」 | ✅ |
 
 * The transport was clean: neither run hit a framing error, and the unit's log
-  usage grew between them (3,228 → 3,260 bytes, 135 → 137 records), so the log
-  was written between the two reads. The GUI then reported `3,292 B`.
-* **The download cannot be used as evidence of a post-flash timestamp.** The
-  unit's only block fails its header checksum and every record fails its
-  per-record checksum, and the spans the client decodes are nonsense. A 64 KiB
-  block that is still being written may not carry a final header, so the record
-  boundaries derived from it may be wrong; whether that explains the failures or
-  the log area is damaged is **未検証**. The `fixes` count and the decoded dates
-  are not used anywhere.
+  usage grew between them (3,228 → 3,260 bytes), so the log was written between
+  the two reads. The GUI then reported `3,292 B`.
+* **The downloads contain no track points.** The block holds the unit's
+  settings / state journal, not position records. The parser takes a 20-byte
+  record from the block header's mask and reads the journal as 135 / 137
+  points, which is why every per-record checksum fails. The same misread
+  reproduces on a log downloaded before the write (2026-11-21, 225,028 bytes;
+  4,481 of 11,088 record checksums failed, and block 1 had none — blocks 0, 2
+  and 3 mix in the journal and lose record sync), so the data does not support
+  "the write damaged the log area". The parser fix is in a separate PR; nothing
+  here moves the post-write timestamp to ✅.
+* **The warning wording is wrong.** The code has no header checksum: the
+  message `N of M blocks failed their header checksum` counts the blocks that
+  contain record-checksum mismatches. A fix is in progress in a separate PR.
+* **The download still cannot be used as evidence of a post-flash timestamp.**
+  The decoded dates are nonsense and are not used anywhere. Whether the unit
+  records track points after the write — with or without a fix — remains
+  **未検証**.
 * The raw dump is not committed: it is the user's track data (`AGENTS.md` §6).
 
 #### The GUI on a real unit (2026-11-22)
@@ -383,12 +412,12 @@ nothing on this page makes the final head verified.
 | Claim | Why it is still open |
 |---|---|
 | The OLED after flashing | never observed; the display was not photographed |
-| The binary log's timestamps after flashing | ⚠️ a post-flash log **was** downloaded on 2026-11-22 (§1.5), but the unit's only block failed its header checksum and every record failed its checksum, so the decoded dates were nonsense; the download therefore does not verify a timestamp. Whether a block that is still being written explains it, or the log area is damaged, is still 未検証 |
+| The binary log's timestamps after flashing | ⚠️ a post-flash log **was** downloaded on 2026-11-22 (§1.5), but it holds only the settings / state journal and no track point; the parser reads the journal as 20-byte records, which is why every record checksum failed, and the decoded dates are nonsense (offline analysis; the parser fix is in a separate PR). The download therefore does not verify a timestamp, and whether the unit records track points after the write — with or without a fix — is still 未検証 |
 | The NMEA date from a live GPS fix after patching | ⚠️ with no fix the unit reported the then-current UTC date on 2026-11-22 (§1.5), but that is a clock value, not a fix-derived one; the patched default with a zero clock is `22-08-99` (epoch `935280000`). No fix was available indoors, so a GPS-derived date after patching is still unobserved |
 | The GUI's Log screen, 追従 render and photo write on a real unit | ⚠️ not exercised. The Connect screen and 「接続して確認」 did run against the unit on 2026-11-22 (§1.5); the Log screen needs a log opened through its keyboard-driven path field (no keyboard could be injected into the X11 window) and the photo write needs a real camera JPEG |
 | `m241 device doctor` against a unit | the command and its tests exist, but no hardware session in §1 ran the port probe, the drop scan or the DA extraction on a unit |
 | `m241 log geotag` on a real camera JPEG | only synthetic JPEGs are written by the tests; no file from a real camera has been geotagged, and a real camera's IFD0 layout has not been read |
-| `m241 nmea proxy` on a live stream | ✅ relayed a live stream from the unit to stdout on 2026-11-22 (§1.5): repaired `$GPRMC` / `$GPGGA` lines were printed, and with the dates already current the `auto` offset applied nothing. The TCP `--bind` relay was not exercised |
+| `m241 nmea proxy` on a live stream | ✅ stdout relay on 2026-11-22 and TCP `--bind` relay on 2026-11-22/23 (§1.5): 9 sentences over `tcp://127.0.0.1:10110`, checksums valid on 9 of 9, date `221126` = 2026-11-22, and `--offset-days 1` corrected it to `231126`. Long runs, multiple clients, a non-loopback bind and a stream carrying a fix are 未検証 |
 | Linux BootROM / firmware dump & flash with a real logger | ✅ measured 2026-11-22 (§1.5): `fw dump`, `fw probe-da`, three `fw flash` runs and their read-backs all ran on Linux over `/dev/ttyUSB0` |
 | macOS with a real logger | ⚠️ never measured: every hardware session in §1 and §1a was Linux over USB; no macOS host was used and the binary was never launched on a Mac |
 | Bluetooth SPP | all hardware work went over USB |
