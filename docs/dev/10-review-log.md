@@ -733,3 +733,65 @@ Stage 1 の 2 レビュアーは `./tools/check.sh` を実行していない（�
 `./tools/check.sh` 6/6（`M241_VENDOR_IMAGE` を設定した状態。実機ポートは開かず、
 `m241-core` と `tools/` は未変更）。
 
+## 2026-11-22 / PR #20 `feat-log-kmz` の Stage 2 修正
+
+対象: `git diff origin/main...2e7468c`（6 ファイル、+764 / −12）。Stage 1 は仕様検収
+（[仕様レビュー](https://github.com/haruki0420/holux-m241-rs/pull/20#issuecomment-7078584766)）と
+可読性（[可読性レビュー](https://github.com/haruki0420/holux-m241-rs/pull/20#issuecomment-7078580687)）を
+別々のレビュアーが並行実施。Stage 2 は別エージェントが担当し、Stage 3 で検証する。
+変更範囲は `crates/m241-cli` と docs のみ（`m241-core` / `m241-flash` / `m241-gui` /
+`Cargo.*` / `tools/` は未変更）。Stage 1 の 2 レビュアーは `./tools/check.sh` を
+実行していない。
+
+### Stage 1 の Must への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| 可読性 M1 / 仕様 S1 | `log kmz` の写真スキップ警告が理由を「gap 超過」と断定し、非 JPEG・撮影時刻なし・EXIF 破損でも誤った次の行動を促す | `GeotagPlan::skipped` の理由をそのまま出す。実体化を `materialize_kmz_photos` に切り出し | `kmz_reports_the_planners_reason_for_a_photo_it_leaves_out` |
+| 仕様 M1 | `log kmz` の `--utc-offset-days` がマッチング前に適用されることが無テスト | `apply_utc_offset` を `geotag::plan` の前に置いたまま、WNRO ずれログ＋実時刻の写真が同梱されることを固定 | `kmz_applies_the_utc_offset_before_matching_photos` |
+| 仕様 M2 | `log edit` が入力ダンプを変更しないことが無テスト | 分割・結合の実行前後で入力（分割元と `--merge` 入力）のバイト列が不変であることを固定 | `edit_does_not_modify_the_input_dump` |
+| 仕様 M3 | merge が時刻なしダンプを最後に置く分岐が無テスト | 時刻あり 2 本＋時刻なし 1 本を join し、JSON の `utc` が `[Some, Some, None]` の順になることを固定（`--merge` 2 回指定も同時に固定） | `edit_merge_puts_a_dump_without_timestamps_last` |
+
+### Should への対応
+
+| # | 指摘 | 対応 |
+|---|---|---|
+| 可読性 S1 / 仕様 S3 | `edit` だけが `ParseReport` を捨て、破損ブロックの警告を出さない | `warn_about_damage` を本体ダンプと各 `--merge` 入力で呼ぶ。merge 入力は複数あり得るので警告に path を付ける |
+| 可読性 S2 | `edit` の `# Errors` が `Error::State`・split の `Error::Log`・sibling の `Error::Safety` を網羅しない | rustdoc に 4 種を明記 |
+| 可読性 S3 | delete のエラーが exclusive 表記（`0..N-1`）で、0 点時に「0 番が有効」と読める | `0..=N-1` の inclusive 表記にし、0 点は「the log has no points」 |
+| 可読性 S4 | `edit` が 44 行で抽象度が混在 | `write_edited` に書き込み＋報告を切り出し、`edit` は操作の選択と実行だけに |
+| 可読性 S5 | `kmz` が 38 行で抽象度が混在 | `plan_kmz_photos` と `materialize_kmz_photos` に切り出し、`kmz` は読み込み→計画→実体化→書き出しの一直線に |
+| 可読性 S6 | 「merge が空だから delete」という暗黙推論 | `LogEdit` enum と `requested_edit` で操作を明示。track index `0` は `FIRST_TRACK` に命名 |
+| 可読性 S7 | モジュール doc 冒頭 2 行がコマンド列挙 | 目的文「Convert, edit and bundle a downloaded track log.」を先頭に |
+| 可読性 S8 | CLI の KMZ doc に外部ビューア未検証の注記が無い | `kmz` の rustdoc に「Google Earth と `unzip` は未実行」を明記（`02-cli.md` は既に明記済み） |
+| 可読性 S9 | `--max-photo-edge` のテストが core のメッセージ文字列に依存 | 見送り（下記「見送った Should と理由」） |
+| 仕様 S2 | `log kmz` に `--tz-offset-minutes` が無く、ローカル時刻カメラでマッチしない | kmz に `--tz-offset-minutes`（既定 0）を追加。カメラ時計に移したコピーでマッチし、アーカイブと写真の時刻は UTC に戻す。`02-cli.md` を追随 |
+| 仕様 S4 | split の派生 2 出力目が既存ファイルを無確認で上書き | `fileio::ensure_free` で両半分を書く前に拒否（exit 5）。`02-cli.md` に「先に削除・改名」を明記 |
+| 仕様 S5 | 負のテスト不足（`edit --utc-offset-days` の exit 2、`--split-at 0`・点数 の exit 1、2 操作の exit 2） | `log_edit_requires_exactly_one_operation` を拡張し、`edit_refuses_a_split_that_would_leave_an_empty_half` を追加 |
+| 仕様 S6 | `12-progress-summary.md` が CLI 15 コマンド・`kmzMaxPhotoEdgeSize` CLI 未接続のまま | 17 コマンド、kmz の CLI 経路・`log edit` を追記。テスト件数を実測値に更新 |
+
+### Could
+
+- 対応: 可読性 C1（`count_label` に統合）、C2（`b"photo/".len()`）、C3（`--merge` の
+  help を「フラグを繰り返す」に）、C4（split 2 本目の書き込み失敗時に「1 本目は
+  書かれた」を stderr に）、C5（kmz の `# Errors` に ZIP32 超過の `Error::Log`）、
+  C7（`second_sibling` に固定）、C8（`edit` が `--utc-offset-days` を受け付けないことを
+  テストで固定）。仕様 C1（`-o` 必須の負テスト）、C2（photos 省略時の実行テスト）、
+  C3（上限以内の byte-for-byte を CLI 経由で）、C4（`GeotagOptions.max_photo_edge_pixels`
+  の冗長設定を削除）、C6（merge の doc 表記）、C7（拡張子なしの `-2` 命名を doc に）、
+  C8（2 操作の exit 2 を直接断言）。
+- 見送り: 仕様 C5（写真の二重読み）は `KmzPhoto` が `jpeg_bytes` を呼び出し側から
+  受け取る crate 契約の帰結で、直すには core API の変更が要る（本ラウンドの変更範囲外）。
+
+### 見送った Should と理由
+
+| # | 指摘 | 理由 |
+|---|---|---|
+| 可読性 S9 | `the_photo_edge_limit_reaches_the_kmz_exporter` が core の文言に結合 | 実際に縮小されることは `m241-core` の `kmz` テスト（縮小・再エンコード・上限以内 byte-for-byte）が固定しており、この CLI テストは「`--max-photo-edge` が exporter に届いた」配線だけを固定する正直なテスト。実 JPEG を encode して CLI 側でも縮小を測るには `image` を `m241-cli` の dev-dependency に足す必要があり、`Cargo.lock` の変更が本ラウンドの変更範囲（`crates/m241-cli` と docs）を超える。上限以内の byte-for-byte は CLI 経由のテストを追加済みで、文言依存はこの 1 本に残る。 |
+| 可読性 C6 | core の split メッセージ「must be 1..{len}」 | `m241-core/src/log/edit.rs` の文言で、本ラウンドは `m241-core` の挙動・文言を変えない条件。CLI 側は split の失敗を exit 1 として固定した。 |
+
+### ゲート
+
+`./tools/check.sh` 6/6（`M241_VENDOR_IMAGE` を設定した状態。実機ポートは開かず、
+`m241-core` / `m241-flash` / `m241-gui` / `Cargo.*` / `tools/` は未変更）。
+

@@ -6,14 +6,14 @@
 //! ```text
 //!   m241 device  ports | info | doctor
 //!   m241 fw      dump  | patch | flash | probe-da | da-restart
-//!   m241 log     info  | download | read | erase | geotag
+//!   m241 log     info  | download | read | edit | erase | geotag | kmz
 //!   m241 nmea    repair | proxy
 //! ```
 //!
 //! Nothing here does any work. The grammar is separate from the handlers so a
 //! test can assert what a command line parses to without opening a port, and so
 //! the handler for one verb is not buried in the middle of the enum that
-//! describes all fifteen.
+//! describes all seventeen.
 //!
 //! Two rules from `docs/reference/02-cli.md` are enforced here rather than in a
 //! handler, because clap can produce the documented exit code 2 for them:
@@ -345,10 +345,14 @@ pub enum LogCommand {
     Download(DownloadOptions),
     /// Convert a dumped track log to GPX, KML, CSV, NMEA or JSON.
     Read(LogReadOptions),
+    /// Split, merge or trim the points of a dumped track log.
+    Edit(LogEditOptions),
     /// Erase the track log on the device (destructive).
     Erase(EraseOptions),
     /// Write capture coordinates into photos' EXIF data.
     Geotag(LogGeotagOptions),
+    /// Bundle a dumped track log and its photos into a KMZ archive.
+    Kmz(LogKmzOptions),
 }
 
 #[derive(Debug, Args)]
@@ -394,6 +398,62 @@ pub struct LogGeotagOptions {
     /// Print one JSON object instead of labelled lines.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct LogKmzOptions {
+    /// The raw dump `m241 log download` wrote.
+    pub log: PathBuf,
+
+    /// Photo files or directories to embed, matched to track points by capture
+    /// time. A directory contributes its immediate regular files.
+    #[arg(value_name = "PHOTOS")]
+    pub photos: Vec<PathBuf>,
+
+    /// Where to write the archive.
+    #[arg(short, long, value_name = "FILE")]
+    pub output: PathBuf,
+
+    /// Largest long edge an embedded photo may keep, in pixels.
+    ///
+    /// A photo over the limit is scaled down and re-encoded, which drops its
+    /// EXIF; one at or under it keeps its exact bytes.
+    #[arg(long, value_parser = parse_photo_edge, value_name = "PIXELS")]
+    pub max_photo_edge: Option<u32>,
+
+    /// Largest accepted difference between photo capture time and track point,
+    /// in seconds. A photo farther away is not embedded.
+    #[arg(
+        long,
+        default_value_t = m241_core::log::geotag::DEFAULT_MAX_GAP_SECONDS,
+        value_name = "SECONDS"
+    )]
+    pub max_gap: u32,
+
+    /// Days to add to every track timestamp, or `auto` to detect a WNRO-shifted log.
+    ///
+    /// Matching photos against a stale log would otherwise never find a point:
+    /// `auto` is what makes a photo from an unpatched unit line up.
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        value_parser = cal::parse_offset,
+        default_value = "auto"
+    )]
+    pub utc_offset_days: OffsetSpec,
+
+    /// Camera clock offset from UTC in minutes (for example `540` for UTC+9)
+    /// when EXIF `DateTimeOriginal` is in local time.
+    ///
+    /// Matching moves a copy of the track into the camera's clock; the archive
+    /// itself stays UTC, including the time recorded for each photo.
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        default_value_t = 0,
+        value_name = "MINUTES"
+    )]
+    pub tz_offset_minutes: i32,
 }
 
 #[derive(Debug, Args)]
@@ -476,6 +536,46 @@ pub struct LogReadOptions {
         default_value = "auto"
     )]
     pub utc_offset_days: OffsetSpec,
+}
+
+/// `m241 log edit`: one pure edit of a dumped track log, then export it.
+///
+/// Exactly one of the three operations must be given. They are exclusive
+/// because each is a single [`m241_core::log::edit::TrackEditor`] operation: a
+/// command line that asked for two would produce a result no single invocation
+/// could describe, and the user could not tell which half failed.
+#[derive(Debug, Args)]
+#[command(group(
+    clap::ArgGroup::new("operation")
+        .required(true)
+        .multiple(false)
+        .args(["split_at", "merge", "delete"])
+))]
+pub struct LogEditOptions {
+    /// The raw dump `m241 log download` wrote.
+    pub log: PathBuf,
+
+    /// Split the log into its first N points and the rest, writing the second
+    /// half to a sibling file with `-2` before its extension (`track-2.gpx`).
+    #[arg(long, value_name = "N")]
+    pub split_at: Option<usize>,
+
+    /// Another log dump to join. Repeat the flag for several dumps; they are
+    /// ordered by their earliest point, not by the order they are listed.
+    #[arg(long, value_name = "FILE")]
+    pub merge: Vec<PathBuf>,
+
+    /// Comma-separated point indices to delete, counted from zero (`3,5,9`).
+    #[arg(long, value_delimiter = ',', value_name = "INDICES")]
+    pub delete: Vec<usize>,
+
+    /// Output format.
+    #[arg(long, value_parser = parse_format, default_value = "gpx")]
+    pub format: ExportFormat,
+
+    /// Where to write the edited track. Required: a split writes two files.
+    #[arg(short, long)]
+    pub output: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]
@@ -563,6 +663,22 @@ fn parse_format(text: &str) -> Result<ExportFormat, String> {
         .ok_or_else(|| format!("{text:?} is not a format; choose gpx, kml, csv, nmea or json"))
 }
 
+/// `--max-photo-edge`: a positive long-edge limit in pixels.
+///
+/// Zero is a usage error rather than "no limit": a user who types it meant a
+/// number, and silently embedding full-size photos would hide the typo.
+fn parse_photo_edge(text: &str) -> Result<u32, String> {
+    let pixels = text
+        .parse::<u32>()
+        .map_err(|_| format!("{text:?} is not a pixel count"))?;
+    if pixels == 0 {
+        return Err(String::from(
+            "--max-photo-edge must be positive; it is a long-edge limit in pixels",
+        ));
+    }
+    Ok(pixels)
+}
+
 /// `--length` for `fw dump`: positive, even (16-bit BootROM reads), and within
 /// the 32-bit BootROM address space from [`BASE_ADDR_FIRMWARE`].
 fn parse_dump_length(text: &str) -> Result<usize, String> {
@@ -615,8 +731,19 @@ mod tests {
             vec!["m241", "log", "info", "track.bin"],
             vec!["m241", "log", "download", "-o", "track.bin"],
             vec!["m241", "log", "read", "track.bin"],
+            vec![
+                "m241",
+                "log",
+                "edit",
+                "track.bin",
+                "--split-at",
+                "2",
+                "-o",
+                "a.gpx",
+            ],
             vec!["m241", "log", "erase", "-o", "track.bin"],
             vec!["m241", "log", "geotag", "track.bin", "photo.jpg"],
+            vec!["m241", "log", "kmz", "track.bin", "-o", "track.kmz"],
             vec!["m241", "nmea", "repair"],
             vec!["m241", "nmea", "proxy"],
         ] {
@@ -1094,6 +1221,203 @@ mod tests {
         ])
         .expect_err("not a number and not auto");
         assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
+    }
+
+    #[test]
+    fn log_kmz_parses_its_documented_flags_and_defaults() {
+        let cli = Cli::try_parse_from(["m241", "log", "kmz", "track.bin", "-o", "track.kmz"])
+            .expect("log kmz without photos");
+        let Command::Log {
+            command: LogCommand::Kmz(kmz),
+        } = cli.command
+        else {
+            panic!("expected log kmz");
+        };
+        assert_eq!(kmz.log, PathBuf::from("track.bin"));
+        assert!(kmz.photos.is_empty(), "the photos are optional");
+        assert_eq!(kmz.output, PathBuf::from("track.kmz"));
+        assert_eq!(
+            kmz.max_photo_edge, None,
+            "no limit embeds the bytes as they are"
+        );
+        assert_eq!(kmz.max_gap, m241_core::log::geotag::DEFAULT_MAX_GAP_SECONDS);
+        assert_eq!(kmz.utc_offset_days, OffsetSpec::Auto);
+        assert_eq!(
+            kmz.tz_offset_minutes, 0,
+            "the camera clock is UTC unless the user says otherwise"
+        );
+
+        let cli = Cli::try_parse_from([
+            "m241",
+            "log",
+            "kmz",
+            "track.bin",
+            "photos",
+            "a.jpg",
+            "-o",
+            "track.kmz",
+            "--max-photo-edge",
+            "1600",
+            "--max-gap",
+            "120",
+            "--utc-offset-days",
+            "7168",
+            "--tz-offset-minutes",
+            "540",
+        ])
+        .expect("log kmz with every flag");
+        let Command::Log {
+            command: LogCommand::Kmz(kmz),
+        } = cli.command
+        else {
+            panic!("expected log kmz");
+        };
+        assert_eq!(
+            kmz.photos,
+            vec![PathBuf::from("photos"), PathBuf::from("a.jpg")]
+        );
+        assert_eq!(kmz.max_photo_edge, Some(1600));
+        assert_eq!(kmz.max_gap, 120);
+        assert_eq!(kmz.utc_offset_days, OffsetSpec::Days(7_168));
+        assert_eq!(kmz.tz_offset_minutes, 540);
+
+        let err = Cli::try_parse_from([
+            "m241",
+            "log",
+            "kmz",
+            "track.bin",
+            "-o",
+            "track.kmz",
+            "--max-photo-edge",
+            "0",
+        ])
+        .expect_err("zero is not a limit");
+        assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
+    }
+
+    #[test]
+    fn log_edit_requires_exactly_one_operation() {
+        // None: the group is required. Two: they conflict. One: it parses, and
+        // each operation carries its own arguments.
+        let err = Cli::try_parse_from(["m241", "log", "edit", "track.bin", "-o", "out.gpx"])
+            .expect_err("no operation");
+        assert!(err.use_stderr(), "got {err}");
+        assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
+
+        let err = Cli::try_parse_from([
+            "m241",
+            "log",
+            "edit",
+            "track.bin",
+            "--split-at",
+            "2",
+            "--delete",
+            "1",
+            "-o",
+            "out.gpx",
+        ])
+        .expect_err("two operations");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert_eq!(
+            crate::exit::exit_code_for_parse_error(&err),
+            2,
+            "two operations are a usage error"
+        );
+
+        // `log edit` works on the timestamps as recorded, so the timer flags
+        // `log read` has are not silently accepted here.
+        let err = Cli::try_parse_from([
+            "m241",
+            "log",
+            "edit",
+            "track.bin",
+            "--split-at",
+            "2",
+            "--utc-offset-days",
+            "-7168",
+            "-o",
+            "out.gpx",
+        ])
+        .expect_err("edit has no --utc-offset-days");
+        assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
+
+        // `-o` is required: a split writes two files, so there is no default.
+        let err = Cli::try_parse_from(["m241", "log", "edit", "track.bin", "--split-at", "2"])
+            .expect_err("edit without -o");
+        assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
+        let err =
+            Cli::try_parse_from(["m241", "log", "kmz", "track.bin"]).expect_err("kmz without -o");
+        assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
+
+        let cli = Cli::try_parse_from([
+            "m241",
+            "log",
+            "edit",
+            "track.bin",
+            "--split-at",
+            "2",
+            "-o",
+            "out.gpx",
+        ])
+        .expect("split");
+        let Command::Log {
+            command: LogCommand::Edit(edit),
+        } = cli.command
+        else {
+            panic!("expected log edit");
+        };
+        assert_eq!(edit.log, PathBuf::from("track.bin"));
+        assert_eq!(edit.split_at, Some(2));
+        assert!(edit.merge.is_empty());
+        assert!(edit.delete.is_empty());
+        assert_eq!(edit.format, ExportFormat::Gpx);
+        assert_eq!(edit.output, PathBuf::from("out.gpx"));
+
+        let cli = Cli::try_parse_from([
+            "m241",
+            "log",
+            "edit",
+            "track.bin",
+            "--merge",
+            "a.bin",
+            "--merge",
+            "b.bin",
+            "--format",
+            "csv",
+            "-o",
+            "out.csv",
+        ])
+        .expect("merge");
+        let Command::Log {
+            command: LogCommand::Edit(edit),
+        } = cli.command
+        else {
+            panic!("expected log edit");
+        };
+        assert_eq!(
+            edit.merge,
+            vec![PathBuf::from("a.bin"), PathBuf::from("b.bin")]
+        );
+        assert_eq!(edit.format, ExportFormat::Csv);
+
+        let cli = Cli::try_parse_from([
+            "m241",
+            "log",
+            "edit",
+            "track.bin",
+            "--delete",
+            "3,5,9",
+            "-o",
+            "out.csv",
+        ])
+        .expect("delete");
+        let Command::Log {
+            command: LogCommand::Edit(edit),
+        } = cli.command
+        else {
+            panic!("expected log edit");
+        };
+        assert_eq!(edit.delete, vec![3, 5, 9]);
     }
 
     #[test]

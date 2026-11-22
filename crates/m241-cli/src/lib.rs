@@ -14,7 +14,7 @@
 //!   cal      civil dates, so the offset flags need no date library
 //!   device   ports, info, doctor
 //!   fw       dump, patch and flash
-//!   logcmd   download, info, read, erase, geotag
+//!   logcmd   download, info, read, edit, erase, geotag, kmz
 //!   nmea     repair and proxy
 //! ```
 //!
@@ -156,7 +156,7 @@ pub(crate) trait Confirm: std::fmt::Debug {
 /// Everything a command needs from the outside world.
 ///
 /// One struct rather than four parameters: every handler takes it, so adding a
-/// seam later does not touch fifteen signatures. `Debug` is written by hand
+/// seam later does not touch seventeen signatures. `Debug` is written by hand
 /// because the traits it holds are object-safe seams: deriving would put a
 /// `Debug` bound on every implementation, and a test double has nothing useful
 /// to print.
@@ -284,8 +284,10 @@ pub(crate) fn run_with(
             LogCommand::Info(options) => logcmd::info(&options, session)?,
             LogCommand::Download(options) => logcmd::download(&options, session)?,
             LogCommand::Read(options) => logcmd::read(&options, session)?,
+            LogCommand::Edit(options) => logcmd::edit(&options, session)?,
             LogCommand::Erase(options) => logcmd::erase(&options, session)?,
             LogCommand::Geotag(options) => logcmd::geotag(&options, session)?,
+            LogCommand::Kmz(options) => logcmd::kmz(&options, session)?,
         },
         Command::Nmea { command } => match command {
             NmeaCommand::Repair(options) => nmea::repair(&options, session)?,

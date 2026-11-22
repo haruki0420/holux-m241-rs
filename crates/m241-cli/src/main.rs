@@ -7,7 +7,7 @@
 //! ```text
 //!   m241 device  ports | info | doctor
 //!   m241 fw      dump  | patch | flash
-//!   m241 log     info  | download | read | erase | geotag
+//!   m241 log     info  | download | read | edit | erase | geotag | kmz
 //!   m241 nmea    repair | proxy
 //! ```
 

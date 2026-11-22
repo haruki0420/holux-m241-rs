@@ -31,14 +31,14 @@
 
 ---
 
-## 2. 現在の到達点（PR #12 時点）
+## 2. 現在の到達点（PR #20 時点）
 
 ### 数字とゲート
 
 | 項目 | 値 |
 |---|---|
 | クレート構成 | 4 クレート（`m241-core` 読取専用 / `m241-flash` 書込専用 / `m241-cli` / `m241-gui`） |
-| テスト | **709 件全緑**（`cargo test --workspace`） |
+| テスト | **767 件全緑**（`cargo test --workspace`、PR #20 修正時点の実測） |
 | ゲート | **6/6 PASS**（`./tools/check.sh`: fmt / clippy / test / docs / design / safety） |
 | CI | Linux / Windows / macOS |
 | **実機検証** | 読み取り・`log erase`（[`05-verification.md`](05-verification.md) §1a）に加え、2026-11-22 の書き込みセッション（同 §1.5）で `fw dump` / `fw probe-da` / `fw flash --recover` / `fw patch` / strict 書き込みが実機で通り、**2 回の書き込み（recovery と strict）が全長読み戻し一致**。`fw flash --allow-vendor` は書込み自体は完了したが、起動したファームが個体データ 4 バイトを復元するため読み戻しが `0x5C` で不一致（設計課題）。残りはパッチ済み V1.14 の起動確認と GUI の実機検証 |
@@ -51,7 +51,7 @@
 | **ezTour 仕様化** | 完了（`docs/dev/07-eztour-spec.ja.md` 615 行、クリーンルーム仕様） |
 | **読み書き分離 + safety ゲート** | 完了（`m241-core` / `m241-flash` 分離、`tools/check_safety.py` + 配線・検出力テスト 19 件） |
 | **コア読み取り・変換・EXIF/ジオタグ基盤** | 完了（PMTK / BootROM / ログ解析 / GPX・KML・CSV・NMEA・JSON 出力 / パッチ計画 / 自前 EXIF・geotag） |
-| **CLI 15 コマンド** | 完了（`device ports` / `info` / `doctor`、`fw dump` / `patch` / `flash` / `probe-da` / `da-restart`、`log info` / `download` / `read` / `erase` / `geotag`、`nmea repair` / `proxy`。`fw flash` は 2026-11-22 に実機で書き込み・読み戻しまで通った（[`05-verification.md`](05-verification.md) §1.5）。`log erase` は PR #12 で配線済み、実機記録は同 §1a。スタブは残っていない） |
+| **CLI 17 コマンド** | 完了（`device ports` / `info` / `doctor`、`fw dump` / `patch` / `flash` / `probe-da` / `da-restart`、`log info` / `download` / `read` / `edit` / `erase` / `geotag` / `kmz`、`nmea repair` / `proxy`。`fw flash` は 2026-11-22 に実機で書き込み・読み戻しまで通った（[`05-verification.md`](05-verification.md) §1.5）。`log erase` は PR #12 で配線済み、実機記録は同 §1a。`log edit` / `log kmz` は PR #20 で追加。スタブは残っていない） |
 | **GUI 4 画面（実データ接続・再生・写真同期）** | 完了（接続 / ログ / ファーム / 設定。実ポート probe・実ログ読込・再生・写真同期・POI・始点終点・設定反映。132 テスト。実機未検証） |
 
 - **2026-11-21 のマージ**: review-gate (#2)、CLI 非破壊 3 コマンド (#3)、GUI 実データ接続 (#4)、
@@ -72,10 +72,10 @@
 
 | 優先度 | 機能 | 現状と不足 |
 |---|---|---|
-| **P0** | **KMZ 書き出し** | マージ済み（PR #5）。写真同梱（`photo/`）＋ zip 化（Store）＋ 色/幅＋ `<Point>`／`<TimeStamp>`、**長辺縮小（`kmzMaxPhotoEdgeSize`）** を実装。`KmzPhoto::max_edge_pixels` が `Some(limit)` で長辺が `limit` を超える写真だけ JPEG を復号し、アスペクト比を保って長辺 = `limit` に縮小（Lanczos3）、JPEG 品質 85 で再符号化する。上限以内と `None` の写真は**元のバイト列のまま**。縮小した写真は **EXIF を保持しない**（`image` の JPEG エンコーダは APP1 を書かない）。上限超過で復号できないバイト列は `Error::State`（写真名と理由つき）。依存は `image` の `jpeg` feature のみ。**残る未実装**: spec §6.3 の `icon/` サムネイル、`kmzMaxPhotoEdgeSize` を CLI/GUI から渡す経路（crate API のみ）。実写真での縮小結果・EXIF Orientation 付き写真の向きは**未検証** |
+| **P0** | **KMZ 書き出し** | マージ済み（PR #5 / #20）。写真同梱（`photo/`）＋ zip 化（Store）＋ 色/幅＋ `<Point>`／`<TimeStamp>`、**長辺縮小（`kmzMaxPhotoEdgeSize`）** を実装。`KmzPhoto::max_edge_pixels` が `Some(limit)` で長辺が `limit` を超える写真だけ JPEG を復号し、アスペクト比を保って長辺 = `limit` に縮小（Lanczos3）、JPEG 品質 85 で再符号化する。上限以内と `None` の写真は**元のバイト列のまま**。縮小した写真は **EXIF を保持しない**（`image` の JPEG エンコーダは APP1 を書かない）。上限超過で復号できないバイト列は `Error::State`（写真名と理由つき）。依存は `image` の `jpeg` feature のみ。CLI 経路は PR #20 で接続済み（`log kmz --max-photo-edge` / `--utc-offset-days` / `--tz-offset-minutes` / `--max-gap`）。**残る未実装**: spec §6.3 の `icon/` サムネイル、GUI から縮小上限を渡す経路。実写真での縮小結果・EXIF Orientation 付き写真の向き、Google Earth / `unzip` での開封は**未検証** |
 | **P0** | **GUI の実データ接続・地図体験** | マージ済み（PR #4）。実ポート probe・実ログ読込・全点 fit・追従（zoom ≥ 12）・再生・写真同期・POI・始点終点を実装。**未検証**: 実ポート probe、追従の実描画、GUI 経由の実 JPEG 書き込み。スライダーのキーボード / accesskit 操作は未対応（見送り理由を記録済み） |
 | **P1** | **写真ジオタグ拡充** | `exif.rs` / `geotag.rs` に実装済み: `GPSVersionID`・`_original` バックアップ・距離グループ化（推移的／順序非依存）・時刻シフト後の再マッチング（`plan_with_shift` で再計画、`apply` が `DateTimeOriginal` を書き換え、次回はシフト無しで一致）。CLI は `log geotag`（dry-run / `--tz-offset-minutes` / シフト / バックアップ）、GUI は写真同期と書き込み確認まで実装済み。未実装: 日/時/分/秒の個別シフトと `byCamera`/`selPhotos`/`allPhotos` の適用範囲、非 JPEG（動画）の「紐づけのみ」。実カメラ JPEG への書き込みは**未検証** |
-| **P1** | **トラック編集** | 分割（Split）・結合（Merge）・点削除・Undo/Redo は `edit.rs` に実装済み（PR #5）。GUI の操作体系（範囲選択）は未着手 |
+| **P1** | **トラック編集** | 分割（Split）・結合（Merge）・点削除・Undo/Redo は `edit.rs` に実装済み（PR #5）。CLI 経路は PR #20 で追加（`log edit --split-at` / `--merge` / `--delete`）。GUI の操作体系（範囲選択）は未着手 |
 | **P2** | **互換・移行機能** | GPX 1.0/1.1 読込（`<wpt>` は読まない）・NMEA 読込→トラック化・座標形式切替（度分秒 / 10 進度 / UTM）は実装済み（PR #5）。CSV 列の ezTour 互換確認・プロジェクト保存が未着手。NMEA 読込は落ちた行数を返さない（doc に明記） |
 
 ### 3.3 実機検証の到達点
@@ -105,7 +105,7 @@
 
 ```bash
 ./tools/check.sh              # 6 ゲート（fmt / clippy / test / docs / design / safety）
-cargo test --workspace        # 全テスト（現在 602 件）
+cargo test --workspace        # 全テスト（現在 767 件）
 cargo build --release
 cargo run -q -p m241-gui -- --screenshot
 ```
