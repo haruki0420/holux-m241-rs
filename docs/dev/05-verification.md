@@ -189,7 +189,7 @@ comparison is skipped; checking only the M-241 vector and family markers`).
 | recovery write | `m241 fw flash --recover` (the unit's own dump) | 1589 packets, `verified: 406620 bytes read back and identical` | ✅ |
 | patch | `m241 fw patch` on a fresh V1.13 dump | 3 bytes changed (`0x402F6`, `0x402F7`, `0x59C2C`), epoch `935280000`, marker V1.14 | ✅ |
 | patched write | `m241 fw flash --yes` (patched image, backup = the fresh dump) | 1589 packets, `verified: 406620 bytes read back and identical` | ✅ |
-| boot of V1.14 | not run: the unit was left in the BootROM by the read-back | — | ⚠️ |
+| boot of V1.14 | `device info` answered; the NMEA default date was `22-08-99` (1999-08-22, the patched epoch `935280000`; unpatched would be `06-01-80`) | ✅ |
 
 The raw command output quoted on this page was captured in the session that ran
 the commands and is not committed here: the captures are device transcripts and
@@ -205,11 +205,17 @@ verbatim; each is the line the client printed.
   `fw patch` was run on the fresh V1.13 dump, so the patched image carries the
   unit's current per-unit bytes; the strict write compared it with that dump and
   only the three patch bytes differ.
-* **未検証: the boot of V1.14.** The patched image was written and read back
-  identical, but the unit was still in the BootROM when attention moved on, so
-  nothing here shows that the patched firmware boots or that the date is
-  corrected. It has to be checked before any row above is read as "the WNRO fix
-  runs on a unit".
+* **The patched firmware boots, and the running firmware carries the patched
+  epoch.** After the strict write the unit was power-cycled by the user and the
+  client answered: `device info` returned `B-core_1.20` / `0043` /
+  `01017-00F`, and the NMEA stream reported the default date `22-08-99`
+  (1999-08-22) — the value the patched constant `935280000` produces when there
+  is no fix. The stock image reported `06-01-80` in the same room, so this is a
+  measured difference between the two images, not a guess from the write.
+* **未検証: the date with a real fix.** With no satellites indoors the unit
+  reports its default time, not a GPS-derived one; that a live fix now produces
+  today's date has not been observed. Recording a track and reading it back with
+  the WNRO-corrected timestamp is the next step, and it needs sky, not a cable.
 
 #### The vendor write completes but the read-back differs at `0x5C`
 
@@ -272,6 +278,7 @@ nothing on this page makes the final head verified.
 |---|---|
 | The OLED after flashing | never observed; the display was not photographed |
 | The binary log's timestamps after flashing | inferred from the shared NMEA conversion path; no post-flash log was downloaded |
+| The NMEA date from a live GPS fix after patching | 2026-11-22 (§1.5) showed the patched default date `22-08-99` (epoch `935280000`) with no fix; no fix was available indoors, so a GPS-derived date after patching has not been observed |
 | Linux BootROM / firmware dump & flash with a real logger | ✅ measured 2026-11-22 (§1.5): `fw dump`, `fw probe-da`, three `fw flash` runs and their read-backs all ran on Linux over `/dev/ttyUSB0` |
 | macOS with a real logger | same |
 | Bluetooth SPP | all hardware work went over USB |
