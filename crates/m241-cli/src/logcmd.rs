@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 use m241_core::log::edit::TrackEditor;
-use m241_core::log::geotag::{self, CaptureTime, GeotagOptions, GeotagPlan};
+use m241_core::log::geotag::{self, CaptureTime, GeotagOptions, GeotagPlan, PhotoTimeShift};
 use m241_core::log::kmz::{KmzPhoto, export_kmz};
 use m241_core::log::{ParseReport, export, parse_dump};
 use m241_core::protocol::PmtkClient;
@@ -27,7 +27,7 @@ use crate::Session;
 use crate::cal::OffsetSpec;
 use crate::cli::{
     DownloadOptions, EraseOptions, LogEditOptions, LogGeotagOptions, LogInfoOptions, LogKmzOptions,
-    LogReadOptions,
+    LogReadOptions, ShiftScopeArg,
 };
 use crate::fileio;
 use crate::link;
@@ -725,10 +725,26 @@ fn parse_document(report: &ParseReport) -> serde_json::Value {
 
 /// Match photos to track points by capture time and write GPS EXIF tags.
 ///
+/// The four `--shift-*` values move the clock of the photos `--scope` selects
+/// and re-match them. Every photo is still planned: one outside the scope keeps
+/// its clock and is tagged at its unshifted time, the contract
+/// [`geotag::plan_with_time_shift`] implements.
+///
+/// For a photo whose capture time came from `DateTimeOriginal`,
+/// [`geotag::apply`] writes the shifted value into that tag, so a later run needs
+/// no shift. A photo whose time came from the file's modification time is the
+/// exception: `apply` deliberately does not stamp a guess into the EXIF, and the
+/// rewrite moves the mtime as well, so the same `--shift-*` values have to be
+/// given again. The run warns about such a photo instead of leaving the
+/// difference to be discovered.
+///
 /// # Errors
 ///
 /// * [`Error::Io`] when `<LOG>`, a directory, or a photo cannot be read or replaced;
-/// * [`Error::Log`] when `<LOG>` is not a valid M-241 dump.
+/// * [`Error::Log`] when `<LOG>` is not a valid M-241 dump;
+/// * [`Error::State`] when the four `--shift-*` values do not add up to a number
+///   of seconds `i64` can hold, or when `--scope selected` names photos and none
+///   of them is one the command planned.
 pub fn geotag(options: &LogGeotagOptions, session: Session<'_>) -> Result<()> {
     let bytes = fileio::read(&options.log)?;
     let (mut track, report) = parse_dump(&bytes)?;
@@ -737,6 +753,42 @@ pub fn geotag(options: &LogGeotagOptions, session: Session<'_>) -> Result<()> {
 
     let offset_days = apply_utc_offset(&mut track, options.utc_offset_days, session.console);
     let photo_paths = expand_photo_inputs(&options.photos)?;
+
+    // The grammar owns which flag belongs to which scope; report what it says
+    // rather than keeping a second copy of that table here.
+    for (flag, needed) in options.flags_for_other_scopes() {
+        session.console.warn(&format!(
+            "{flag} is only read with --scope {}; it is ignored here",
+            needed.label()
+        ));
+    }
+    let shift = options.photo_time_shift();
+    let shift_seconds = shift.total_seconds();
+    let scope = options.photo_shift_scope();
+
+    // A `--photo` that matches no planned path is a typo, not a selection: the
+    // comparison is exact against the expanded paths, so shifting nothing would
+    // otherwise look like success.
+    if options.scope == ShiftScopeArg::Selected
+        && !options
+            .photo
+            .iter()
+            .any(|selection| photo_paths.contains(selection))
+    {
+        let mut shown: Vec<String> = photo_paths
+            .iter()
+            .take(2)
+            .map(|path| path.display().to_string())
+            .collect();
+        if shown.is_empty() {
+            shown.push(String::from("the photo list is empty"));
+        }
+        return Err(Error::State(format!(
+            "--photo matched none of the photos in <PHOTOS>; it is compared with the expanded \
+             paths (a directory contributes <DIR>/<NAME>), and <PHOTOS> expanded to: {}",
+            shown.join(", ")
+        )));
+    }
 
     // The camera's clock, not the log's. `DateTimeOriginal` is written from the
     // camera's local time, so a camera set to UTC+9 records a capture nine hours
@@ -757,13 +809,36 @@ pub fn geotag(options: &LogGeotagOptions, session: Session<'_>) -> Result<()> {
         max_gap_seconds: options.max_gap,
         ..GeotagOptions::default()
     };
-    let mut plans = geotag::plan(&photo_paths, &matching_track, &geotag_options)?;
+    // One path for both cases: an all-photos, zero-second shift is exactly
+    // what `plan` does.
+    let mut plans = geotag::plan_with_time_shift(
+        &photo_paths,
+        &matching_track,
+        &geotag_options,
+        shift,
+        &scope,
+    )?;
     if tz_delta_seconds != 0 {
         for plan in &mut plans {
             if let Some(point) = &mut plan.point {
                 point.utc = point
                     .utc
                     .map(|utc| shift_timestamp_seconds(utc, -tz_delta_seconds));
+            }
+        }
+    }
+
+    // A file-time capture is never written: the shift moves only this run's
+    // match, and the rewrite moves the mtime too, so the next run has to be
+    // told about the shift again. Say it rather than only documenting it.
+    if shift_seconds.is_some_and(|seconds| seconds != 0) {
+        for plan in &plans {
+            if matches!(plan.capture_time, Some(CaptureTime::FileModified(_))) {
+                session.console.warn(&format!(
+                    "{}: the capture time comes from the file's modification time; the shift is \
+                     not written into the photo, so give the same --shift-* again next time",
+                    plan.photo.display()
+                ));
             }
         }
     }
@@ -785,6 +860,7 @@ pub fn geotag(options: &LogGeotagOptions, session: Session<'_>) -> Result<()> {
         return session.console.json(&geotag_document(
             options,
             offset_days,
+            shift,
             &plans,
             matched_count,
             written_count,
@@ -795,14 +871,18 @@ pub fn geotag(options: &LogGeotagOptions, session: Session<'_>) -> Result<()> {
     for plan in &plans {
         if let Some(point) = &plan.point {
             let action = if options.dry_run { "plan" } else { "tag" };
+            // The capture time is printed as well as the matched point's: with a
+            // shift in play they differ, and the dry run is where the user checks
+            // that the shifted clock is the one that found the point.
             session.console.result(&format!(
-                "{:<8}: {} -> {:.6}, {:.6} ({}, gap {} s)",
+                "{:<8}: {} -> {:.6}, {:.6} ({}, gap {} s, capture {})",
                 action,
                 plan.photo.display(),
                 point.latitude.unwrap_or(0.0),
                 point.longitude.unwrap_or(0.0),
                 timestamp(point.utc),
                 plan.gap_seconds.unwrap_or(0),
+                timestamp(plan.capture_time.map(CaptureTime::utc)),
             ));
         } else {
             let reason = plan.skipped.as_deref().unwrap_or("skipped");
@@ -816,6 +896,16 @@ pub fn geotag(options: &LogGeotagOptions, session: Session<'_>) -> Result<()> {
     session
         .console
         .result(&format!("{:<8}: {offset_days}", "offset"));
+    // The line names the request, not the outcome: how many photos moved is what
+    // `matched` and `written` report, and a scope that selected nothing still
+    // shows up there rather than being implied by a shift line.
+    if let Some(shift_seconds) = shift_seconds.filter(|&seconds| seconds != 0) {
+        session.console.result(&format!(
+            "{:<8}: {shift_seconds} s requested ({})",
+            "shift",
+            options.scope.label()
+        ));
+    }
     session
         .console
         .result(&format!("{:<8}: {matched_count}", "matched"));
@@ -890,6 +980,7 @@ fn shift_timestamp_seconds(utc: u32, delta_seconds: i64) -> u32 {
 fn geotag_document(
     options: &LogGeotagOptions,
     offset_days: i32,
+    shift: PhotoTimeShift,
     plans: &[GeotagPlan],
     matched_count: usize,
     written_count: usize,
@@ -935,6 +1026,8 @@ fn geotag_document(
         "dry_run": options.dry_run,
         "offset_days": offset_days,
         "tz_offset_minutes": options.tz_offset_minutes,
+        "shift_seconds": shift.total_seconds(),
+        "shift_scope": options.scope.label(),
         "max_gap_seconds": options.max_gap,
         "matched": matched_count,
         "written": written_count,
@@ -999,6 +1092,26 @@ mod tests {
         let path = scratch.join(name);
         fileio::write(&path, &synthetic_dump(points)).expect("write dump");
         path
+    }
+
+    /// `log geotag` options with every flag at its documented default, for the
+    /// tests to override only the ones they are about.
+    fn geotag_options(log: PathBuf, photos: Vec<PathBuf>) -> LogGeotagOptions {
+        // Parsed, not copied: the defaults in `cli.rs` stay the one definition of
+        // "documented default", so a change there reaches these tests.
+        use clap::Parser as _;
+
+        let cli = crate::Cli::try_parse_from(["m241", "log", "geotag", "track.bin", "a.jpg"])
+            .expect("the documented geotag defaults parse");
+        let crate::Command::Log {
+            command: crate::cli::LogCommand::Geotag(mut options),
+        } = cli.command
+        else {
+            panic!("expected log geotag");
+        };
+        options.log = log;
+        options.photos = photos;
+        options
     }
 
     /// A session whose `FakeDevice` replies land without waiting out a timeout.
@@ -2184,41 +2297,114 @@ mod tests {
 
     /// Build a minimal valid JPEG containing an APP1 Exif block with `DateTimeOriginal`.
     fn synthetic_jpeg_with_datetime(datetime: &str) -> Vec<u8> {
+        synthetic_jpeg_exif(datetime, None)
+    }
+
+    /// Build a JPEG whose IFD0 names `make` and `model` as a camera does and
+    /// whose Exif sub-IFD carries `DateTimeOriginal`.
+    fn synthetic_jpeg_with_camera(datetime: &str, make: &str, model: &str) -> Vec<u8> {
+        synthetic_jpeg_exif(datetime, Some((make, model)))
+    }
+
+    /// The one Exif JPEG builder: `DateTimeOriginal` always, the IFD0 camera
+    /// tags when `camera` is given.
+    ///
+    /// Laid out the way a camera writes it — IFD0 entries in ascending tag
+    /// order and the strings that do not fit inline in a value area after the
+    /// last IFD — so these tests exercise the reader's offset handling.
+    fn synthetic_jpeg_exif(datetime: &str, camera: Option<(&str, &str)>) -> Vec<u8> {
+        const TYPE_ASCII: u16 = 2;
+        const TYPE_LONG: u16 = 4;
+        const TAG_MAKE: u16 = 0x010F;
+        const TAG_MODEL: u16 = 0x0110;
+        const TAG_EXIF_POINTER: u16 = 0x8769;
+        const TAG_DATE_TIME_ORIGINAL: u16 = 0x9003;
+
+        fn ascii(text: &str) -> Vec<u8> {
+            let mut bytes = text.as_bytes().to_vec();
+            bytes.push(0);
+            bytes
+        }
+
+        fn push_entry(out: &mut Vec<u8>, tag: u16, field_type: u16, count: u32, field: u32) {
+            out.extend_from_slice(&tag.to_le_bytes());
+            out.extend_from_slice(&field_type.to_le_bytes());
+            out.extend_from_slice(&count.to_le_bytes());
+            out.extend_from_slice(&field.to_le_bytes());
+        }
+
+        let datetime_bytes = ascii(datetime);
+        let make_bytes = camera.map(|(make, _)| ascii(make));
+        let model_bytes = camera.map(|(_, model)| ascii(model));
+
+        // Header (8) + IFD0 (1 or 3 entries) + Exif IFD (1 entry), then a
+        // 4-aligned value area holding the strings.
+        let ifd0_count = if camera.is_some() { 3usize } else { 1 };
+        let ifd0_offset = 8usize;
+        let exif_ifd_offset = ifd0_offset + 2 + 12 * ifd0_count + 4;
+        let value_area = (exif_ifd_offset + 2 + 12 + 4 + 3) & !3;
+        let datetime_at = value_area;
+        let make_at = datetime_at + datetime_bytes.len();
+        let model_at = make_at + make_bytes.as_ref().map_or(0, Vec::len);
+
         let mut tiff = Vec::new();
-        // Little-endian TIFF header: "II", 42, IFD0 at offset 8.
         tiff.extend_from_slice(b"II");
         tiff.extend_from_slice(&42u16.to_le_bytes());
-        tiff.extend_from_slice(&8u32.to_le_bytes());
+        tiff.extend_from_slice(&(ifd0_offset as u32).to_le_bytes());
 
-        // IFD0 at offset 8: 1 entry (ExifIFDPointer), next IFD = 0.
-        // IFD0 size = 2 + 12 + 4 = 18 bytes -> ends at offset 26.
-        let exif_ifd_offset = 26u32;
-        tiff.extend_from_slice(&1u16.to_le_bytes());
-        tiff.extend_from_slice(&0x8769u16.to_le_bytes()); // EXIF_IFD_POINTER
-        tiff.extend_from_slice(&4u16.to_le_bytes()); // LONG
-        tiff.extend_from_slice(&1u32.to_le_bytes());
-        tiff.extend_from_slice(&exif_ifd_offset.to_le_bytes());
+        tiff.extend_from_slice(&(ifd0_count as u16).to_le_bytes());
+        if let (Some(make_bytes), Some(model_bytes)) = (&make_bytes, &model_bytes) {
+            push_entry(
+                &mut tiff,
+                TAG_MAKE,
+                TYPE_ASCII,
+                make_bytes.len() as u32,
+                make_at as u32,
+            );
+            push_entry(
+                &mut tiff,
+                TAG_MODEL,
+                TYPE_ASCII,
+                model_bytes.len() as u32,
+                model_at as u32,
+            );
+        }
+        push_entry(
+            &mut tiff,
+            TAG_EXIF_POINTER,
+            TYPE_LONG,
+            1,
+            exif_ifd_offset as u32,
+        );
         tiff.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            tiff.len(),
+            exif_ifd_offset,
+            "the IFD0 offset was miscounted"
+        );
 
-        // Exif SubIFD at offset 26: 1 entry (DateTimeOriginal), next IFD = 0.
-        // SubIFD size = 2 + 12 + 4 = 18 bytes -> ends at offset 44.
-        let mut dt_bytes = datetime.as_bytes().to_vec();
-        dt_bytes.push(0);
-        let value_offset = 44u32;
         tiff.extend_from_slice(&1u16.to_le_bytes());
-        tiff.extend_from_slice(&0x9003u16.to_le_bytes()); // DATE_TIME_ORIGINAL
-        tiff.extend_from_slice(&2u16.to_le_bytes()); // ASCII
-        tiff.extend_from_slice(&(dt_bytes.len() as u32).to_le_bytes());
-        tiff.extend_from_slice(&value_offset.to_le_bytes());
+        push_entry(
+            &mut tiff,
+            TAG_DATE_TIME_ORIGINAL,
+            TYPE_ASCII,
+            datetime_bytes.len() as u32,
+            datetime_at as u32,
+        );
         tiff.extend_from_slice(&0u32.to_le_bytes());
-        tiff.extend_from_slice(&dt_bytes);
+        while tiff.len() < value_area {
+            tiff.push(0);
+        }
+        tiff.extend_from_slice(&datetime_bytes);
+        if let (Some(make_bytes), Some(model_bytes)) = (&make_bytes, &model_bytes) {
+            tiff.extend_from_slice(make_bytes);
+            tiff.extend_from_slice(model_bytes);
+        }
 
         let mut app1 = Vec::from(b"Exif\0\0".as_slice());
         app1.extend_from_slice(&tiff);
-        let app1_len = (app1.len() + 2) as u16;
-
         let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xE1];
-        jpeg.extend_from_slice(&app1_len.to_be_bytes());
+        jpeg.extend_from_slice(&((app1.len() + 2) as u16).to_be_bytes());
         jpeg.extend_from_slice(&app1);
         jpeg.extend_from_slice(&[0xFF, 0xD9]);
         jpeg
@@ -2234,6 +2420,37 @@ mod tests {
             (secs % 3_600) / 60,
             secs % 60
         )
+    }
+
+    /// The `DateTimeOriginal` a photo file carries, as EXIF's `YYYY:MM:DD HH:MM:SS`.
+    fn photo_datetime(path: &Path) -> String {
+        let bytes = fileio::read(path).expect("photo bytes");
+        let utc = m241_core::log::exif::read_datetime_original(&bytes)
+            .expect("parse exif")
+            .expect("a capture time");
+        format_exif_utc(utc)
+    }
+
+    /// A JPEG with no Exif at all, so its capture time has to come from the
+    /// file's modification time. SOI, one quantisation table, EOI.
+    fn synthetic_jpeg_without_exif() -> Vec<u8> {
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x43, 0x00];
+        jpeg.extend(std::iter::repeat_n(0x10u8, 64));
+        jpeg.extend_from_slice(&[0xFF, 0xD9]);
+        jpeg
+    }
+
+    /// Make `photo`'s modification time `utc`, the clock a photo with no
+    /// `DateTimeOriginal` falls back on.
+    fn set_photo_mtime(photo: &Path, utc: u32) {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(photo)
+            .expect("open the photo to set its mtime")
+            .set_modified(UNIX_EPOCH + Duration::from_secs(u64::from(utc)))
+            .expect("set the photo's mtime");
     }
 
     #[test]
@@ -2256,13 +2473,9 @@ mod tests {
         let dry_console = RecordingConsole::default();
         geotag(
             &LogGeotagOptions {
-                log: log_path.clone(),
-                photos: vec![photo_path.clone()],
-                max_gap: 300,
-                utc_offset_days: OffsetSpec::Auto,
-                tz_offset_minutes: 0,
                 dry_run: true,
                 json: true,
+                ..geotag_options(log_path.clone(), vec![photo_path.clone()])
             },
             Session::new(&links, &dry_console, &confirm),
         )
@@ -2283,15 +2496,7 @@ mod tests {
         // Real run writes GPS EXIF tags verified by exif::read_gps.
         let apply_console = RecordingConsole::default();
         geotag(
-            &LogGeotagOptions {
-                log: log_path,
-                photos: vec![photo_path.clone()],
-                max_gap: 300,
-                utc_offset_days: OffsetSpec::Auto,
-                tz_offset_minutes: 0,
-                dry_run: false,
-                json: false,
-            },
+            &geotag_options(log_path, vec![photo_path.clone()]),
             Session::new(&links, &apply_console, &confirm),
         )
         .expect("apply geotag");
@@ -2346,13 +2551,10 @@ mod tests {
         let confirm = AutoConfirm;
         geotag(
             &LogGeotagOptions {
-                log: log_path,
-                photos: vec![photos_dir],
-                max_gap: 300,
                 utc_offset_days: OffsetSpec::Days(0),
                 tz_offset_minutes: 540,
-                dry_run: false,
                 json: true,
+                ..geotag_options(log_path, vec![photos_dir])
             },
             Session::new(&links, &console, &confirm),
         )
@@ -2393,6 +2595,500 @@ mod tests {
             .expect("exif present without gps");
         assert_eq!(nested_gps.latitude, None);
         assert_eq!(nested_gps.longitude, None);
+    }
+
+    #[test]
+    fn a_selected_scope_shift_moves_only_the_named_photos_clock() {
+        let scratch = Scratch::new("geotag-selected");
+        let track_utc = 1_700_000_000u32;
+        // The chosen photo is moved onto the second track point, so both
+        // photos still find a point inside the gap after the shift.
+        let shifted_utc = track_utc + 3_600;
+        let log_path = scratch.join("track.bin");
+        fileio::write(&log_path, &dump_with_timestamps(&[track_utc, shifted_utc]))
+            .expect("write dump");
+
+        let chosen = scratch.join("chosen.jpg");
+        let chosen_bytes = synthetic_jpeg_with_datetime(&format_exif_utc(track_utc));
+        fileio::write(&chosen, &chosen_bytes).expect("write chosen photo");
+        let other = scratch.join("other.jpg");
+        let other_bytes = synthetic_jpeg_with_datetime(&format_exif_utc(track_utc));
+        fileio::write(&other, &other_bytes).expect("write other photo");
+
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+
+        // The dry run reports the shifted capture time and writes nothing.
+        let dry_console = RecordingConsole::default();
+        geotag(
+            &LogGeotagOptions {
+                scope: ShiftScopeArg::Selected,
+                photo: vec![chosen.clone()],
+                shift_hours: 1,
+                dry_run: true,
+                json: true,
+                ..geotag_options(log_path.clone(), vec![chosen.clone(), other.clone()])
+            },
+            Session::new(&links, &dry_console, &confirm),
+        )
+        .expect("dry run of a selected shift");
+        assert_eq!(
+            fileio::read(&chosen).expect("chosen photo"),
+            chosen_bytes,
+            "a dry run must not touch the selected photo"
+        );
+        assert_eq!(
+            fileio::read(&other).expect("other photo"),
+            other_bytes,
+            "a dry run must not touch an out-of-scope photo either"
+        );
+        let dry_doc: serde_json::Value =
+            serde_json::from_str(&dry_console.stdout()).expect("one JSON object");
+        assert_eq!(dry_doc["shift_seconds"], 3_600);
+        assert_eq!(dry_doc["shift_scope"], "selected");
+        assert_eq!(dry_doc["plans"][0]["capture_utc"], shifted_utc);
+        // `matched_utc` is what proves the shifted clock was used for matching:
+        // every track point has the same coordinates, so only the time says
+        // which point this photo landed on.
+        assert_eq!(dry_doc["plans"][0]["matched_utc"], shifted_utc);
+        assert_eq!(dry_doc["plans"][0]["gap_seconds"], 0);
+        assert_eq!(dry_doc["plans"][1]["capture_utc"], track_utc);
+        assert_eq!(dry_doc["plans"][1]["matched_utc"], track_utc);
+
+        // The real run writes the shifted clock only into the selected photo,
+        // and still tags both photos at a position.
+        let console = RecordingConsole::default();
+        geotag(
+            &LogGeotagOptions {
+                scope: ShiftScopeArg::Selected,
+                photo: vec![chosen.clone()],
+                shift_hours: 1,
+                json: true,
+                ..geotag_options(log_path, vec![chosen.clone(), other.clone()])
+            },
+            Session::new(&links, &console, &confirm),
+        )
+        .expect("a selected shift");
+        assert_eq!(photo_datetime(&chosen), format_exif_utc(shifted_utc));
+        assert_eq!(
+            photo_datetime(&other),
+            format_exif_utc(track_utc),
+            "a photo outside the scope keeps its clock"
+        );
+        for photo in [&chosen, &other] {
+            let gps = m241_core::log::exif::read_gps(&fileio::read(photo).expect("photo"))
+                .expect("parse exif")
+                .expect("gps tags written");
+            assert!(
+                gps.latitude.is_some(),
+                "{} was dropped instead of tagged",
+                photo.display()
+            );
+        }
+        let doc: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(doc["written"], 2);
+        assert_eq!(doc["skipped"], 0);
+    }
+
+    #[test]
+    fn a_by_camera_scope_shift_moves_only_photos_from_that_camera() {
+        let scratch = Scratch::new("geotag-by-camera");
+        let track_utc = 1_700_000_000u32;
+        let shifted_utc = track_utc + 3_600;
+        let log_path = scratch.join("track.bin");
+        fileio::write(&log_path, &dump_with_timestamps(&[track_utc, shifted_utc]))
+            .expect("write dump");
+
+        let holux = scratch.join("holux.jpg");
+        fileio::write(
+            &holux,
+            &synthetic_jpeg_with_camera(&format_exif_utc(track_utc), "HOLUX", "M-241"),
+        )
+        .expect("write HOLUX photo");
+        let phone = scratch.join("phone.jpg");
+        fileio::write(
+            &phone,
+            &synthetic_jpeg_with_camera(&format_exif_utc(track_utc), "Other", "Phone"),
+        )
+        .expect("write phone photo");
+
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+        let console = RecordingConsole::default();
+        geotag(
+            &LogGeotagOptions {
+                scope: ShiftScopeArg::ByCamera,
+                camera_make: Some(String::from("HOLUX")),
+                camera_model: Some(String::from("M-241")),
+                shift_seconds: 3_600,
+                json: true,
+                ..geotag_options(log_path, vec![holux.clone(), phone.clone()])
+            },
+            Session::new(&links, &console, &confirm),
+        )
+        .expect("a by-camera shift");
+
+        assert_eq!(photo_datetime(&holux), format_exif_utc(shifted_utc));
+        assert_eq!(
+            photo_datetime(&phone),
+            format_exif_utc(track_utc),
+            "a photo from another camera keeps its clock"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(doc["shift_scope"], "by-camera");
+        assert_eq!(doc["plans"][0]["matched_utc"], shifted_utc);
+        assert_eq!(doc["plans"][1]["matched_utc"], track_utc);
+        assert_eq!(doc["written"], 2);
+        assert_eq!(doc["skipped"], 0);
+    }
+
+    #[test]
+    fn a_photo_flag_under_the_all_scope_is_reported_and_ignored() {
+        let scratch = Scratch::new("geotag-photo-warning");
+        let track_utc = 1_700_000_000u32;
+        let shifted_utc = track_utc + 3_600;
+        let log_path = scratch.join("track.bin");
+        fileio::write(&log_path, &dump_with_timestamps(&[track_utc, shifted_utc]))
+            .expect("write dump");
+
+        let chosen = scratch.join("chosen.jpg");
+        fileio::write(
+            &chosen,
+            &synthetic_jpeg_with_datetime(&format_exif_utc(track_utc)),
+        )
+        .expect("write chosen photo");
+        let other = scratch.join("other.jpg");
+        fileio::write(
+            &other,
+            &synthetic_jpeg_with_datetime(&format_exif_utc(track_utc)),
+        )
+        .expect("write other photo");
+
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+        let console = RecordingConsole::default();
+        geotag(
+            &LogGeotagOptions {
+                scope: ShiftScopeArg::All,
+                photo: vec![chosen.clone()],
+                shift_hours: 1,
+                ..geotag_options(log_path, vec![chosen.clone(), other.clone()])
+            },
+            Session::new(&links, &console, &confirm),
+        )
+        .expect("a stray --photo is a warning, not an error");
+
+        assert!(
+            console
+                .stderr()
+                .contains("--photo is only read with --scope selected"),
+            "the ignored flag must be reported, got stderr: {}",
+            console.stderr()
+        );
+        // `--scope all` wins: `--photo` is ignored, so both clocks move.
+        assert_eq!(photo_datetime(&chosen), format_exif_utc(shifted_utc));
+        assert_eq!(photo_datetime(&other), format_exif_utc(shifted_utc));
+        // The human dry-run style line carries the shifted capture time, not
+        // only the matched point's UTC (Should 4).
+        assert!(
+            console
+                .stdout()
+                .contains(&format!("capture {}", export::utc_iso(shifted_utc))),
+            "the plan line must report the shifted capture time, got: {}",
+            console.stdout()
+        );
+        // The summary names the request, not "this much was applied" (M3).
+        assert!(
+            console.stdout().contains("3600 s requested (all)"),
+            "the shift summary must read as a request, got: {}",
+            console.stdout()
+        );
+    }
+
+    #[test]
+    fn camera_flags_under_the_selected_scope_are_reported_and_ignored() {
+        let scratch = Scratch::new("geotag-camera-warning");
+        let track_utc = 1_700_000_000u32;
+        let shifted_utc = track_utc + 3_600;
+        let log_path = scratch.join("track.bin");
+        fileio::write(&log_path, &dump_with_timestamps(&[track_utc, shifted_utc]))
+            .expect("write dump");
+
+        // The camera flags name the HOLUX photo while `--photo` names the other
+        // one, so only one of the two can move: which one says which flag won.
+        let holux = scratch.join("holux.jpg");
+        fileio::write(
+            &holux,
+            &synthetic_jpeg_with_camera(&format_exif_utc(track_utc), "HOLUX", "M-241"),
+        )
+        .expect("write HOLUX photo");
+        let phone = scratch.join("phone.jpg");
+        fileio::write(
+            &phone,
+            &synthetic_jpeg_with_camera(&format_exif_utc(track_utc), "Other", "Phone"),
+        )
+        .expect("write phone photo");
+
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+        let console = RecordingConsole::default();
+        geotag(
+            &LogGeotagOptions {
+                scope: ShiftScopeArg::Selected,
+                photo: vec![phone.clone()],
+                camera_make: Some(String::from("HOLUX")),
+                camera_model: Some(String::from("M-241")),
+                shift_seconds: 3_600,
+                json: true,
+                ..geotag_options(log_path, vec![holux.clone(), phone.clone()])
+            },
+            Session::new(&links, &console, &confirm),
+        )
+        .expect("camera flags under --scope selected are a warning, not an error");
+
+        assert!(
+            console
+                .stderr()
+                .contains("--camera-make is only read with --scope by-camera"),
+            "the ignored flags must be reported, got stderr: {}",
+            console.stderr()
+        );
+        assert_eq!(photo_datetime(&phone), format_exif_utc(shifted_utc));
+        assert_eq!(
+            photo_datetime(&holux),
+            format_exif_utc(track_utc),
+            "the camera flags must not select a photo under --scope selected"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(doc["shift_scope"], "selected");
+        assert_eq!(doc["plans"][0]["matched_utc"], track_utc);
+        assert_eq!(doc["plans"][1]["matched_utc"], shifted_utc);
+    }
+
+    #[test]
+    fn a_selected_scope_can_name_a_photo_contributed_by_a_directory() {
+        let scratch = Scratch::new("geotag-selected-dir");
+        let track_utc = 1_700_000_000u32;
+        let shifted_utc = track_utc + 3_600;
+        let log_path = scratch.join("track.bin");
+        fileio::write(&log_path, &dump_with_timestamps(&[track_utc, shifted_utc]))
+            .expect("write dump");
+
+        let photos_dir = scratch.join("photos");
+        std::fs::create_dir_all(&photos_dir).expect("create photos dir");
+        let chosen = photos_dir.join("chosen.jpg");
+        fileio::write(
+            &chosen,
+            &synthetic_jpeg_with_datetime(&format_exif_utc(track_utc)),
+        )
+        .expect("write chosen photo");
+        let other = photos_dir.join("other.jpg");
+        fileio::write(
+            &other,
+            &synthetic_jpeg_with_datetime(&format_exif_utc(track_utc)),
+        )
+        .expect("write other photo");
+
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+        let console = RecordingConsole::default();
+        geotag(
+            &LogGeotagOptions {
+                scope: ShiftScopeArg::Selected,
+                // The directory contributes `<DIR>/<NAME>`, so this is the
+                // spelling that selects the photo.
+                photo: vec![chosen.clone()],
+                shift_hours: 1,
+                json: true,
+                ..geotag_options(log_path, vec![photos_dir.clone()])
+            },
+            Session::new(&links, &console, &confirm),
+        )
+        .expect("a directory-expanded selection");
+
+        assert_eq!(photo_datetime(&chosen), format_exif_utc(shifted_utc));
+        assert_eq!(
+            photo_datetime(&other),
+            format_exif_utc(track_utc),
+            "a photo the selection does not name keeps its clock"
+        );
+        let doc: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(doc["shift_scope"], "selected");
+        assert_eq!(
+            doc["plans"].as_array().expect("plans array").len(),
+            2,
+            "the directory contributes both photos"
+        );
+    }
+
+    #[test]
+    fn a_photo_selection_that_matches_none_of_the_planned_photos_is_an_error() {
+        let scratch = Scratch::new("geotag-selected-miss");
+        let track_utc = 1_700_000_000u32;
+        let log_path = scratch.join("track.bin");
+        fileio::write(&log_path, &dump_with_timestamps(&[track_utc])).expect("write dump");
+
+        let photos_dir = scratch.join("photos");
+        std::fs::create_dir_all(&photos_dir).expect("create photos dir");
+        let chosen = photos_dir.join("chosen.jpg");
+        let original = synthetic_jpeg_with_datetime(&format_exif_utc(track_utc));
+        fileio::write(&chosen, &original).expect("write chosen photo");
+
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+        // A bare file name and a differently-spelled path are both compared
+        // with the expanded `<DIR>/<NAME>` paths, so neither selects anything.
+        for selection in [PathBuf::from("chosen.jpg"), photos_dir.join("CHOSEN.jpg")] {
+            let err = geotag(
+                &LogGeotagOptions {
+                    scope: ShiftScopeArg::Selected,
+                    photo: vec![selection],
+                    shift_hours: 1,
+                    ..geotag_options(log_path.clone(), vec![photos_dir.clone()])
+                },
+                Session::new(&links, &RecordingConsole::default(), &confirm),
+            )
+            .expect_err("a selection that matches nothing must not succeed");
+            assert!(matches!(err, Error::State(_)), "got {err}");
+            let message = format!("{err}");
+            assert!(
+                message.contains("--photo matched none"),
+                "the error must name the problem, got: {message}"
+            );
+            assert!(
+                message.contains("chosen.jpg"),
+                "the error must show a planned path, got: {message}"
+            );
+        }
+        assert_eq!(
+            fileio::read(&chosen).expect("photo"),
+            original,
+            "a refused selection writes nothing"
+        );
+    }
+
+    #[test]
+    fn a_shift_of_a_photo_with_only_a_file_time_is_not_written_into_it() {
+        let scratch = Scratch::new("geotag-mtime-shift");
+        let track_utc = 1_700_000_000u32;
+        let shifted_utc = track_utc + 3_600;
+        let log_path = scratch.join("track.bin");
+        fileio::write(&log_path, &dump_with_timestamps(&[track_utc, shifted_utc]))
+            .expect("write dump");
+
+        let photo = scratch.join("no-exif.jpg");
+        fileio::write(&photo, &synthetic_jpeg_without_exif()).expect("write photo");
+        set_photo_mtime(&photo, track_utc);
+
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+
+        // The dry run matches on the shifted file time and says where the time
+        // came from; nothing is written.
+        let dry_console = RecordingConsole::default();
+        geotag(
+            &LogGeotagOptions {
+                shift_seconds: 3_600,
+                dry_run: true,
+                json: true,
+                ..geotag_options(log_path.clone(), vec![photo.clone()])
+            },
+            Session::new(&links, &dry_console, &confirm),
+        )
+        .expect("dry run of a shift on a file time");
+        let dry_doc: serde_json::Value =
+            serde_json::from_str(&dry_console.stdout()).expect("one JSON object");
+        assert_eq!(dry_doc["shift_scope"], "all");
+        assert_eq!(dry_doc["plans"][0]["capture_source"], "mtime");
+        assert_eq!(dry_doc["plans"][0]["capture_utc"], shifted_utc);
+        assert!(
+            dry_console
+                .stderr()
+                .contains("the capture time comes from the file's modification time"),
+            "a shift on a file time must be reported as not persisted, got: {}",
+            dry_console.stderr()
+        );
+
+        // The real run writes the position but not the shifted time: a file
+        // modification time is a guess, and `apply` does not turn a guess into
+        // an EXIF claim, so the next run has to be told about the shift again.
+        let console = RecordingConsole::default();
+        geotag(
+            &LogGeotagOptions {
+                shift_seconds: 3_600,
+                json: true,
+                ..geotag_options(log_path, vec![photo.clone()])
+            },
+            Session::new(&links, &console, &confirm),
+        )
+        .expect("a shift on a file time");
+        let written = fileio::read(&photo).expect("photo after the run");
+        assert!(
+            m241_core::log::exif::read_gps(&written)
+                .expect("parse exif")
+                .expect("gps written")
+                .latitude
+                .is_some(),
+            "the photo still receives its position"
+        );
+        assert_eq!(
+            m241_core::log::exif::read_datetime_original(&written).expect("parse exif"),
+            None,
+            "a file-time capture must not be stamped into DateTimeOriginal"
+        );
+    }
+
+    #[test]
+    fn a_tz_offset_and_a_shift_compose_without_moving_the_written_position_time() {
+        let scratch = Scratch::new("geotag-tz-shift");
+        let track_utc = 1_700_000_000u32;
+        // The camera's clock is UTC+9, so its local capture is 32,400 s ahead.
+        let tz_offset_minutes = 540i32;
+        let local_capture = track_utc + u32::try_from(tz_offset_minutes * 60).expect("u32");
+        let log_path = scratch.join("track.bin");
+        fileio::write(
+            &log_path,
+            &dump_with_timestamps(&[track_utc, track_utc + 3_600]),
+        )
+        .expect("write dump");
+
+        let photo = scratch.join("local.jpg");
+        fileio::write(
+            &photo,
+            &synthetic_jpeg_with_datetime(&format_exif_utc(local_capture)),
+        )
+        .expect("write photo");
+
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+        let console = RecordingConsole::default();
+        geotag(
+            &LogGeotagOptions {
+                tz_offset_minutes,
+                shift_seconds: 3_600,
+                json: true,
+                ..geotag_options(log_path, vec![photo.clone()])
+            },
+            Session::new(&links, &console, &confirm),
+        )
+        .expect("a tz offset and a shift together");
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(doc["tz_offset_minutes"], 540);
+        assert_eq!(doc["shift_seconds"], 3_600);
+        // The shift moved the camera clock, the tz offset moved only the track:
+        // the matched point is still the true UTC instant, and what is written
+        // into the photo is the shifted local (camera) clock.
+        assert_eq!(doc["plans"][0]["matched_utc"], track_utc + 3_600);
+        assert_eq!(
+            photo_datetime(&photo),
+            format_exif_utc(local_capture + 3_600)
+        );
     }
 
     /// The UTC values of a JSON export, in file order, with `None` for a point

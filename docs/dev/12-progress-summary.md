@@ -41,7 +41,7 @@
 | テスト | **767 件全緑**（`cargo test --workspace`、PR #20 修正時点の実測） |
 | ゲート | **6/6 PASS**（`./tools/check.sh`: fmt / clippy / test / docs / design / safety） |
 | CI | Linux / Windows / macOS |
-| **実機検証** | 読み取り・`log erase`（[`05-verification.md`](05-verification.md) §1a）に加え、2026-11-22 の書き込みセッション（同 §1.5）で `fw dump` / `fw probe-da` / `fw flash --recover` / `fw patch` / strict 書き込みが実機で通り、**2 回の書き込み（recovery と strict）が全長読み戻し一致**。`fw flash --allow-vendor` は書込み自体は完了したが、起動したファームが個体データ 4 バイトを復元するため読み戻しが `0x5C` で不一致（設計課題）。残りはパッチ済み V1.14 の起動確認と GUI の実機検証 |
+| **実機検証** | 読み取り・`log erase`（[`05-verification.md`](05-verification.md) §1a）に加え、2026-11-22 の書き込みセッション（同 §1.5）で `fw dump` / `fw probe-da` / `fw flash --recover` / `fw patch` / strict 書き込みが実機で通り、**2 回の書き込み（recovery と strict）が全長読み戻し一致**。`fw flash --allow-vendor` は書込み自体は完了したが、起動したファームが個体データ 4 バイトを復元するため読み戻しが `0x5C` で不一致（設計課題）。パッチ済み V1.14 の起動も確認済み（既定日付が `22-08-99`＝パッチ済みエポック）。残りは**測位ありでの日付確認**と GUI の実機検証 |
 
 ### 完成・`main` 統合済み（三段構成で検証済み、[`10-review-log.md`](10-review-log.md) 記録済み）
 
@@ -87,7 +87,7 @@
 - `fw flash --allow-vendor`（ベンダー V1.13）: 書込みは完了したが、起動したファームが個体データ 4 バイトを復元するため読み戻しが `0x5C` で不一致（設計課題）
 - V1.12 の書き込み拒否を実測
 
-残る実機検証: パッチ済み V1.14 の起動と日付、GUI（実ポート probe・追従描画・GUI 経由の JPEG 書き込み）、他のユニット形状（V1.12・4 MiB 品・GR-245 系）、Bluetooth SPP。
+残る実機検証: 測位ありでの日付確認（屋内では既定値のみ）、GUI（実ポート probe・追従描画・GUI 経由の JPEG 書き込み）、他のユニット形状（V1.12・4 MiB 品・GR-245 系）、Bluetooth SPP。
 
 ---
 
