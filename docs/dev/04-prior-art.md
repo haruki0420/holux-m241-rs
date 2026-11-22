@@ -108,10 +108,13 @@ the docstring, about dumping twice.
 **This project.** The specification has two refusals — the image matches a
 known profile **and** is either identical to `--backup` or differs from it only
 inside the patch offsets; the user passed `--yes` (`docs/reference/02-cli.md`
-§`m241 fw flash`, `AGENTS.md` §2.3) — plus a read-back after the write. There is
-no vendor-package or cross-model exception; the backup is the only image the
-backup check will accept. **It is implemented and wired into `fw flash`, but it
-has not run against a unit.** `crates/m241-flash/src/da.rs` accepts only the
+§`m241 fw flash`, `AGENTS.md` §2.3) — plus a read-back after the write. In this
+strict path there is no vendor-package or cross-model exception; the backup is
+the only image the backup check will accept. The separate, explicit
+`--allow-vendor` gate (fixed V1.13 SHA-256) is the only vendor exception, and
+it still requires the backup comparison and read-back. **It is implemented and
+wired into `fw flash`, but it has not run against a unit.**
+`crates/m241-flash/src/da.rs` accepts only the
 settled DA-side range (`FLASH_WRITE_START = 0`, `check_layout`) and drives
 `verify_device`, the DA load, `0xD3`/`0xD5` and the `0xD9` read-back;
 `crates/m241-cli/src/lib.rs` calls it from `fw flash` after the confirmation,
@@ -220,6 +223,14 @@ reconstructed from the repository.
    output file and exit status 0; a checksum mismatch inside `write16` is printed
    and the write continues. The pattern is reasonable for a script its author
    watched run, and wrong for a tool whose user will not read stderr.
+5. **Writing a published vendor image over the unit's per-unit fields.** The
+   vendor utility's image is the stock release: its bytes at the per-unit
+   regions replace the individual values from the unit's own dump. This project
+   keeps that as a separate, explicit gate (`--allow-vendor`, fixed V1.13
+   SHA-256, `--yes`, `verify_device`, read-back and a warning that 14 bytes are
+   overwritten); the normal path still writes only the user's own backup with
+   the WNRO bytes moved. The user made that trade-off deliberately; it is not
+   inferred from the vendor tool's behaviour.
 
 ## Designs this project deliberately does not adopt
 

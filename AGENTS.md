@@ -125,14 +125,38 @@ Any image whose differing bytes fall outside the patch offsets of the user's own
 backup is refused. An image identical to the backup is accepted. Do not weaken
 that check.
 
+**Official vendor image gate (explicit user decision, 2026-11-22).** The user
+has explicitly decided that writing the *unmodified* official V1.13 vendor
+image is allowed, accepting that its 14 bytes of per-unit data overwrite this
+unit's values. This is a separate gate, never a digest branch inside the backup
+check:
+
+* only the V1.13 vendor image whose full SHA-256 is
+  `32fe52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435` and whose
+  length is 406,620 bytes. V1.12 and every other build are refused;
+* `--allow-vendor` and `--yes` are both required, and `--backup` and `--da` stay
+  required;
+* the unit must still match that backup before the DA is loaded
+  (`verify_device`), and the written range is read back and compared with the
+  vendor image;
+* the command prints which per-unit data is overwritten before writing and on
+  success;
+* the vendor V1.13 image is the **stock, unpatched** release: epoch
+  `315964800`, marker `V1.13`. Writing it leaves the date 7168 days behind
+  until the image is patched, so the dry run, the pre-write warning and the
+  success output all say so;
+* `--allow-vendor --yes` is inside §2.5. The strict `check_image` must not gain a
+  digest branch: `accept_vendor_image` is the only way to obtain the
+  `VendorImage` token `write_vendor` accepts.
+
 ### 2.4 Never commit personal data
 
 See §6.
 
-### 2.5 Who may approve a write-capable run (`fw flash --yes`, `fw flash --recover --yes`, `fw probe-da --yes`)
+### 2.5 Who may approve a write-capable run (`fw flash --yes`, `fw flash --recover --yes`, `fw flash --allow-vendor --yes`, `fw probe-da --yes`)
 
-By default, passing `--yes` to `fw flash` (**including `--recover`**) or
-`fw probe-da` requires the
+By default, passing `--yes` to `fw flash` (**including `--recover` and
+`--allow-vendor`**) or `fw probe-da` requires the
 user's own approval. Subagent approval under this section applies **only** when
 the user has explicitly delegated approval for these write-capable runs in that
 session or instruction; any explicit user requirement for prior human approval
@@ -200,10 +224,17 @@ the reviewer independently verifies:
   came from and that the run is a recovery, not a normal write. The request
   names `--recover` explicitly; without it, the normal `verify_device` path
   applies;
+* for `fw flash --allow-vendor --yes`, the image's **full** SHA-256 must equal
+  `32fe52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435`
+  (V1.13, 406,620 bytes). Any other vendor build, a prefix, or a V1.12 image is
+  a refusal. The request must state that the user knows the vendor image
+  overwrites the unit's 14 bytes of per-unit data, and must include the same
+  backup and unit-identity artifacts as a normal write. The normal
+  `verify_device` is still required; `--allow-vendor` does not skip it;
 * the exact full command line to run, including `--yes`, the resolved `--port`,
-  `--da`, the image path, and the backup path, plus `--recover` when used.
-  `fw flash` implements these flags; re-check the command against
-  `m241 fw flash --help` before approving.
+  `--da`, the image path, and the backup path, plus `--recover` or
+  `--allow-vendor` when used. `fw flash` implements these flags; re-check the
+  command against `m241 fw flash --help` before approving.
 
 A missing item, a hash or byte-diff mismatch, an unsettled
 `FLASH_WRITE_START`, `--port auto`, or a non-independent/forked reviewer is a

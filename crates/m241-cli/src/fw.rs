@@ -30,8 +30,9 @@ use m241_core::protocol::port::Transport;
 use m241_core::{Error, FirmwareProfile, PatchPlan, Result};
 use m241_flash::da::{
     Confirmation, DaLoadId, DaLoader, DownloadAgent, FLASH_WRITE_START, PROBE_ADDRESSES,
-    PROBE_PAGE_SIZE, VECTOR, WritePlan, WriteReport, check_da_image, check_image, check_layout,
-    read_candidates, write_plan,
+    PROBE_PAGE_SIZE, VECTOR, VENDOR_PER_UNIT_DATA_BYTES, WritePlan, WriteReport,
+    accept_vendor_image, check_da_image, check_image, check_layout, read_candidates, write_plan,
+    write_plan_vendor,
 };
 
 use crate::Session;
@@ -512,30 +513,39 @@ fn plan_document(report: &PatchReport, written: Option<&std::path::Path>) -> ser
 /// `m241 fw flash`: check an image against a backup, then write and verify it.
 ///
 /// `--dry-run` reads the two files, identifies the image against a known profile,
-/// runs [`write_plan`] — the same acceptance rule [`DownloadAgent::write`] runs —
-/// and prints what a write would do. It **opens no port and sends nothing**.
+/// runs [`write_plan`] — or [`write_plan_vendor`] when `--allow-vendor` accepted
+/// the pinned vendor image — and prints what a write would do. It **opens no
+/// port and sends nothing**.
 ///
 /// A real run does everything decidable without a device first, in this order:
 /// the `--yes` confirmation, [`check_layout`], the driver's own acceptance rule
-/// against the pinned V1.13 range ([`check_image`]), and the DA file
-/// ([`check_da_image`]). Only then is a port opened. On the device it:
+/// against the pinned V1.13 range ([`check_image`] or
+/// [`accept_vendor_image`]), and the DA file ([`check_da_image`]). Only then is
+/// a port opened. On the device it:
 ///
 /// 1. enters the BootROM ([`enter_bootrom`]) and syncs;
 /// 2. calls [`DownloadAgent::verify_device`], so a unit that does not hold
-///    `backup` byte for byte is refused **before** anything is erased;
+///    `backup` byte for byte is refused **before** anything is erased. This is
+///    required for the vendor path too;
 /// 3. loads the DA into the chip's RAM ([`DaLoader::load`], RAM only);
-/// 4. programs the image ([`DownloadAgent::write`], `0xD3` + `0xD5`);
+/// 4. programs the image ([`DownloadAgent::write`] or, for the pinned vendor
+///    image, [`DownloadAgent::write_vendor`], `0xD3` + `0xD5`);
 /// 5. restarts the chip (`0xD9`), re-enters the BootROM through the same NMEA
 ///    probe and `$PMTK180*3B` hand-over the initial entry used, and reads the
 ///    range back ([`PendingWrite::verify_written`]), reporting success only
-///    when every byte matches.
+///    when every byte matches. For `--allow-vendor` the comparison is against
+///    the vendor image.
+///
+/// The vendor path is the explicit user decision in `AGENTS.md` §2.3: it
+/// overwrites the unit's 14 bytes of per-unit data. The dry run and the success
+/// output say so; this function never treats it as a backup-preserving write.
 ///
 /// The read-back after `0xD9` can fail: the unit boots its firmware, and if
 /// that firmware does not stream NMEA the BootROM cannot be re-entered. That is
 /// reported as a read-back that could not be reached, with the power-cycle and
 /// `fw dump` checks; this function never upgrades a failed read-back to success.
-/// ⚠️ 未検証 on hardware: the write path, including the post-`0xD9` re-entry,
-/// has run against the fake only.
+/// ⚠️ 未検証 on hardware: the write path, including the post-`0xD9` re-entry and
+/// the vendor-image write, has run against the fake only.
 ///
 /// # Errors
 ///
@@ -544,8 +554,8 @@ fn plan_document(report: &PatchReport, written: Option<&std::path::Path>) -> ser
 ///   not identified; it is checked by length and the byte-for-byte diff.
 /// * [`Error::Firmware`] when the image is too short to hold a header.
 /// * [`Error::Safety`] when the image is not acceptable ([`write_plan`] /
-///   [`check_image`]), when `--yes` was not given, from [`check_layout`], or
-///   from [`check_da_image`] / the device check.
+///   [`check_image`] / [`accept_vendor_image`]), when `--yes` was not given,
+///   from [`check_layout`], or from [`check_da_image`] / the device check.
 /// * [`Error::Port`] when no plausible port can be opened.
 /// * [`Error::State`] when the BootROM cannot be re-entered after `0xD9`.
 /// * [`Error::Timeout`] / [`Error::Framing`] / [`Error::Rejected`] from the
@@ -560,12 +570,34 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
     // profile and compares it with the image byte for byte.
     let image_view = FirmwareImage::new(&image)?;
     let profile = identify(&image_view)?.profile;
-    let plan = write_plan(profile, &backup, &image)?;
+
+    // Strict first: the backup-diff rule is the normal path. A vendor image
+    // fails that diff by design, so it reaches the separate fixed-SHA gate only
+    // when `--allow-vendor` is set. The strict `check_image` never grows a
+    // digest branch.
+    let strict_plan = write_plan(profile, &backup, &image);
+    let (plan, vendor) = match strict_plan {
+        Ok(plan) => (plan, None),
+        Err(strict_err) => {
+            if !options.allow_vendor {
+                return Err(strict_err);
+            }
+            let token = accept_vendor_image(profile, &image)?;
+            let plan = write_plan_vendor(profile, &backup, token)?;
+            (plan, Some(token))
+        }
+    };
 
     // The plan may describe a V1.12 or V1.14 image, but the driver programs the
     // pinned V1.13 range. Run its own acceptance rule now so a dry run can say a
     // write would be refused, and a real run stops before opening a port.
-    let writable = check_image(&PROFILE_V1_13, &backup, &image);
+    // A vendor token already carries its own acceptance; the strict path still
+    // runs `check_image` against the pinned V1.13 range.
+    let writable = if vendor.is_some() {
+        Ok(())
+    } else {
+        check_image(&PROFILE_V1_13, &backup, &image).map(|_| ())
+    };
 
     if options.dry_run {
         print_write_plan(
@@ -582,6 +614,7 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
     // first, in the order a person would want to be told: the confirmation,
     // then the layout and the files the write needs.
     let confirmation = Confirmation::of_command_line(options.yes)?;
+    warn_vendor_write(session.console, &plan);
     check_layout()?;
     writable?;
     if options.recover && image != backup {
@@ -654,7 +687,11 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
     ));
 
     let mut da_session = DownloadAgent::new(rom.into_transport());
-    let pending = match da_session.write(confirmation, &backup, &image) {
+    let written = match vendor {
+        Some(token) => da_session.write_vendor(confirmation, &backup, token),
+        None => da_session.write(confirmation, &backup, &image),
+    };
+    let pending = match written {
         Ok(pending) => pending,
         Err(err) => {
             note_write_failure(session.console, &options.backup);
@@ -753,12 +790,35 @@ fn note_write_failure(console: &dyn Console, backup: &std::path::Path) {
     ));
 }
 
+/// Warn about what writing the vendor image changes, before any port is opened.
+///
+/// Shared by the dry run and the real path so the two cannot drift. The vendor
+/// V1.13 image is the stock, unpatched release: it overwrites the unit's 14
+/// per-unit bytes and leaves the WNRO fix off (epoch `315964800`, marker
+/// `V1.13`), so dates are 7168 days behind until the image is patched.
+fn warn_vendor_write(console: &dyn Console, plan: &WritePlan) {
+    if !plan.vendor {
+        return;
+    }
+    console.warn(&format!(
+        "warning: this is the official vendor image, not this unit's backup. Writing it \
+         replaces the unit's {} bytes of per-unit data with the vendor values and leaves the \
+         WNRO fix off: the vendor V1.13 epoch is 315964800 and its marker is V1.13, so dates \
+         are 7168 days behind until the image is patched. The backup is still required and is \
+         compared with the unit before the DA is loaded",
+        VENDOR_PER_UNIT_DATA_BYTES
+    ));
+}
+
 /// The label for `plan`'s image against its backup.
 ///
 /// A zero-diff image is the backup itself, which is a distinct case from a WNRO
 /// patch: `--recover` requires exactly this, and a user should not be told a
 /// patch was applied when none was.
 fn acceptance_label(plan: &WritePlan) -> &'static str {
+    if plan.vendor {
+        return "official vendor image";
+    }
     match plan.differing_bytes {
         Some(0) => "identical to the backup",
         Some(_) => "patched backup",
@@ -786,6 +846,9 @@ fn print_write_report(
             "backup": options.backup.display().to_string(),
             "profile": plan.profile.name,
             "acceptance": acceptance_label(plan),
+            "vendor_image": plan.vendor,
+            "per_unit_data_overwritten": plan.vendor,
+            "vendor_image_unpatched": plan.vendor,
             "start": format!("0x{:08X}", report.start),
             "length": report.length,
             "packets": report.packets,
@@ -802,6 +865,21 @@ fn print_write_report(
         "{:<12}: {} ({}, {} bytes)",
         "profile", plan.profile.name, plan.profile.device_type, plan.size
     ));
+    console.result(&format!(
+        "{:<12}: {}",
+        "accepted as",
+        acceptance_label(plan)
+    ));
+    if plan.vendor {
+        console.result(&format!(
+            "{:<12}: yes; the unit's {} bytes of per-unit data were overwritten",
+            "vendor image", VENDOR_PER_UNIT_DATA_BYTES
+        ));
+        console.result(&format!(
+            "{:<12}: no (the vendor V1.13 image is unpatched; dates are 7168 days behind)",
+            "wnro patch"
+        ));
+    }
     console.result(&format!("{:<12}: 0x{:08X}", "start", report.start));
     console.result(&format!("{:<12}: {}", "length", report.length));
     console.result(&format!("{:<12}: {}", "packets", report.packets));
@@ -879,6 +957,9 @@ fn print_write_plan(
             "backup": options.backup.display().to_string(),
             "profile": plan.profile.name,
             "acceptance": acceptance_label(plan),
+            "vendor_image": plan.vendor,
+            "per_unit_data_overwritten": plan.vendor,
+            "vendor_image_unpatched": plan.vendor,
             "size": plan.size,
             "device_type": plan.device_type,
             "write_length": plan.write_length,
@@ -909,6 +990,17 @@ fn print_write_plan(
         acceptance_label(plan)
     ));
     console.result(&format!("{:<12}: {}", "device", plan.device_type));
+    if plan.vendor {
+        console.result(&format!(
+            "{:<12}: yes; the unit's {} bytes of per-unit data will be overwritten",
+            "vendor image", VENDOR_PER_UNIT_DATA_BYTES
+        ));
+        console.result(&format!(
+            "{:<12}: no (the vendor V1.13 image is unpatched; dates are 7168 days behind)",
+            "wnro patch"
+        ));
+        warn_vendor_write(console, plan);
+    }
     console.result(&format!(
         "{:<12}: {} bytes ({} packets of {} bytes)",
         "write range",
@@ -2430,6 +2522,43 @@ mod tests {
         data
     }
 
+    /// The pinned vendor image, when `M241_VENDOR_IMAGE` points at it.
+    ///
+    /// The binary is not committed (`AGENTS.md` §6). Tests that need it return
+    /// early when the variable is unset; the rejection tests run without it.
+    fn vendor_image() -> Option<Vec<u8>> {
+        let path = std::env::var_os("M241_VENDOR_IMAGE")?;
+        Some(std::fs::read(path).expect("M241_VENDOR_IMAGE must be readable"))
+    }
+
+    /// Rebuild the documented 17-byte diff against a unit's own dump.
+    ///
+    /// The per-unit values here are synthetic, not a real unit's data
+    /// (`AGENTS.md` §6). They let the fake unit match the backup while the
+    /// vendor image stays the pinned vendor file; the count (14 per-unit +
+    /// WNRO 2 + marker 1) is what the test pins.
+    fn vendor_backup(vendor: &[u8]) -> Vec<u8> {
+        assert_eq!(vendor.len(), PROFILE_V1_13.size);
+        let mut backup = vendor.to_vec();
+        backup[0x5C..0x60].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        backup[0xF8..0xFE].copy_from_slice(&[0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22]);
+        let after = GPS_EPOCH_UNIX_WNRO.to_le_bytes();
+        backup[EFFECTIVE_EPOCH_OFFSET + 2] = after[2];
+        backup[EFFECTIVE_EPOCH_OFFSET + 3] = after[3];
+        backup[0x59C2C] = b'4';
+        backup[0x63458..0x6345C].copy_from_slice(&[0xFF; 4]);
+        let differing = backup
+            .iter()
+            .zip(vendor.iter())
+            .filter(|(unit, vendor)| unit != vendor)
+            .count();
+        assert_eq!(
+            differing, 17,
+            "the documented vendor/backup diff is 17 bytes"
+        );
+        backup
+    }
+
     /// Write `image` and `backup` into `scratch` and return their paths.
     fn flash_case(
         scratch: &crate::testing::Scratch,
@@ -2450,6 +2579,7 @@ mod tests {
             da: None,
             dry_run: true,
             recover: false,
+            allow_vendor: false,
             yes: false,
             assume_brom: false,
             port: String::from("auto"),
@@ -2885,6 +3015,283 @@ mod tests {
     }
 
     #[test]
+    fn flash_dry_run_allow_vendor_warns_about_per_unit_data() {
+        let Some(vendor) = vendor_image() else {
+            return;
+        };
+        let backup = vendor_backup(&vendor);
+        let scratch = crate::testing::Scratch::new("flash-dry-vendor");
+        let case = flash_case(&scratch, &vendor, &backup);
+        let console = RecordingConsole::default();
+        let links = FakePorts::empty();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        let mut options = flash_options(&case);
+        options.allow_vendor = true;
+
+        flash(&options, session).expect("the pinned vendor image is acceptable");
+        let stdout = console.stdout();
+        assert!(
+            stdout.contains("official vendor image"),
+            "the plan names the vendor path: {stdout}"
+        );
+        assert!(
+            stdout.contains("14 bytes of per-unit data will be overwritten"),
+            "the plan warns about the per-unit bytes: {stdout}"
+        );
+        assert!(
+            stdout.contains("wnro patch") && stdout.contains("7168 days behind"),
+            "the plan warns that the vendor image is unpatched: {stdout}"
+        );
+        assert!(
+            console
+                .stderr()
+                .contains("warning: this is the official vendor image"),
+            "the warning is on stderr: {}",
+            console.stderr()
+        );
+        assert!(
+            console.stderr().contains("7168 days behind"),
+            "the warning says the WNRO fix is absent: {}",
+            console.stderr()
+        );
+        assert!(
+            stdout.contains("port opened : no"),
+            "a dry run opens no port: {stdout}"
+        );
+    }
+
+    #[test]
+    fn flash_dry_run_vendor_without_allow_vendor_is_refused() {
+        let Some(vendor) = vendor_image() else {
+            return;
+        };
+        let backup = vendor_backup(&vendor);
+        let scratch = crate::testing::Scratch::new("flash-dry-vendor-refused");
+        let case = flash_case(&scratch, &vendor, &backup);
+        let console = RecordingConsole::default();
+        let links = FakePorts::empty();
+        let session = Session::new(&links, &console, &AutoConfirm);
+
+        let err = flash(&flash_options(&case), session).expect_err("no --allow-vendor");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        assert!(
+            format!("{err}").contains("outside the V1.13 patch offsets"),
+            "the strict path refuses the vendor diff: {err}"
+        );
+        assert!(
+            console.stdout().is_empty(),
+            "no plan is printed on a refusal"
+        );
+    }
+
+    #[test]
+    fn flash_allow_vendor_writes_the_vendor_image_and_reads_it_back() {
+        let Some(vendor) = vendor_image() else {
+            return;
+        };
+        let backup = vendor_backup(&vendor);
+        let scratch = crate::testing::Scratch::new("flash-vendor-e2e");
+        let case = flash_case(&scratch, &vendor, &backup);
+        let chip = m241_flash::FakeDa::with_firmware(&backup);
+        let links = da_write::DaWritePorts::new(chip);
+        let ports = links.clone();
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.allow_vendor = true;
+        options.yes = true;
+        options.da = Some(da_file(scratch.path()));
+
+        flash(&options, session).expect("the vendor image is written and verified");
+        assert!(ports.opens() > 0);
+        {
+            let chip = chip.borrow();
+            assert!(chip.started(), "the DA was loaded and jumped to");
+            assert!(chip.restarted(), "the read-back sent 0xD9");
+            assert_eq!(
+                &chip.memory()[..FLASH_WRITE_LENGTH],
+                &vendor[..],
+                "the vendor image is what the flash window holds"
+            );
+        }
+        let stdout = console.stdout();
+        assert!(
+            stdout.contains("official vendor image"),
+            "success names the vendor path: {stdout}"
+        );
+        assert!(
+            stdout.contains("per-unit data were overwritten"),
+            "success states the per-unit overwrite: {stdout}"
+        );
+        assert!(
+            stdout.contains("wnro patch") && stdout.contains("7168 days behind"),
+            "success states that the vendor image is unpatched: {stdout}"
+        );
+        assert!(
+            console
+                .stderr()
+                .contains("warning: this is the official vendor image"),
+            "the real path warns before the port is opened: {}",
+            console.stderr()
+        );
+        assert!(
+            console.stderr().contains("7168 days behind"),
+            "the real warning says the WNRO fix is absent: {}",
+            console.stderr()
+        );
+        assert!(stdout.contains("verified    : 406620"), "got {stdout}");
+    }
+
+    #[test]
+    fn flash_allow_vendor_still_requires_the_unit_to_match_the_backup() {
+        let Some(vendor) = vendor_image() else {
+            return;
+        };
+        let backup = vendor_backup(&vendor);
+        let mut unit = backup.clone();
+        unit[0x1000] ^= 0xFF;
+        let scratch = crate::testing::Scratch::new("flash-vendor-wrong-unit");
+        let case = flash_case(&scratch, &vendor, &backup);
+        let chip = m241_flash::FakeDa::with_firmware(&unit);
+        let links = da_write::DaWritePorts::new(chip);
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.allow_vendor = true;
+        options.yes = true;
+        options.da = Some(da_file(scratch.path()));
+
+        let err = flash(&options, session).expect_err("the unit does not match the backup");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        assert!(
+            format!("{err}").contains("differs from the backup at image offset 0x1000"),
+            "verify_device is still required: {err}"
+        );
+        let chip = chip.borrow();
+        assert!(!chip.started(), "the DA must not be loaded");
+        assert!(
+            !chip.opcodes().contains(&0xD3),
+            "no write opcode may leave: {:02X?}",
+            chip.opcodes()
+        );
+    }
+
+    #[test]
+    fn flash_allow_vendor_without_yes_refuses_before_opening_a_port() {
+        let Some(vendor) = vendor_image() else {
+            return;
+        };
+        let backup = vendor_backup(&vendor);
+        let scratch = crate::testing::Scratch::new("flash-vendor-no-yes");
+        let case = flash_case(&scratch, &vendor, &backup);
+        let chip = m241_flash::FakeDa::with_firmware(&backup);
+        let links = da_write::DaWritePorts::new(chip);
+        let ports = links.clone();
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.allow_vendor = true;
+        options.yes = false;
+        options.da = Some(scratch.join("absent.bin"));
+
+        let err = flash(&options, session).expect_err("no --yes");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        assert!(format!("{err}").contains("--yes"), "got {err}");
+        assert_eq!(ports.opens(), 0, "no port may be opened");
+        assert_eq!(chip.borrow().read_bytes(), 0);
+    }
+
+    #[test]
+    fn flash_allow_vendor_warns_before_a_missing_da_file() {
+        // The warning must be before the DA file and the port, so a failure
+        // still shows that the vendor image's per-unit/WNRO effects were known.
+        let Some(vendor) = vendor_image() else {
+            return;
+        };
+        let backup = vendor_backup(&vendor);
+        let scratch = crate::testing::Scratch::new("flash-vendor-warn-before-da");
+        let case = flash_case(&scratch, &vendor, &backup);
+        let chip = m241_flash::FakeDa::with_firmware(&backup);
+        let links = da_write::DaWritePorts::new(chip);
+        let ports = links.clone();
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.allow_vendor = true;
+        options.yes = true;
+        options.da = Some(scratch.join("absent.bin"));
+
+        let err = flash(&options, session).expect_err("the DA file is missing");
+        assert!(matches!(err, Error::Io { .. }), "got {err}");
+        assert!(
+            console
+                .stderr()
+                .contains("warning: this is the official vendor image"),
+            "the warning must precede the DA-file failure: {}",
+            console.stderr()
+        );
+        assert!(
+            console.stderr().contains("7168 days behind"),
+            "the warning must name the WNRO effect: {}",
+            console.stderr()
+        );
+        assert_eq!(ports.opens(), 0, "the port must not be opened");
+        assert_eq!(chip.borrow().read_bytes(), 0);
+    }
+
+    #[test]
+    fn flash_allow_vendor_rejects_a_non_vendor_digest() {
+        let image = flash_image(&PROFILE_V1_13, false);
+        let mut backup = image.clone();
+        backup[0x1000] ^= 0xFF;
+        let scratch = crate::testing::Scratch::new("flash-vendor-wrong-sha");
+        let case = flash_case(&scratch, &image, &backup);
+        let console = RecordingConsole::default();
+        let links = FakePorts::empty();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        let mut options = flash_options(&case);
+        options.allow_vendor = true;
+
+        let err = flash(&options, session).expect_err("not the pinned vendor digest");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        let text = format!("{err}");
+        assert!(
+            text.contains("SHA-256") && text.contains("pinned V1.13 vendor digest"),
+            "the refusal names the digest gate: {text}"
+        );
+    }
+
+    #[test]
+    fn flash_allow_vendor_rejects_a_v1_12_candidate() {
+        let image = flash_image(&PROFILE_V1_12, false);
+        let mut backup = image.clone();
+        backup[0x1000] ^= 0xFF;
+        let scratch = crate::testing::Scratch::new("flash-vendor-v112");
+        let case = flash_case(&scratch, &image, &backup);
+        let console = RecordingConsole::default();
+        let links = FakePorts::empty();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        let mut options = flash_options(&case);
+        options.allow_vendor = true;
+
+        let err = flash(&options, session).expect_err("V1.12 is not in this gate");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        let text = format!("{err}");
+        assert!(
+            text.contains("V1.13") && text.contains("not supported"),
+            "the refusal says the gate is V1.13 only: {text}"
+        );
+    }
+
+    #[test]
     fn flash_writes_through_the_da_and_reports_the_verified_read_back() {
         // The end-to-end path against the write crate's own fake DA: entry,
         // `verify_device`, the RAM load, `0xD3` + `0xD5`, `0xD9`, the BootROM
@@ -3106,6 +3513,7 @@ mod tests {
             da: None,
             dry_run: false,
             recover: false,
+            allow_vendor: false,
             yes: true,
             assume_brom: false,
             port: String::from("auto"),

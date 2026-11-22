@@ -44,20 +44,24 @@ Seven checks, each for a different way the split can rot:
    trait) and `src/protocol/simulator.rs` (the fake records it so a test can
    prove it was not pulsed). A second call site is how a "safe because it is
    gated" function stops being gated.
-6. **No digest-based image acceptance in `m241-flash`.** `AGENTS.md` §2.3
-   allows an image only when it is the user's own backup or differs from it at
-   the recorded patch offsets. A second route that accepts an image because its
-   SHA-256 matches a vendor profile weakens that check even though the code
-   still "checks the backup" first. The rule is textual because no byte fixture
-   can stand in for the vendor package: a synthetic image never hashes to the
-   real digest, so an end-to-end test alone cannot catch the old branch coming
-   back.
-7. **The write path runs the layout gate.** `crates/m241-flash/src/da.rs`'s
-   `pub fn write` must call `check_layout()?` at its own brace depth, before it
-   reaches `write_range`. That call is what refuses every start other than the
-   settled `0`; without it the fixed range is a comment. The check looks inside
-   `write`'s body only, so a call in another function, a comment, or an uncalled
-   nested function does not satisfy it.
+6. **No digest-based acceptance in the strict backup-diff path.**
+   `AGENTS.md` §2.3 allows an image in the strict path only when it is the
+   user's own backup or differs from it at the recorded patch offsets. A digest
+   branch in `check_image` / `all_within` would be a second acceptance route
+   that weakens that check. The vendor image is a **separate** fixed-SHA gate
+   (`accept_vendor_image`), pinned to one V1.13 release and tested separately;
+   this check deliberately does not treat that function as the strict path.
+   The rule is textual because a synthetic fixture never hashes to the real
+   vendor digest, so an end-to-end test alone cannot catch the old strict-path
+   branch coming back.
+7. **Every public writer runs the layout gate.** `crates/m241-flash/src/da.rs`'s
+   public functions that reach `write_range` or `write_range_accepted` must call
+   `check_layout()?` at their own brace depth, before that range call. That call
+   is what refuses every start other than the settled `0`; without it the fixed
+   range is a comment. Both `DownloadAgent::write` and `write_vendor` are
+   covered, and a future public writer is found by its range call rather than by
+   its name. The check looks inside each body only, so a call in another
+   function, a comment, or an uncalled nested function does not satisfy it.
 
 A rule enforced only by review is a rule that holds until the reviewer is busy.
 These are mechanical so they hold every commit.
@@ -140,12 +144,15 @@ DIGEST_ACCEPTANCE = re.compile(
 #: Start of a Rust raw string literal (`r"`, `r#"`, `br#"`, `cr#"`).
 RAW_STRING_START = re.compile(r'(?:b|c)?r(#*)"')
 
-#: The one function that may reach the write range, and the gate it must run
-#: first. `check_layout()` refuses a start other than the settled `0`; if the
-#: call moves, disappears, or sits in another function, the write runs ungated.
-WRITE_FUNCTION = re.compile(r"\bpub\s+fn\s+write\s*\(")
+#: Every public function that reaches the range programmer must run the layout
+#: gate first. `check_layout()` refuses a start other than the settled `0`; if
+#: the call moves, disappears, or sits in another function, that write runs
+#: ungated. This is intentionally not a name allowlist: it finds both
+#: `DownloadAgent::write` and `write_vendor`, and any future public writer that
+#: reaches `write_range` or `write_range_accepted`.
+PUB_FN = re.compile(r"\bpub\s+fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 WRITE_LAYOUT_CALL = re.compile(r"\bcheck_layout\s*\(\s*\)\s*\?")
-WRITE_RANGE_CALL = re.compile(r"\bwrite_range\s*\(")
+WRITE_RANGE_CALL = re.compile(r"\b(write_range|write_range_accepted)\s*\(")
 
 
 def rust_sources(root: Path) -> list[Path]:
@@ -336,22 +343,18 @@ def masked_source(text: str) -> str:
     return "".join(out)
 
 
-def write_body_span(masked: str) -> tuple[int, int, int] | str:
-    """The span of `pub fn write` and its body in masked source.
+def pub_fn_body_span(masked: str, match: re.Match[str]) -> tuple[int, int, int] | str:
+    """The span of one `pub fn` and its body in masked source.
 
     Returns `(function_start, body_open, body_end)`, where `body_open` is the
     index of the body's opening `{` and `body_end` is just past its matching
     `}`. Returning the brace positions lets the caller require a call at the
     body's own level rather than anywhere inside it.
     """
-    matches = list(WRITE_FUNCTION.finditer(masked))
-    if not matches:
-        return "no `pub fn write`"
-    if len(matches) > 1:
-        return "more than one `pub fn write`; the write path is ambiguous"
-    opening = masked.find("{", matches[0].end())
+    name = match.group(1)
+    opening = masked.find("{", match.end())
     if opening < 0:
-        return "`pub fn write` has no body"
+        return f"`pub fn {name}` has no body"
     depth = 0
     for index in range(opening, len(masked)):
         if masked[index] == "{":
@@ -359,8 +362,8 @@ def write_body_span(masked: str) -> tuple[int, int, int] | str:
         elif masked[index] == "}":
             depth -= 1
             if depth == 0:
-                return (matches[0].start(), opening, index + 1)
-    return "`pub fn write`'s body is not balanced"
+                return (match.start(), opening, index + 1)
+    return f"`pub fn {name}`'s body is not balanced"
 
 
 def top_level_source(body: str) -> str:
@@ -387,7 +390,7 @@ def top_level_source(body: str) -> str:
 
 
 def check_write_layout_gate() -> list[str]:
-    """`DownloadAgent::write` must run `check_layout()` before `write_range`."""
+    """Every public writer must run `check_layout()` before the range call."""
     if not FLASH_DA.is_file():
         return [
             f"{relative(FLASH_DA)} is missing; cannot verify that the write path "
@@ -396,32 +399,39 @@ def check_write_layout_gate() -> list[str]:
 
     text = FLASH_DA.read_text(encoding="utf-8")
     masked = masked_source(text)
-    span = write_body_span(masked)
-    if isinstance(span, str):
-        return [f"{relative(FLASH_DA)}: {span}"]
-
-    function_start, body_open, body_end = span
-    number = text.count("\n", 0, function_start) + 1
-    top = top_level_source(masked[body_open:body_end])
-    layout = WRITE_LAYOUT_CALL.search(top)
-    if layout is None:
-        return [
-            f"{relative(FLASH_DA)}:{number}: `pub fn write` does not call "
-            "`check_layout()?` at its top level; the fixed write range is not gated"
-        ]
-
-    write_at = WRITE_RANGE_CALL.search(top)
-    if write_at is None:
-        return [
-            f"{relative(FLASH_DA)}:{number}: `pub fn write` does not call "
-            "`write_range`; cannot verify that `check_layout()` runs before the write"
-        ]
-    if layout.start() > write_at.start():
-        return [
-            f"{relative(FLASH_DA)}:{number}: `pub fn write` calls `write_range` "
-            "before `check_layout()`; the layout gate is not in front of the write"
-        ]
-    return []
+    problems = []
+    writers = 0
+    for match in PUB_FN.finditer(masked):
+        span = pub_fn_body_span(masked, match)
+        if isinstance(span, str):
+            problems.append(f"{relative(FLASH_DA)}: {span}")
+            continue
+        function_start, body_open, body_end = span
+        top = top_level_source(masked[body_open:body_end])
+        range_call = WRITE_RANGE_CALL.search(top)
+        if range_call is None:
+            continue
+        writers += 1
+        name = match.group(1)
+        number = text.count("\n", 0, function_start) + 1
+        layout = WRITE_LAYOUT_CALL.search(top)
+        if layout is None:
+            problems.append(
+                f"{relative(FLASH_DA)}:{number}: `pub fn {name}` does not call "
+                "`check_layout()?` at its top level; the fixed write range is not gated"
+            )
+        elif layout.start() > range_call.start():
+            problems.append(
+                f"{relative(FLASH_DA)}:{number}: `pub fn {name}` calls "
+                f"`{range_call.group(1)}` before `check_layout()`; the layout gate is not "
+                "in front of the write"
+            )
+    if writers == 0:
+        problems.append(
+            f"{relative(FLASH_DA)}: no `pub fn` reaches `write_range` or "
+            "`write_range_accepted`; cannot verify the layout gate"
+        )
+    return problems
 
 
 def check_destructive_symbols() -> list[str]:
@@ -489,13 +499,15 @@ def function_body_range(text: str, name: str) -> tuple[int, int] | None:
 def check_flash_acceptance() -> list[str]:
     """`check_image` and `all_within` must accept images only by the backup diff.
 
-    `check_image` is the one place a write is allowed to decide that an image is
+    `check_image` is the place the strict path decides that an image is
     acceptable. It must compare the image with the user's backup and permit only
-    the recorded patch offsets; a digest comparison is the vendor release gate
-    `AGENTS.md` §2.3 removed. A synthetic test fixture cannot catch that branch
-    because it does not hash to the real vendor digest, so this check looks at
-    the function source. Comments and doc comments are stripped first: the file
-    explains why there is no digest route, and that prose must remain allowed.
+    the recorded patch offsets; a digest comparison here would be a second
+    acceptance route. The vendor image is a separate fixed-SHA gate
+    (`accept_vendor_image`), not part of this check. A synthetic test fixture
+    cannot catch a digest branch in the strict path because it does not hash to
+    the real vendor digest, so this check looks at the function source.
+    Comments and doc comments are stripped first: the file explains why the
+    strict path has no digest route, and that prose must remain allowed.
 
     The ranges are the `check_image`/`all_within` bodies, not all of `da.rs`:
     `check_da_image` is the DA file's own length/head check, and follow-up W2a
@@ -520,7 +532,7 @@ def check_flash_acceptance() -> list[str]:
         for match in DIGEST_ACCEPTANCE.finditer(line):
             problems.append(
                 f"{relative(FLASH_DA)}:{number}: digest-based image acceptance "
-                f"`{match.group(0)}`; AGENTS.md §2.3 allows only the backup diff"
+                f"`{match.group(0)}` in the strict path; AGENTS.md §2.3 allows only the backup diff"
             )
     return problems
 
@@ -636,8 +648,8 @@ def main() -> int:
         return 1
     print(
         "no write path in m241-core or m241-gui; the dependency runs one way; "
-        "m241-flash accepts images only by the backup diff; "
-        "DownloadAgent::write runs check_layout() first"
+        "the strict image path accepts only the backup diff; the vendor gate is a separate "
+        "fixed-SHA function; every public writer runs check_layout() first"
     )
     return 0
 

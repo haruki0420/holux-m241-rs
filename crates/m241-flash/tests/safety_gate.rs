@@ -226,15 +226,27 @@ impl Drop for FakeRepo {
     }
 }
 
-/// Remove the layout-gate line from `da_rs`, accepting LF or CRLF.
+/// Remove one `check_layout()?;` line from the named public function.
 ///
 /// A Windows checkout reads `da.rs` with `\r\n`. The pattern below is written
 /// with `\n`, so normalising first is what keeps the mutation test from
-/// panicking with "the line was not found" on that platform.
+/// panicking with "the line was not found" on that platform. The function name
+/// matters: `write` and `write_vendor` both have the line, and a mutation must
+/// remove only the one under test.
+fn without_layout_gate_in(da_rs: &str, function: &str) -> String {
+    let normalized = da_rs.replace("\r\n", "\n");
+    let marker = format!("pub fn {function}(");
+    let start = normalized
+        .find(&marker)
+        .expect("the function is missing from da.rs");
+    let (head, tail) = normalized.split_at(start);
+    let tail = tail.replacen("        check_layout()?;\n", "", 1);
+    format!("{head}{tail}")
+}
+
+/// Remove `DownloadAgent::write`'s layout-gate line, accepting LF or CRLF.
 fn without_layout_gate(da_rs: &str) -> String {
-    da_rs
-        .replace("\r\n", "\n")
-        .replacen("        check_layout()?;\n", "", 1)
+    without_layout_gate_in(da_rs, "write")
 }
 
 #[test]
@@ -506,6 +518,31 @@ fn removing_check_layout_from_the_real_write_body_is_reported() {
 }
 
 #[test]
+fn removing_check_layout_from_the_real_write_vendor_body_is_reported() {
+    // `write_vendor` reaches `write_range_accepted`, not `write_range`; the
+    // gate must cover it too. Remove only its own line, leaving `write`'s line
+    // intact, so a gate that still checked only `pub fn write(` would pass.
+    let real = std::fs::read_to_string(
+        repo_root()
+            .join("crates")
+            .join("m241-flash")
+            .join("src")
+            .join("da.rs"),
+    )
+    .expect("crates/m241-flash/src/da.rs is missing");
+    let without = without_layout_gate_in(&real, "write_vendor");
+    assert_ne!(without, real.replace("\r\n", "\n"));
+    assert!(
+        without.contains("        check_layout()?;\n"),
+        "the `write` layout-gate line must remain for this mutation"
+    );
+
+    let repo = FakeRepo::new("da-real-minus-vendor-layout", &[]);
+    repo.write_flash_da(&without);
+    repo.assert_reports("`pub fn write_vendor` does not call `check_layout()?`");
+}
+
+#[test]
 fn a_crlf_checkout_detects_the_removed_layout_gate() {
     // windows-latest checks the file out with CRLF. The gate itself reads
     // either ending, but a mutation test that matched only `\n` panicked
@@ -535,8 +572,12 @@ fn a_crlf_checkout_detects_the_removed_layout_gate() {
 
     let without = without_layout_gate(&crlf);
     assert!(
-        !without.contains("check_layout()?;"),
-        "the CRLF layout-gate line was not removed"
+        without.contains("check_layout()?;"),
+        "the other writer's layout-gate line must remain: {without}"
+    );
+    assert!(
+        without_layout_gate_in(&crlf, "write_vendor").contains("check_layout()?;"),
+        "the write_vendor layout-gate line must remain"
     );
     // Feed the gate a CRLF file that is missing the call, not an LF one.
     let without_crlf = without.replace('\n', "\r\n");

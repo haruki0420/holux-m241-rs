@@ -117,7 +117,8 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
    1 フレームで読むと 115,200 8N1 で約 35 秒かかり、`MtkBootRom` の 5 秒
    deadline を超える。`the_device_check_reads_the_span_in_chunked_bootrom_frames`
    と `the_read_back_reads_the_span_in_chunked_bootrom_frames` がフレーム数と
-   各 count の上限を fake の記録で固定する。実機の全範囲読み戻しは未検証である。
+   各 count の上限を fake の記録で固定する。`--allow-vendor` の読み戻しも
+   書き込んだベンダーイメージとの比較である。実機の全範囲読み戻しは未検証である。
 4. **失敗時に装置を既知の状態に戻せるか。** 👁
    途中で失敗したとき、どこまで書けたかを報告し、リセット（`0xD9`）後に
    BootROM へ再入する手順が案内されること。`0xD9` は応答を返さないので、
@@ -261,8 +262,8 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
 | `cargo tree -p m241-flash --edges normal,build,dev` に `m241-core` がある | 正しい向きの依存が消えていない |
 | `crates/m241-core/Cargo.toml` と `crates/m241-gui/Cargo.toml` が `m241-flash` を名指ししない | 解決結果に出ない形の依存（dev 依存など）も塞ぐ |
 | `set_control_lines` が `crates/m241-core/src/protocol/brom.rs` / `crates/m241-core/src/protocol/port.rs` / `crates/m241-core/src/protocol/simulator.rs` 以外に無い | DTR/RTS を触る場所が増えていない（同名別パスのすり抜けも防ぐ） |
-| `crates/m241-flash/src/da.rs` の `check_image` / `all_within` 本体に `firmware::digest` / `digest::matches` / `sha256(_hex)` が無い | ベンダー digest による第二の受理経路が戻らない（差分ヘルパーへ移しても検出し、`check_da_image` の W2a 用 SHA-256 は対象外） |
-| `crates/m241-flash/src/da.rs` の `pub fn write` が本体のトップレベル（brace depth 1）で `write_range` より前に `check_layout()?` を含む | 開始アドレスのゲートが書き込み経路から外れていない（コメント・別関数・未呼び出しの入れ子関数では通らない） |
+| `crates/m241-flash/src/da.rs` の `check_image` / `all_within` 本体に `firmware::digest` / `digest::matches` / `sha256(_hex)` が無い | strict なバックアップ差分経路に digest 受理が戻らない（差分ヘルパーへ移しても検出。vendor は固定 SHA の別関数 `accept_vendor_image`、`check_da_image` の W2a 用 SHA-256 は対象外） |
+| `crates/m241-flash/src/da.rs` の `pub fn write` / `write_vendor` が本体のトップレベル（brace depth 1）で `write_range` / `write_range_accepted` より前に `check_layout()?` を含む | 開始アドレスのゲートが書き込み経路から外れていない（コメント・別関数・未呼び出しの入れ子関数では通らない。`write_range(_accepted)` に到達する公開関数を名前ではなく呼び出しで探す） |
 
 すべての検査と `tools/check.sh` への配線は
 `crates/m241-flash/tests/safety_gate.rs` で自動検証している。違反を植えた一時
@@ -279,12 +280,12 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
 - **書き込み手順そのものの正しさ:** 範囲定数の値そのものの妥当性、`start = 0`
   が正しいことの根拠（`docs/dev/05-verification.md` §1.2）、読み戻し照合の有無、
   失敗時のリカバリ案内は `tools/check_safety.py` の対象外であり、上の 2 つの
-  レビュー節とテストで担保する。同ファイルの `write` が `check_layout()` を
-  呼ぶこと自体は機械的に検査するが、そのゲートの中身は検査しない。
+  レビュー節とテストで担保する。同ファイルの `write` / `write_vendor` が
+  `check_layout()` を呼ぶこと自体は機械的に検査するが、そのゲートの中身は検査しない。
 
-## 書き込み可能な実行（`fw flash --yes` / `fw flash --recover --yes` / `fw probe-da --yes`）の承認（2026-11-21 変更）
+## 書き込み可能な実行（`fw flash --yes` / `fw flash --recover --yes` / `fw flash --allow-vendor --yes` / `fw probe-da --yes`）の承認（2026-11-21 変更）
 
-`fw flash --yes`（`--recover` を含む）と `fw probe-da --yes` の承認は原則として
+`fw flash --yes`（`--recover` / `--allow-vendor` を含む）と `fw probe-da --yes` の承認は原則として
 ユーザー本人が行う。その
 セッションまたは指示でユーザーが明示的にサブエージェントへ承認権限を委任した場合
 **に限り**、対象の実行を準備したセッションとは独立したサブエージェントが `--yes`
@@ -337,6 +338,17 @@ follow-up **W2a** であり、それまでの承認は手動照合で行う（�
   `flash_recover_writes_the_backup_without_the_whole_unit_comparison`、
   `flash_recover_refuses_an_image_that_is_not_the_backup`、
   `flash_refuses_a_unit_that_does_not_hold_the_backup_before_any_write_opcode`。🧪
+- **`fw flash --allow-vendor` の承認**: `--allow-vendor` は公式 V1.13 ベンダー
+  イメージ（長さ 406,620、SHA-256
+  `32fe52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435`）だけを
+  受理する別ゲートで、strict な `check_image` のバックアップ差分を置き換えない。
+  承認者は固定 SHA-256 の完全一致、`--backup` とユニット同一性、`verify_device` が
+  スキップされないこと、読み戻しがベンダーイメージと比較されること、個体データ
+  14 バイトが上書きされることを確認する。V1.12 や別ビルドは拒否する。固定する
+  テストは `the_vendor_gate_accepts_only_the_pinned_v1_13_digest`、
+  `flash_allow_vendor_writes_the_vendor_image_and_reads_it_back`、
+  `flash_allow_vendor_still_requires_the_unit_to_match_the_backup`、および
+  `M241_VENDOR_IMAGE` を渡した dry-run 警告テスト。🧪
 - **記録主体の分離と永続記録**: 承認者はポートを開かず、準備ブランチも編集しない。
   `--yes` 実行**前**に承認者自身のセッションから直接、**永続的な**判定記録
   （承認者が投稿する PR コメント、または承認者が準備とは別のブランチ / PR で
