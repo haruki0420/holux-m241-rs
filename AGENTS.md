@@ -47,6 +47,20 @@ real M-241, the docs say 未検証 and so does your report. The hardware session
 `docs/dev/05-verification.md` is the only file allowed to move a claim from
 unverified to verified.
 
+**A subagent request is a tool call.** Writing the request into the message is
+not a request: the child never starts. Read the session id from the tool result
+and say "running" only when that id exists.
+
+**Before asking the user to unplug the battery or the cable, look for a software
+way back.** A unit left in the DA's RAM is restarted with `0xD9`; if the CLI has
+no command for it, add one (`fw da-restart`) rather than asking for a physical
+power cycle. A unit that has booted its firmware is reached with the `$PMTK180`
+route or `--assume-brom`. A physical power cycle is the last resort.
+
+**The simulator is a regression pin, not an oracle.** The hardware decides
+unknown behaviour; the fake records what the hardware has already shown. A green
+fake is not evidence that the write path works on a unit.
+
 **Read §9 before merging or accepting a fix.** It records what has already gone
 wrong here, including the two times 5/5 and a readable diff were mistaken for
 verification.
