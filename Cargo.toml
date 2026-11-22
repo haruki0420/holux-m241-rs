@@ -8,6 +8,8 @@ members = [
 ]
 
 [workspace.package]
+# The four crates inherit this (`version.workspace = true`); bump only here at
+# release time. `release.yml` checks the `vX.Y.Z` tag against this value.
 version = "1.0.0"
 edition = "2024"
 rust-version = "1.95"

@@ -7,18 +7,28 @@ GPS エポックから Unix 時刻への変換に使う定数 `315964800` を直
 `315964800` から `935280000` に置き換えてこのずれを直し（イメージ全体で実際に値が変わるのは
 3 バイト）、あわせて記録した軌跡を端末から吸い出して地図に出す。
 
-**状態: 1.0.0（初回公開リリース）。** 読み取り系（ファームの吸い出し、ログの取得と変換、
-パッチ適用、NMEA の日付補正）と書き込み系（`fw flash`）の主要経路は実機の M-241 で動いて
-いる。2026-11-22 のセッションで、復旧書き込みと strict 書き込みの 2 回が 1589 パケット
-完走し、406,620 バイトの全長読み戻しが一致した。パッチ済み V1.14 の起動も確認済みで、
-NMEA の既定日付はパッチ済みエポックの `22-08-99` になる。`log erase` は 2026-11-21 の
-実機セッションで動作を確認している（その後の変更は未検証、`docs/dev/05-verification.md` §1a）。
+**状態: 1.0.0（初回公開リリース）。** 実機の M-241 で動いているのは、読み取り系
+（`device info` / `fw dump` / `fw probe-da`、ログの取得と変換）、PC 上で完結するパッチ適用
+（`fw patch`）、書き込み系（`fw flash`）である。書き込みは 2026-11-22 のセッションで、
+復旧書き込みと通常の書き込み（自機バックアップとの差分だけを許す経路）の 2 回が
+1589 パケット完走し、406,620 バイトの全長読み戻しが一致した。パッチ済み V1.14 の起動も
+確認済みで、NMEA の既定日付はパッチ済みエポックの `22-08-99` になる。ただし、実機で動いた
+バイナリは [`docs/dev/05-verification.md`](docs/dev/05-verification.md) §1.5 に記録された
+`b8d91ee` 時点のもので、その後の flash / CLI の変更（DA ダイジェストゲートなど）は実機で
+実行していない。`log erase` は 2026-11-21 の実機セッションで動作を確認している（その後の
+変更は未検証、同ページ §1a）。
+
+NMEA については、壊れた NMEA の日付を直す `nmea repair` はオフラインの変換処理として
+実装済みだが、実機のストリームを中継する `nmea proxy` は**実機未検証**である。
 
 一方で、**測位ありの日付、GUI の実機動作（接続・追従・JPEG 書き込み）、macOS、Bluetooth
-SPP、他のユニット形状は未検証**である。ベンダー公式イメージの書き込みは完走するものの、
-起動したファームが個体データ 4 バイトを復元するため、現在の読み戻し照合では一致しない
-（設計課題）。何が検証済みで何が未検証かは
-[`docs/dev/05-verification.md`](docs/dev/05-verification.md) に列挙してある。
+SPP、`nmea proxy`、他のユニット形状は未検証**である。ベンダー公式イメージの書き込みは
+完走するものの、起動したファームが個体データ 4 バイトを復元するため、現在の読み戻し照合
+では一致しない（設計課題）。個体データは 14 バイト（`0x5C`–`0x5F` の 4、`0xF8`–`0xFD` の
+6、`0x63458`–`0x6345B` の 4）である。このうち起動時にファームが書き戻すのは `0x5C`–`0x5F`
+の 4 バイトで、実測で読み戻しに差が出たのはそのうち `0x5C` の 1 バイトだけだった。何が
+検証済みで何が未検証かは
+[`docs/dev/05-verification.md`](docs/dev/05-verification.md) §2 に列挙してある。
 
 ## 機能
 
@@ -49,8 +59,10 @@ GUI（`m241-gui`）は同じ仕事を 4 画面（接続 / ログ / ファーム 
 
 ### リリースバイナリ
 
-`v*` タグの push で GitHub Release が作られ、Ubuntu / Windows / macOS のバイナリと
-SHA-256 チェックサム（`SHA256SUMS.txt`）が添付される。リリースページ
+`v1.0.0` のような安定版タグの push で GitHub Release が作られ、Ubuntu / Windows / macOS の
+バイナリ、`LICENSE`、SHA-256 チェックサム（`SHA256SUMS.txt`）が添付される。**このリリース
+手順はまだ一度も実行していない**（`v1.0.0` タグも Release も未作成）。初回のタグ push 後は、
+リリースページ
 （<https://github.com/haruki0420/holux-m241-rs/releases>）から自分の OS のファイルを取る。
 
 | OS | CLI | GUI |
@@ -59,12 +71,24 @@ SHA-256 チェックサム（`SHA256SUMS.txt`）が添付される。リリー�
 | Windows (x86_64) | `m241-windows-x86_64.exe` | `m241-gui-windows-x86_64.exe` |
 | macOS (aarch64) | `m241-macos-aarch64` | `m241-gui-macos-aarch64` |
 
-取得したファイルは `SHA256SUMS.txt` と照合する（例: `sha256sum -c SHA256SUMS.txt`）。
+取得したファイルは `SHA256SUMS.txt` と照合する（PowerShell では
+`certutil -hashfile <ファイル> SHA256`）。アセット名は `m241-linux-x86_64` のように OS 名
+つきなので、`m241`（Windows は `m241.exe`）など任意の名前にリネームしてよい。
 インストーラは無く、`PATH` の通った場所に置けば動く（実行ビットが落ちている場合は
 `chmod +x`）。Linux では udev（`libudev`）が、GUI では X11 / Wayland と OpenGL の
 ライブラリが実行時に要る。端末にアクセスするユーザーは `dialout` グループに入れる
-（`sudo usermod -aG dialout $USER` の後、ログインし直す）。OS ごとの詳細は
-[`docs/user/01-install.md`](docs/user/01-install.md) にある。
+（`sudo usermod -aG dialout $USER` の後、ログインし直す）。
+
+バイナリは**コード署名されていない**。macOS では Gatekeeper が検疫（quarantine）を付けて
+起動を止めることがあり、その場合は「システム設定 > プライバシーとセキュリティ」で許可するか、
+`xattr -d com.apple.quarantine m241` を実行してから起動する。Windows では SmartScreen が
+「Windows によって PC が保護されました」と表示することがあり、「詳細情報 > 実行」で進む。
+どちらも配布元（このリポジトリの Release）と SHA-256 を確認してから行う。SHA-256 は転送の
+破損しか検出しない（署名・provenance は付けていない）。
+
+Linux 版は Ubuntu 24.04（glibc 2.39）の runner でビルドしており、glibc 系の
+ディストリビューションと `libudev.so.1` を前提とする（musl の静的バイナリではない）。
+OS ごとの詳細は [`docs/user/01-install.md`](docs/user/01-install.md)（英語）にある。
 
 ### ソースからビルド
 
@@ -100,6 +124,7 @@ m241 device ports
 m241 device info
 
 # まず自分のファームウェアを吸い出して保管する。2 回読んでハッシュ一致を要求する
+# （1 回目の後、電池を抜き差しして Enter を押す）
 m241 fw dump -o backup/firmware.bin
 
 # 吸い出したイメージに日付修正を当てる。PC 上だけで完結し、端末には触れない
@@ -114,12 +139,15 @@ m241 log read backup/log.bin --format gpx -o track.gpx
 [`DISCLAIMER.md`](DISCLAIMER.md) を読み、自分で吸い出したバックアップを用意する。
 GUI は `m241-gui` で起動する。
 
+日付修正を実際に行う手順は [`docs/user/02-fix-the-date.md`](docs/user/02-fix-the-date.md)
+（英語）に、書き込みが失敗したときの復旧は
+[`docs/user/03-recovery.md`](docs/user/03-recovery.md)（英語）にある。
+
 ## このリポジトリに含まれないもの
 
 Holux のファームウェアイメージ、ダウンロードエージェント（`DA_v3.8.4.bin`）、ベンダーの DLL、
 ベンダーの実行ファイルはプロプライエタリであり、このリポジトリでは再配布していない。これらの
-ベンダーファイルは利用者が用意したローカルのフォルダから読み込む。`.gitignore` がよくある
-ファイル名を塞いでいるため、誤って `git add .` しても公開されない。
+ベンダーファイルは利用者が用意したローカルのフォルダから読み込む。
 
 `DA_v3.8.4.bin` を必要とするのはファームウェアの書き込み（`m241 fw flash`）だけで、端末の
 読み取りや PC 上でのパッチ適用には要らない。入手方法と置き場所は
@@ -133,10 +161,8 @@ Holux のファームウェアイメージ、ダウンロードエージェン�
 [`docs/reference/01-da-protocol.md`](docs/reference/01-da-protocol.md) に記録してから実装する。
 ダウンロードエージェントのドライバは読み取り側とは別クレートの
 `crates/m241-flash/src/da.rs` にあり、書き込み範囲は DA 側の開始アドレス `0` に固定して
-`check_layout` で検査する。`fw flash` は 2026-11-22 に実機で書き込みと全長の読み戻しまで
-通っている（[`docs/dev/05-verification.md`](docs/dev/05-verification.md) §1.5）。ただし、
-ベンダー公式イメージの書き込みは読み戻しが一致しない設計課題を抱えている。読み取り専用の
-`m241-core` は書き込み・消去ルーチンを持たない。
+`check_layout` で検査する。読み取り専用の `m241-core` は書き込み・消去ルーチンを持たない。
+実機での確認状況は [`docs/dev/05-verification.md`](docs/dev/05-verification.md) §1.5 を見る。
 
 どこから何を取り入れたか、どの主張がまだ仮説かは
 [`docs/dev/04-prior-art.md`](docs/dev/04-prior-art.md) に書いてある。
@@ -149,10 +175,21 @@ JTAG を持たない、生産終了から年数が経つ機器のファームウ
 
 ## ドキュメント
 
+利用者向け:
+
 | ページ | 何が分かるか |
 |---|---|
 | [`CHANGELOG.md`](CHANGELOG.md) | リリースごとの変更点と、既知の未検証項目 |
-| [`docs/user/01-install.md`](docs/user/01-install.md) | OS ごとの導入、ポートの見つけ方、ベンダーファイルの用意 |
+| [`docs/user/01-install.md`](docs/user/01-install.md) | OS ごとの導入、ポートの見つけ方、ベンダーファイルの用意（英語） |
+| [`docs/user/02-fix-the-date.md`](docs/user/02-fix-the-date.md) | 日付を直す手順と、書き込み前の確認（英語） |
+| [`docs/user/03-recovery.md`](docs/user/03-recovery.md) | 書き込みが失敗したときの復旧手順（英語） |
+| [`DISCLAIMER.md`](DISCLAIMER.md) | 書き込みを行う前に読む免責事項 |
+| [`PRODUCT.md`](PRODUCT.md) | 誰のためのもので、何をしてはいけないか |
+
+開発者向け:
+
+| ページ | 何が分かるか |
+|---|---|
 | [`docs/dev/03-hardware-facts.md`](docs/dev/03-hardware-facts.md) | 実測した定数すべてと、その測定方法 |
 | [`docs/dev/05-verification.md`](docs/dev/05-verification.md) | 何を検証済みで、何が未検証か |
 | [`docs/dev/04-prior-art.md`](docs/dev/04-prior-art.md) | どこから何を持ってきたか |
@@ -162,7 +199,6 @@ JTAG を持たない、生産終了から年数が経つ機器のファームウ
 | [`docs/reference/01-da-protocol.md`](docs/reference/01-da-protocol.md) | `DA_v3.8.4.bin` 逆解析による Download Agent プロトコル仕様 |
 | [`docs/reference/02-cli.md`](docs/reference/02-cli.md) | コマンド体系と終了コード |
 | [`DESIGN.md`](DESIGN.md) | 画面の設計（方向、トークン、各画面） |
-| [`PRODUCT.md`](PRODUCT.md) | 誰のためのもので、何をしてはいけないか |
 | [`AGENTS.md`](AGENTS.md) | 自動化されたコントリビューター向けの作業メモ |
 
 ## ライセンス

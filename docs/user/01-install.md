@@ -10,8 +10,27 @@
 
 ## Get the binary
 
-Download `m241` (or `m241.exe` on Windows) and `m241-gui` from the latest CI
-artifact or release. Put them somewhere on your `PATH`.
+Releases are built by `.github/workflows/release.yml` on a `v1.0.0`-style tag.
+**No release has been published yet** (there is no `vX.Y.Z` tag), so until the
+first tag, take the binaries from a CI artifact. A release will carry one CLI
+and one GUI binary per platform, plus `LICENSE` and `SHA256SUMS.txt`:
+
+| Platform | CLI | GUI |
+|---|---|---|
+| Linux (x86_64) | `m241-linux-x86_64` | `m241-gui-linux-x86_64` |
+| Windows (x86_64) | `m241-windows-x86_64.exe` | `m241-gui-windows-x86_64.exe` |
+| macOS (aarch64) | `m241-macos-aarch64` | `m241-gui-macos-aarch64` |
+
+Verify the download against `SHA256SUMS.txt` (`sha256sum -c SHA256SUMS.txt`;
+on Windows, `certutil -hashfile <file> SHA256`). The asset name carries the
+platform, so rename it to `m241` (`m241.exe` on Windows) if you like, then put
+it somewhere on your `PATH`.
+
+The binaries are **not code-signed**. macOS Gatekeeper may quarantine the
+download (`xattr -d com.apple.quarantine m241`, or allow it under System
+Settings > Privacy & Security); Windows SmartScreen may block it behind
+"More info > Run anyway". The Linux build assumes a glibc distribution with
+`libudev.so.1` (it is not a static musl binary).
 
 There is no installer, no daemon, and nothing runs in the background.
 

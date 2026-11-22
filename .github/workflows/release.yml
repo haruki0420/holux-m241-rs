@@ -1,13 +1,15 @@
 name: Release
 
-# A `v*` tag is the only trigger: the tag is the release version, and the
-# workspace version in `Cargo.toml` is expected to match it (the tag is not used
-# to rewrite the version). Building here stays separate from `ci.yml` so a tag
-# can be moved only by re-pushing it, not by a branch push.
+# A stable `vX.Y.Z` tag is the only trigger: the tag is the release version and
+# the workspace version in `Cargo.toml` must match it (checked in the build job;
+# the tag is not used to rewrite the version). The pattern excludes pre-release
+# tags such as `v1.0.0-rc1`, which would otherwise be published as `--latest`.
+# Building here stays separate from `ci.yml` so a tag can be moved only by
+# re-pushing it, not by a branch push.
 on:
   push:
     tags:
-      - "v*"
+      - "v[0-9]+.[0-9]+.[0-9]+"
 
 permissions:
   contents: read
@@ -18,7 +20,7 @@ env:
 
 jobs:
   build:
-    name: build (${{ matrix.os }})
+    name: build (${{ matrix.platform }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -41,6 +43,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The tag is the version. Refuse a tag that does not match `Cargo.toml`
+      # so the asset name, the tag and `m241 --version` cannot disagree.
+      - name: Check the tag matches the workspace version
+        shell: bash
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          version=$(grep -m1 '^version = "' Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')
+          if [ "v${version}" != "$tag" ]; then
+            echo "::error::tag ${tag} does not match the workspace version ${version} in Cargo.toml"
+            exit 1
+          fi
+          echo "tag ${tag} matches the workspace version ${version}"
       # The same packages `ci.yml` uses: `serialport` links libudev on Linux,
       # and egui links the X11 / Wayland / GL stack.
       - name: Install the Linux build dependencies
@@ -51,8 +66,10 @@ jobs:
             libudev-dev \
             libxkbcommon-dev libwayland-dev libx11-dev libxi-dev \
             libgl1-mesa-dev libegl1-mesa-dev pkg-config
+      - name: Test
+        run: cargo test --workspace --locked
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --locked
       # Rename per platform so the assets from the three matrix jobs do not
       # collide on the release, and keep the Windows `.exe` suffix.
       - name: Collect the release assets (Linux / macOS)
@@ -86,16 +103,21 @@ jobs:
       contents: write
       actions: read
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      # MIT requires the copyright and permission notice to travel with the
+      # binaries, so the release carries `LICENSE` as an asset too.
+      - name: Add the license
+        run: cp LICENSE dist/LICENSE
       - name: Write the SHA-256 checksums
         run: |
           cd dist
-          # Artifact downloads can drop the executable bit; restore it so the
-          # assets are runnable after download. The checksum covers bytes only.
-          chmod +x m241-* 2>/dev/null || true
+          # GitHub Releases do not preserve POSIX execute bits, so there is
+          # nothing to restore here; the README tells users to `chmod +x` after
+          # download. The checksum covers bytes only.
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
       - name: Create or update the Release
