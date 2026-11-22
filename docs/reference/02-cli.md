@@ -299,7 +299,8 @@ The recomputed facts are the same ones ezTour showed
 
 * **distance** — great-circle distance summed between consecutive positioned
   points, in metres. A gap without a fix contributes nothing: the distance across
-  it was not measured.
+  it was not measured. With no positioned point at all it is `-` (text) or a
+  numeric zero in JSON beside `"fixes": 0`, not a measured distance.
 * **duration** — whole seconds between the first and last timestamp.
 * **average speed** — distance divided by duration, in km/h. Recomputed, as
   ezTour's was, because most records carry no speed field.
@@ -326,13 +327,19 @@ The recomputed facts are the same ones ezTour showed
     "format": "decimal",
     "start": {"latitude": "N 35.68123627°", "longitude": "E 139.76713562°",
               "lat": 35.681236267089844, "lon": 139.7671356201172},
-    "end": null
+    "end": {"latitude": "N 35.68123627°", "longitude": "E 139.76713562°",
+            "lat": 35.681236267089844, "lon": 139.7671356201172}
   }
 }
 ```
 
-`position` is `null` when no record has a position. A fact is `null` (JSON) or
-`-` (text) when the track has no data for it; it is never silently zero.
+`position` is `null` when no record has a position, and when it is not `null`
+both `start` and `end` are objects: the report is produced only when a first
+*and* a last positioned point exist. A fact is `null` (JSON) or `-` (text) when
+the track has no data for it; it is never silently zero. `distance` follows the
+same rule: with no positioned point at all it prints `-`, because no distance was
+measured (with one positioned point it is a measured `0.00 m` — there is no
+second point to be distant from).
 
 | `parse` field | Unit | Meaning |
 |---|---|---|
@@ -357,7 +364,8 @@ Converts a dumped log — or, with `--nmea` / `--gpx`, another kind of input —
 CSV, GPX, KML, NMEA or JSON (`--format`, default `gpx`), writing to
 `-o/--output <FILE>` or stdout when omitted.
 `--utc-offset-days` accepts a number or `auto` (default `auto`); `auto` shifts
-only if the newest record looks stale.
+only if the newest record looks stale, and **is never applied to an imported
+GPX** (see below). An explicit number is applied to every input.
 
 ### Input kinds
 
@@ -387,12 +395,19 @@ exported by ezTour or another tool. `<trkpt>` elements (with `ele`, `time`,
 **`<wpt>` waypoints are not read**: a saved place is a different kind of object
 from a recorded position, and this importer has no rule for turning one into the
 other. The two input switches cannot be combined with each other or with
-`--cache`.
+`--cache`. A GPX document with no `<trkpt>` (a `<wpt>`-only or `<rte>`-only
+file) is an **error** naming the file, with nothing written: the same rule as an
+NMEA capture that yields no point, because an empty export with exit code 0
+would look like a successful conversion.
 
-`--utc-offset-days auto` applies to an imported capture or GPX too, because a GPX
-exported from an unpatched unit carries the same 7168-day error. A genuinely
-historical GPX is kept as it is by passing `--utc-offset-days 0`; the shift is
-announced on stderr, so an unexpected shift is visible.
+**`auto` is not applied to an imported GPX.** The stale window `auto` uses
+(1999-08-22 to 2019-04-06) identifies a dump from an unpatched unit; a GPX from
+another tool can be a genuinely historical trip in the same window, so its
+timestamps are kept as written. When a GPX's newest date falls in that window,
+the run warns and names the day count that would shift it
+(`--utc-offset-days 7168` for a file exported from an unpatched unit); a GPX
+exported by this toolkit from a fixed unit needs no shift. An explicit number
+always applies.
 
 Dropped sentences are a warning: a partial track is still written. A **non-empty**
 capture that yields no point at all is an error naming the file and the counts,
@@ -425,22 +440,29 @@ thinning for a web upload; ezTour asks whether to simplify a GPX before upload,
 not define the rule, so this command implements the **stride** form only — not a
 distance threshold. A stride is deterministic: which points survive follows from
 the number alone, where a distance cut would depend on where the vehicle slowed
-down. `--simplify 1` keeps every point; `--simplify 0` is a usage error because it
-would keep none.
+down. `--simplify 1` keeps every point, which is the same as omitting the flag:
+nothing is thinned, no `simplified …` line is printed and no `"simplify"` field is
+written. `--simplify 0` is a usage error because it would keep none.
 
 ### Parse cache
 
 `--cache <FILE>` stores the parsed dump as JSON and reads it back on the next run
 when the input is unchanged. "Unchanged" means the file's length **and** a 64-bit
 FNV-1a content hash match; a changed dump is re-parsed and the cache is rewritten.
-A cache that is not this project's JSON is a warning and a re-parse, never an
-error: the dump is the source of truth and the cache can be rebuilt. This file is
-**this project's own format, not ezTour's `.tki`**; the specification records only
-that ezTour keeps a track-information cache, not its layout, so no compatibility
-is claimed. A cache hit is announced as `read the track from the parse cache`;
-only a raw dump can be cached. A cache hit skips the parser, so the parser's
-damage warnings (`bad checksums`, `unparsed bytes`, …) appear only on the run
-that actually parsed the dump; `log info` always parses and always reports them.
+A cache that is not this project's JSON — or one written by an older schema — is
+a warning and a re-parse, never an error: the dump is the source of truth and the
+cache can be rebuilt. This file is **this project's own format, not ezTour's
+`.tki`**; the specification records only that ezTour keeps a track-information
+cache, not its layout, so no compatibility is claimed. A cache hit is announced
+as `read the track from the parse cache`; only a raw dump can be cached.
+
+The cache stores the **parse report** as well as the points, so a hit replays the
+same damage warnings a fresh parse prints (`bad checksums`, `unparsed bytes`,
+`damaged blocks`, …). A damaged dump therefore looks the same on the first and
+the second run; only the parse itself, not what the parser observed, is skipped.
+The file is written beside the dump at the path given, replacing an existing file
+at that path (the path is always named by the user, unlike the sibling paths
+`log edit` derives).
 
 ### Formats
 
@@ -460,14 +482,15 @@ specification is the source. This replaces the provisional nine-column layout
 `--format json`, and `fix` is the presence of a coordinate.
 
 `--csv-report` writes the second CSV kind ezTour offers — a report — instead of
-the point CSV, and is exclusive with `--format`. It is a `KEY,VALUE` summary
-followed by a blank line and the same twelve-column point table. The **summary
-keys are this project's own layout and the report's columns are inferred, not
-specified**: the specification records ezTour's CSV columns once and does not
-define the report's own layout, so a byte comparison with ezTour is 未検証. The
-summary carries the recomputed facts (`RECORDS`, `FIXES`, `START`, `END`,
-`DISTANCE M`, `DURATION S`, `AVERAGE SPEED KMH`, `MAX SPEED KMH`,
-`MIN ALTITUDE M`, `MAX ALTITUDE M`).
+the point CSV, and is exclusive with `--format`. It is a `REPORT` marker line, a
+`KEY,VALUE` summary, a blank line, and the same twelve-column point table. The
+summary starts with `GENERATED BY,m241` and `TRACK NAME,M241 log`. The **summary keys are this
+project's own layout and the report's columns are inferred, not specified**: the
+specification records ezTour's CSV columns once and does not define the report's
+own layout, so a byte comparison with ezTour is 未検証. The summary carries the
+recomputed facts (`RECORDS`, `FIXES`, `START`, `END`, `DISTANCE M`,
+`DURATION S`, `AVERAGE SPEED KMH`, `MAX SPEED KMH`, `MIN ALTITUDE M`,
+`MAX ALTITUDE M`); a fact with no data is an empty value there.
 
 `--format gpx` writes GPX 1.1 with ezTour's template shape
 ([`07-eztour-spec.ja.md`](../dev/07-eztour-spec.ja.md) §2): `lat`/`lon` to nine
@@ -486,24 +509,35 @@ carries a `<Style id="trackStyle">` with `<LineStyle>` (purple `b3ff0080`, width
 5, from §5), a `<Style id="waypointStyle">` with `<IconStyle>`, a `<LookAt>`
 framed on the track (three times the bounding box diagonal, minimum 1 km — this
 is a framing choice, not a measured field of view), the track `<LineString>`, and
-one `<Point>` placemark per manual waypoint.
+one `<Point>` placemark per manual waypoint. Children follow KML's `FeatureType`
+sequence — `<name>`, `<LookAt>`, then the two `<Style>` blocks, then the
+`<Placemark>`s — because the schema is a sequence: a `<LookAt>` after a `<Style>`
+is invalid even though every element is present. `xmllint` against a minimal
+`FeatureType` schema rejects the old order and accepts this one (see
+[`05-verification.md`](../dev/05-verification.md) §2).
 
 `--format nmea` regenerates `$GPGGA`, `$GPGSA` and `$GPRMC` per point that has a
 time and a position — the set §2 records ezTour rebuilding, and the set the unit
-streams. The log record carries **no satellite count, no satellite list, no DOP
-and no geoid separation**, so those fields are empty (NMEA's "not available") or
-`0` where a digit is required; they are never filled with a plausible value:
+streams. The log format *defines* NSAT / satellite-list / PDOP / HDOP / VDOP
+fields in its block header (`03-hardware-facts.md`), but **the measured masks
+(`0x1D` / `0x3D`) select none of them and `TrackPoint` does not keep them**, so
+the exporter has no measured satellite count, satellite list, DOP or geoid
+separation to write. Every such field is written **empty** (NMEA's "not
+available") — never `00`, which is a valid satellite count beside a fix quality
+of 1. In particular:
 
-* GGA: fix quality `1` (a record exists only with coordinates), satellite count
-  `00`, HDOP and geoid separation empty, altitude from the record's height in
-  metres (empty when the record has none).
+* GGA: fix quality `1` (a record exists only with coordinates, which is the
+  unit's own statement that it had a fix), satellite count, HDOP and geoid
+  separation empty, altitude from the record's height in metres (empty when the
+  record has none).
 * GSA: mode `A`, fix type `3` when the record has an altitude and `2` when it
-  does not (the only evidence available for a 3D fix), twelve satellite fields
-  and all three DOPs empty.
+  does not. The fix type is an **inference from the record's field mask**, not
+  the receiver's own classification, and a reader should not treat it as one;
+  the twelve satellite fields and all three DOPs are empty.
 * RMC: time, position, speed in knots when the record has one, date.
 
-A zero DOP would read as an excellent dilution of precision; an empty field is
-the honest "unknown". [`03-hardware-facts.md`](../dev/03-hardware-facts.md)
+An empty DOP is the honest "unknown"; a zero DOP would read as an excellent
+dilution of precision. [`03-hardware-facts.md`](../dev/03-hardware-facts.md)
 records the same limit for the log format.
 
 The parser's observations go to stderr as warnings: skipped records that failed
@@ -726,9 +760,16 @@ replaced the run copies the original to `<photo>_original` (for example
 only copy of the photo, and a mis-aimed match cannot be undone from the tagged
 file. An existing `_original` is never overwritten, so a second run cannot
 replace the true original with an already-tagged copy. `--no-backup` suppresses
-the sibling for a caller that already keeps its own copy. The human summary
+the siblings for a caller that already keeps its own copy. The human summary
 prints `backup  : on` or `backup  : off`, and `--json` carries `keep_backup` as a
 boolean, so a dry run tells the user which behaviour the real run will have.
+
+The default lives on `m241_core::log::geotag::GeotagOptions`, not on the CLI
+flag, so **every caller that uses the default gets the backup** — including the
+GUI's Log screen, whose photo write calls `geotag::apply` with a default-built
+plan and has no toggle of its own. In 1.0.0 and earlier no backup was written;
+see [`CHANGELOG.md`](../../CHANGELOG.md)'s Unreleased entry. A library caller
+that wants the old behaviour must pass `keep_backup: false` explicitly.
 
 ### Grouping matched photos by distance
 
@@ -777,8 +818,11 @@ cannot be decoded is an error naming the photo, not a full-size embed.
 `--icons 128` asks for 128; the value must be positive. The thumbnail is produced
 by the same reduction path as the photo entry: a photo over the icon limit is
 scaled and re-encoded (dropping its EXIF, as above), one at or under it — or one
-whose frame header cannot be read — contributes its own bytes. Without the flag
-the archive has no `icon/` entries, which is the shape earlier builds wrote.
+whose frame header cannot be read — contributes its own bytes. A photo whose
+frame header *can* be read, whose long edge is over the icon limit, and which
+cannot be decoded is an **error naming the photo** (exit 1), not a
+full-size icon: the same rule as the photo entry. Without the flag the archive
+has no `icon/` entries, which is the shape earlier builds wrote.
 
 The archive is checked by this project's own ZIP reader and CRC in `m241-core`'s
 tests; **Google Earth and `unzip` have not been run on the output**. The KML

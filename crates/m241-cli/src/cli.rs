@@ -799,7 +799,8 @@ pub struct LogReadOptions {
     /// The way in for a track exported by ezTour or another tool. `<trkpt>`
     /// elements (with `ele`, `time`, `speed`) become points; `<wpt>` waypoints
     /// are **not** read, because a saved place is a different kind of object
-    /// from a recorded position.
+    /// from a recorded position. A document with no `<trkpt>` is an error (exit
+    /// 1) rather than an empty export with exit 0.
     #[arg(long, conflicts_with = "nmea")]
     pub gpx: bool,
 
@@ -829,15 +830,20 @@ pub struct LogReadOptions {
     ///
     /// ezTour asks whether to simplify GPX before an upload (`07-eztour-spec.ja.md`
     /// §2) without defining the rule; this is the stride form, so which points
-    /// survive is predictable from the number alone. `1` keeps every point.
+    /// survive is predictable from the number alone. `1` keeps every point,
+    /// which is the same as omitting the flag: nothing is thinned and no
+    /// `simplify` fact is reported.
     #[arg(long, value_parser = parse_stride, value_name = "N")]
     pub simplify: Option<usize>,
 
     /// Cache the parsed dump in this JSON file, or read it back when it matches.
     ///
     /// The cache records the input's length and a 64-bit content hash, so a
-    /// changed dump is re-parsed rather than served stale. It is this project's
-    /// own format and is not ezTour's `.tki`; only a raw dump can be cached.
+    /// changed dump is re-parsed rather than served stale. A hit replays the
+    /// stored parse report as the same warnings a fresh parse prints, and an
+    /// unreadable or older cache is a warning and a re-parse. It is this
+    /// project's own format and is not ezTour's `.tki`; only a raw dump can be
+    /// cached.
     #[arg(long, conflicts_with_all = ["nmea", "gpx"], value_name = "FILE")]
     pub cache: Option<PathBuf>,
 
@@ -846,6 +852,13 @@ pub struct LogReadOptions {
     pub output: Option<PathBuf>,
 
     /// Days to add to every timestamp, or `auto` to detect a WNRO-shifted log.
+    ///
+    /// `auto` is a rule for a raw dump: it shifts a log whose newest record
+    /// falls in the window an unpatched unit emits (1999-08-22 to 2019-04-06).
+    /// **It is never applied to `--gpx`**: a GPX from another tool can be
+    /// genuinely historical, so its dates are kept as written and a warning
+    /// names the day count that would shift them. Pass an explicit number to
+    /// shift either input, including a negative one to undo a shift.
     ///
     /// `allow_hyphen_values` is what makes `--utc-offset-days -7168` a value
     /// rather than an unknown flag: a negative shift is the normal way to undo

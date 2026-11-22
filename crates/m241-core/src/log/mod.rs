@@ -8,10 +8,12 @@
 //!              recognised and skipped, never read as track records
 //!   record     one record -> a TrackPoint, for that block's bitmask
 //!   parse      a whole dump -> `Track`, tolerating the damage real dumps have
-//!   export     a `Track` -> GPX / KML / CSV / NMEA / JSON
-//!   kmz        a `Track` + photos -> uncompressed KMZ (KML 2.0 + Store ZIP)
+//!   export     a `Track` -> GPX / KML / CSV / CSV report / NMEA / JSON
+//!   kmz        a `Track` + photos -> uncompressed KMZ (KML 2.0 + Store ZIP),
+//!              with optional `icon/` thumbnails for the map
 //!   import     GPX 1.0/1.1 or NMEA 0183 -> `Track` (plus the NMEA line counts)
-//!   edit       split, merge, delete points, and multi-step Undo/Redo
+//!   edit       split, merge, delete points, thin by stride, and multi-step
+//!              Undo/Redo
 //!   coord      format coordinates as Decimal, DMS, or WGS84 UTM
 //!   exif       the GPS tags in a JPEG's Exif block: read, validate, replace
 //!              (write_gps and write_datetime_original return new bytes; only

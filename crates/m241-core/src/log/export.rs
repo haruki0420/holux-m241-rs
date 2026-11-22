@@ -20,10 +20,9 @@
 //!   file that no parser will open.
 //! * **GPX coordinates carry nine decimals** (`%.9f`), which is what
 //!   `07-eztour-spec.ja.md` §2 records for ezTour's template. Eight places are
-//!   enough for a whole millimetre, but the log's latitude and longitude are
-//!   4-byte floats, so the extra digit preserves the decoded value exactly and
-//!   lets a round trip through this writer and [`crate::log::import`] keep the
-//!   bits it started with.
+//!   enough for a whole millimetre; the ninth is ezTour's format, and it is also
+//!   enough to round-trip a 4-byte-float coordinate, whose decoded `f64` carries
+//!   no digit beyond it.
 //! * **The GPX metadata carries a link and a time.** GPX 1.1's `metadataType`
 //!   has both, and §2 records that ezTour's header writes them. The time is the
 //!   track's first recorded instant: this library has no clock of its own, and a
@@ -173,7 +172,7 @@ pub fn to_gpx(track: &Track) -> String {
     out.push_str("  </metadata>\n");
 
     for (index, point) in track.points.iter().enumerate() {
-        let (Some(lat), Some(lon)) = (point.latitude, point.longitude) else {
+        let Some((lat, lon)) = point.position() else {
             continue;
         };
         if !point.is_waypoint() {
@@ -196,7 +195,7 @@ pub fn to_gpx(track: &Track) -> String {
         escape_xml(DOCUMENT_NAME)
     );
     for (index, point) in track.points.iter().enumerate() {
-        let (Some(lat), Some(lon)) = (point.latitude, point.longitude) else {
+        let Some((lat, lon)) = point.position() else {
             continue;
         };
         let _ = writeln!(out, "      <trkpt lat=\"{lat:.9}\" lon=\"{lon:.9}\">");
@@ -231,20 +230,24 @@ pub fn to_gpx(track: &Track) -> String {
 /// `waypointStyle` its waypoint placemarks reference, a `LookAt` framed on the
 /// track, the track's `LineString`, and one `<Point>` placemark per manual
 /// waypoint (`07-eztour-spec.ja.md` §2, §8 P0-4).
+///
+/// # Child order is the schema's, not this writer's taste
+///
+/// KML's `FeatureType` is an XSD `sequence`: `name` → `LookAt` →
+/// `TimePrimitive` → `styleUrl` → `StyleSelector*` → `Region` → `Metadata`.
+/// A `<LookAt>` after a `<Style>` is therefore invalid even though every element
+/// is present, and a validator rejects the document with "element LookAt is not
+/// expected". The `LookAt` block is emitted immediately after `<name>` for that
+/// reason; `a_kml_feature_children_follow_the_schema_order` pins the order,
+/// because a `contains` assertion cannot see a reordering.
 #[must_use]
 pub fn to_kml(track: &Track) -> String {
     let mut out = String::new();
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     let _ = writeln!(out, "<kml xmlns=\"{KML_NAMESPACE}\">\n  <Document>");
     let _ = writeln!(out, "    <name>{}</name>", escape_xml(DOCUMENT_NAME));
-    out.push_str(&track_style());
-    out.push('\n');
-    out.push_str(
-        "    <Style id=\"waypointStyle\">\n      <IconStyle>\n        <scale>1</scale>\n        \
-         <Icon>\n          ",
-    );
-    let _ = writeln!(out, "<href>{WAYPOINT_ICON_HREF}</href>");
-    out.push_str("        </Icon>\n      </IconStyle>\n    </Style>\n");
+    // FeatureType's sequence puts LookAt before every StyleSelector, so this
+    // block cannot follow `track_style()` and still validate.
     if let Some((lon, lat, range)) = look_at(track) {
         let _ = writeln!(
             out,
@@ -254,13 +257,21 @@ pub fn to_kml(track: &Track) -> String {
              </LookAt>"
         );
     }
+    out.push_str(&track_style());
+    out.push('\n');
+    out.push_str(
+        "    <Style id=\"waypointStyle\">\n      <IconStyle>\n        <scale>1</scale>\n        \
+         <Icon>\n          ",
+    );
+    let _ = writeln!(out, "<href>{WAYPOINT_ICON_HREF}</href>");
+    out.push_str("        </Icon>\n      </IconStyle>\n    </Style>\n");
     out.push_str("    <Placemark>\n");
     let _ = writeln!(out, "      <name>{}</name>", escape_xml(DOCUMENT_NAME));
     out.push_str("      <styleUrl>#trackStyle</styleUrl>\n");
     out.push_str("      <LineString>\n        <tessellate>1</tessellate>\n");
     out.push_str("        <coordinates>\n");
     for point in &track.points {
-        let (Some(lat), Some(lon)) = (point.latitude, point.longitude) else {
+        let Some((lat, lon)) = point.position() else {
             continue;
         };
         // KML orders coordinates lon,lat,altitude — the opposite of GPX, and the
@@ -271,7 +282,7 @@ pub fn to_kml(track: &Track) -> String {
     out.push_str("        </coordinates>\n      </LineString>\n    </Placemark>\n");
 
     for (index, point) in track.points.iter().enumerate() {
-        let (Some(lat), Some(lon)) = (point.latitude, point.longitude) else {
+        let Some((lat, lon)) = point.position() else {
             continue;
         };
         if !point.is_waypoint() {
@@ -303,12 +314,9 @@ pub fn to_kml(track: &Track) -> String {
 fn look_at(track: &Track) -> Option<(f64, f64, f64)> {
     let mut bounds: Option<(f64, f64, f64, f64)> = None;
     for point in &track.points {
-        let (Some(lat), Some(lon)) = (point.latitude, point.longitude) else {
+        let Some((lat, lon)) = point.position() else {
             continue;
         };
-        if !lat.is_finite() || !lon.is_finite() {
-            continue;
-        }
         bounds = Some(match bounds {
             Some((min_lat, max_lat, min_lon, max_lon)) => (
                 min_lat.min(lat),
@@ -498,26 +506,30 @@ fn csv_field(text: &str) -> String {
 ///
 /// # What the sentences can and cannot say
 ///
-/// A log record carries a time, a position, a height and sometimes a speed. It
-/// carries **no satellite count, no satellite list, no DOP and no geoid
-/// separation**. Those fields are written empty — NMEA's "not available" — or,
-/// where the field must hold a digit, as `0`; they are not filled with a
-/// plausible value, because a fabricated satellite count is data the unit never
-/// measured and a reader cannot tell it from a real one. In particular:
+/// A log record carries a time, a position, a height and sometimes a speed. The
+/// log format *defines* NSAT/DOP fields in its block header
+/// ([`crate::log::block`]), but the measured mask (`0x1D` / `0x3D`) selects none
+/// of them and [`TrackPoint`] does not retain them, so this writer has no
+/// satellite count, satellite list, DOP or geoid separation to put in a
+/// sentence. Every missing value is written **empty** — NMEA's "not available" —
+/// rather than as a digit, because `00` is a valid satellite count that a reader
+/// cannot tell from a measured one. (GSA's fix type is the one inferred value,
+/// described below.) A GGA with quality `1` and an empty satellite field
+/// therefore says exactly what is known: the unit had a fix, and the receiver's
+/// satellite count was not recorded. In particular:
 ///
 /// * GGA's fix quality is `1` (a GPS fix): a record only exists with coordinates,
-///   which is the unit's own statement that it had a fix. Its satellite count is
-///   `00`, its HDOP and geoid separation are empty, and its altitude is the
-///   record's height with unit `M` (empty when the record has none).
+///   which is the unit's own statement that it had a fix. Its satellite count,
+///   HDOP and geoid separation are empty, and its altitude is the record's
+///   height with unit `M` (empty when the record has none).
 /// * GSA's mode is `A` (automatic selection). Its fix type is `3` when the
 ///   record has an altitude and `2` when it does not: a record with a height is
 ///   the only evidence this writer has of a three-dimensional fix, and the
-///   satellite geometry that would settle it is not in the log. Its twelve
+///   satellite geometry that would settle it is not in the log. **This is an
+///   inference from the record's field mask, not the receiver's own fix
+///   classification**, and a reader that treats it as the latter is over-reading
+///   it; the alternative, an empty fix type, would say even less. Its twelve
 ///   satellite fields and all three DOPs are empty.
-///
-/// # Errors
-///
-/// This function cannot fail; a point that cannot form a sentence is skipped.
 #[must_use]
 pub fn to_nmea(track: &Track) -> String {
     let mut out = String::new();
@@ -563,8 +575,9 @@ pub fn rmc_sentence(point: &TrackPoint) -> Option<String> {
 
 /// One `$GPGGA` sentence for `point`, or `None` when it has no time or position.
 ///
-/// The satellite count, HDOP and geoid separation are empty or `0` because the
-/// log does not record them; see [`to_nmea`] for why they are not guessed.
+/// The satellite count, HDOP and geoid separation are empty because the log does
+/// not record them; `00` would be a valid satellite count, so it is not written.
+/// See [`to_nmea`] for the full contract.
 #[must_use]
 pub fn gga_sentence(point: &TrackPoint) -> Option<String> {
     let utc = point.utc?;
@@ -579,8 +592,10 @@ pub fn gga_sentence(point: &TrackPoint) -> Option<String> {
         .unwrap_or_default();
     // Fields: time, lat, N/S, lon, E/W, quality, satellites, HDOP, altitude,
     // altitude unit, geoid separation, separation unit, age, station id.
+    // Field 7 stays empty: the log has no satellite count, and `00` would read
+    // as a measured zero beside quality `1`.
     let body = format!(
-        "GPGGA,{},{lat_text},{lat_hemisphere},{lon_text},{lon_hemisphere},1,00,,{altitude},M,,M,,",
+        "GPGGA,{},{lat_text},{lat_hemisphere},{lon_text},{lon_hemisphere},1,,,{altitude},M,,M,,",
         nmea_time(utc)
     );
     Some(nmea_sentence(&body))
@@ -588,8 +603,10 @@ pub fn gga_sentence(point: &TrackPoint) -> Option<String> {
 
 /// One `$GPGSA` sentence for `point`, or `None` when it has no time or position.
 ///
-/// The fix type is derived from the record's altitude (`3` for a fix with a
-/// height, `2` without); the satellite list and DOPs are empty. See [`to_nmea`].
+/// The fix type is **inferred** from the record's altitude (`3` for a fix with a
+/// height, `2` without), not read from the log, which records no fix dimension;
+/// this is an inference that a reader should not treat as the receiver's own
+/// classification. The satellite list and DOPs are empty. See [`to_nmea`].
 #[must_use]
 pub fn gsa_sentence(point: &TrackPoint) -> Option<String> {
     point.utc?;
@@ -916,6 +933,86 @@ mod tests {
         assert!(kml.contains("<name>WP000001</name>"), "got {kml}");
     }
 
+    /// Position of `needle` in `haystack`, failing with the document when absent.
+    fn at(haystack: &str, needle: &str) -> usize {
+        haystack
+            .find(needle)
+            .unwrap_or_else(|| panic!("missing {needle} in {haystack}"))
+    }
+
+    #[test]
+    fn a_kml_feature_children_follow_the_schema_order() {
+        // KML's FeatureType is a sequence: name, LookAt, styleUrl, StyleSelector*.
+        // A `contains` assertion cannot see the order, and a LookAt after a Style
+        // is invalid KML even though every element is present (xmllint rejects it
+        // with "element LookAt is not expected").
+        let track = Track {
+            points: vec![
+                tokyo_point(),
+                TrackPoint {
+                    rcr: Some(0x0008),
+                    ..tokyo_point()
+                },
+            ],
+            damaged_blocks: Vec::new(),
+        };
+        let kml = to_kml(&track);
+        let name = at(&kml, "<name>");
+        let look_at = at(&kml, "<LookAt>");
+        let track_style = at(&kml, "<Style id=\"trackStyle\">");
+        let waypoint_style = at(&kml, "<Style id=\"waypointStyle\">");
+        let placemark = at(&kml, "<Placemark>");
+        assert!(name < look_at, "LookAt follows the Document name: {kml}");
+        assert!(
+            look_at < track_style,
+            "LookAt must precede both StyleSelectors: {kml}"
+        );
+        assert!(
+            track_style < waypoint_style,
+            "both Style blocks stay in emission order: {kml}"
+        );
+        assert!(
+            waypoint_style < placemark,
+            "StyleSelectors precede the user content: {kml}"
+        );
+        // `styleUrl` is a child of Placemark, not of Document, so it cannot be
+        // compared with the Document-level children above; it must still follow
+        // the Placemark's own name and precede the geometry.
+        let placemark_name = placemark + at(&kml[placemark..], "</name>");
+        let style_url = at(&kml, "<styleUrl>#trackStyle</styleUrl>");
+        let line_string = at(&kml, "<LineString>");
+        assert!(
+            placemark_name < style_url && style_url < line_string,
+            "a Placemark's name, styleUrl and geometry are ordered: {kml}"
+        );
+    }
+
+    #[test]
+    fn a_non_finite_position_is_not_written_to_gpx_or_kml() {
+        // A record can decode a NaN coordinate from a corrupt block. `None` and
+        // `NaN` are both "no usable position" to every writer, so the document
+        // must not carry `lat="NaN"` and the camera must not frame it.
+        let track = Track {
+            points: vec![
+                tokyo_point(),
+                TrackPoint {
+                    latitude: Some(f64::NAN),
+                    longitude: Some(139.767_125),
+                    ..TrackPoint::default()
+                },
+            ],
+            damaged_blocks: Vec::new(),
+        };
+        let gpx = to_gpx(&track);
+        assert!(!gpx.contains("NaN"), "got {gpx}");
+        let kml = to_kml(&track);
+        assert!(!kml.contains("NaN"), "got {kml}");
+        assert!(
+            kml.contains("<LookAt>"),
+            "one finite point still frames: {kml}"
+        );
+    }
+
     #[test]
     fn a_kml_without_a_position_has_no_look_at() {
         let track = Track {
@@ -1106,7 +1203,11 @@ mod tests {
         assert_eq!(fields.len(), 15, "GGA has 15 fields: {body}");
         assert_eq!(fields[0], "GPGGA");
         assert_eq!(fields[6], "1", "a record with a position is a GPS fix");
-        assert_eq!(fields[7], "00", "the log records no satellite count");
+        assert_eq!(
+            fields[7], "",
+            "the log records no satellite count, so the field is empty rather than `00` \
+             (which beside quality 1 would read as a measured zero)"
+        );
         assert_eq!(fields[8], "", "the log records no HDOP");
         assert_eq!(fields[9], "80.0", "the altitude is the record's height");
         assert_eq!(fields[10], "M");

@@ -76,6 +76,19 @@ impl TrackPoint {
         self.latitude.is_some() && self.longitude.is_some()
     }
 
+    /// The finite position this point carries, when it has one.
+    ///
+    /// A coordinate pair that is present but non-finite (a NaN or infinity
+    /// decoded from a corrupt record) is not a position: writing it would put
+    /// `NaN` into a GPX or KML document no map can draw, and feeding it to a
+    /// distance would poison every later sum. Every writer and statistic uses
+    /// this one predicate, so they cannot disagree about what counts as a place.
+    #[must_use]
+    pub fn position(&self) -> Option<(f64, f64)> {
+        let (lat, lon) = (self.latitude?, self.longitude?);
+        (lat.is_finite() && lon.is_finite()).then_some((lat, lon))
+    }
+
     /// Whether this point is a manual waypoint.
     #[must_use]
     pub fn is_waypoint(&self) -> bool {
@@ -159,10 +172,14 @@ impl LogSummary {
 /// carry no speed field at all, so a summary built only from fields would
 /// describe the minority of points that have one.
 ///
-/// This is a public API the CLI and the GUI both read, so the fields are
-/// additive: a new fact may appear, but an existing field is not renamed or
+/// This is a public API the CLI reads today and the GUI will read, so the fields
+/// are additive: a new fact may appear, but an existing field is not renamed or
 /// removed. The struct is produced by [`TrackStats::of`]; the `Default` value
 /// (all zeros and `None`) is an empty track, not a meaningful default to edit.
+///
+/// Precision is mixed on purpose: device values (`max_speed_kmh`, the altitudes)
+/// are `f32` because that is what a record carries, while the recomputed
+/// distance and average are `f64` because they are sums.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct TrackStats {
     /// Points the track holds, including those without a position.
@@ -214,10 +231,7 @@ impl TrackStats {
         let mut distance_m = 0.0;
         let mut previous: Option<(f64, f64)> = None;
         for point in &track.points {
-            let position = match (point.latitude, point.longitude) {
-                (Some(lat), Some(lon)) if lat.is_finite() && lon.is_finite() => Some((lat, lon)),
-                _ => None,
-            };
+            let position = point.position();
             if let (Some((lat1, lon1)), Some((lat2, lon2))) = (previous, position) {
                 distance_m += haversine_meters(lat1, lon1, lat2, lon2);
             }

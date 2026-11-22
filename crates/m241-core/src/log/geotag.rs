@@ -474,11 +474,7 @@ pub fn group_matched_plans(plans: &mut [GeotagPlan], max_distance_meters: f64) {
     // The matched plans' coordinates, in listing order.
     let positions: Vec<(f64, f64)> = plans
         .iter()
-        .filter_map(|plan| {
-            let point = plan.point?;
-            let (lat, lon) = (point.latitude?, point.longitude?);
-            (lat.is_finite() && lon.is_finite()).then_some((lat, lon))
-        })
+        .filter_map(|plan| plan.point.as_ref().and_then(TrackPoint::position))
         .collect();
 
     let mut sets = DisjointSets::new(positions.len());
@@ -500,10 +496,7 @@ pub fn group_matched_plans(plans: &mut [GeotagPlan], max_distance_meters: f64) {
     let mut indices: Vec<Option<usize>> = Vec::with_capacity(plans.len());
     let mut next_index = 0usize;
     for plan in plans.iter() {
-        let matched = plan
-            .point
-            .and_then(|point| Some((point.latitude?, point.longitude?)))
-            .is_some_and(|(lat, lon)| lat.is_finite() && lon.is_finite());
+        let matched = plan.point.and_then(|point| point.position()).is_some();
         if matched {
             indices.push(Some(next_index));
             next_index += 1;

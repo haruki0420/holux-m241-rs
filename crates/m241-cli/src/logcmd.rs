@@ -5,13 +5,16 @@
 //!
 //! Downloading talks PMTK182 to the logger and saves the raw flash blocks;
 //! `info` summarises a dump without converting it so the user can check damage
-//! before exporting; `read` converts a dump (or, with `--nmea`, an NMEA 0183
-//! capture whose line counts it reports) to GPX, KML, CSV, NMEA or JSON,
-//! optionally shifting WNRO-stale timestamps; `edit` splits, merges or trims a
-//! dump and exports the result in the same formats; `erase` saves the log and
-//! then destroys it on the device through `m241-flash`; `geotag` matches photos
-//! by capture time and writes GPS EXIF tags; `kmz` bundles the track and the
-//! matched photos into an archive for a map viewer.
+//! before exporting; `read` converts a dump — or, with `--nmea`, an NMEA 0183
+//! capture whose line counts it reports, or, with `--gpx`, a GPX document from
+//! another tool — to GPX, KML, CSV, CSV report, NMEA or JSON, optionally
+//! thinning the points (`--simplify`), rendering the reported positions in
+//! `--coord-format`, and caching the parse (`--cache`, owned by
+//! [`crate::logcache`]); `edit` splits, merges or trims a dump and exports the
+//! result in the same formats; `erase` saves the log and then destroys it on the
+//! device through `m241-flash`; `geotag` matches photos by capture time and
+//! writes GPS EXIF tags; `kmz` bundles the track and the matched photos into an
+//! archive for a map viewer.
 
 use std::path::{Path, PathBuf};
 
@@ -239,13 +242,16 @@ fn print_download(
 ///
 /// `--utc-offset-days auto` shifts only a log whose newest record is stale — one
 /// written by an unpatched unit, whose every timestamp is 7168 days in the past.
-/// An explicit number is applied as given, including negative values. The rule
-/// applies to an imported GPX too, because a GPX exported from an unpatched unit
-/// carries the same 7168-day error; a genuinely historical GPX is kept as it is
-/// by passing `--utc-offset-days 0`.
+/// An explicit number is applied as given, including negative values. **`auto` is
+/// not applied to an imported GPX**: a GPX from another tool may genuinely be
+/// historical, and the stale window covers ordinary 2000s and 2010s trips. A GPX
+/// whose dates fall in that window is kept as written, with a warning naming the
+/// `--utc-offset-days` value that would shift it; an explicit number always
+/// applies.
 ///
 /// `--simplify` thins the points after the shift and before the export, so the
-/// two settings compose in the order the user reads them. `--coord-format`
+/// two settings compose in the order the user reads them. `--simplify 1` keeps
+/// every point, so it does no thinning and reports none. `--coord-format`
 /// selects how the start and end positions are rendered: in the report on
 /// stderr, and in `--format json`'s `position` object. The file formats define
 /// their own coordinate encoding, so the flag does not rewrite them.
@@ -256,8 +262,9 @@ fn print_download(
 /// [`m241_core::Error::Log`] when the input is not a dump, a GPX document or a
 /// capture of the kind named;
 /// [`m241_core::Error::State`] when a non-empty `--nmea` capture yields no point
-/// at all — an empty export must not look like a converted capture — and when
-/// `--coord-format utm` is asked for a point outside the UTM band.
+/// at all, or an imported GPX has no `<trkpt>` — in both cases an empty export
+/// must not look like a successful conversion — and when `--coord-format utm` is
+/// asked for a point outside the UTM band.
 pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
     let (mut track, input) = if options.nmea {
         let report = m241_core::log::import_nmea(&fileio::read_text(&options.file)?)?;
@@ -272,6 +279,17 @@ pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
         (report.track, ReadInput::Nmea(counts))
     } else if options.gpx {
         let track = m241_core::log::import_gpx(&fileio::read_text(&options.file)?)?;
+        // The same rule as `--nmea`: a document that parsed but produced no
+        // point is an error, not a header-only export with exit code 0. A
+        // `<wpt>`-only GPX is the common case — waypoints are deliberately not
+        // read — and an empty track written as success would hide it.
+        if track.points.is_empty() {
+            return Err(Error::State(format!(
+                "{}: no point could be imported from this GPX document; `<wpt>` and `<rte>` are \
+                 not read and a `<trkpt>` is required. Nothing was written",
+                options.file.display()
+            )));
+        }
         session.console.note(&format!(
             "read {}: {} imported from GPX (waypoints are not read)",
             options.file.display(),
@@ -285,13 +303,28 @@ pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
         )
     };
 
-    let shift = apply_utc_offset(&mut track, options.utc_offset_days, session.console);
+    // `--gpx` is somebody else's document: `auto` is not applied to it (see
+    // `apply_utc_offset`), so a historical GPX keeps its dates by default.
+    let offset_input = if options.gpx {
+        OffsetInput::Gpx
+    } else {
+        OffsetInput::Unit
+    };
+    let shift = apply_utc_offset(
+        &mut track,
+        options.utc_offset_days,
+        offset_input,
+        session.console,
+    );
 
-    if let Some(stride) = options.simplify {
+    // Stride 1 keeps every point, so there is nothing to thin and nothing to
+    // report: `after` is `before` and a "simplified 7 to 7" line would be noise.
+    let simplify = options.simplify.filter(|stride| *stride > 1);
+    if let Some(stride) = simplify {
         let before = track.points.len();
         track = m241_core::log::simplify_track(&track, stride);
         session.console.note(&format!(
-            "simplified {} to {}: kept every {stride}th point and the last one",
+            "simplified {} to {}: kept the first point, every {stride}th after it, and the last",
             count_label(before, "point"),
             count_label(track.points.len(), "point")
         ));
@@ -324,7 +357,7 @@ pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
     let report = ReadReport {
         shift_days: shift,
         input,
-        simplify: options.simplify,
+        simplify,
         position,
     };
     let exported = attach_read_report(exported, options.format, &report);
@@ -345,11 +378,13 @@ pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
 
 /// Read a raw dump, through the parse cache when one was named.
 ///
-/// A cache hit is announced on stderr; a stale cache (different length or
-/// content hash) is silently re-parsed and overwritten, because a dump that
-/// changed between two runs is the normal way to use the flag. A cache that is
-/// not this project's JSON is a warning and a re-parse rather than an error: the
-/// dump is the source of truth and the cache can always be rebuilt.
+/// A cache hit is announced on stderr **and replays the stored parse report as
+/// warnings**, so a damaged dump does not look clean on the second run; a stale
+/// cache (different length or content hash) is silently re-parsed and
+/// overwritten, because a dump that changed between two runs is the normal way
+/// to use the flag. A cache that is not this project's JSON is a warning and a
+/// re-parse rather than an error: the dump is the source of truth and the cache
+/// can always be rebuilt. See [`crate::logcache`] for what the cache guarantees.
 fn read_dump(path: &Path, cache: Option<&Path>, console: &dyn Console) -> Result<Track> {
     let bytes = fileio::read(path)?;
     let Some(cache_path) = cache else {
@@ -357,185 +392,27 @@ fn read_dump(path: &Path, cache: Option<&Path>, console: &dyn Console) -> Result
         warn_about_parse_report(console, &report.summary(&track), &report, None);
         return Ok(track);
     };
-    if let Some(track) = cache_load(cache_path, &bytes, console)? {
+    if let Some(cached) = crate::logcache::load(cache_path, &bytes, console)? {
         console.note(&format!(
             "read the track from the parse cache {}",
             cache_path.display()
         ));
-        return Ok(track);
+        warn_about_parse_report(
+            console,
+            &cached.report.summary(&cached.track),
+            &cached.report,
+            None,
+        );
+        return Ok(cached.track);
     }
     let (track, report) = parse_dump(&bytes)?;
     warn_about_parse_report(console, &report.summary(&track), &report, None);
-    cache_store(cache_path, &bytes, &track)?;
+    crate::logcache::store(cache_path, &bytes, &track, &report)?;
     console.note(&format!(
         "wrote the parse cache to {}",
         cache_path.display()
     ));
     Ok(track)
-}
-
-/// Marker and schema version of this project's parse cache.
-///
-/// Not ezTour's `.tki`: the specification records only that a cache exists, not
-/// its format, so this file says what it is and claims no compatibility.
-const CACHE_FORMAT: &str = "m241-cache";
-/// Schema version of the parse cache; a different version is ignored and rebuilt.
-const CACHE_VERSION: u64 = 1;
-
-/// 64-bit FNV-1a hash of `bytes`.
-///
-/// A content hash, not a timestamp: two dumps of the same unit on different days
-/// can share a size, and an mtime is not portable between a copy and its source.
-/// FNV-1a is not cryptographic — a cache is not a security boundary, and the
-/// dump itself is what gets parsed when the hash differs.
-fn content_hash(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
-}
-
-/// Load `path` when it describes exactly `bytes`; `None` when it is stale.
-///
-/// # Errors
-///
-/// [`Error::Io`] when the cache exists but cannot be read.
-fn cache_load(path: &Path, bytes: &[u8], console: &dyn Console) -> Result<Option<Track>> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(Error::io(path.display().to_string(), source)),
-    };
-    let document = match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(document) => document,
-        Err(_) => {
-            console.warn(&format!(
-                "{}: not a JSON cache; the dump will be parsed again",
-                path.display()
-            ));
-            return Ok(None);
-        }
-    };
-    if document.get("format").and_then(serde_json::Value::as_str) != Some(CACHE_FORMAT)
-        || document.get("version").and_then(serde_json::Value::as_u64) != Some(CACHE_VERSION)
-    {
-        console.warn(&format!(
-            "{}: not a cache this build understands; the dump will be parsed again",
-            path.display()
-        ));
-        return Ok(None);
-    }
-    let expected_hash = format!("{:016x}", content_hash(bytes));
-    let expected_length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    let source = match document.get("source") {
-        Some(source) => source,
-        None => return Ok(None),
-    };
-    if source.get("bytes").and_then(serde_json::Value::as_u64) != Some(expected_length)
-        || source.get("hash").and_then(serde_json::Value::as_str) != Some(expected_hash.as_str())
-    {
-        return Ok(None);
-    }
-    let Some(entries) = document.get("points").and_then(serde_json::Value::as_array) else {
-        console.warn(&format!(
-            "{}: the cache has no point list; the dump will be parsed again",
-            path.display()
-        ));
-        return Ok(None);
-    };
-    let mut track = Track::default();
-    for entry in entries {
-        let Some(point) = cache_point(entry) else {
-            console.warn(&format!(
-                "{}: a cached point could not be read; the dump will be parsed again",
-                path.display()
-            ));
-            return Ok(None);
-        };
-        track.points.push(point);
-    }
-    if let Some(blocks) = document
-        .get("damaged_blocks")
-        .and_then(serde_json::Value::as_array)
-    {
-        for block in blocks {
-            let Some(block) = block.as_u64().and_then(|value| u32::try_from(value).ok()) else {
-                continue;
-            };
-            track.damaged_blocks.push(block);
-        }
-    }
-    Ok(Some(track))
-}
-
-/// Write the cache beside the dump.
-///
-/// # Errors
-///
-/// [`Error::Io`] when the cache cannot be written, or [`Error::State`] when the
-/// document cannot be serialised (it cannot fail for these values).
-fn cache_store(path: &Path, bytes: &[u8], track: &Track) -> Result<()> {
-    let document = serde_json::json!({
-        "format": CACHE_FORMAT,
-        "version": CACHE_VERSION,
-        "source": {
-            "bytes": u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            "hash": format!("{:016x}", content_hash(bytes)),
-        },
-        "damaged_blocks": track.damaged_blocks,
-        "points": track.points.iter().map(|point| serde_json::json!({
-            "utc": point.utc,
-            "lat": point.latitude,
-            "lon": point.longitude,
-            "height_m": point.height_m,
-            "speed_kmh": point.speed_kmh,
-            "rcr": point.rcr,
-        })).collect::<Vec<_>>(),
-    });
-    let text = serde_json::to_string(&document)
-        .map_err(|err| Error::State(format!("could not serialise the parse cache: {err}")))?;
-    fileio::write_text(path, &text)
-}
-
-/// One cached point, or `None` when a field has a shape the cache cannot hold.
-///
-/// A present-but-wrong field fails the whole cache rather than becoming a
-/// default: a cache that silently turns a latitude into `None` would produce a
-/// track that differs from the dump, which is worse than parsing the dump again.
-fn cache_point(value: &serde_json::Value) -> Option<TrackPoint> {
-    let object = value.as_object()?;
-    let integer = |key: &str| -> Option<Option<u64>> {
-        match object.get(key) {
-            None | Some(serde_json::Value::Null) => Some(None),
-            Some(found) => found.as_u64().map(Some),
-        }
-    };
-    let float = |key: &str| -> Option<Option<f64>> {
-        match object.get(key) {
-            None | Some(serde_json::Value::Null) => Some(None),
-            Some(found) => found.as_f64().filter(|value| value.is_finite()).map(Some),
-        }
-    };
-    let utc = match integer("utc")? {
-        Some(raw) => Some(u32::try_from(raw).ok()?),
-        None => None,
-    };
-    let rcr = match integer("rcr")? {
-        Some(raw) => Some(u16::try_from(raw).ok()?),
-        None => None,
-    };
-    let height_m = float("height_m")?.map(|raw| raw as f32);
-    let speed_kmh = float("speed_kmh")?.map(|raw| raw as f32);
-    Some(TrackPoint {
-        utc,
-        latitude: float("lat")?,
-        longitude: float("lon")?,
-        height_m,
-        speed_kmh,
-        rcr,
-    })
 }
 
 /// The NMEA line counts, kept after [`NmeaImport`]'s track has moved out.
@@ -596,8 +473,8 @@ struct PositionReport {
 /// no band beyond 80° S / 84° N, so `--coord-format utm` on a polar track is an
 /// error rather than a silently different format.
 fn position_report(track: &Track, format: CoordFormatArg) -> Result<Option<PositionReport>> {
-    let first = track.points.iter().find_map(positioned);
-    let last = track.points.iter().rev().find_map(positioned);
+    let first = track.points.iter().find_map(TrackPoint::position);
+    let last = track.points.iter().rev().find_map(TrackPoint::position);
     let (Some((start_lat, start_lon)), Some((end_lat, end_lon))) = (first, last) else {
         return Ok(None);
     };
@@ -606,12 +483,6 @@ fn position_report(track: &Track, format: CoordFormatArg) -> Result<Option<Posit
         start: Some(render_position(start_lat, start_lon, format)?),
         end: Some(render_position(end_lat, end_lon, format)?),
     }))
-}
-
-/// The finite position a point carries, when it has one.
-fn positioned(point: &TrackPoint) -> Option<(f64, f64)> {
-    let (lat, lon) = (point.latitude?, point.longitude?);
-    (lat.is_finite() && lon.is_finite()).then_some((lat, lon))
 }
 
 /// Render one coordinate pair.
@@ -783,9 +654,48 @@ fn shift_track_days(track: &mut Track, days: i32) {
     }
 }
 
+/// Which kind of input `apply_utc_offset` is looking at.
+///
+/// `--utc-offset-days auto` exists for one input class: a dump written by an
+/// unpatched M-241, whose every timestamp is 7168 days in the past. An imported
+/// GPX is somebody else's document and can legitimately be historical, so `auto`
+/// is never applied to it — see [`apply_utc_offset`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OffsetInput {
+    /// A raw dump, an NMEA capture or an edited track, all written by the unit.
+    Unit,
+    /// A GPX document imported from another tool.
+    Gpx,
+}
+
 /// Apply `--utc-offset-days` (`auto` or explicit) to `track` and return the applied day shift.
-fn apply_utc_offset(track: &mut Track, spec: OffsetSpec, console: &dyn Console) -> i32 {
-    let shift = track_days(track).map_or(0, |days| spec.shift_for(days));
+///
+/// `auto` shifts a WNRO-stale dump by one rollover. It is **never applied to an
+/// imported GPX**: a GPX from another tool can be genuinely historical, and the
+/// stale window (`cal::is_stale`, 1999-08-22 to 2019-04-06) catches ordinary
+/// 2000s and 2010s trips. When a GPX's dates fall in that window, this warns
+/// that `auto` did not act and how to shift the track deliberately; the dates
+/// themselves are left as written. An explicit number is applied to either
+/// input, including a negative one.
+fn apply_utc_offset(
+    track: &mut Track,
+    spec: OffsetSpec,
+    input: OffsetInput,
+    console: &dyn Console,
+) -> i32 {
+    let automatic = track_days(track).map_or(0, |days| spec.shift_for(days));
+    if input == OffsetInput::Gpx && matches!(spec, OffsetSpec::Auto) {
+        if automatic != 0 {
+            console.warn(&format!(
+                "the imported GPX falls inside the window --utc-offset-days auto treats as \
+                 WNRO-stale (1999-08-22 to 2019-04-06), but auto is not applied to an imported \
+                 GPX: its timestamps are kept as written. Pass --utc-offset-days {automatic} if \
+                 the file came from an unpatched unit"
+            ));
+        }
+        return 0;
+    }
+    let shift = automatic;
     if shift != 0 {
         shift_track_days(track, shift);
         let reason = if matches!(spec, OffsetSpec::Auto) {
@@ -1018,7 +928,12 @@ pub fn kmz(options: &LogKmzOptions, session: Session<'_>) -> Result<()> {
     let bytes = fileio::read(&options.log)?;
     let (mut track, report) = parse_dump(&bytes)?;
     warn_about_parse_report(session.console, &report.summary(&track), &report, None);
-    apply_utc_offset(&mut track, options.utc_offset_days, session.console);
+    apply_utc_offset(
+        &mut track,
+        options.utc_offset_days,
+        OffsetInput::Unit,
+        session.console,
+    );
 
     let photo_paths = expand_photo_inputs(&options.photos)?;
     let geotag_options = GeotagOptions {
@@ -1188,7 +1103,17 @@ fn print_info(
         ("truncated records", report.truncated_records.to_string()),
         ("start", timestamp(summary.started_at)),
         ("end", timestamp(summary.ended_at)),
-        ("distance", format!("{:.2} m", stats.distance_m)),
+        (
+            "distance",
+            // No positioned point means no distance was measured. Zero here
+            // would read as "the track moved nowhere", which is a measurement;
+            // `-` is the same "no data" marker the other facts use.
+            if stats.fixes == 0 {
+                String::from("-")
+            } else {
+                format!("{:.2} m", stats.distance_m)
+            },
+        ),
         (
             "duration",
             stats
@@ -1319,7 +1244,12 @@ pub fn geotag(options: &LogGeotagOptions, session: Session<'_>) -> Result<()> {
     let summary = report.summary(&track);
     warn_about_parse_report(session.console, &summary, &report, None);
 
-    let offset_days = apply_utc_offset(&mut track, options.utc_offset_days, session.console);
+    let offset_days = apply_utc_offset(
+        &mut track,
+        options.utc_offset_days,
+        OffsetInput::Unit,
+        session.console,
+    );
     let photo_paths = expand_photo_inputs(&options.photos)?;
 
     // The grammar owns which flag belongs to which scope; report what it says
@@ -1415,23 +1345,25 @@ pub fn geotag(options: &LogGeotagOptions, session: Session<'_>) -> Result<()> {
     } else {
         geotag::apply(&plans)?
     };
-    let matched_count = plans.iter().filter(|plan| plan.will_write()).count();
-    let skipped_count = plans.len().saturating_sub(matched_count);
-    let written_count = if options.dry_run {
-        0
-    } else {
-        written_paths.len()
+    let matched = plans.iter().filter(|plan| plan.will_write()).count();
+    let counts = GeotagCounts {
+        matched,
+        written: if options.dry_run {
+            0
+        } else {
+            written_paths.len()
+        },
+        skipped: plans.len().saturating_sub(matched),
     };
 
     if options.json {
         return session.console.json(&geotag_document(
             options,
+            &geotag_options,
             offset_days,
             shift,
             &plans,
-            matched_count,
-            written_count,
-            skipped_count,
+            counts,
         ));
     }
 
@@ -1464,11 +1396,13 @@ pub fn geotag(options: &LogGeotagOptions, session: Session<'_>) -> Result<()> {
         .console
         .result(&format!("{:<8}: {offset_days}", "offset"));
     // The backup is a promise the run keeps or does not; say which, so a user
-    // who expected `_original` files is not left to notice their absence.
+    // who expected `_original` files is not left to notice their absence. The
+    // value comes from the one `GeotagOptions` the run used, so the line cannot
+    // disagree with what `apply` does.
     session.console.result(&format!(
         "{:<8}: {}",
         "backup",
-        if options.geotag_options().keep_backup {
+        if geotag_options.keep_backup {
             "on"
         } else {
             "off"
@@ -1486,13 +1420,13 @@ pub fn geotag(options: &LogGeotagOptions, session: Session<'_>) -> Result<()> {
     }
     session
         .console
-        .result(&format!("{:<8}: {matched_count}", "matched"));
+        .result(&format!("{:<8}: {}", "matched", counts.matched));
     session
         .console
-        .result(&format!("{:<8}: {written_count}", "written"));
+        .result(&format!("{:<8}: {}", "written", counts.written));
     session
         .console
-        .result(&format!("{:<8}: {skipped_count}", "skipped"));
+        .result(&format!("{:<8}: {}", "skipped", counts.skipped));
     if options.dry_run {
         session
             .console
@@ -1554,15 +1488,29 @@ fn shift_timestamp_seconds(utc: u32, delta_seconds: i64) -> u32 {
     })
 }
 
+/// How many plans a `log geotag` run matched, wrote and skipped.
+///
+/// Grouped so the human summary and the JSON object carry the same three numbers
+/// without repeating the counting rule (and so the JSON builder stays under the
+/// argument-count limit without a lint exemption).
+#[derive(Debug, Clone, Copy)]
+struct GeotagCounts {
+    /// Plans whose photo matched a track point.
+    matched: usize,
+    /// Photos actually written; `0` on a dry run.
+    written: usize,
+    /// Plans that matched nothing.
+    skipped: usize,
+}
+
 /// Render `m241 log geotag --json` as a single JSON object.
 fn geotag_document(
     options: &LogGeotagOptions,
+    core_options: &GeotagOptions,
     offset_days: i32,
     shift: PhotoTimeShift,
     plans: &[GeotagPlan],
-    matched_count: usize,
-    written_count: usize,
-    skipped_count: usize,
+    counts: GeotagCounts,
 ) -> serde_json::Value {
     let entries: Vec<serde_json::Value> = plans
         .iter()
@@ -1600,7 +1548,6 @@ fn geotag_document(
             })
         })
         .collect();
-    let core_options = options.geotag_options();
     serde_json::json!({
         "log": options.log.display().to_string(),
         "dry_run": options.dry_run,
@@ -1611,9 +1558,9 @@ fn geotag_document(
         "max_gap_seconds": options.max_gap,
         "keep_backup": core_options.keep_backup,
         "group_photo_distance_m": options.group_photo_distance,
-        "matched": matched_count,
-        "written": written_count,
-        "skipped": skipped_count,
+        "matched": counts.matched,
+        "written": counts.written,
+        "skipped": counts.skipped,
         "plans": entries,
     })
 }
@@ -4825,6 +4772,111 @@ mod tests {
     }
 
     #[test]
+    fn read_gpx_refuses_a_document_with_no_track_point() {
+        // `<wpt>`-only is the realistic case: waypoints are deliberately not
+        // read, and a header-only export with exit code 0 would look like a
+        // successful conversion of a file with no track in it.
+        let scratch = Scratch::new("read-gpx-empty");
+        let input = scratch.join("places.gpx");
+        fileio::write_text(
+            &input,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="ezTour">
+  <wpt lat="35.0" lon="139.0"><name>saved place</name></wpt>
+</gpx>
+"#,
+        )
+        .expect("write gpx");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        let mut options = read_options(input, ExportFormat::Gpx);
+        options.gpx = true;
+        let err = read(&options, Session::new(&links, &console, &confirm))
+            .expect_err("a GPX with no trkpt is an error");
+        assert!(
+            matches!(err, Error::State(_)),
+            "expected a state error, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("no point could be imported"),
+            "the error names the reason: {err}"
+        );
+        assert!(
+            console.stdout().is_empty(),
+            "nothing is written for a failed import: {}",
+            console.stdout()
+        );
+    }
+
+    #[test]
+    fn a_historical_gpx_keeps_its_dates_under_the_auto_default() {
+        // 2015-06-01 falls inside the window `auto` treats as WNRO-stale
+        // (1999-08-22 to 2019-04-06). For a dump that is the signature of an
+        // unpatched unit; for somebody else's GPX it is an ordinary trip, so
+        // `auto` must not move it — and must say why it did not.
+        let scratch = Scratch::new("read-gpx-historical");
+        let input = scratch.join("trip.gpx");
+        fileio::write_text(
+            &input,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="other-tool">
+  <trk><trkseg>
+    <trkpt lat="35.681236" lon="139.767125">
+      <time>2015-06-01T00:00:00Z</time>
+    </trkpt>
+  </trkseg></trk>
+</gpx>
+"#,
+        )
+        .expect("write gpx");
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+
+        let console = RecordingConsole::default();
+        let mut options = read_options(input.clone(), ExportFormat::Gpx);
+        options.gpx = true;
+        options.utc_offset_days = OffsetSpec::Auto;
+        read(&options, Session::new(&links, &console, &confirm)).expect("gpx read");
+        assert!(
+            console.stdout().contains("2015-06-01T00:00:00Z"),
+            "the imported date is kept as written: {}",
+            console.stdout()
+        );
+        assert!(
+            !console.stdout().contains("2035-"),
+            "the default offset must not shift a GPX: {}",
+            console.stdout()
+        );
+        assert!(
+            console
+                .stderr()
+                .contains("auto is not applied to an imported GPX"),
+            "the run says why nothing was shifted: {}",
+            console.stderr()
+        );
+        assert!(
+            console.stderr().contains("--utc-offset-days 7168"),
+            "the warning names the day count that would shift it: {}",
+            console.stderr()
+        );
+
+        // An explicit number is still applied, which is the deliberate escape
+        // hatch for a GPX exported from an unpatched unit.
+        let shifted = RecordingConsole::default();
+        let mut options = read_options(input, ExportFormat::Gpx);
+        options.gpx = true;
+        options.utc_offset_days = OffsetSpec::Days(crate::cal::WNRO_DAYS);
+        read(&options, Session::new(&links, &shifted, &confirm)).expect("shifted gpx read");
+        assert!(
+            shifted.stdout().contains("2035-01-15T00:00:00Z"),
+            "an explicit day count shifts the GPX: {}",
+            shifted.stdout()
+        );
+    }
+
+    #[test]
     fn read_simplify_keeps_every_nth_point_and_the_last_one() {
         let scratch = Scratch::new("read-simplify");
         // Seven points: a stride of three keeps indices 0, 3 and 6.
@@ -4848,6 +4900,39 @@ mod tests {
         assert!(
             console.stderr().contains("simplified 7 points to 3"),
             "got {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
+    fn a_stride_of_one_thins_nothing_and_reports_no_simplify_fact() {
+        // `--simplify 1` keeps every point, so it is the same as omitting the
+        // flag: a `"simplify": 1` field or a "simplified 7 to 7" line would
+        // claim a fact that did not happen.
+        let scratch = Scratch::new("read-simplify-one");
+        let path = write_dump(&scratch, "track.bin", 7);
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        let mut options = read_options(path, ExportFormat::Json);
+        options.simplify = Some(1);
+        read(&options, Session::new(&links, &console, &confirm)).expect("stride one read");
+
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(
+            document["points"].as_array().map(Vec::len),
+            Some(7),
+            "stride one keeps every point: {document}"
+        );
+        assert!(
+            document.get("simplify").is_none(),
+            "no thinning happened, so no simplify fact: {document}"
+        );
+        assert!(
+            !console.stderr().contains("simplified"),
+            "no thinning happened, so nothing is announced: {}",
             console.stderr()
         );
     }
@@ -5030,6 +5115,92 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&corrupt_console.stdout()).is_ok(),
             "the export is still written: {}",
             corrupt_console.stdout()
+        );
+    }
+
+    #[test]
+    fn a_cache_hit_replays_the_parse_warnings_it_stored() {
+        // The cache exists to skip parsing, not to hide damage: a dump whose
+        // first run warned about a bad record must warn again on the hit. The
+        // report is stored rather than recomputed, because a hit never parses.
+        use m241_core::log::block::BLOCK_HEADER_SIZE;
+
+        let scratch = Scratch::new("cache-warnings");
+        let path = scratch.join("damaged.bin");
+        let mut bytes = synthetic_dump(2);
+        // Record layout is UTC + lat + lon + height + checksum (16 bytes); the
+        // trailer is the last byte, so flipping it breaks exactly one record.
+        let trailer = BLOCK_HEADER_SIZE + 15;
+        bytes[trailer] ^= 0xFF;
+        fileio::write(&path, &bytes).expect("write damaged dump");
+        let cache = scratch.join("damaged.cache.json");
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+
+        let first_console = RecordingConsole::default();
+        let mut options = read_options(path.clone(), ExportFormat::Json);
+        options.cache = Some(cache.clone());
+        read(&options, Session::new(&links, &first_console, &confirm)).expect("cache write");
+        let first_stderr = first_console.stderr();
+        let first_warnings: Vec<&str> = first_stderr
+            .lines()
+            .filter(|line| !line.contains("parse cache"))
+            .collect();
+        assert!(
+            !first_warnings.is_empty(),
+            "the damaged dump must warn on the first parse: {}",
+            first_console.stderr()
+        );
+
+        let second_console = RecordingConsole::default();
+        let mut options = read_options(path, ExportFormat::Json);
+        options.cache = Some(cache);
+        read(&options, Session::new(&links, &second_console, &confirm)).expect("cache hit");
+        assert!(
+            second_console
+                .stderr()
+                .contains("read the track from the parse cache"),
+            "the hit is still announced: {}",
+            second_console.stderr()
+        );
+        for warning in first_warnings {
+            assert!(
+                second_console.stderr().contains(warning),
+                "the cache hit dropped the warning {warning:?}; got {}",
+                second_console.stderr()
+            );
+        }
+    }
+
+    #[test]
+    fn info_shows_no_distance_for_a_track_without_a_fix() {
+        // A journal-only dump has no positioned point at all, so a distance is
+        // not a measured zero: the text form uses the same `-` marker as the
+        // other facts with no data.
+        let scratch = Scratch::new("info-no-fix");
+        let path = scratch.join("journal.bin");
+        fileio::write(&path, &synthetic_journal_only_dump()).expect("write dump");
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+
+        let console = RecordingConsole::default();
+        info(
+            &info_options(path, false),
+            Session::new(&links, &console, &confirm),
+        )
+        .expect("info text");
+        let text = console.stdout();
+        assert!(
+            text.contains("distance          : -"),
+            "no fix means no distance: {text}"
+        );
+        assert!(
+            text.contains("fixes             : 0"),
+            "the zero fix count is the fact: {text}"
+        );
+        assert!(
+            !text.contains("distance          : 0.00 m"),
+            "a zero would read as a measurement: {text}"
         );
     }
 

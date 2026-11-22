@@ -1,8 +1,9 @@
 //! Pure track-editing operations and multi-step Undo/Redo history.
 //!
-//! Splitting, merging, and point deletion operate on [`Track`] values without
-//! mutating files or touching the device. [`TrackEditor`] wraps a `Vec<Track>`
-//! with an undo/redo stack so UI or CLI layers can compose edits safely.
+//! Splitting, merging, point deletion and stride thinning ([`simplify_track`])
+//! operate on [`Track`] values without mutating files or touching the device.
+//! [`TrackEditor`] wraps a `Vec<Track>` with an undo/redo stack so UI or CLI
+//! layers can compose edits safely.
 
 use std::collections::HashSet;
 
