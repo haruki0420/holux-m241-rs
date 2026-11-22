@@ -1385,3 +1385,71 @@ Could 9）と可読性（Must 4 / Should 17 / Could 13）の 2 本で、レビ�
 ### Stage 3 検証
 
 未検証（別エージェントが記入する）。
+
+---
+
+## 2026-11-23 / PR #38 GUI 書き込み Stage 2 修正（`feat-gui-write`）
+
+- 対象: PR #38（base `origin/main` = `142750ed`、Stage 1 レビュー head `77d4f6e`）。修正コードの head は `e83370f`、本節はその次の commit。
+- Stage 1: [仕様・安全検収](https://github.com/haruki0420/holux-m241-rs/pull/38#issuecomment-7083564043) と[可読性](https://github.com/haruki0420/holux-m241-rs/pull/38#issuecomment-7083539732)。修正は Stage 1 のどちらのレビューにも参加していない担当が行った。
+- 実機ポートは開いていない。実機書き込みもしていない（シミュレータのみ）。個人データは扱っていない。
+
+### Must への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| 仕様 M1 | GUI の破壊的オペコード検査が宣言どおりに動かない（`masked_source` で `\xNN` / `$PMTK182,6` が死に、裸リテラルのパターンが無い） | 走査を 2 系統に分割。識別子と裸の整数リテラルはコメント・文字列マスク済みソース、`\xNN` と `$PMTK182,6` はコメントのみ除去（文字列は保持）したソース。`theme.rs` の RGB とログ fixture の `0xD9` だけパス限定で除外。ゲート docstring を「Nine checks」に直し、`AGENTS.md` / `11-safety-review.md` の主張と一致させた | `a_bare_hex_opcode_in_gui_code_is_reported`（`0xD3` / `0xD5u8` / `0xD9`）、`a_hex_escape_opcode_in_gui_code_is_reported`（`\xd3` / `\xD5` / `\xD9`）、`a_pmtk_erase_in_gui_code_is_reported`、`gui_operator_prose_naming_an_opcode_is_not_a_finding`、`a_colour_or_journal_fixture_literal_is_not_an_opcode` |
+| 仕様 M2 | GUI の吸い出しが 1 回読みなのに README / `docs/user` は 2 回読み＋ハッシュ比較と書く | GUI を 2 回読みに実装（安全側）。1 回目は `Job::Dump` が digest を報告して電源入れ直し待ち、2 回目は `Job::DumpSecond` がハッシュ比較し、一致したときだけ `create_new` で保存（不一致は何も保存しない）。`DumpState::WaitingForPowerCycle` / `Mismatch` が再び到達可能になった。`02-cli.md` と `02-fix-the-date.md` に GUI も同じ 2 回読みであることを明記 | `a_dump_is_two_reads_and_the_second_pass_needs_the_first`、`two_reads_that_disagree_are_shown_and_nothing_is_verified`、`two_reads_that_agree_become_the_loaded_backup`、`save_dump_never_replaces_a_file_and_writes_the_bytes_it_was_given` |
+| 可読性 M1 | 成功表示「検証済み」と Connect 画面「未検証」が矛盾、`firmware.rs:29-31` の doc も不一致 | 成功表示を「読み戻しが一致しました（実機での書き込み検証は未実施）」に。書き込みステップに `Status::Unverified` の「この書き込み経路は実機で未検証です」を追加（同じ語を Connect 画面と共有）。module doc を実装に合わせた | `the_write_success_text_does_not_claim_hardware_verification` |
+| 可読性 M2 | `Confirmation` の保証の過大表示、`PROBE` のタイプ語ゲートが検査外 | `firmware.rs` / `device.rs` の doc を「token は入力の証明ではない。`start_write` / `start_probe_da` の再検査がゲート」に修正。`check_safety.py` に connect.rs の `PROBE_CONFIRMATION` + `Confirmation::granted` を追加し、`Confirmation::granted` と `Job::Flash` の構築ファイルを allowlist 化（テキスト検査であることも docstring に明記） | `a_gui_probe_without_its_typed_word_is_reported`、`a_gui_confirmation_outside_the_typed_word_screens_is_reported`、`a_gui_write_job_outside_the_firmware_screen_is_reported` |
+| 可読性 M3 | 書き込み状態パネルの二重描画 | `ui()` の 1 箇所だけに（`Idle` も含めて常時）描画し、`flash_step` 末尾の呼び出しを削除。コメントを実装に一致させた | render テスト（各状態）で重複なし |
+| 可読性 M4 | 何も検証しないテスト、`probe_da` / `probe_bootrom` / `settled` 未検証 | 自己参照 assert を削除。`settled` を純関数 `settled_address` に切り出し 0/1/2 件を直接テスト。`FakeDa` 経由で `probe_da` と `probe_bootrom` を通すテストを追加。`probe_da` は digest token を引数に取り、シミュレータでテスト可能にした | `a_probe_settles_only_on_exactly_one_matching_page`、`probe_da_reads_both_candidate_pages_through_the_fake_and_writes_no_flash`、`probe_bootrom_confirms_the_sync_without_touching_the_device` |
+| 可読性 M5 | preflight の検査結果を捨ててファイルを読み直す（TOCTOU） | `preflight` が `Preflight { backup, image, da }` を返し、`run` はそのバイト列で `FlashRequest` を構築（読み直さない）。vendor token も同じ in-memory バイトから作る | `a_backup_of_the_wrong_length_is_refused_with_the_expected_size`（次の一手まで文言に含む）、既存の recovery / missing-backup テスト |
+| 可読性 M6 | 外した安全ゲートの理由が削除箇所に無い | `firmware.rs` と `device.rs` の module doc に「旧ゲートは依存グラフ、新ゲートはテキスト検査で弱い。構造で残る保証は `m241-flash` 側」と明記。`AGENTS.md` §0 / §2.2 と `11-safety-review.md` も同じ主張に統一。型に近い強制として `Job::Flash` / `Confirmation::granted` の構築ファイル allowlist をゲートに追加 | `a_gui_write_job_outside_the_firmware_screen_is_reported` ほか上記 |
+
+### Should への対応
+
+| # | 指摘 | 対応 |
+|---|---|---|
+| 仕様 S1 / 可読性 S1 | 「Eight checks」が 9 項目、タイトルが範囲不足 | 「Nine checks」に修正し、タイトルを「read-only crate が write path に到達する / GUI が writer を迂回する」に拡張 |
+| 可読性 S2 | ゲートは token の存在しか見ない | docstring に「証明できるのは構築場所まで。入力を拒むのはアクションの再検査と単体テスト」と明記。`Job::Flash` allowlist を追加して迂回路を狭めた |
+| 可読性 S3 | `REENTRY_SETTLE` の「同じ数字に依存しない」が false、未検証の範囲が広い | 「意図は同じだが独立した 2 リテラル。手で揃える規約」に修正。CLI 経路は実機で実行済み、GUI 経由の組み合わせが未検証、と範囲を限定 |
+| 可読性 S4 | 復旧 / vendor の進捗が 0% のまま | `write_vendor_with_progress` を追加し、`flow::write_once` の 3 経路すべてが progress sink を渡す |
+| 可読性 S5 | `probe_da` が digest を引数に取らずテスト不能 | `da_digest: DaDigest` を引数に追加（`flash` と同じ形）。CLI は `DaDigest::vendor()`、テストは simulator token |
+| 可読性 S6 | 未使用 `pub` と無意味なヘルパ | `flow::probe_page_size`、`firmware::verified_bytes`、`is_meaning` を削除。`set_flash_state` などは screenshot / render テストが使うため `pub` のまま（理由は各 doc） |
+| 可読性 S7 | 長大関数 | `screenshot::write_all` の render→PNG→write 反復を `write_frame` に集約。`flash_step` / `diagnostics_panel` / `device::run` は「1 パネルを順に読ませる」「1 つの message と busy を共有」「エラー経路が 1 チャネル」という分割しない理由を doc に 1 行ずつ。`connect::diagnostics_panel` の 3 分割は見送り（理由を doc） |
+| 可読性 S8 | `poll_job` の 2 画面コピー | `device::poll_channel` に drain ループを 1 本化。`JobEvent` を画面別 enum に割る変更は見送り（job enum が GUI の起動可能ジョブの一覧であり、ゲートの allowlist の対象でもある。共有 channel 型のまま、握り潰し腕には理由コメントがある） |
+| 可読性 S9 | `start()` の doc が「キャンセル」と言うが中断しない | 「receiver を落としても書き込みは完走し、報告だけ止まる。安全側の挙動」に修正 |
+| 可読性 S10 | `device.rs` の「jobs call flow and nothing else」が false | module doc に例外（`Restart` は `DownloadAgent::restart` 直呼び、`Doctor` は `Port` / `PmtkClient` 直使用）と理由を列挙 |
+| 可読性 S11 | 表示文字列を分類に使う（`kind.contains("DA")`） | `DropKind` enum（`Da` / `DaCandidate` / `Firmware` / `TooLarge` / `Unreadable` / `Unknown`）を追加し、表示は `label()`。doctor のポート列挙エラーは `ports_error` に分離 | 
+| 可読性 S12 | 次の一手の無いエラー文言 | backup 長・recovery 不一致に「どのファイルを選び直すか」を追加。worker が結果を返さず死んだ場合を「端末の状態は不明。吸い出しで確認するか復旧へ」に変更（書き込み失敗時の再試行を勧めない） |
+| 可読性 S13 | 削除された why コメント | `progress_bar` の `animate(false)`、`write_patched`（元ファイルを上書きしない理由）、`open` の `MAX_IMAGE_BYTES` に理由コメントを戻した |
+| 可読性 S14 | 死んだ `DumpState` 変種 | 2 回読み実装で `WaitingForPowerCycle` / `Mismatch` が実際に生成されるようになった（テストと screenshot も追加） |
+| 可読性 S15 | マジックナンバーとテスト専用関数 | `256` を `PACKET_SIZE` に。テスト専用 `recovery_command` とそのテストを削除（GUI は CLI コマンド文字列を生成しない） |
+| 仕様 Should 1 | `Confirmation` が型で強制されていない | 型での強制は見送り（画面の入力状態を型に持ち上げる変更で、本 PR の範囲を超える）。代わりにゲートで `Job::Flash` / `Confirmation::granted` の構築ファイルを限定し、`AGENTS.md` §2.2 を「型ではなくソース検査」と明記 |
+| 仕様 Should 2 | ファーム画面に「未検証」表示が無い | 書き込みステップに `Unverified` の行を追加（上記 M1） |
+| 仕様 Should 3 / Could 3 | CLI との差（自動リトライ・`check_layout` のタイミング） | `02-cli.md` の GUI 対応表の下に 3 点（リトライなし / `check_layout` は DA ロード後だが最初の `0xD3` より前 / GUI 書き込みは実機未検証）を記載 |
+| 仕様 Could 1 | 「Eight checks」 | 上記 S1 で解消 |
+| 仕様 Could 2 | `show_sample_write` が `WRITE` を自動充填 | 「`pub(crate)`、ポートを開かずジョブも開始しない、sample にポートが無いので `write_armed` は false のまま、全 figure は 見本」と doc に明記して維持（armed ボタンの描画に必要） |
+| 仕様 Could 4 | 接続画面の成功スクリーンショットに「見本」マーカーが無い | 見送り: 診断 / probe-da のフレームは sample 状態を注入して描いており、画面側の `見本` 表示は sample パネルにしか出ない。実機値との誤読を避けるには Connect 画面の sample 表示自体を広げる必要があり、本 PR の範囲外 |
+| 仕様 Could 5 | 死んだ `DumpState` | 上記 S14 で解消 |
+
+### 見送った指摘と理由
+
+- 可読性 S8 の `JobEvent` 分割: 画面ごとの channel 型に割ると `device::start` が 2 本になり、job enum・ゲート allowlist・テストが同時に増える。まず drain ループの重複を `poll_channel` で解消し、enum 分割は follow-up。
+- 仕様 Should 1 の型強制: `FlashJob` を画面外で構築不能にするには、タイプ語の入力を型状態として持ち上げる設計変更が要る。ゲートの allowlist で「別ファイルからの構築」は検出できるようにした。
+- 接続画面の診断 / probe-da screenshot の「見本」マーカー: 上記 Could 4。
+- `connect::diagnostics_panel` の 3 分割: 3 セクションが 1 つの `message` 行と `busy` を共有しており、分割すると同じ `&mut self` を 3 つに渡すだけになる。理由を doc に記載。
+
+### 検証
+
+- `M241_VENDOR_IMAGE=<vendor V1.13> TMPDIR=/var/tmp ./tools/check.sh`: **6/6**（修正コード head `e83370f`、46 秒）。
+- `cargo test -p m241-flash -p m241-gui`: flash 135 + safety_gate 31 + gui 141 + design_gate 6 + design_invariants 6 + render 36。`cargo test --workspace` も成功。
+- 追加テスト: safety_gate 8 件（上表）、firmware 4 件、device 4 件、flow 3 件。既存のレイアウトゲート変異テスト 3 件は、`write` / `write_vendor` が `_with_progress` 本体へ委譲する形に合わせて対象関数を更新した。
+- `--screenshot /tmp/m241-pr38-stage2`: 全画面 2 サイズ + 注入フレーム（write-progress / write-result / write-recovery / dump-power-cycle / dump-mismatch / connect-diagnostics / connect-probe-da）を出力し、成功表示・未検証表示・復旧パネル・2 回目読み取りの待ち画面を目視した（別項に詳細）。
+- 注意（実状態）: `cargo test --workspace` の 1 回で `fw::tests::probe_da_reads_both_candidates_through_the_fake_and_sends_no_write_opcode`（`m241-cli`、本差分の非変更経路）が失敗したが、単体実行とその後の full run 2 回では成功。再現しなかったため flaky として記録し、原因は特定していない。
+- 実機: 開いていない。GUI からの書き込み・2 回読みはシミュレータのみで、実機では未検証。
+
+### Stage 3 検証
+
+未検証（別エージェントが記入する）。
