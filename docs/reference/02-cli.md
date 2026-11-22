@@ -296,65 +296,97 @@ read 6 lines: 1 sentence(s) imported, 2 dropped, 3 ignored
 * **dropped** — one of those sentences that produced no point: a broken
   checksum, a no-fix sentence, or a missing/unreadable time or coordinate.
 * **ignored** — a line this reader never turns into a point: blank, free text,
-  or another sentence kind (`$GPGSA`, `$GPGSV`, `$GPVTG`).
+  or another sentence kind (`$GPGSA`, `$GPGSV`, `$GPVTG`). The address is read
+  before the checksum, so a sentence of another kind is `ignored` even when its
+  checksum is wrong; only `$GPRMC` / `$GPGGA` lines can be `dropped`.
 
 The sentence counts and the point count differ because an RMC and a GGA sharing
 a timestamp are merged into one point.
 
-The shift, when one was applied, is announced on stderr and — for
-`--format json` — also carried as an `offset_days` field in the exported object.
-The field is absent when nothing was shifted.
+Dropped sentences are a warning: a partial track is still written. A **non-empty**
+capture that yields no point at all is an error naming the file and the counts,
+and nothing is written — a header-only export with exit code 0 would look like a
+successful conversion of a damaged capture. An empty file is still an empty
+track with exit code 0, as an empty dump is.
+
+The line counts, and the shift when one was applied, are announced on stderr and
+— for `--format json` — also carried as fields in the exported object:
+`"nmea": {"imported": N, "dropped": N, "ignored": N}` for a capture, and
+`"offset_days": N` when something was shifted. A field is absent when the fact
+does not apply (a dump has no `nmea`; nothing shifted means no `offset_days`).
 
 `--format csv` writes ezTour's columns in ezTour's order: `INDEX`, `TRACK
 NUMBER`, `UTC DATE`, `UTC TIME`, `LOCAL DATE`, `LOCAL TIME`, `LATITUDE`, `N/S`,
 `LONGITUDE`, `E/W`, `ALTITUDE`, `SPEED`
-([`07-eztour-spec.ja.md`](../dev/07-eztour-spec.ja.md) §2). `TRACK NUMBER` is
-`1` (one track is rendered). `LOCAL DATE` and `LOCAL TIME` are written **empty**:
-ezTour filled them from a display time zone whose basis the specification does
-not record, this command has no zone setting, and writing UTC or the machine's
-zone there would label a guess as local time. The unconfirmed points are listed
-in [`12-progress-summary.md`](../dev/12-progress-summary.md).
+([`07-eztour-spec.ja.md`](../dev/07-eztour-spec.ja.md) §2). `INDEX` is the
+zero-based point index and `TRACK NUMBER` is `1` (one track is rendered).
+`LOCAL DATE` and `LOCAL TIME` are written **empty**: ezTour filled them from a
+display time zone whose basis the specification does not record, this command
+has no zone setting, and writing UTC or the machine's zone there would label a
+guess as local time. The unconfirmed points are listed in
+[`12-progress-summary.md`](../dev/12-progress-summary.md). A byte-for-byte
+comparison with an actual ezTour export has not been done (未検証); the
+specification is the source. This replaces the provisional nine-column layout
+(`index,utc,lat,lon,…`) of earlier builds: `rcr` and `waypoint` remain in
+`--format json`, and `fix` is the presence of a coordinate.
 
 ## `m241 log project save`
 
-Writes one JSON file naming a raw dump, an optional photo folder, the day
-correction and where `project load` writes. It does not open the log.
+Writes one JSON file naming a log, an optional photo folder, the day correction
+and where `project load` writes. It does not open the log.
 
 Usage: `m241 log project save <PROJECT> <LOG> <OUTPUT>`.
 
 Flags: `--format gpx|kml|csv|nmea|json` (default `gpx`), `--kmz` (write a KMZ
-archive instead; requires `--photos`), `--photos <DIR>`, `--utc-offset-days
-<DAYS>` (default `0`, stored as an explicit correction; `auto` is not stored).
-An existing project file is replaced, as `log read -o` replaces its output.
+archive instead; requires `--photos`), `--nmea` (the log is an NMEA 0183 capture
+instead of a raw dump; it cannot be combined with `--kmz`, which reads a dump),
+`--photos <DIR>`, `--utc-offset-days <DAYS>` (default `0`, stored as an explicit
+correction; a number is required — `auto` is a usage error and the default is
+stored as the explicit `0` it is). An existing project file is replaced, as
+`log read -o` replaces its output, but the project path may not also be the log
+or the output: that would overwrite a file the project names.
+
+A relative `LOG`, `PHOTOS` or `OUTPUT` is resolved against the current directory
+once — what it meant when typed — and then stored **relative to the project
+file's directory**. An absolute path is stored as an absolute path. Either form
+means the same file when `load` resolves it, so a project directory can be moved
+as one unit with the files it names.
 
 The format is this project's own. ezTour's `.itm` is an undocumented SQLite
-database, and the reimplementation only has to keep the "one file plus referenced
-photos" granularity (`07-eztour-spec.ja.md` §1.5, §8-12):
+database; this JSON neither reads nor writes it and only keeps the "one file plus
+referenced photos" granularity (`07-eztour-spec.ja.md` §1, §8 item 12):
 
 ```json
 {
   "format": "m241-project",
   "version": 1,
+  "input": "nmea",
   "log": "capture.nmea",
-  "photos": "photos",
+  "photos": null,
   "utc_offset_days": 0,
   "output": "track.gpx",
   "export_format": "gpx"
 }
 ```
 
-`photos` is `null` when the project has no photo folder. Paths are stored as
-given and resolved against the project file's directory on load, so a project
-directory can be moved as one unit. `export_format` is `gpx`, `kml`, `csv`,
-`nmea`, `json` or `kmz`.
+`input` is `dump` (a raw dump from `log download`; `"log": "track.bin"`) or
+`nmea` (a capture, read back as `log read --nmea`). `photos` is `null` when the
+project has no photo folder, and `--photos` is only used by a `--kmz` project.
+`export_format` is `gpx`, `kml`, `csv`, `nmea`, `json` or `kmz`.
 
 ## `m241 log project load`
 
 Reads the project file and writes the export it names, through the same code as
-`log read` (or `log kmz` when `export_format` is `kmz`). The stored day
-correction is applied before export and announced on stderr as `log read` does.
-A malformed project, an unknown `export_format`, a version this build does not
-read, or a `kmz` project with no photo folder is an error; nothing is guessed.
+`log read` (using the stored `input` kind) or `log kmz` when `export_format` is
+`kmz`. The stored day correction is applied before export and announced on
+stderr as `log read` does. A `kmz` project needs a photo folder and a raw dump.
+
+A malformed project, a missing required key (`input`, `log`, `photos`,
+`utc_offset_days`, `output`, `export_format`, `format`, `version`), an unknown
+`input` or `export_format`, a version this build does not read, or a `kmz`
+project with no photo folder is an error naming the project file; nothing is
+guessed. A capture whose every line fails is the error `log read --nmea` gives,
+after the project's own fields were accepted.
 
 ## `m241 log edit`
 

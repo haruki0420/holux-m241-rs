@@ -149,29 +149,37 @@ pub fn to_kml(track: &Track) -> String {
     out
 }
 
+/// `TRACK NUMBER` for every CSV row.
+///
+/// ezTour numbers tracks; a [`Track`] is exactly one track, so the column is a
+/// constant rather than a per-point value.
+const TRACK_NUMBER: &str = "1";
+
 /// Render `track` as CSV with the [`CSV_COLUMNS`] header.
 ///
-/// The columns and order are ezTour's; LOCAL DATE and LOCAL TIME stay empty
-/// because its time-zone basis is unrecorded (`docs/dev/12-progress-summary.md`).
+/// The columns and order follow the ezTour layout recorded in
+/// `docs/dev/07-eztour-spec.ja.md` §2; that specification is the source, and a
+/// byte-for-byte comparison with an ezTour export is 未検証.
+///
+/// `INDEX` is the zero-based index of the point in the track. `LOCAL DATE` and
+/// `LOCAL TIME` stay empty because the time-zone basis ezTour used is
+/// unrecorded. The dump's `rcr` / `fix` / `waypoint` fields have no column in
+/// ezTour's layout: `rcr` and `waypoint` are in the JSON export, and `fix` is
+/// the presence of a coordinate ([`TrackPoint::has_position`]).
 #[must_use]
 pub fn to_csv(track: &Track) -> String {
     let mut out = String::new();
     out.push_str(&CSV_COLUMNS.join(","));
     out.push('\n');
     for (index, point) in track.points.iter().enumerate() {
-        let (utc_date, utc_time) = point.utc.map_or_else(
-            || (String::new(), String::new()),
-            |utc| {
-                let iso = utc_iso(utc);
-                let (date, rest) = iso.split_once('T').unwrap_or((iso.as_str(), ""));
-                (date.to_owned(), rest.trim_end_matches('Z').to_owned())
-            },
-        );
+        let (utc_date, utc_time) = point
+            .utc
+            .map_or_else(|| (String::new(), String::new()), utc_date_and_time);
         let (latitude, north_south) = csv_coordinate(point.latitude, 'N', 'S');
         let (longitude, east_west) = csv_coordinate(point.longitude, 'E', 'W');
         let fields = [
             index.to_string(),
-            String::from("1"),
+            String::from(TRACK_NUMBER),
             utc_date,
             utc_time,
             String::new(),
@@ -202,6 +210,10 @@ fn csv_coordinate(value: Option<f64>, positive: char, negative: char) -> (String
     (format!("{:.8}", value.abs()), letter.to_string())
 }
 
+/// An optional numeric column: empty when absent.
+///
+/// `digits` is the per-column precision (`ALTITUDE` 2, `SPEED` 3) rather than a
+/// constant because the two columns carry different units.
 fn csv_optional(value: Option<f32>, digits: usize) -> String {
     value.map_or_else(String::new, |value| format!("{value:.digits$}"))
 }
@@ -352,6 +364,27 @@ pub(crate) fn escape_xml(text: &str) -> String {
     out
 }
 
+/// `(YYYY-MM-DD, HH:MM:SS)` for a Unix timestamp, in UTC.
+///
+/// The two halves the CSV columns need. [`utc_iso`] renders the same instant
+/// with a `T` and a trailing `Z`, and both go through this conversion, so the
+/// date surgery in the CSV writer cannot drift from the ISO form.
+#[must_use]
+pub fn utc_date_and_time(seconds: u32) -> (String, String) {
+    let days = i64::from(seconds / 86_400);
+    let time = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    (
+        format!("{year:04}-{month:02}-{day:02}"),
+        format!(
+            "{:02}:{:02}:{:02}",
+            time / 3_600,
+            (time % 3_600) / 60,
+            time % 60
+        ),
+    )
+}
+
 /// `1970-01-01T00:00:00Z` for a Unix timestamp.
 ///
 /// The crate has no date library (and does not want one for five format
@@ -361,15 +394,8 @@ pub(crate) fn escape_xml(text: &str) -> String {
 /// arithmetic cannot overflow.
 #[must_use]
 pub fn utc_iso(seconds: u32) -> String {
-    let days = i64::from(seconds / 86_400);
-    let time = seconds % 86_400;
-    let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        time / 3_600,
-        (time % 3_600) / 60,
-        time % 60
-    )
+    let (date, time) = utc_date_and_time(seconds);
+    format!("{date}T{time}Z")
 }
 
 /// `(day, month, year)` a Unix timestamp falls on, in UTC.
@@ -650,6 +676,15 @@ mod tests {
         assert_eq!(utc_iso(315_964_800), "1980-01-06T00:00:00Z");
         assert_eq!(utc_iso(935_280_000), "1999-08-22T00:00:00Z");
         assert_eq!(utc_iso(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn the_csv_date_and_time_agree_with_the_iso_rendering() {
+        let seconds = 1_700_000_000;
+        let (date, time) = utc_date_and_time(seconds);
+        assert_eq!(date, "2023-11-14");
+        assert_eq!(time, "22:13:20");
+        assert_eq!(format!("{date}T{time}Z"), utc_iso(seconds));
     }
 
     #[test]

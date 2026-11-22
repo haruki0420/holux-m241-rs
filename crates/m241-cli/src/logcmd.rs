@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use m241_core::log::edit::TrackEditor;
 use m241_core::log::geotag::{self, CaptureTime, GeotagOptions, GeotagPlan, PhotoTimeShift};
 use m241_core::log::kmz::{KmzPhoto, export_kmz};
-use m241_core::log::{ParseReport, export, parse_dump};
+use m241_core::log::{NmeaImport, ParseReport, export, parse_dump};
 use m241_core::protocol::PmtkClient;
 use m241_core::protocol::port::Transport;
 use m241_core::{Error, ExportFormat, LogSummary, Result, Track};
@@ -234,7 +234,8 @@ fn print_download(
     console.result(&format!("{:<12}: {}", "fixes", summary.fixes));
 }
 
-/// Convert a dumped log to GPX, KML, CSV, NMEA or JSON.
+/// Convert a dumped log — or, with `--nmea`, an NMEA 0183 capture — to GPX,
+/// KML, CSV, NMEA or JSON.
 ///
 /// `--utc-offset-days auto` shifts only a log whose newest record is stale — one
 /// written by an unpatched unit, whose every timestamp is 7168 days in the past.
@@ -242,49 +243,37 @@ fn print_download(
 ///
 /// # Errors
 ///
-/// [`m241_core::Error::Io`] when the file cannot be read or the output written,
-/// [`m241_core::Error::Log`] when it is not a dump at all.
+/// [`m241_core::Error::Io`] when the file cannot be read or the output written;
+/// [`m241_core::Error::Log`] when the input is not a dump;
+/// [`m241_core::Error::State`] when a non-empty `--nmea` capture yields no point
+/// at all — an empty export must not look like a converted capture.
 pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
-    let mut track = if options.nmea {
-        // The line counts are what tells "empty" from "all rejected".
-        let imported = m241_core::log::import_nmea(&fileio::read_text(&options.file)?)?;
-        session.console.note(&format!(
-            "read {}: {} sentence(s) imported, {} dropped, {} ignored",
-            count_label(
-                imported.imported + imported.dropped + imported.ignored,
-                "line"
-            ),
-            imported.imported,
-            imported.dropped,
-            imported.ignored
-        ));
-        imported.track
+    let (mut track, nmea) = if options.nmea {
+        let report = m241_core::log::import_nmea(&fileio::read_text(&options.file)?)?;
+        report_nmea_import(&options.file, session.console, &report)?;
+        // `NmeaImport` owns its track; the counts live on after the move so a
+        // JSON reader still gets them.
+        let counts = NmeaCounts {
+            imported: report.imported,
+            dropped: report.dropped,
+            ignored: report.ignored,
+        };
+        (report.track, Some(counts))
     } else {
         let bytes = fileio::read(&options.file)?;
         let (track, report) = parse_dump(&bytes)?;
         let summary = report.summary(&track);
         warn_about_damage(session.console, &summary, &report, None);
-        track
+        (track, None)
     };
 
     let shift = apply_utc_offset(&mut track, options.utc_offset_days, session.console);
 
-    // The shift is already announced on stderr by `apply_utc_offset`. A JSON
-    // reader gets it as a field too, so `--format json` carries the same fact as
-    // `geotag --json` rather than leaving the number in a human message.
+    // The facts that live outside the export — the shift and, for `--nmea`, the
+    // line counts — are announced on stderr and also carried as JSON fields, so
+    // a script does not have to parse a human message.
     let exported = export(&track, options.format);
-    let exported = if options.format == ExportFormat::Json && shift != 0 {
-        match serde_json::from_str::<serde_json::Value>(&exported) {
-            Ok(serde_json::Value::Object(mut object)) => {
-                object.insert(String::from("offset_days"), serde_json::Value::from(shift));
-                format!("{}\n", serde_json::Value::Object(object))
-            }
-            // Not an object: leave the exporter's text exactly as it wrote it.
-            _ => exported,
-        }
-    } else {
-        exported
-    };
+    let exported = attach_read_report(exported, options.format, shift, nmea);
 
     match &options.output {
         Some(path) => {
@@ -298,6 +287,91 @@ pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
         None => session.console.text(&exported),
     }
     Ok(())
+}
+
+/// The NMEA line counts, kept after [`NmeaImport`]'s track has moved out.
+struct NmeaCounts {
+    imported: usize,
+    dropped: usize,
+    ignored: usize,
+}
+
+/// Announce what an NMEA import counted, and stop when it yielded nothing.
+///
+/// The counts go to stderr so the export on stdout stays machine-readable. A
+/// non-empty capture that produced no point is an error rather than a header-only
+/// export: an empty GPX written with exit 0 is indistinguishable from a
+/// successful conversion of a damaged capture. An empty file still yields an
+/// empty track, as an empty dump does.
+///
+/// # Errors
+///
+/// [`Error::State`] naming the input when it had lines but none produced a
+/// point.
+fn report_nmea_import(path: &Path, console: &dyn Console, report: &NmeaImport) -> Result<()> {
+    let lines = report.imported + report.dropped + report.ignored;
+    console.note(&format!(
+        "read {}: {} sentence(s) imported, {} dropped, {} ignored",
+        count_label(lines, "line"),
+        report.imported,
+        report.dropped,
+        report.ignored
+    ));
+    if lines > 0 && report.imported == 0 {
+        return Err(Error::State(format!(
+            "{}: no point could be imported from {}; {} dropped, {} ignored. The input may be \
+             damaged, taken before the unit had a fix, or not an NMEA 0183 capture at all; nothing \
+             was written",
+            path.display(),
+            count_label(lines, "line"),
+            report.dropped,
+            report.ignored
+        )));
+    }
+    if report.dropped > 0 {
+        // Same weight as the dump path's damage warning: a partial track is
+        // worth writing, but the user must know sentences were lost.
+        console.warn(&format!(
+            "{}: {} dropped sentence(s) produced no point (a broken checksum, a no-fix sentence, \
+             or missing fields); they were skipped",
+            path.display(),
+            report.dropped
+        ));
+    }
+    Ok(())
+}
+
+/// Add the announced facts that are not part of the export to `--format json`.
+///
+/// A field is added only when the fact exists: `offset_days` when something was
+/// shifted, `nmea` when the input was a capture. A non-object export is left
+/// exactly as the exporter wrote it.
+fn attach_read_report(
+    exported: String,
+    format: ExportFormat,
+    shift: i32,
+    nmea: Option<NmeaCounts>,
+) -> String {
+    if format != ExportFormat::Json || (shift == 0 && nmea.is_none()) {
+        return exported;
+    }
+    let Ok(serde_json::Value::Object(mut object)) = serde_json::from_str(&exported) else {
+        return exported;
+    };
+    if shift != 0 {
+        object.insert(String::from("offset_days"), serde_json::Value::from(shift));
+    }
+    if let Some(nmea) = nmea {
+        object.insert(
+            String::from("nmea"),
+            serde_json::json!({
+                "imported": nmea.imported,
+                "dropped": nmea.dropped,
+                "ignored": nmea.ignored,
+            }),
+        );
+    }
+    format!("{}\n", serde_json::Value::Object(object))
 }
 
 /// `1 point`, `2 points`, `1 photo`, `2 photos` — a count as it reads in a
@@ -1370,7 +1444,9 @@ mod tests {
         )
         .expect("read");
         assert!(
-            console.stdout().starts_with("INDEX,TRACK NUMBER,UTC DATE"),
+            console
+                .stdout()
+                .starts_with(&m241_core::log::export::CSV_COLUMNS.join(",")),
             "got {}",
             console.stdout()
         );
@@ -1435,6 +1511,8 @@ mod tests {
         let document: serde_json::Value =
             serde_json::from_str(&console.stdout()).expect("one JSON object");
         assert!(document.get("offset_days").is_none(), "got {document}");
+        // A dump carries no line counts, so the NMEA field is absent too.
+        assert!(document.get("nmea").is_none(), "got {document}");
     }
 
     #[test]
@@ -1485,7 +1563,9 @@ mod tests {
         )
         .expect("empty dump");
         assert!(
-            console.stdout().starts_with("INDEX,TRACK NUMBER,UTC DATE"),
+            console
+                .stdout()
+                .starts_with(&m241_core::log::export::CSV_COLUMNS.join(",")),
             "the header is still written: {}",
             console.stdout()
         );
@@ -3764,6 +3844,128 @@ mod tests {
         assert!(
             notes.contains("1 point"),
             "the point count differs from the sentence count: {notes}"
+        );
+        assert!(
+            notes.contains("warning:") && notes.contains("dropped sentence"),
+            "a partial loss is a warning, as damage on the dump path is: {notes}"
+        );
+    }
+
+    #[test]
+    fn read_nmea_refuses_a_capture_that_yields_no_point() {
+        let scratch = Scratch::new("import-nmea-none");
+        // A position sentence whose checksum is wrong: the counts show it was
+        // read as a sentence, not as free text.
+        let broken = String::from("$GPRMC,221320.00,A,3540.8742,N,13946.0275,E,10.00,,141123,,*00");
+        let input = scratch.join("capture.nmea");
+        fileio::write_text(&input, &format!("{broken}\r\n")).expect("write capture");
+        let output = scratch.join("track.gpx");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        let err = read(
+            &LogReadOptions {
+                nmea: true,
+                file: input,
+                format: m241_core::ExportFormat::Gpx,
+                output: Some(output.clone()),
+                utc_offset_days: crate::cal::OffsetSpec::Days(0),
+            },
+            Session::new(&links, &console, &confirm),
+        )
+        .expect_err("an all-rejected capture is not an empty track");
+        let text = format!("{err}");
+        assert!(
+            text.contains("capture.nmea"),
+            "the failure names the input: {text}"
+        );
+        assert!(text.contains("no point"), "got {text}");
+        assert!(!output.exists(), "a rejected capture writes no file");
+        assert!(
+            console
+                .stderr()
+                .contains("1 line: 0 sentence(s) imported, 1 dropped, 0 ignored"),
+            "the counts still reach stderr: {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
+    fn read_nmea_refuses_a_file_that_is_not_a_capture() {
+        let scratch = Scratch::new("import-nmea-foreign");
+        let input = scratch.join("notes.txt");
+        fileio::write_text(&input, "hello\r\nthis is not NMEA\r\n").expect("write notes");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        let err = read(
+            &LogReadOptions {
+                nmea: true,
+                file: input,
+                format: m241_core::ExportFormat::Csv,
+                output: None,
+                utc_offset_days: crate::cal::OffsetSpec::Days(0),
+            },
+            Session::new(&links, &console, &confirm),
+        )
+        .expect_err("free text is not a capture");
+        let text = format!("{err}");
+        assert!(
+            text.contains("notes.txt"),
+            "the failure names the input: {text}"
+        );
+        assert!(
+            console
+                .stderr()
+                .contains("2 lines: 0 sentence(s) imported, 0 dropped, 2 ignored"),
+            "both non-NMEA lines are counted as ignored: {}",
+            console.stderr()
+        );
+        assert!(
+            console.stdout().is_empty(),
+            "no header-only export reaches stdout: {}",
+            console.stdout()
+        );
+    }
+
+    #[test]
+    fn read_nmea_json_carries_the_line_counts() {
+        use m241_core::protocol::pmtk::sentence;
+
+        let scratch = Scratch::new("import-nmea-json");
+        let input = scratch.join("capture.nmea");
+        let good = sentence("GPRMC,221320.00,A,3540.8742,N,13946.0275,E,10.00,,141123,,");
+        let broken = String::from("$GPRMC,221320.00,A,3540.8742,N,13946.0275,E,10.00,,141123,,*00");
+        fileio::write_text(&input, &format!("{good}\r\n{broken}\r\n")).expect("write capture");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        read(
+            &LogReadOptions {
+                nmea: true,
+                file: input,
+                format: m241_core::ExportFormat::Json,
+                output: None,
+                utc_offset_days: crate::cal::OffsetSpec::Days(0),
+            },
+            Session::new(&links, &console, &confirm),
+        )
+        .expect("import nmea");
+
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        // A script must be able to tell "empty" from "all rejected" without
+        // parsing the human message, which is the rule `offset_days` set.
+        assert_eq!(document["nmea"]["imported"], 1, "got {document}");
+        assert_eq!(document["nmea"]["dropped"], 1, "got {document}");
+        assert_eq!(document["nmea"]["ignored"], 0, "got {document}");
+        assert_eq!(document["points"].as_array().map(Vec::len), Some(1));
+        assert!(
+            document.get("offset_days").is_none(),
+            "no shift was asked for: {document}"
         );
     }
 }

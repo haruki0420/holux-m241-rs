@@ -348,7 +348,7 @@ pub enum LogCommand {
     Download(DownloadOptions),
     /// Convert a dumped track log to GPX, KML, CSV, NMEA or JSON.
     Read(LogReadOptions),
-    /// Save or load the settings that make one track an output.
+    /// Save or re-run the settings for one export.
     Project {
         #[command(subcommand)]
         command: LogProjectCommand,
@@ -720,11 +720,15 @@ pub enum LogProjectCommand {
 }
 
 /// `m241 log project save`: write a project file without opening the log.
+///
+/// A relative path is stored relative to the project file's directory, so
+/// `load` finds the same file from any working directory; an absolute path is
+/// stored as given.
 #[derive(Debug, Args)]
 pub struct LogProjectSaveOptions {
     /// Where to write the project file.
     pub project: PathBuf,
-    /// The raw dump `project load` reads.
+    /// The log `project load` reads: a raw dump, or an NMEA capture with `--nmea`.
     pub log: PathBuf,
     /// Where `project load` writes the converted track.
     pub output: PathBuf,
@@ -734,6 +738,9 @@ pub struct LogProjectSaveOptions {
     /// Write a KMZ archive instead; requires `--photos`.
     #[arg(long)]
     pub kmz: bool,
+    /// Read the log as an NMEA 0183 capture instead of a raw dump.
+    #[arg(long, conflicts_with = "kmz")]
+    pub nmea: bool,
     /// Photo folder the project matches into a KMZ.
     #[arg(long)]
     pub photos: Option<PathBuf>,
@@ -745,6 +752,7 @@ pub struct LogProjectSaveOptions {
 /// `m241 log project load`: apply a saved project.
 #[derive(Debug, Args)]
 pub struct LogProjectLoadOptions {
+    /// The project file to read.
     pub project: PathBuf,
 }
 
@@ -1870,7 +1878,7 @@ mod tests {
             "project",
             "save",
             "trip.json",
-            "capture.nmea",
+            "track.bin",
             "track.kmz",
             "--kmz",
             "--photos",
@@ -1888,11 +1896,57 @@ mod tests {
         let LogProjectCommand::Save(options) = command else {
             panic!("expected project save");
         };
-        assert_eq!(options.log, PathBuf::from("capture.nmea"));
+        assert_eq!(options.log, PathBuf::from("track.bin"));
         assert_eq!(options.output, PathBuf::from("track.kmz"));
         assert!(options.kmz);
+        assert!(!options.nmea);
         assert_eq!(options.photos, Some(PathBuf::from("photos")));
         assert_eq!(options.utc_offset_days, -7168);
+
+        // The documented way to store an NMEA capture is the same command with
+        // `--nmea`; `load` reads it back with `log read --nmea`.
+        let cli = Cli::try_parse_from([
+            "m241",
+            "log",
+            "project",
+            "save",
+            "trip.json",
+            "capture.nmea",
+            "track.gpx",
+            "--nmea",
+        ])
+        .expect("project save --nmea parses");
+        let Command::Log {
+            command: LogCommand::Project { command },
+        } = cli.command
+        else {
+            panic!("expected log project");
+        };
+        let LogProjectCommand::Save(options) = command else {
+            panic!("expected project save");
+        };
+        assert!(options.nmea);
+        assert_eq!(options.log, PathBuf::from("capture.nmea"));
+
+        // kmz reads a raw dump, so the two input switches cannot both be given.
+        let err = Cli::try_parse_from([
+            "m241",
+            "log",
+            "project",
+            "save",
+            "trip.json",
+            "track.bin",
+            "track.kmz",
+            "--kmz",
+            "--photos",
+            "photos",
+            "--nmea",
+        ])
+        .expect_err("--nmea conflicts with --kmz");
+        assert!(
+            format!("{err}").contains("cannot be used with"),
+            "got {err}"
+        );
 
         let cli = Cli::try_parse_from(["m241", "log", "project", "load", "trip.json"])
             .expect("project load parses");

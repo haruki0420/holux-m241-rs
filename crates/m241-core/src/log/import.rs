@@ -138,7 +138,11 @@ pub fn import_gpx(text: &str) -> Result<Track> {
 
 /// What an NMEA import read, kept and dropped.
 ///
-/// The counts tell an empty capture from one whose every sentence was rejected.
+/// The counts separate an empty capture from a non-empty one that produced no
+/// point. `dropped` deliberately mixes two causes — a sentence that could not be
+/// read (broken checksum, missing fields) and a well-formed sentence that
+/// carried no fix — because both mean "this line gave us no position"; the
+/// message that quotes the counts names both possibilities.
 #[derive(Debug, Clone)]
 pub struct NmeaImport {
     pub track: Track,
@@ -148,6 +152,10 @@ pub struct NmeaImport {
     /// no-fix sentence, or missing coordinates.
     pub dropped: usize,
     /// Lines never turned into a point: blank, free text, another kind.
+    ///
+    /// The address is read before the checksum, so a `$GPGSA` line with a broken
+    /// checksum is still `ignored`: this reader never reads that sentence, and
+    /// its checksum is not its concern.
     pub ignored: usize,
 }
 
@@ -155,8 +163,15 @@ pub struct NmeaImport {
 ///
 /// Malformed lines, broken checksums, unsupported kinds and no-fix sentences are
 /// skipped and counted; sentences sharing a `HHMMSS` are merged so date/speed
-/// (RMC) and altitude (GGA) survive together. Infallible for well-typed input;
-/// `Result` mirrors [`import_gpx`].
+/// (RMC) and altitude (GGA) survive together. Only `$GPRMC` / `$GPGGA` lines can
+/// be `imported` or `dropped`: the address is read first, so a line of another
+/// kind is `ignored` whatever its checksum says.
+///
+/// # Errors
+///
+/// Never fails on text input: a malformed line is counted, not returned. The
+/// `Result` mirrors [`import_gpx`] so a caller can handle both importers the
+/// same way.
 pub fn import_nmea(text: &str) -> Result<NmeaImport> {
     let mut points: Vec<TrackPoint> = Vec::new();
     let mut last_bucket: Option<String> = None;
@@ -167,6 +182,13 @@ pub fn import_nmea(text: &str) -> Result<NmeaImport> {
     for raw_line in text.lines() {
         let line = raw_line.trim();
         if !line.starts_with('$') {
+            ignored += 1;
+            continue;
+        }
+        // The address decides the counter before `parse_sentence` checks the
+        // checksum: a sentence this reader does not read is `ignored` even when
+        // its checksum is wrong, and only RMC/GGA lines can be `dropped`.
+        if !is_position_sentence(line) {
             ignored += 1;
             continue;
         }
@@ -206,6 +228,17 @@ pub fn import_nmea(text: &str) -> Result<NmeaImport> {
         dropped,
         ignored,
     })
+}
+
+/// Is `line`'s address `$GPRMC` or `$GPGGA`?
+///
+/// Reads only the address field, before the checksum is verified: this decides
+/// which counter a line belongs to, and a sentence of another kind must count as
+/// ignored whether or not its checksum is valid.
+fn is_position_sentence(line: &str) -> bool {
+    line.strip_prefix('$')
+        .and_then(|rest| rest.split(',').next())
+        .is_some_and(|kind| matches!(kind, "GPRMC" | "GPGGA"))
 }
 
 /// One parsed RMC sentence: its `HHMMSS` bucket and the point it carries.
@@ -940,6 +973,26 @@ mod tests {
         assert_eq!(imported.imported, 2);
         assert_eq!(imported.dropped, 0);
         assert_eq!(imported.track.points.len(), 1);
+    }
+
+    #[test]
+    fn another_sentence_kind_with_a_broken_checksum_is_ignored_not_dropped() {
+        // The address decides the counter before the checksum is verified: a
+        // sentence this reader never reads is `ignored` even when its checksum
+        // is wrong, and only RMC/GGA lines can be `dropped`.
+        let text = [
+            String::from("$GPGSA,A,3,01,02,03,,,,,,,,,1.5,1.0,1.2*00"),
+            String::from("$GPGSV,1,1,00"),
+            crate::protocol::pmtk::sentence(
+                "GPRMC,221320.00,A,3540.8742,N,13946.0275,E,10.00,,141123,,",
+            ),
+        ]
+        .join("\r\n");
+        let imported = import_nmea(&text).expect("import nmea");
+        assert_eq!(imported.imported, 1);
+        assert_eq!(imported.dropped, 0, "another kind is not this reader's");
+        assert_eq!(imported.ignored, 2);
+        assert_eq!(imported.imported + imported.dropped + imported.ignored, 3);
     }
 
     #[test]

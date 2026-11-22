@@ -8,7 +8,7 @@
 //!   parse      a whole dump -> `Track`, tolerating the damage real dumps have
 //!   export     a `Track` -> GPX / KML / CSV / NMEA / JSON
 //!   kmz        a `Track` + photos -> uncompressed KMZ (KML 2.0 + Store ZIP)
-//!   import     GPX 1.0/1.1 or NMEA 0183 -> `Track`
+//!   import     GPX 1.0/1.1 or NMEA 0183 -> `Track` (plus the NMEA line counts)
 //!   edit       split, merge, delete points, and multi-step Undo/Redo
 //!   coord      format coordinates as Decimal, DMS, or WGS84 UTM
 //!   exif       the GPS tags in a JPEG's Exif block: read, validate, replace
