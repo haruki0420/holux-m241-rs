@@ -56,6 +56,7 @@ pub mod exit;
 mod fileio;
 mod fw;
 mod link;
+mod logcache;
 mod logcmd;
 mod nmea;
 mod output;

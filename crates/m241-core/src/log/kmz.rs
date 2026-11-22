@@ -66,7 +66,9 @@ use std::io::Cursor;
 
 use crate::error::{Error, Result};
 use crate::log::exif::{JPEG_MARKER_EOI, JPEG_MARKER_SOI};
-use crate::log::export::{DOCUMENT_NAME, escape_xml, utc_date, utc_iso};
+use crate::log::export::{
+    DOCUMENT_NAME, KML_NAMESPACE, escape_xml, track_style, utc_date, utc_iso,
+};
 use crate::log::geotag::CaptureTime;
 use crate::types::Track;
 
@@ -82,24 +84,6 @@ const METHOD_STORE: u16 = 0;
 const ZIP_VERSION_20: u16 = 20;
 /// General purpose bit 11: filename and comment are UTF-8 encoded.
 const FLAG_UTF8: u16 = 0x0800;
-
-/// Default track style colour as KML's `<color>` string: `aabbggrr`.
-///
-/// Read right to left in byte pairs: `ff` is red, `80` green, `00` blue — a
-/// purple — and the leading `b3` is alpha, 179/255 ≈ 0.7 opacity. Width 5 and
-/// this alpha come from `07-eztour-spec.ja.md` §5, which records what ezTour's
-/// map drew (purple, 5 px, 0.7 opacity).
-///
-/// The hex value is **this project's choice**, not ezTour's: the spec names the
-/// colours in words and says they were carried as `#rrggbb` strings, and
-/// nothing in this repository records the exact bytes ezTour emitted. So this
-/// matches the *description*, and a side-by-side against real ezTour output is
-/// unverified. A single colour is all one track needs; the ten-colour palette is
-/// a multi-track feature (§5) that this exporter has no caller for yet, so
-/// adding the other nine now would be untested colour data.
-const DEFAULT_LINE_COLOR: &str = "b3ff0080";
-/// Default track polyline width in pixels, from the same §5 measurement.
-const DEFAULT_LINE_WIDTH: u8 = 5;
 
 /// JPEG quality used when a photo over the long-edge limit is re-encoded.
 ///
@@ -560,15 +544,13 @@ fn deduplicate_name(base: &str, used_lower: &mut HashSet<String>) -> String {
 fn build_kml(track: &Track, photos: &[(String, &KmzPhoto)]) -> String {
     let mut out = String::new();
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    out.push_str("<kml xmlns=\"http://earth.google.com/kml/2.0\">\n");
+    let _ = writeln!(out, "<kml xmlns=\"{KML_NAMESPACE}\">");
     out.push_str("  <Document>\n");
     let _ = writeln!(out, "    <name>{}</name>", escape_xml(DOCUMENT_NAME));
-    let _ = writeln!(
-        out,
-        "    <Style id=\"trackStyle\">\n      <LineStyle>\n        \
-         <color>{DEFAULT_LINE_COLOR}</color>\n        <width>{DEFAULT_LINE_WIDTH}</width>\n      \
-         </LineStyle>\n    </Style>"
-    );
+    // The style is shared with the standalone `.kml` writer so the two documents
+    // cannot drift; see `export::track_style`.
+    out.push_str(&track_style());
+    out.push('\n');
     out.push_str("    <Placemark>\n");
     let _ = writeln!(out, "      <name>{}</name>", escape_xml(DOCUMENT_NAME));
     out.push_str("      <styleUrl>#trackStyle</styleUrl>\n");

@@ -9,7 +9,48 @@
 
 ## [Unreleased]
 
-（次のリリースに向けた変更はまだ無い）
+### Added
+
+- `log read --gpx`: ezTour など他ツールが書き出した GPX 1.0/1.1 を取り込む入力
+  経路。`<trkpt>` だけを読み、`<wpt>` は読まない。空でない GPX が 1 点も
+  作れないときはエラー（exit 1）で、何も書かない。
+- `log read --cache <FILE>`: パース結果を JSON に保存し、内容が同一なら次回
+  読み戻す。長さと FNV-1a 64 bit の一致だけでヒットとし、壊れたキャッシュ・
+  旧スキーマは警告して再パースする。**ヒット時も解析レポート（破損ブロック・
+  未解析バイト等）を警告として再生する。**
+- `log read --csv-report`: ezTour の 2 種類目の CSV（summary + 点表）。
+- `log read --coord-format decimal|dms|utm` と `log info --coord-format`。
+- `log read --simplify <N>`: ストライド間引き（`1` は間引きなし）。
+- `log info` の `stats`（再計算した距離・時間・平均/最高速度・高度）と
+  `position`、および `TrackStats` の公開 API。
+- `log geotag --group-photo-distance`（距離による写真のグルーピング）と
+  `--no-backup`、KMZ の `--icons`。
+
+### Changed
+
+- **写真の EXIF 書き換えは既定で `<photo>_original` バックアップを作る。**
+  1.0.0 以前は作らなかった。既定は `m241_core` の `GeotagOptions` にあるため、
+  GUI の Log 画面からの書き込みにも同じ既定が効く（GUI にトグルは無い）。
+  旧挙動が必要なライブラリ利用者は `keep_backup: false` を明示する。
+- `log read --format nmea`: 衛星数フィールドを `00` ではなく**空**にした。`00`
+  は有効な衛星数で、fix quality `1` の隣では測定値に見えるため。HDOP・geoid
+  separation と同じ「not available」表現に揃えた。
+- `log read --format kml`: 要素順を KML 2.0 の `FeatureType` に合わせ、
+  `<LookAt>` を `<Style>` より前に出した（旧順序はスキーマ違反）。
+- `log read --gpx`: `--utc-offset-days auto` を**適用しない**。他ツールの GPX は
+  歴史的な日付を持ち得るため、既定では日時をそのまま保持し、stale 窓に入る
+  場合だけ理由と修正方法を警告する。明示した日数はこれまでどおり適用する。
+
+### Fixed
+
+- `log read --cache` のヒットで解析警告が消え、破損ダンプが 2 回目にきれいに
+  見えていた問題。
+- `log read --gpx` が `<wpt>` だけの GPX で exit 0・空出力になっていた問題。
+- `log info` が位置を持つ点ゼロのトラックで `distance : 0.00 m` と表示していた
+  問題（`-` に修正）。
+- `--simplify 1` が「間引いた」と表示し JSON に `simplify` を出していた問題。
+- 非有限（NaN）の座標を GPX/KML に書き出していた問題。位置判定を
+  `TrackPoint::position` に一本化した。
 
 ## [1.0.0] - 2026-11-22
 

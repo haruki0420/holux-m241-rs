@@ -33,7 +33,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use m241_core::ExportFormat;
-use m241_core::log::geotag::{CameraModel, PhotoShiftScope, PhotoTimeShift};
+use m241_core::log::CoordFormat;
+use m241_core::log::geotag::{CameraModel, GeotagOptions, PhotoShiftScope, PhotoTimeShift};
 use m241_core::protocol::brom::BASE_ADDR_FIRMWARE;
 
 use crate::cal::{self, OffsetSpec};
@@ -403,6 +404,50 @@ impl ShiftScopeArg {
     }
 }
 
+/// The coordinate display format `--coord-format` selects
+/// (`07-eztour-spec.ja.md` §3.3, §3.6).
+///
+/// Three of the fourteen codes ezTour's `CoorCvt32.dll` offers are enough for
+/// this toolkit: decimal degrees with a hemisphere letter, degrees-minutes-
+/// seconds, and WGS84 UTM. The other eleven are national grids for countries
+/// this logger was not sold in, and the DLL's user-defined code has no
+/// definition to copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum CoordFormatArg {
+    /// `N 35.68123600°`.
+    #[default]
+    Decimal,
+    /// `N 35°40'52.450"`.
+    Dms,
+    /// `54S 388436E 3949294N`.
+    Utm,
+}
+
+impl CoordFormatArg {
+    /// The core formatter this flag selects.
+    #[must_use]
+    pub const fn to_core(self) -> CoordFormat {
+        match self {
+            Self::Decimal => CoordFormat::Decimal,
+            Self::Dms => CoordFormat::Dms,
+            Self::Utm => CoordFormat::Utm,
+        }
+    }
+
+    /// The value `--coord-format`'s value enum uses, for output and tests.
+    ///
+    /// The same words as the variants so a `required_if_eq` or a documented
+    /// spelling cannot drift; a test pins this against clap's accepted values.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Decimal => "decimal",
+            Self::Dms => "dms",
+            Self::Utm => "utm",
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct LogGeotagOptions {
     /// The raw dump `m241 log download` wrote.
@@ -420,6 +465,27 @@ pub struct LogGeotagOptions {
         value_name = "SECONDS"
     )]
     pub max_gap: u32,
+
+    /// Do not write a `<photo>_original` backup before replacing a photo.
+    ///
+    /// The backup is on by default: a rewrite replaces the only copy of the
+    /// photo, and losing it cannot be undone from the tagged file. The flag
+    /// exists for a caller that already has its own copy.
+    #[arg(long)]
+    pub no_backup: bool,
+
+    /// Group matched photos that landed within this many metres of each other,
+    /// as ezTour's `groupPhotoDistance` does (`07-eztour-spec.ja.md` §6.1-5).
+    ///
+    /// Off when omitted. The specification records that ezTour ships a non-zero
+    /// default but not what it is, so this command chooses no grouping rather
+    /// than a guessed threshold.
+    #[arg(
+        long,
+        value_parser = parse_positive_distance,
+        value_name = "METRES"
+    )]
+    pub group_photo_distance: Option<f64>,
 
     /// Days to add to every track timestamp, or `auto` to detect a WNRO-shifted log.
     #[arg(
@@ -518,6 +584,23 @@ pub struct LogGeotagOptions {
 }
 
 impl LogGeotagOptions {
+    /// The matching and backup settings these flags describe.
+    ///
+    /// One place builds the core options so a handler cannot miss a flag: the
+    /// backup default and the grouping threshold both live here, and the tests
+    /// assert on this value rather than on a second copy in the handler.
+    /// `photo_shift_seconds` is left at zero because `log geotag` passes the
+    /// shift to the re-matching planner instead.
+    #[must_use]
+    pub fn geotag_options(&self) -> GeotagOptions {
+        GeotagOptions {
+            max_gap_seconds: self.max_gap,
+            keep_backup: !self.no_backup,
+            group_distance_meters: self.group_photo_distance,
+            ..GeotagOptions::default()
+        }
+    }
+
     /// The clock movement the four `--shift-*` flags add up to.
     ///
     /// The single-value form is `--shift-seconds` alone. `--tz-offset-minutes`
@@ -622,12 +705,33 @@ pub struct LogKmzOptions {
         value_name = "MINUTES"
     )]
     pub tz_offset_minutes: i32,
+
+    /// Also store an `icon/<name>` thumbnail beside each embedded photo, with
+    /// this long edge in pixels.
+    ///
+    /// Bare `--icons` uses 64 px; `--icons 128` asks for 128. A thumbnail is
+    /// drawn in a map balloon rather than viewed full screen, so 64 px is large
+    /// enough to recognise the frame and small enough that a folder of photos
+    /// adds little to the archive. Without the flag the archive has no `icon/`
+    /// entries, which is the shape `export_kmz` has always written.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "64",
+        value_parser = parse_positive_pixels,
+        value_name = "PIXELS"
+    )]
+    pub icons: Option<u32>,
 }
 
 #[derive(Debug, Args)]
 pub struct LogInfoOptions {
     /// The raw dump `m241 log download` wrote.
     pub file: PathBuf,
+
+    /// How to render the start and end coordinates.
+    #[arg(long, value_enum, default_value = "decimal", value_name = "FORMAT")]
+    pub coord_format: CoordFormatArg,
 
     /// Print one JSON object instead of labelled lines.
     #[arg(long)]
@@ -682,22 +786,79 @@ pub struct EraseOptions {
 /// `m241 log read`: one dumped log, converted and written out.
 #[derive(Debug, Args)]
 pub struct LogReadOptions {
-    /// The raw dump `m241 log download` wrote, or an NMEA 0183 capture with `--nmea`.
+    /// The raw dump `m241 log download` wrote, an NMEA 0183 capture with `--nmea`,
+    /// or a GPX document with `--gpx`.
     pub file: PathBuf,
 
     /// Read the input as an NMEA 0183 capture instead of a raw dump.
     #[arg(long)]
     pub nmea: bool,
 
+    /// Read the input as a GPX 1.0/1.1 document instead of a raw dump.
+    ///
+    /// The way in for a track exported by ezTour or another tool. `<trkpt>`
+    /// elements (with `ele`, `time`, `speed`) become points; `<wpt>` waypoints
+    /// are **not** read, because a saved place is a different kind of object
+    /// from a recorded position. A document with no `<trkpt>` is an error (exit
+    /// 1) rather than an empty export with exit 0.
+    #[arg(long, conflicts_with = "nmea")]
+    pub gpx: bool,
+
     /// Output format.
     #[arg(long, value_parser = parse_format, default_value = "gpx")]
     pub format: ExportFormat,
+
+    /// Write the summary-plus-point-table CSV report instead of the point CSV.
+    ///
+    /// Exclusive with `--format`: the report is a different document, not a
+    /// sixth `--format` value. Its point table reuses the twelve point columns;
+    /// the summary rows above it are this project's own layout.
+    #[arg(long, conflicts_with = "format")]
+    pub csv_report: bool,
+
+    /// How to render the start and end coordinates in the report on stderr and
+    /// in `--format json`'s `position` object.
+    ///
+    /// GPX, KML, CSV and NMEA each define their own coordinate encoding
+    /// (decimal degrees, or `ddmm.mmmm` for NMEA), so this flag does not rewrite
+    /// them; it selects the display form of the two positions this command
+    /// announces.
+    #[arg(long, value_enum, default_value = "decimal", value_name = "FORMAT")]
+    pub coord_format: CoordFormatArg,
+
+    /// Keep every Nth point, plus the last one (point thinning).
+    ///
+    /// ezTour asks whether to simplify GPX before an upload (`07-eztour-spec.ja.md`
+    /// §2) without defining the rule; this is the stride form, so which points
+    /// survive is predictable from the number alone. `1` keeps every point,
+    /// which is the same as omitting the flag: nothing is thinned and no
+    /// `simplify` fact is reported.
+    #[arg(long, value_parser = parse_stride, value_name = "N")]
+    pub simplify: Option<usize>,
+
+    /// Cache the parsed dump in this JSON file, or read it back when it matches.
+    ///
+    /// The cache records the input's length and a 64-bit content hash, so a
+    /// changed dump is re-parsed rather than served stale. A hit replays the
+    /// stored parse report as the same warnings a fresh parse prints, and an
+    /// unreadable or older cache is a warning and a re-parse. It is this
+    /// project's own format and is not ezTour's `.tki`; only a raw dump can be
+    /// cached.
+    #[arg(long, conflicts_with_all = ["nmea", "gpx"], value_name = "FILE")]
+    pub cache: Option<PathBuf>,
 
     /// Where to write the converted track; stdout when omitted.
     #[arg(short, long)]
     pub output: Option<PathBuf>,
 
     /// Days to add to every timestamp, or `auto` to detect a WNRO-shifted log.
+    ///
+    /// `auto` is a rule for a raw dump: it shifts a log whose newest record
+    /// falls in the window an unpatched unit emits (1999-08-22 to 2019-04-06).
+    /// **It is never applied to `--gpx`**: a GPX from another tool can be
+    /// genuinely historical, so its dates are kept as written and a warning
+    /// names the day count that would shift them. Pass an explicit number to
+    /// shift either input, including a negative one to undo a shift.
     ///
     /// `allow_hyphen_values` is what makes `--utc-offset-days -7168` a value
     /// rather than an unknown flag: a negative shift is the normal way to undo
@@ -895,6 +1056,53 @@ fn parse_photo_edge(text: &str) -> Result<u32, String> {
         ));
     }
     Ok(pixels)
+}
+
+/// `--icons`: a positive long-edge limit for an `icon/` thumbnail, in pixels.
+fn parse_positive_pixels(text: &str) -> Result<u32, String> {
+    let pixels = text
+        .parse::<u32>()
+        .map_err(|_| format!("{text:?} is not a pixel count"))?;
+    if pixels == 0 {
+        return Err(String::from(
+            "--icons must be positive; it is a thumbnail long-edge limit in pixels",
+        ));
+    }
+    Ok(pixels)
+}
+
+/// `--group-photo-distance`: a positive distance in metres.
+///
+/// Zero would be the configuration that cannot group anything meaningful (every
+/// two photos are more than zero apart), so it is a usage error rather than a
+/// silent "off".
+fn parse_positive_distance(text: &str) -> Result<f64, String> {
+    let metres = text
+        .parse::<f64>()
+        .map_err(|_| format!("{text:?} is not a distance in metres"))?;
+    if !metres.is_finite() || metres <= 0.0 {
+        return Err(format!(
+            "--group-photo-distance must be a positive number of metres, got {text:?}"
+        ));
+    }
+    Ok(metres)
+}
+
+/// `--simplify`: a stride of at least one point.
+///
+/// Zero would keep no points at all and leave a GPX with a header and an empty
+/// `<trkseg>`; one already means "keep every point", so the two are not the same
+/// request and only the latter is valid.
+fn parse_stride(text: &str) -> Result<usize, String> {
+    let stride = text
+        .parse::<usize>()
+        .map_err(|_| format!("{text:?} is not a point count"))?;
+    if stride == 0 {
+        return Err(String::from(
+            "--simplify must be at least 1; 1 keeps every point",
+        ));
+    }
+    Ok(stride)
 }
 
 /// `--length` for `fw dump`: positive, even (16-bit BootROM reads), and within
@@ -1960,5 +2168,244 @@ mod tests {
             panic!("expected project load");
         };
         assert_eq!(options.project, PathBuf::from("trip.json"));
+    }
+
+    /// Parse `args` and return the `log read` options.
+    fn parse_read(args: &[&str]) -> LogReadOptions {
+        let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?} failed: {e}"));
+        let Command::Log {
+            command: LogCommand::Read(options),
+        } = cli.command
+        else {
+            panic!("expected log read for {args:?}");
+        };
+        options
+    }
+
+    /// Parse `args` and return the `log geotag` options.
+    fn parse_geotag(args: &[&str]) -> LogGeotagOptions {
+        let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?} failed: {e}"));
+        let Command::Log {
+            command: LogCommand::Geotag(options),
+        } = cli.command
+        else {
+            panic!("expected log geotag for {args:?}");
+        };
+        options
+    }
+
+    /// Parse `args` and return the `log kmz` options.
+    fn parse_kmz(args: &[&str]) -> LogKmzOptions {
+        let cli = Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?} failed: {e}"));
+        let Command::Log {
+            command: LogCommand::Kmz(options),
+        } = cli.command
+        else {
+            panic!("expected log kmz for {args:?}");
+        };
+        options
+    }
+
+    #[test]
+    fn log_read_defaults_and_the_new_input_and_output_flags_parse() {
+        let options = parse_read(&["m241", "log", "read", "track.bin"]);
+        assert!(!options.nmea);
+        assert!(!options.gpx);
+        assert!(!options.csv_report);
+        assert_eq!(options.coord_format, CoordFormatArg::Decimal);
+        assert_eq!(options.simplify, None);
+        assert_eq!(options.cache, None);
+        assert_eq!(options.format, ExportFormat::Gpx);
+
+        let options = parse_read(&["m241", "log", "read", "track.gpx", "--gpx"]);
+        assert!(options.gpx);
+        assert!(!options.nmea);
+
+        let options = parse_read(&[
+            "m241",
+            "log",
+            "read",
+            "track.bin",
+            "--format",
+            "json",
+            "--coord-format",
+            "utm",
+            "--simplify",
+            "4",
+        ]);
+        assert_eq!(options.coord_format, CoordFormatArg::Utm);
+        assert_eq!(options.simplify, Some(4));
+
+        let options = parse_read(&[
+            "m241",
+            "log",
+            "read",
+            "track.bin",
+            "--csv-report",
+            "--cache",
+            "track.cache.json",
+        ]);
+        assert!(options.csv_report);
+        assert_eq!(options.cache, Some(PathBuf::from("track.cache.json")));
+
+        // The input kinds are one choice, and so are the point CSV and the report.
+        for args in [
+            vec!["m241", "log", "read", "a", "--gpx", "--nmea"],
+            vec!["m241", "log", "read", "a", "--cache", "c.json", "--gpx"],
+            vec![
+                "m241",
+                "log",
+                "read",
+                "a",
+                "--csv-report",
+                "--format",
+                "csv",
+            ],
+        ] {
+            let err = Cli::try_parse_from(&args).expect_err("the flags conflict");
+            assert_eq!(
+                crate::exit::exit_code_for_parse_error(&err),
+                2,
+                "{args:?} must be a usage error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_zero_simplify_stride_is_a_usage_error() {
+        // 1 is "keep every point"; 0 would keep none, which is not the same
+        // request and would write an empty track.
+        let err = Cli::try_parse_from(["m241", "log", "read", "a", "--simplify", "0"])
+            .expect_err("a zero stride is invalid");
+        assert!(format!("{err}").contains("at least 1"), "got {err}");
+        Cli::try_parse_from(["m241", "log", "read", "a", "--simplify", "1"])
+            .expect("1 keeps every point");
+    }
+
+    #[test]
+    fn log_info_accepts_the_coordinate_format_and_defaults_to_decimal() {
+        let cli = Cli::try_parse_from(["m241", "log", "info", "track.bin"]).expect("info");
+        let Command::Log {
+            command: LogCommand::Info(options),
+        } = cli.command
+        else {
+            panic!("expected log info");
+        };
+        assert_eq!(options.coord_format, CoordFormatArg::Decimal);
+
+        let cli = Cli::try_parse_from(["m241", "log", "info", "t.bin", "--coord-format", "dms"])
+            .expect("dms parses");
+        let Command::Log {
+            command: LogCommand::Info(options),
+        } = cli.command
+        else {
+            panic!("expected log info");
+        };
+        assert_eq!(options.coord_format, CoordFormatArg::Dms);
+
+        let err = Cli::try_parse_from(["m241", "log", "info", "t.bin", "--coord-format", "mgrs"])
+            .expect_err("an unknown format is a usage error");
+        assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
+    }
+
+    #[test]
+    fn the_coord_format_labels_are_the_values_clap_accepts() {
+        use clap::ValueEnum as _;
+
+        assert_eq!(CoordFormatArg::value_variants().len(), 3);
+        for variant in CoordFormatArg::value_variants() {
+            let possible = variant.to_possible_value().expect("a possible value");
+            assert_eq!(
+                possible.get_name(),
+                variant.label(),
+                "the label and the accepted value must not drift"
+            );
+        }
+        assert_eq!(CoordFormatArg::Decimal.to_core(), CoordFormat::Decimal);
+        assert_eq!(CoordFormatArg::Dms.to_core(), CoordFormat::Dms);
+        assert_eq!(CoordFormatArg::Utm.to_core(), CoordFormat::Utm);
+    }
+
+    #[test]
+    fn log_geotag_backup_and_grouping_flags_reach_the_core_options() {
+        let options = parse_geotag(&["m241", "log", "geotag", "track.bin", "a.jpg"]);
+        assert!(!options.no_backup);
+        assert_eq!(options.group_photo_distance, None);
+        let core = options.geotag_options();
+        assert!(core.keep_backup, "the backup is on by default");
+        assert_eq!(core.max_gap_seconds, options.max_gap);
+        assert_eq!(core.group_distance_meters, None);
+
+        let options = parse_geotag(&[
+            "m241",
+            "log",
+            "geotag",
+            "track.bin",
+            "a.jpg",
+            "--no-backup",
+            "--group-photo-distance",
+            "15.5",
+        ]);
+        assert!(options.no_backup);
+        assert_eq!(options.group_photo_distance, Some(15.5));
+        let core = options.geotag_options();
+        assert!(!core.keep_backup);
+        assert_eq!(core.group_distance_meters, Some(15.5));
+
+        for bad in ["0", "-1", "nan", "far"] {
+            let err = Cli::try_parse_from([
+                "m241",
+                "log",
+                "geotag",
+                "track.bin",
+                "a.jpg",
+                "--group-photo-distance",
+                bad,
+            ])
+            .expect_err("a non-positive distance is a usage error");
+            assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2, "{bad}");
+        }
+    }
+
+    #[test]
+    fn log_kmz_icons_takes_an_optional_long_edge() {
+        let options = parse_kmz(&["m241", "log", "kmz", "track.bin", "-o", "track.kmz"]);
+        assert_eq!(options.icons, None, "no flag writes no icon/ entries");
+
+        let options = parse_kmz(&[
+            "m241",
+            "log",
+            "kmz",
+            "track.bin",
+            "-o",
+            "track.kmz",
+            "--icons",
+        ]);
+        assert_eq!(options.icons, Some(64), "bare --icons uses 64 px");
+
+        let options = parse_kmz(&[
+            "m241",
+            "log",
+            "kmz",
+            "track.bin",
+            "-o",
+            "track.kmz",
+            "--icons",
+            "128",
+        ]);
+        assert_eq!(options.icons, Some(128));
+
+        let err = Cli::try_parse_from([
+            "m241",
+            "log",
+            "kmz",
+            "track.bin",
+            "-o",
+            "track.kmz",
+            "--icons",
+            "0",
+        ])
+        .expect_err("a zero thumbnail is invalid");
+        assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
     }
 }
