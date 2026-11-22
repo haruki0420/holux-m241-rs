@@ -17,18 +17,18 @@ use std::path::{Path, PathBuf};
 
 use m241_core::log::edit::TrackEditor;
 use m241_core::log::geotag::{self, CaptureTime, GeotagOptions, GeotagPlan, PhotoTimeShift};
-use m241_core::log::kmz::{KmzPhoto, export_kmz};
+use m241_core::log::kmz::{KmzIconOptions, KmzPhoto, export_kmz, export_kmz_with_icons};
 use m241_core::log::{NmeaImport, ParseReport, export, parse_dump};
 use m241_core::protocol::PmtkClient;
 use m241_core::protocol::port::Transport;
-use m241_core::{Error, ExportFormat, LogSummary, Result, Track};
+use m241_core::{Error, ExportFormat, LogSummary, Result, Track, TrackPoint, TrackStats};
 use m241_flash::erase::{BackupProof, LogEraser};
 
 use crate::Session;
 use crate::cal::OffsetSpec;
 use crate::cli::{
-    DownloadOptions, EraseOptions, LogEditOptions, LogGeotagOptions, LogInfoOptions, LogKmzOptions,
-    LogReadOptions, ShiftScopeArg,
+    CoordFormatArg, DownloadOptions, EraseOptions, LogEditOptions, LogGeotagOptions,
+    LogInfoOptions, LogKmzOptions, LogReadOptions, ShiftScopeArg,
 };
 use crate::fileio;
 use crate::link;
@@ -234,21 +234,32 @@ fn print_download(
     console.result(&format!("{:<12}: {}", "fixes", summary.fixes));
 }
 
-/// Convert a dumped log — or, with `--nmea`, an NMEA 0183 capture — to GPX,
-/// KML, CSV, NMEA or JSON.
+/// Convert a dumped log — or, with `--nmea` / `--gpx`, another capture or
+/// document — to GPX, KML, CSV, NMEA or JSON, or to the CSV report.
 ///
 /// `--utc-offset-days auto` shifts only a log whose newest record is stale — one
 /// written by an unpatched unit, whose every timestamp is 7168 days in the past.
-/// An explicit number is applied as given, including negative values.
+/// An explicit number is applied as given, including negative values. The rule
+/// applies to an imported GPX too, because a GPX exported from an unpatched unit
+/// carries the same 7168-day error; a genuinely historical GPX is kept as it is
+/// by passing `--utc-offset-days 0`.
+///
+/// `--simplify` thins the points after the shift and before the export, so the
+/// two settings compose in the order the user reads them. `--coord-format`
+/// selects how the start and end positions are rendered: in the report on
+/// stderr, and in `--format json`'s `position` object. The file formats define
+/// their own coordinate encoding, so the flag does not rewrite them.
 ///
 /// # Errors
 ///
 /// [`m241_core::Error::Io`] when the file cannot be read or the output written;
-/// [`m241_core::Error::Log`] when the input is not a dump;
+/// [`m241_core::Error::Log`] when the input is not a dump, a GPX document or a
+/// capture of the kind named;
 /// [`m241_core::Error::State`] when a non-empty `--nmea` capture yields no point
-/// at all — an empty export must not look like a converted capture.
+/// at all — an empty export must not look like a converted capture — and when
+/// `--coord-format utm` is asked for a point outside the UTM band.
 pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
-    let (mut track, nmea) = if options.nmea {
+    let (mut track, input) = if options.nmea {
         let report = m241_core::log::import_nmea(&fileio::read_text(&options.file)?)?;
         report_nmea_import(&options.file, session.console, &report)?;
         // `NmeaImport` owns its track; the counts live on after the move so a
@@ -258,22 +269,65 @@ pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
             dropped: report.dropped,
             ignored: report.ignored,
         };
-        (report.track, Some(counts))
+        (report.track, ReadInput::Nmea(counts))
+    } else if options.gpx {
+        let track = m241_core::log::import_gpx(&fileio::read_text(&options.file)?)?;
+        session.console.note(&format!(
+            "read {}: {} imported from GPX (waypoints are not read)",
+            options.file.display(),
+            count_label(track.points.len(), "point")
+        ));
+        (track, ReadInput::Gpx)
     } else {
-        let bytes = fileio::read(&options.file)?;
-        let (track, report) = parse_dump(&bytes)?;
-        let summary = report.summary(&track);
-        warn_about_parse_report(session.console, &summary, &report, None);
-        (track, None)
+        (
+            read_dump(&options.file, options.cache.as_deref(), session.console)?,
+            ReadInput::Dump,
+        )
     };
 
     let shift = apply_utc_offset(&mut track, options.utc_offset_days, session.console);
 
-    // The facts that live outside the export — the shift and, for `--nmea`, the
-    // line counts — are announced on stderr and also carried as JSON fields, so
-    // a script does not have to parse a human message.
-    let exported = export(&track, options.format);
-    let exported = attach_read_report(exported, options.format, shift, nmea);
+    if let Some(stride) = options.simplify {
+        let before = track.points.len();
+        track = m241_core::log::simplify_track(&track, stride);
+        session.console.note(&format!(
+            "simplified {} to {}: kept every {stride}th point and the last one",
+            count_label(before, "point"),
+            count_label(track.points.len(), "point")
+        ));
+    }
+
+    let position = position_report(&track, options.coord_format)?;
+    if let Some(position) = &position {
+        let start = position
+            .start
+            .as_ref()
+            .map_or_else(|| String::from("-"), RenderedPosition::line);
+        let end = position
+            .end
+            .as_ref()
+            .map_or_else(|| String::from("-"), RenderedPosition::line);
+        session
+            .console
+            .note(&format!("position: start {start}; end {end}"));
+    }
+
+    // The facts that live outside the export — the shift, the input kind, the
+    // thinning and the rendered positions — are announced on stderr and also
+    // carried as JSON fields, so a script does not have to parse a human
+    // message.
+    let exported = if options.csv_report {
+        m241_core::log::to_csv_report(&track)
+    } else {
+        export(&track, options.format)
+    };
+    let report = ReadReport {
+        shift_days: shift,
+        input,
+        simplify: options.simplify,
+        position,
+    };
+    let exported = attach_read_report(exported, options.format, &report);
 
     match &options.output {
         Some(path) => {
@@ -289,11 +343,319 @@ pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Read a raw dump, through the parse cache when one was named.
+///
+/// A cache hit is announced on stderr; a stale cache (different length or
+/// content hash) is silently re-parsed and overwritten, because a dump that
+/// changed between two runs is the normal way to use the flag. A cache that is
+/// not this project's JSON is a warning and a re-parse rather than an error: the
+/// dump is the source of truth and the cache can always be rebuilt.
+fn read_dump(path: &Path, cache: Option<&Path>, console: &dyn Console) -> Result<Track> {
+    let bytes = fileio::read(path)?;
+    let Some(cache_path) = cache else {
+        let (track, report) = parse_dump(&bytes)?;
+        warn_about_parse_report(console, &report.summary(&track), &report, None);
+        return Ok(track);
+    };
+    if let Some(track) = cache_load(cache_path, &bytes, console)? {
+        console.note(&format!(
+            "read the track from the parse cache {}",
+            cache_path.display()
+        ));
+        return Ok(track);
+    }
+    let (track, report) = parse_dump(&bytes)?;
+    warn_about_parse_report(console, &report.summary(&track), &report, None);
+    cache_store(cache_path, &bytes, &track)?;
+    console.note(&format!(
+        "wrote the parse cache to {}",
+        cache_path.display()
+    ));
+    Ok(track)
+}
+
+/// Marker and schema version of this project's parse cache.
+///
+/// Not ezTour's `.tki`: the specification records only that a cache exists, not
+/// its format, so this file says what it is and claims no compatibility.
+const CACHE_FORMAT: &str = "m241-cache";
+/// Schema version of the parse cache; a different version is ignored and rebuilt.
+const CACHE_VERSION: u64 = 1;
+
+/// 64-bit FNV-1a hash of `bytes`.
+///
+/// A content hash, not a timestamp: two dumps of the same unit on different days
+/// can share a size, and an mtime is not portable between a copy and its source.
+/// FNV-1a is not cryptographic — a cache is not a security boundary, and the
+/// dump itself is what gets parsed when the hash differs.
+fn content_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Load `path` when it describes exactly `bytes`; `None` when it is stale.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the cache exists but cannot be read.
+fn cache_load(path: &Path, bytes: &[u8], console: &dyn Console) -> Result<Option<Track>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(Error::io(path.display().to_string(), source)),
+    };
+    let document = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(document) => document,
+        Err(_) => {
+            console.warn(&format!(
+                "{}: not a JSON cache; the dump will be parsed again",
+                path.display()
+            ));
+            return Ok(None);
+        }
+    };
+    if document.get("format").and_then(serde_json::Value::as_str) != Some(CACHE_FORMAT)
+        || document.get("version").and_then(serde_json::Value::as_u64) != Some(CACHE_VERSION)
+    {
+        console.warn(&format!(
+            "{}: not a cache this build understands; the dump will be parsed again",
+            path.display()
+        ));
+        return Ok(None);
+    }
+    let expected_hash = format!("{:016x}", content_hash(bytes));
+    let expected_length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let source = match document.get("source") {
+        Some(source) => source,
+        None => return Ok(None),
+    };
+    if source.get("bytes").and_then(serde_json::Value::as_u64) != Some(expected_length)
+        || source.get("hash").and_then(serde_json::Value::as_str) != Some(expected_hash.as_str())
+    {
+        return Ok(None);
+    }
+    let Some(entries) = document.get("points").and_then(serde_json::Value::as_array) else {
+        console.warn(&format!(
+            "{}: the cache has no point list; the dump will be parsed again",
+            path.display()
+        ));
+        return Ok(None);
+    };
+    let mut track = Track::default();
+    for entry in entries {
+        let Some(point) = cache_point(entry) else {
+            console.warn(&format!(
+                "{}: a cached point could not be read; the dump will be parsed again",
+                path.display()
+            ));
+            return Ok(None);
+        };
+        track.points.push(point);
+    }
+    if let Some(blocks) = document
+        .get("damaged_blocks")
+        .and_then(serde_json::Value::as_array)
+    {
+        for block in blocks {
+            let Some(block) = block.as_u64().and_then(|value| u32::try_from(value).ok()) else {
+                continue;
+            };
+            track.damaged_blocks.push(block);
+        }
+    }
+    Ok(Some(track))
+}
+
+/// Write the cache beside the dump.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the cache cannot be written, or [`Error::State`] when the
+/// document cannot be serialised (it cannot fail for these values).
+fn cache_store(path: &Path, bytes: &[u8], track: &Track) -> Result<()> {
+    let document = serde_json::json!({
+        "format": CACHE_FORMAT,
+        "version": CACHE_VERSION,
+        "source": {
+            "bytes": u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            "hash": format!("{:016x}", content_hash(bytes)),
+        },
+        "damaged_blocks": track.damaged_blocks,
+        "points": track.points.iter().map(|point| serde_json::json!({
+            "utc": point.utc,
+            "lat": point.latitude,
+            "lon": point.longitude,
+            "height_m": point.height_m,
+            "speed_kmh": point.speed_kmh,
+            "rcr": point.rcr,
+        })).collect::<Vec<_>>(),
+    });
+    let text = serde_json::to_string(&document)
+        .map_err(|err| Error::State(format!("could not serialise the parse cache: {err}")))?;
+    fileio::write_text(path, &text)
+}
+
+/// One cached point, or `None` when a field has a shape the cache cannot hold.
+///
+/// A present-but-wrong field fails the whole cache rather than becoming a
+/// default: a cache that silently turns a latitude into `None` would produce a
+/// track that differs from the dump, which is worse than parsing the dump again.
+fn cache_point(value: &serde_json::Value) -> Option<TrackPoint> {
+    let object = value.as_object()?;
+    let integer = |key: &str| -> Option<Option<u64>> {
+        match object.get(key) {
+            None | Some(serde_json::Value::Null) => Some(None),
+            Some(found) => found.as_u64().map(Some),
+        }
+    };
+    let float = |key: &str| -> Option<Option<f64>> {
+        match object.get(key) {
+            None | Some(serde_json::Value::Null) => Some(None),
+            Some(found) => found.as_f64().filter(|value| value.is_finite()).map(Some),
+        }
+    };
+    let utc = match integer("utc")? {
+        Some(raw) => Some(u32::try_from(raw).ok()?),
+        None => None,
+    };
+    let rcr = match integer("rcr")? {
+        Some(raw) => Some(u16::try_from(raw).ok()?),
+        None => None,
+    };
+    let height_m = float("height_m")?.map(|raw| raw as f32);
+    let speed_kmh = float("speed_kmh")?.map(|raw| raw as f32);
+    Some(TrackPoint {
+        utc,
+        latitude: float("lat")?,
+        longitude: float("lon")?,
+        height_m,
+        speed_kmh,
+        rcr,
+    })
+}
+
 /// The NMEA line counts, kept after [`NmeaImport`]'s track has moved out.
+#[derive(Debug, Clone, Copy)]
 struct NmeaCounts {
     imported: usize,
     dropped: usize,
     ignored: usize,
+}
+
+/// Which reader produced the track `log read` is exporting.
+#[derive(Debug, Clone, Copy)]
+enum ReadInput {
+    /// A raw dump from `log download`.
+    Dump,
+    /// An NMEA 0183 capture, with its line counts.
+    Nmea(NmeaCounts),
+    /// A GPX document from another tool.
+    Gpx,
+}
+
+/// A position rendered in the caller's `--coord-format`.
+#[derive(Debug, Clone)]
+struct RenderedPosition {
+    /// The decoded coordinate, kept beside the text for JSON consumers.
+    lat: f64,
+    /// The decoded coordinate, kept beside the text for JSON consumers.
+    lon: f64,
+    /// The rendered latitude, e.g. `N 35.68123600°`.
+    latitude: String,
+    /// The rendered longitude, e.g. `E 139.76712500°`.
+    longitude: String,
+}
+
+impl RenderedPosition {
+    /// The two rendered axes, as one line.
+    fn line(&self) -> String {
+        format!("{} {}", self.latitude, self.longitude)
+    }
+}
+
+/// The first and last positioned point, rendered in one format.
+#[derive(Debug, Clone)]
+struct PositionReport {
+    /// The `--coord-format` value the texts were rendered with.
+    format: &'static str,
+    /// The first point that carries a position.
+    start: Option<RenderedPosition>,
+    /// The last point that carries a position.
+    end: Option<RenderedPosition>,
+}
+
+/// Render the first and last positioned points, or `None` when there is none.
+///
+/// # Errors
+///
+/// [`Error::State`] when the chosen format cannot express a coordinate — UTM has
+/// no band beyond 80° S / 84° N, so `--coord-format utm` on a polar track is an
+/// error rather than a silently different format.
+fn position_report(track: &Track, format: CoordFormatArg) -> Result<Option<PositionReport>> {
+    let first = track.points.iter().find_map(positioned);
+    let last = track.points.iter().rev().find_map(positioned);
+    let (Some((start_lat, start_lon)), Some((end_lat, end_lon))) = (first, last) else {
+        return Ok(None);
+    };
+    Ok(Some(PositionReport {
+        format: format.label(),
+        start: Some(render_position(start_lat, start_lon, format)?),
+        end: Some(render_position(end_lat, end_lon, format)?),
+    }))
+}
+
+/// The finite position a point carries, when it has one.
+fn positioned(point: &TrackPoint) -> Option<(f64, f64)> {
+    let (lat, lon) = (point.latitude?, point.longitude?);
+    (lat.is_finite() && lon.is_finite()).then_some((lat, lon))
+}
+
+/// Render one coordinate pair.
+fn render_position(lat: f64, lon: f64, format: CoordFormatArg) -> Result<RenderedPosition> {
+    let (latitude, longitude) = m241_core::log::format_coordinate(lat, lon, format.to_core())?;
+    Ok(RenderedPosition {
+        lat,
+        lon,
+        latitude,
+        longitude,
+    })
+}
+
+/// The `position` object `--format json` and `log info --json` carry.
+fn position_document(position: Option<&PositionReport>) -> serde_json::Value {
+    let Some(position) = position else {
+        return serde_json::Value::Null;
+    };
+    let rendered = |position: Option<&RenderedPosition>| match position {
+        Some(position) => serde_json::json!({
+            "latitude": position.latitude,
+            "longitude": position.longitude,
+            "lat": position.lat,
+            "lon": position.lon,
+        }),
+        None => serde_json::Value::Null,
+    };
+    serde_json::json!({
+        "format": position.format,
+        "start": rendered(position.start.as_ref()),
+        "end": rendered(position.end.as_ref()),
+    })
+}
+
+/// Everything `log read` announces about the conversion.
+struct ReadReport {
+    /// The day shift that was applied, `0` when none was.
+    shift_days: i32,
+    /// Which reader produced the track.
+    input: ReadInput,
+    /// The stride `--simplify` applied.
+    simplify: Option<usize>,
+    /// The rendered start and end positions.
+    position: Option<PositionReport>,
 }
 
 /// Announce what an NMEA import counted, and stop when it yielded nothing.
@@ -344,31 +706,45 @@ fn report_nmea_import(path: &Path, console: &dyn Console, report: &NmeaImport) -
 /// Add the announced facts that are not part of the export to `--format json`.
 ///
 /// A field is added only when the fact exists: `offset_days` when something was
-/// shifted, `nmea` when the input was a capture. A non-object export is left
-/// exactly as the exporter wrote it.
-fn attach_read_report(
-    exported: String,
-    format: ExportFormat,
-    shift: i32,
-    nmea: Option<NmeaCounts>,
-) -> String {
-    if format != ExportFormat::Json || (shift == 0 && nmea.is_none()) {
+/// shifted, `nmea` for a capture, `input: "gpx"` for a GPX document,
+/// `simplify` when points were thinned, and `position` when a point carries a
+/// coordinate. A non-object export is left exactly as the exporter wrote it.
+fn attach_read_report(exported: String, format: ExportFormat, report: &ReadReport) -> String {
+    if format != ExportFormat::Json {
         return exported;
     }
     let Ok(serde_json::Value::Object(mut object)) = serde_json::from_str(&exported) else {
         return exported;
     };
-    if shift != 0 {
-        object.insert(String::from("offset_days"), serde_json::Value::from(shift));
-    }
-    if let Some(nmea) = nmea {
+    if report.shift_days != 0 {
         object.insert(
-            String::from("nmea"),
-            serde_json::json!({
-                "imported": nmea.imported,
-                "dropped": nmea.dropped,
-                "ignored": nmea.ignored,
-            }),
+            String::from("offset_days"),
+            serde_json::Value::from(report.shift_days),
+        );
+    }
+    match report.input {
+        ReadInput::Nmea(nmea) => {
+            object.insert(
+                String::from("nmea"),
+                serde_json::json!({
+                    "imported": nmea.imported,
+                    "dropped": nmea.dropped,
+                    "ignored": nmea.ignored,
+                }),
+            );
+        }
+        ReadInput::Gpx => {
+            object.insert(String::from("input"), serde_json::Value::from("gpx"));
+        }
+        ReadInput::Dump => {}
+    }
+    if let Some(stride) = report.simplify {
+        object.insert(String::from("simplify"), serde_json::Value::from(stride));
+    }
+    if report.position.is_some() {
+        object.insert(
+            String::from("position"),
+            position_document(report.position.as_ref()),
         );
     }
     format!("{}\n", serde_json::Value::Object(object))
@@ -657,7 +1033,17 @@ pub fn kmz(options: &LogKmzOptions, session: Session<'_>) -> Result<()> {
     )?;
     let photos = materialize_kmz_photos(&plans, options.max_photo_edge, session.console)?;
 
-    let archive = export_kmz(&track, &photos)?;
+    let archive = match options.icons {
+        Some(edge) => {
+            // `--icons` also stores a thumbnail per photo under `icon/`; the
+            // photo entries and the KML are the same as without it.
+            let icons = KmzIconOptions {
+                max_edge_pixels: edge,
+            };
+            export_kmz_with_icons(&track, &photos, &icons)?
+        }
+        None => export_kmz(&track, &photos)?,
+    };
     fileio::write(&options.output, &archive)?;
     session.console.note(&format!(
         "wrote {} and {} to {}",
@@ -746,12 +1132,19 @@ pub fn info(options: &LogInfoOptions, session: Session<'_>) -> Result<()> {
     let summary = report.summary(&track);
     warn_about_parse_report(session.console, &summary, &report, None);
 
+    // Recomputed from the points, as ezTour's own summary was: most records
+    // carry no speed, so a total read from fields would describe the minority.
+    let stats = TrackStats::of(&track);
+    let position = position_report(&track, options.coord_format)?;
+
     if options.json {
         return session.console.json(&serde_json::json!({
             "file": options.file.display().to_string(),
             "size": bytes.len(),
             "summary": summary_document(summary),
             "parse": parse_document(&report),
+            "stats": stats_document(stats),
+            "position": position_document(position.as_ref()),
         }));
     }
     print_info(
@@ -760,6 +1153,8 @@ pub fn info(options: &LogInfoOptions, session: Session<'_>) -> Result<()> {
         bytes.len(),
         summary,
         &report,
+        stats,
+        position.as_ref(),
     );
     Ok(())
 }
@@ -769,12 +1164,18 @@ pub fn info(options: &LogInfoOptions, session: Session<'_>) -> Result<()> {
 const NO_TRACK_POINTS: &str = "no track points (settings journal only)";
 
 /// The labelled lines `log info` prints on stdout.
+///
+/// The statistics and positions come after the parser's facts: `start`/`end` are
+/// the parser's timestamps, the distance and speeds are recomputed from the
+/// points, and a `-` means the track has no data for that fact rather than zero.
 fn print_info(
     console: &dyn Console,
     file: &Path,
     size: usize,
     summary: LogSummary,
     report: &ParseReport,
+    stats: TrackStats,
+    position: Option<&PositionReport>,
 ) {
     let mut lines = vec![
         ("file", file.display().to_string()),
@@ -787,7 +1188,41 @@ fn print_info(
         ("truncated records", report.truncated_records.to_string()),
         ("start", timestamp(summary.started_at)),
         ("end", timestamp(summary.ended_at)),
+        ("distance", format!("{:.2} m", stats.distance_m)),
+        (
+            "duration",
+            stats
+                .duration_seconds
+                .map_or_else(|| String::from("-"), |seconds| format!("{seconds} s")),
+        ),
+        (
+            "average speed",
+            stats
+                .average_speed_kmh
+                .map_or_else(|| String::from("-"), |speed| format!("{speed:.3} km/h")),
+        ),
+        (
+            "max speed",
+            stats
+                .max_speed_kmh
+                .map_or_else(|| String::from("-"), |speed| format!("{speed:.3} km/h")),
+        ),
+        (
+            "altitude",
+            match (stats.min_altitude_m, stats.max_altitude_m) {
+                (Some(min), Some(max)) => format!("{min:.2} .. {max:.2} m"),
+                _ => String::from("-"),
+            },
+        ),
     ];
+    if let Some(position) = position {
+        if let Some(start) = &position.start {
+            lines.push(("start position", start.line()));
+        }
+        if let Some(end) = &position.end {
+            lines.push(("end position", end.line()));
+        }
+    }
     if report.journal_items > 0 {
         lines.push(("journal items", report.journal_items.to_string()));
     }
@@ -809,6 +1244,20 @@ fn print_info(
     for (label, value) in lines {
         console.result(&format!("{label:<18}: {value}"));
     }
+}
+
+/// [`TrackStats`] as a JSON object.
+fn stats_document(stats: TrackStats) -> serde_json::Value {
+    serde_json::json!({
+        "records": stats.records,
+        "fixes": stats.fixes,
+        "distance_m": stats.distance_m,
+        "duration_seconds": stats.duration_seconds,
+        "average_speed_kmh": stats.average_speed_kmh,
+        "max_speed_kmh": stats.max_speed_kmh,
+        "min_altitude_m": stats.min_altitude_m,
+        "max_altitude_m": stats.max_altitude_m,
+    })
 }
 
 /// One summary as JSON, with the timestamps rendered as ISO-8601 as well.
@@ -924,12 +1373,11 @@ pub fn geotag(options: &LogGeotagOptions, session: Session<'_>) -> Result<()> {
         shift_track_seconds(&mut matching_track, tz_delta_seconds);
     }
 
-    let geotag_options = GeotagOptions {
-        max_gap_seconds: options.max_gap,
-        ..GeotagOptions::default()
-    };
-    // One path for both cases: an all-photos, zero-second shift is exactly
-    // what `plan` does.
+    // One place builds the core options, so the backup default and the grouping
+    // threshold cannot be wired into the handler and not the JSON output.
+    let geotag_options = options.geotag_options();
+    // One path for both cases: an all-photos, zero-second shift is exactly what
+    // `plan` does.
     let mut plans = geotag::plan_with_time_shift(
         &photo_paths,
         &matching_track,
@@ -1015,6 +1463,17 @@ pub fn geotag(options: &LogGeotagOptions, session: Session<'_>) -> Result<()> {
     session
         .console
         .result(&format!("{:<8}: {offset_days}", "offset"));
+    // The backup is a promise the run keeps or does not; say which, so a user
+    // who expected `_original` files is not left to notice their absence.
+    session.console.result(&format!(
+        "{:<8}: {}",
+        "backup",
+        if options.geotag_options().keep_backup {
+            "on"
+        } else {
+            "off"
+        }
+    ));
     // The line names the request, not the outcome: how many photos moved is what
     // `matched` and `written` report, and a scope that selected nothing still
     // shows up there rather than being implied by a shift line.
@@ -1134,12 +1593,14 @@ fn geotag_document(
                 "matched_utc": matched_utc,
                 "matched_iso": matched_utc.map(export::utc_iso),
                 "gap_seconds": plan.gap_seconds,
+                "group_id": plan.group_id,
                 "latitude": plan.point.and_then(|point| point.latitude),
                 "longitude": plan.point.and_then(|point| point.longitude),
                 "height_m": plan.point.and_then(|point| point.height_m),
             })
         })
         .collect();
+    let core_options = options.geotag_options();
     serde_json::json!({
         "log": options.log.display().to_string(),
         "dry_run": options.dry_run,
@@ -1148,6 +1609,8 @@ fn geotag_document(
         "shift_seconds": shift.total_seconds(),
         "shift_scope": options.scope.label(),
         "max_gap_seconds": options.max_gap,
+        "keep_backup": core_options.keep_backup,
+        "group_photo_distance_m": options.group_photo_distance,
         "matched": matched_count,
         "written": written_count,
         "skipped": skipped_count,
@@ -1234,6 +1697,42 @@ mod tests {
         path
     }
 
+    /// `log read` options with every flag at its documented default, for the
+    /// tests to override only the ones they are about.
+    fn read_options(file: PathBuf, format: ExportFormat) -> LogReadOptions {
+        use clap::Parser as _;
+
+        let cli = crate::Cli::try_parse_from(["m241", "log", "read", "track.bin"])
+            .expect("the documented read defaults parse");
+        let crate::Command::Log {
+            command: crate::cli::LogCommand::Read(mut options),
+        } = cli.command
+        else {
+            panic!("expected log read");
+        };
+        options.file = file;
+        options.format = format;
+        options.utc_offset_days = OffsetSpec::Days(0);
+        options
+    }
+
+    /// `log info` options with every flag at its documented default.
+    fn info_options(file: PathBuf, json: bool) -> LogInfoOptions {
+        use clap::Parser as _;
+
+        let cli = crate::Cli::try_parse_from(["m241", "log", "info", "track.bin"])
+            .expect("the documented info defaults parse");
+        let crate::Command::Log {
+            command: crate::cli::LogCommand::Info(mut options),
+        } = cli.command
+        else {
+            panic!("expected log info");
+        };
+        options.file = file;
+        options.json = json;
+        options
+    }
+
     /// `log geotag` options with every flag at its documented default, for the
     /// tests to override only the ones they are about.
     fn geotag_options(log: PathBuf, photos: Vec<PathBuf>) -> LogGeotagOptions {
@@ -1273,6 +1772,7 @@ mod tests {
         info(
             &LogInfoOptions {
                 file: path,
+                coord_format: CoordFormatArg::Decimal,
                 json: false,
             },
             Session::new(&links, &console, &confirm),
@@ -1294,6 +1794,7 @@ mod tests {
         info(
             &LogInfoOptions {
                 file: path,
+                coord_format: CoordFormatArg::Decimal,
                 json: true,
             },
             Session::new(&links, &console, &confirm),
@@ -1317,6 +1818,7 @@ mod tests {
         info(
             &LogInfoOptions {
                 file: path,
+                coord_format: CoordFormatArg::Decimal,
                 json: true,
             },
             Session::new(&links, &console, &confirm),
@@ -1360,6 +1862,7 @@ mod tests {
         info(
             &LogInfoOptions {
                 file: path,
+                coord_format: CoordFormatArg::Decimal,
                 json: false,
             },
             Session::new(&links, &console, &confirm),
@@ -1390,6 +1893,7 @@ mod tests {
         let err = info(
             &LogInfoOptions {
                 file: path,
+                coord_format: CoordFormatArg::Decimal,
                 json: false,
             },
             Session::new(&links, &console, &confirm),
@@ -1537,6 +2041,11 @@ mod tests {
                 format: m241_core::ExportFormat::Gpx,
                 output: Some(output.clone()),
                 utc_offset_days: crate::cal::OffsetSpec::Days(0),
+                gpx: false,
+                csv_report: false,
+                coord_format: CoordFormatArg::Decimal,
+                simplify: None,
+                cache: None,
             },
             fast(&links, &console, &confirm),
         )
@@ -1560,6 +2069,11 @@ mod tests {
                 format: m241_core::ExportFormat::Csv,
                 output: None,
                 utc_offset_days: crate::cal::OffsetSpec::Days(0),
+                gpx: false,
+                csv_report: false,
+                coord_format: CoordFormatArg::Decimal,
+                simplify: None,
+                cache: None,
             },
             fast(&links, &console, &confirm),
         )
@@ -1587,6 +2101,11 @@ mod tests {
                 format: m241_core::ExportFormat::Json,
                 output: None,
                 utc_offset_days: crate::cal::OffsetSpec::Days(1),
+                gpx: false,
+                csv_report: false,
+                coord_format: CoordFormatArg::Decimal,
+                simplify: None,
+                cache: None,
             },
             fast(&links, &console, &confirm),
         )
@@ -1625,6 +2144,11 @@ mod tests {
                 format: m241_core::ExportFormat::Json,
                 output: None,
                 utc_offset_days: OffsetSpec::Days(0),
+                gpx: false,
+                csv_report: false,
+                coord_format: CoordFormatArg::Decimal,
+                simplify: None,
+                cache: None,
             },
             fast(&links, &console, &confirm),
         )
@@ -1650,6 +2174,11 @@ mod tests {
                 format: m241_core::ExportFormat::Json,
                 output: None,
                 utc_offset_days: crate::cal::OffsetSpec::Auto,
+                gpx: false,
+                csv_report: false,
+                coord_format: CoordFormatArg::Decimal,
+                simplify: None,
+                cache: None,
             },
             fast(&links, &console, &confirm),
         )
@@ -1679,6 +2208,11 @@ mod tests {
                 format: m241_core::ExportFormat::Csv,
                 output: None,
                 utc_offset_days: crate::cal::OffsetSpec::Auto,
+                gpx: false,
+                csv_report: false,
+                coord_format: CoordFormatArg::Decimal,
+                simplify: None,
+                cache: None,
             },
             fast(&links, &console, &confirm),
         )
@@ -1712,6 +2246,11 @@ mod tests {
                 format: m241_core::ExportFormat::Csv,
                 output: None,
                 utc_offset_days: crate::cal::OffsetSpec::Days(0),
+                gpx: false,
+                csv_report: false,
+                coord_format: CoordFormatArg::Decimal,
+                simplify: None,
+                cache: None,
             },
             fast(&links, &console, &confirm),
         )
@@ -1748,6 +2287,11 @@ mod tests {
                 format: m241_core::ExportFormat::Csv,
                 output: None,
                 utc_offset_days: crate::cal::OffsetSpec::Days(0),
+                gpx: false,
+                csv_report: false,
+                coord_format: CoordFormatArg::Decimal,
+                simplify: None,
+                cache: None,
             },
             fast(&links, &console, &confirm),
         )
@@ -1787,6 +2331,11 @@ mod tests {
                 format: m241_core::ExportFormat::Csv,
                 output: None,
                 utc_offset_days: crate::cal::OffsetSpec::Days(0),
+                gpx: false,
+                csv_report: false,
+                coord_format: CoordFormatArg::Decimal,
+                simplify: None,
+                cache: None,
             },
             fast(&links, &console, &confirm),
         )
@@ -1902,6 +2451,11 @@ mod tests {
                 format: m241_core::ExportFormat::Json,
                 output: None,
                 utc_offset_days: OffsetSpec::Auto,
+                gpx: false,
+                csv_report: false,
+                coord_format: CoordFormatArg::Decimal,
+                simplify: None,
+                cache: None,
             },
             fast(&links, &console, &confirm),
         )
@@ -1936,6 +2490,11 @@ mod tests {
                 format: m241_core::ExportFormat::Json,
                 output: None,
                 utc_offset_days: OffsetSpec::Auto,
+                gpx: false,
+                csv_report: false,
+                coord_format: CoordFormatArg::Decimal,
+                simplify: None,
+                cache: None,
             },
             fast(&links, &console, &confirm),
         )
@@ -1967,6 +2526,11 @@ mod tests {
                 format: m241_core::ExportFormat::Json,
                 output: None,
                 utc_offset_days: OffsetSpec::Days(crate::cal::WNRO_DAYS),
+                gpx: false,
+                csv_report: false,
+                coord_format: CoordFormatArg::Decimal,
+                simplify: None,
+                cache: None,
             },
             fast(&links, &console, &confirm),
         )
@@ -2591,6 +3155,11 @@ mod tests {
                 format: m241_core::ExportFormat::Kml,
                 output: None,
                 utc_offset_days: OffsetSpec::Days(0),
+                gpx: false,
+                csv_report: false,
+                coord_format: CoordFormatArg::Decimal,
+                simplify: None,
+                cache: None,
             },
             fast(&links, &kml_console, &confirm),
         )
@@ -2609,6 +3178,11 @@ mod tests {
                 format: m241_core::ExportFormat::Nmea,
                 output: None,
                 utc_offset_days: OffsetSpec::Days(0),
+                gpx: false,
+                csv_report: false,
+                coord_format: CoordFormatArg::Decimal,
+                simplify: None,
+                cache: None,
             },
             fast(&links, &nmea_console, &confirm),
         )
@@ -3465,6 +4039,7 @@ mod tests {
             max_gap: m241_core::log::geotag::DEFAULT_MAX_GAP_SECONDS,
             utc_offset_days: OffsetSpec::Days(0),
             tz_offset_minutes: 0,
+            icons: None,
         }
     }
 
@@ -4043,6 +4618,11 @@ mod tests {
                 format: m241_core::ExportFormat::Gpx,
                 output: Some(output.clone()),
                 utc_offset_days: crate::cal::OffsetSpec::Days(0),
+                gpx: false,
+                csv_report: false,
+                coord_format: CoordFormatArg::Decimal,
+                simplify: None,
+                cache: None,
             },
             Session::new(&links, &console, &confirm),
         )
@@ -4086,6 +4666,11 @@ mod tests {
                 format: m241_core::ExportFormat::Gpx,
                 output: Some(output.clone()),
                 utc_offset_days: crate::cal::OffsetSpec::Days(0),
+                gpx: false,
+                csv_report: false,
+                coord_format: CoordFormatArg::Decimal,
+                simplify: None,
+                cache: None,
             },
             Session::new(&links, &console, &confirm),
         )
@@ -4122,6 +4707,11 @@ mod tests {
                 format: m241_core::ExportFormat::Csv,
                 output: None,
                 utc_offset_days: crate::cal::OffsetSpec::Days(0),
+                gpx: false,
+                csv_report: false,
+                coord_format: CoordFormatArg::Decimal,
+                simplify: None,
+                cache: None,
             },
             Session::new(&links, &console, &confirm),
         )
@@ -4165,6 +4755,11 @@ mod tests {
                 format: m241_core::ExportFormat::Json,
                 output: None,
                 utc_offset_days: crate::cal::OffsetSpec::Days(0),
+                gpx: false,
+                csv_report: false,
+                coord_format: CoordFormatArg::Decimal,
+                simplify: None,
+                cache: None,
             },
             Session::new(&links, &console, &confirm),
         )
@@ -4182,5 +4777,466 @@ mod tests {
             document.get("offset_days").is_none(),
             "no shift was asked for: {document}"
         );
+    }
+
+    #[test]
+    fn read_gpx_imports_the_track_points_and_not_the_waypoints() {
+        let scratch = Scratch::new("read-gpx-import");
+        let input = scratch.join("track.gpx");
+        fileio::write_text(
+            &input,
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="ezTour">
+  <wpt lat="35.0" lon="139.0"><name>saved place</name></wpt>
+  <trk><trkseg>
+    <trkpt lat="35.681236" lon="139.767125">
+      <ele>80.0</ele><time>2023-11-14T22:13:20Z</time><speed>11.8</speed>
+    </trkpt>
+    <trkpt lat="35.682236" lon="139.768125">
+      <time>2023-11-14T22:13:30Z</time>
+    </trkpt>
+  </trkseg></trk>
+</gpx>
+"#,
+        )
+        .expect("write gpx");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        // The document name is parsed, so the input switch carries the format;
+        // `--format` still chooses the output.
+        let mut options = read_options(input, ExportFormat::Json);
+        options.gpx = true;
+        read(&options, Session::new(&links, &console, &confirm)).expect("read gpx");
+
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(document["input"], "gpx", "got {document}");
+        assert_eq!(document["points"].as_array().map(Vec::len), Some(2));
+        assert_eq!(document["points"][0]["lat"], 35.681236);
+        assert_eq!(document["points"][0]["height_m"], 80.0);
+        let stderr = console.stderr();
+        assert!(
+            stderr.contains("2 points imported from GPX"),
+            "the waypoint shows up as no point: {stderr}"
+        );
+        assert!(stderr.contains("waypoints are not read"), "got {stderr}");
+    }
+
+    #[test]
+    fn read_simplify_keeps_every_nth_point_and_the_last_one() {
+        let scratch = Scratch::new("read-simplify");
+        // Seven points: a stride of three keeps indices 0, 3 and 6.
+        let path = write_dump(&scratch, "track.bin", 7);
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        let mut options = read_options(path, ExportFormat::Json);
+        options.simplify = Some(3);
+        read(&options, Session::new(&links, &console, &confirm)).expect("simplified read");
+
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(
+            document["points"].as_array().map(Vec::len),
+            Some(3),
+            "got {document}"
+        );
+        assert_eq!(document["simplify"], 3);
+        assert!(
+            console.stderr().contains("simplified 7 points to 3"),
+            "got {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
+    fn read_renders_the_position_in_the_selected_coordinate_format() {
+        let scratch = Scratch::new("read-coord-format");
+        let path = scratch.join("track.bin");
+        fileio::write(&path, &dump_with_timestamps(&[1_700_000_000])).expect("write dump");
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+
+        let console = RecordingConsole::default();
+        let mut options = read_options(path.clone(), ExportFormat::Json);
+        options.coord_format = CoordFormatArg::Dms;
+        read(&options, Session::new(&links, &console, &confirm)).expect("dms read");
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(document["position"]["format"], "dms", "got {document}");
+        let latitude = document["position"]["start"]["latitude"]
+            .as_str()
+            .expect("a rendered latitude");
+        assert!(
+            latitude.contains('°'),
+            "a DMS latitude has degrees: {latitude}"
+        );
+        assert!(
+            latitude.contains('\''),
+            "a DMS latitude has minutes: {latitude}"
+        );
+        assert!(
+            console.stderr().contains("position: start N "),
+            "got {}",
+            console.stderr()
+        );
+
+        // The default is decimal, and it is spelled out in the JSON.
+        let decimal_console = RecordingConsole::default();
+        let options = read_options(path, ExportFormat::Json);
+        read(&options, Session::new(&links, &decimal_console, &confirm)).expect("decimal read");
+        let document: serde_json::Value =
+            serde_json::from_str(&decimal_console.stdout()).expect("one JSON object");
+        assert_eq!(document["position"]["format"], "decimal");
+        assert!(
+            document["position"]["start"]["latitude"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("N ")),
+            "got {document}"
+        );
+    }
+
+    #[test]
+    fn read_refuses_a_utm_rendering_outside_the_utm_band() {
+        // 85 N is a valid latitude and an invalid UTM latitude: asking for UTM
+        // must fail rather than silently render another format.
+        let scratch = Scratch::new("read-utm-band");
+        let input = scratch.join("polar.gpx");
+        fileio::write_text(
+            &input,
+            r#"<gpx version="1.1"><trk><trkseg>
+                <trkpt lat="85.0" lon="10.0"><time>2023-11-14T22:13:20Z</time></trkpt>
+            </trkseg></trk></gpx>"#,
+        )
+        .expect("write gpx");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        let mut options = read_options(input, ExportFormat::Csv);
+        options.gpx = true;
+        options.coord_format = CoordFormatArg::Utm;
+        let err = read(&options, Session::new(&links, &console, &confirm))
+            .expect_err("UTM has no band at 85 N");
+        assert!(matches!(err, Error::State(_)), "got {err}");
+        assert!(
+            format!("{err}").to_lowercase().contains("utm"),
+            "the refusal names the format: {err}"
+        );
+        assert!(
+            console.stdout().is_empty(),
+            "nothing is written when the format cannot render: {}",
+            console.stdout()
+        );
+    }
+
+    #[test]
+    fn read_writes_the_csv_report_with_a_summary_and_the_point_table() {
+        let scratch = Scratch::new("read-csv-report");
+        let path = write_dump(&scratch, "track.bin", 3);
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        let mut options = read_options(path, ExportFormat::Csv);
+        options.csv_report = true;
+        read(&options, Session::new(&links, &console, &confirm)).expect("csv report");
+
+        let report = console.stdout();
+        let mut lines = report.lines();
+        assert_eq!(lines.next(), Some("REPORT"), "got {report}");
+        assert!(report.contains("RECORDS,3"), "got {report}");
+        assert!(
+            report.contains(&m241_core::log::export::CSV_COLUMNS.join(",")),
+            "the point table reuses the twelve columns: {report}"
+        );
+        // The report is the CSV kind, not the point kind: the summary must come
+        // before the point table rather than being absent.
+        let summary_at = report.find("REPORT").expect("marker");
+        let header_at = report
+            .find(&m241_core::log::export::CSV_COLUMNS.join(","))
+            .expect("header");
+        assert!(summary_at < header_at, "got {report}");
+    }
+
+    #[test]
+    fn read_cache_is_written_then_hit_and_a_changed_dump_is_reparsed() {
+        let scratch = Scratch::new("read-cache");
+        let path = write_dump(&scratch, "track.bin", 2);
+        let cache = scratch.join("track.cache.json");
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+
+        let first_console = RecordingConsole::default();
+        let mut options = read_options(path.clone(), ExportFormat::Json);
+        options.cache = Some(cache.clone());
+        read(&options, Session::new(&links, &first_console, &confirm)).expect("cache write");
+        assert!(cache.exists(), "the first run must write the cache");
+        assert!(
+            first_console.stderr().contains("wrote the parse cache"),
+            "got {}",
+            first_console.stderr()
+        );
+        let first = first_console.stdout();
+
+        let second_console = RecordingConsole::default();
+        let mut options = read_options(path.clone(), ExportFormat::Json);
+        options.cache = Some(cache.clone());
+        read(&options, Session::new(&links, &second_console, &confirm)).expect("cache hit");
+        assert_eq!(
+            second_console.stdout(),
+            first,
+            "a cache hit must produce the same export"
+        );
+        assert!(
+            second_console
+                .stderr()
+                .contains("read the track from the parse cache"),
+            "got {}",
+            second_console.stderr()
+        );
+
+        // A different dump is not served from the stale cache.
+        fileio::write(&path, &synthetic_dump(4)).expect("rewrite dump");
+        let stale_console = RecordingConsole::default();
+        let mut options = read_options(path, ExportFormat::Json);
+        options.cache = Some(cache.clone());
+        read(&options, Session::new(&links, &stale_console, &confirm)).expect("reparse");
+        let document: serde_json::Value =
+            serde_json::from_str(&stale_console.stdout()).expect("one JSON object");
+        assert_eq!(document["points"].as_array().map(Vec::len), Some(4));
+        assert!(
+            stale_console.stderr().contains("wrote the parse cache"),
+            "a changed dump is parsed again and cached: {}",
+            stale_console.stderr()
+        );
+
+        // A cache that is not this project's JSON is a warning, not an error.
+        fileio::write_text(&cache, "not a cache").expect("corrupt cache");
+        let corrupt_console = RecordingConsole::default();
+        let mut options = read_options(scratch.join("track.bin"), ExportFormat::Json);
+        options.cache = Some(cache);
+        read(&options, Session::new(&links, &corrupt_console, &confirm))
+            .expect("a corrupt cache is rebuilt");
+        assert!(
+            corrupt_console.stderr().contains("not a JSON cache"),
+            "got {}",
+            corrupt_console.stderr()
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&corrupt_console.stdout()).is_ok(),
+            "the export is still written: {}",
+            corrupt_console.stdout()
+        );
+    }
+
+    #[test]
+    fn info_reports_the_recomputed_stats_and_the_rendered_position() {
+        let scratch = Scratch::new("info-stats");
+        let path = write_dump(&scratch, "track.bin", 3);
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+
+        let console = RecordingConsole::default();
+        info(
+            &info_options(path.clone(), true),
+            Session::new(&links, &console, &confirm),
+        )
+        .expect("info json");
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(document["stats"]["records"], 3, "got {document}");
+        assert_eq!(document["stats"]["fixes"], 3);
+        assert_eq!(document["stats"]["duration_seconds"], 2);
+        assert_eq!(document["stats"]["distance_m"], 0.0);
+        assert_eq!(document["position"]["format"], "decimal");
+        assert!(
+            document["position"]["start"]["latitude"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("N ")),
+            "got {document}"
+        );
+
+        let text_console = RecordingConsole::default();
+        info(
+            &info_options(path, false),
+            Session::new(&links, &text_console, &confirm),
+        )
+        .expect("info text");
+        let text = text_console.stdout();
+        assert!(text.contains("distance          : 0.00 m"), "got {text}");
+        assert!(text.contains("duration          : 2 s"), "got {text}");
+        // The decoded 4-byte float prints as 35.68123627, so the assertion is on
+        // the digits both forms share rather than on a rounded constant.
+        assert!(
+            text.contains("start position    : N 35.681236"),
+            "got {text}"
+        );
+        assert!(
+            text.contains("end position      : N 35.681236"),
+            "got {text}"
+        );
+    }
+
+    #[test]
+    fn info_renders_the_position_as_utm_when_asked() {
+        let scratch = Scratch::new("info-utm");
+        let path = write_dump(&scratch, "track.bin", 1);
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        let mut options = info_options(path, true);
+        options.coord_format = CoordFormatArg::Utm;
+        info(&options, Session::new(&links, &console, &confirm)).expect("utm info");
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(document["position"]["format"], "utm", "got {document}");
+        assert!(
+            document["position"]["start"]["latitude"]
+                .as_str()
+                .is_some_and(|text| text.contains('E')),
+            "a UTM easting carries its hemisphere: {document}"
+        );
+    }
+
+    #[test]
+    fn geotag_writes_a_backup_by_default_and_no_backup_suppresses_it() {
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+
+        let scratch = Scratch::new("geotag-backup-on");
+        let log_path = scratch.join("track.bin");
+        fileio::write(&log_path, &dump_with_timestamps(&[1_700_000_000])).expect("write dump");
+        let photo = scratch.join("shot.jpg");
+        fileio::write(
+            &photo,
+            &synthetic_jpeg_with_datetime(&format_exif_utc(1_700_000_000)),
+        )
+        .expect("write photo");
+        let console = RecordingConsole::default();
+        geotag(
+            &geotag_options(log_path, vec![photo]),
+            Session::new(&links, &console, &confirm),
+        )
+        .expect("geotag");
+        assert!(
+            scratch.join("shot.jpg_original").exists(),
+            "the default run must keep the pre-tag photo"
+        );
+        assert!(
+            console.stdout().contains("backup  : on"),
+            "the run says the backup is on: {}",
+            console.stdout()
+        );
+
+        let scratch = Scratch::new("geotag-backup-off");
+        let log_path = scratch.join("track.bin");
+        fileio::write(&log_path, &dump_with_timestamps(&[1_700_000_000])).expect("write dump");
+        let photo = scratch.join("shot.jpg");
+        fileio::write(
+            &photo,
+            &synthetic_jpeg_with_datetime(&format_exif_utc(1_700_000_000)),
+        )
+        .expect("write photo");
+        let mut options = geotag_options(log_path, vec![photo]);
+        options.no_backup = true;
+        let console = RecordingConsole::default();
+        geotag(&options, Session::new(&links, &console, &confirm)).expect("geotag no backup");
+        assert!(
+            !scratch.join("shot.jpg_original").exists(),
+            "--no-backup must not write the sibling"
+        );
+        assert!(
+            console.stdout().contains("backup  : off"),
+            "the run says the backup is off: {}",
+            console.stdout()
+        );
+    }
+
+    #[test]
+    fn geotag_group_photo_distance_groups_matched_photos_by_distance() {
+        let scratch = Scratch::new("geotag-group");
+        let log_path = scratch.join("track.bin");
+        fileio::write(
+            &log_path,
+            &dump_with_timestamps(&[1_700_000_000, 1_700_000_001]),
+        )
+        .expect("write dump");
+        let mut photos = Vec::new();
+        for (name, utc) in [("a.jpg", 1_700_000_000u32), ("b.jpg", 1_700_000_001)] {
+            let path = scratch.join(name);
+            fileio::write(&path, &synthetic_jpeg_with_datetime(&format_exif_utc(utc)))
+                .expect("write photo");
+            photos.push(path);
+        }
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+
+        let console = RecordingConsole::default();
+        let mut options = geotag_options(log_path.clone(), photos.clone());
+        options.dry_run = true;
+        options.json = true;
+        options.group_photo_distance = Some(15.0);
+        geotag(&options, Session::new(&links, &console, &confirm)).expect("grouped plan");
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(document["group_photo_distance_m"], 15.0, "got {document}");
+        assert_eq!(document["plans"][0]["group_id"], 0, "got {document}");
+        assert_eq!(
+            document["plans"][1]["group_id"], 0,
+            "two photos at the same place are one group: {document}"
+        );
+
+        // Without the flag every matched photo is its own group, which is the
+        // documented default: no threshold, no grouping.
+        let ungrouped_console = RecordingConsole::default();
+        let mut options = geotag_options(log_path, photos);
+        options.dry_run = true;
+        options.json = true;
+        geotag(&options, Session::new(&links, &ungrouped_console, &confirm))
+            .expect("ungrouped plan");
+        let document: serde_json::Value =
+            serde_json::from_str(&ungrouped_console.stdout()).expect("one JSON object");
+        assert!(
+            document["plans"][0]["group_id"].is_null(),
+            "no threshold means no group: {document}"
+        );
+    }
+
+    #[test]
+    fn kmz_with_icons_adds_an_icon_entry_beside_each_photo() {
+        let scratch = Scratch::new("kmz-icons");
+        let log = write_dump(&scratch, "track.bin", 2);
+        let photo = scratch.join("shot.jpg");
+        fileio::write(
+            &photo,
+            &synthetic_jpeg_with_datetime(&format_exif_utc(1_700_000_000)),
+        )
+        .expect("write photo");
+        let output = scratch.join("track.kmz");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+
+        let mut options = kmz_options(log, vec![photo], &output);
+        options.icons = Some(16);
+        kmz(&options, Session::new(&links, &console, &confirm)).expect("kmz with icons");
+
+        let archive = fileio::read(&output).expect("archive");
+        for name in [
+            &b"doc.kml"[..],
+            &b"photo/shot.jpg"[..],
+            &b"icon/shot.jpg"[..],
+        ] {
+            assert!(
+                archive.windows(name.len()).any(|window| window == name),
+                "the archive must carry {:?}",
+                String::from_utf8_lossy(name)
+            );
+        }
     }
 }

@@ -105,6 +105,14 @@ unit also writes a settings journal between record runs.
 | Header mask vs data | the mask can disagree with the actual record length in the block | 2026-11-21 block 0: header mask `0x1D` says 16-byte records, while all 3,244 records are 20 bytes and only the 20-byte grid checksums |
 | Fields when mask and data disagree | the boundary comes from the checksum evidence and the field meanings from the mask; a field the detected length has no room for is not decoded | block 0's 3,244 points therefore carry no speed, and the measured points with speed are 7,698 — exactly blocks 1–3 (3,251 + 3,198 + 1,249) |
 | Journal-only dump | a configured unit can hold a block header plus journal and no records at all (3,228 and 3,260 bytes) | both 2026-11-22 dumps; read as 20-byte records by the old grid they produced 135 / 137 checksum-failing points |
+| Fields a record can carry | UTC, latitude, longitude, height, and optionally speed. **No satellite count, satellite list, DOP or geoid separation** | the block-header mask selects the fields and `crates/m241-core/src/log/record.rs` decodes them; there is no field for the others, so a regenerated `$GPGGA`/`$GPGSA` cannot carry them (`docs/reference/02-cli.md`, `log read --format nmea`) |
+
+The missing satellite and DOP fields are a property of the log, not of the NMEA
+sentences a live unit streams: `$GPGGA`/`$GPGSA` on the wire carry them, but the
+log record that is written for each point does not. An exported GGA therefore
+writes `00` for the satellite count and leaves HDOP and the geoid separation
+empty, and an exported GSA leaves its satellite list and all three DOPs empty;
+inventing a value there would present unmeasured data as measured.
 
 Journal bytes are not track records. Reading them as records is what produced the
 checksum-failing garbage points in the earlier parser (on the 2026-11-21 dump,

@@ -49,6 +49,7 @@ pub mod types;
 pub use error::{Error, Result};
 pub use types::{
     DeviceInfo, ExportFormat, FirmwareProfile, LogSummary, PatchEdit, PatchPlan, Track, TrackPoint,
+    TrackStats,
 };
 
 /// Version of the crate, taken from `Cargo.toml` at build time.

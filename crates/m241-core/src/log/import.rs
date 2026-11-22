@@ -788,10 +788,13 @@ mod tests {
         let original = sample_track();
         let nmea = to_nmea(&original);
         let imported = import_nmea(&nmea).expect("import exported nmea");
+        // Two points, each exported as GGA + GSA + RMC: both position sentences
+        // of a pair are imported (they merge into one point), and the GSA of each
+        // point is a kind this reader never reads, so it is ignored.
         assert_eq!(
             (imported.imported, imported.dropped, imported.ignored),
-            (2, 0, 0),
-            "both exported sentences are usable"
+            (4, 0, 2),
+            "two GGA + two RMC imported, two GSA ignored"
         );
         assert_eq!(imported.track.points.len(), 2);
 
@@ -810,6 +813,14 @@ mod tests {
                 want.longitude
             );
             assert!((got.speed_kmh.unwrap() - want.speed_kmh.unwrap()).abs() < 0.05);
+            // GGA writes one decimal of a metre — the resolution a GPS altitude
+            // has — so a round trip keeps the height to that precision.
+            assert!(
+                (got.height_m.unwrap() - want.height_m.unwrap()).abs() < 0.1,
+                "height {:?} vs {:?}",
+                got.height_m,
+                want.height_m
+            );
         }
     }
 

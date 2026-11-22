@@ -57,12 +57,12 @@ mod fixture;
 pub use crate::types::TrackPoint;
 pub use block::{BLOCK_HEADER_SIZE, BLOCK_SIZE, BlockHeader};
 pub use coord::{CoordFormat, format_coordinate};
-pub use edit::{TrackEditor, delete_points, merge_tracks, split_track};
+pub use edit::{TrackEditor, delete_points, merge_tracks, simplify_track, split_track};
 pub use exif::{
     GpsPosition, GpsTags, MAX_SEGMENT_LENGTH, read_datetime_original, read_gps,
     write_datetime_original, write_gps,
 };
-pub use export::{export, to_csv, to_gpx, to_json, to_kml, to_nmea};
+pub use export::{export, to_csv, to_csv_report, to_gpx, to_json, to_kml, to_nmea};
 pub use geotag::{
     CameraModel, CaptureTime, GeotagOptions, GeotagPlan, PhotoShiftScope, PhotoTimeShift,
     apply as apply_geotags, group_matched_plans, plan as plan_geotags, plan_with_shift,
