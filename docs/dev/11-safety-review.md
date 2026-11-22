@@ -263,7 +263,7 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
 | `crates/m241-core/Cargo.toml` と `crates/m241-gui/Cargo.toml` が `m241-flash` を名指ししない | 解決結果に出ない形の依存（dev 依存など）も塞ぐ |
 | `set_control_lines` が `crates/m241-core/src/protocol/brom.rs` / `crates/m241-core/src/protocol/port.rs` / `crates/m241-core/src/protocol/simulator.rs` 以外に無い | DTR/RTS を触る場所が増えていない（同名別パスのすり抜けも防ぐ） |
 | `crates/m241-flash/src/da.rs` の `check_image` / `all_within` 本体に `firmware::digest` / `digest::matches` / `sha256(_hex)` が無い | strict なバックアップ差分経路に digest 受理が戻らない（差分ヘルパーへ移しても検出。vendor は固定 SHA の別関数 `accept_vendor_image`、`check_da_image` の W2a 用 SHA-256 は対象外） |
-| `crates/m241-flash/src/da.rs` の `pub fn write` が本体のトップレベル（brace depth 1）で `write_range` より前に `check_layout()?` を含む | 開始アドレスのゲートが書き込み経路から外れていない（コメント・別関数・未呼び出しの入れ子関数では通らない） |
+| `crates/m241-flash/src/da.rs` の `pub fn write` / `write_vendor` が本体のトップレベル（brace depth 1）で `write_range` / `write_range_accepted` より前に `check_layout()?` を含む | 開始アドレスのゲートが書き込み経路から外れていない（コメント・別関数・未呼び出しの入れ子関数では通らない。`write_range(_accepted)` に到達する公開関数を名前ではなく呼び出しで探す） |
 
 すべての検査と `tools/check.sh` への配線は
 `crates/m241-flash/tests/safety_gate.rs` で自動検証している。違反を植えた一時
@@ -280,8 +280,8 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
 - **書き込み手順そのものの正しさ:** 範囲定数の値そのものの妥当性、`start = 0`
   が正しいことの根拠（`docs/dev/05-verification.md` §1.2）、読み戻し照合の有無、
   失敗時のリカバリ案内は `tools/check_safety.py` の対象外であり、上の 2 つの
-  レビュー節とテストで担保する。同ファイルの `write` が `check_layout()` を
-  呼ぶこと自体は機械的に検査するが、そのゲートの中身は検査しない。
+  レビュー節とテストで担保する。同ファイルの `write` / `write_vendor` が
+  `check_layout()` を呼ぶこと自体は機械的に検査するが、そのゲートの中身は検査しない。
 
 ## 書き込み可能な実行（`fw flash --yes` / `fw flash --recover --yes` / `fw flash --allow-vendor --yes` / `fw probe-da --yes`）の承認（2026-11-21 変更）
 

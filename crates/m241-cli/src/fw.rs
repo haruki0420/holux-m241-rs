@@ -614,6 +614,7 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
     // first, in the order a person would want to be told: the confirmation,
     // then the layout and the files the write needs.
     let confirmation = Confirmation::of_command_line(options.yes)?;
+    warn_vendor_write(session.console, &plan);
     check_layout()?;
     writable?;
     if options.recover && image != backup {
@@ -789,6 +790,26 @@ fn note_write_failure(console: &dyn Console, backup: &std::path::Path) {
     ));
 }
 
+/// Warn about what writing the vendor image changes, before any port is opened.
+///
+/// Shared by the dry run and the real path so the two cannot drift. The vendor
+/// V1.13 image is the stock, unpatched release: it overwrites the unit's 14
+/// per-unit bytes and leaves the WNRO fix off (epoch `315964800`, marker
+/// `V1.13`), so dates are 7168 days behind until the image is patched.
+fn warn_vendor_write(console: &dyn Console, plan: &WritePlan) {
+    if !plan.vendor {
+        return;
+    }
+    console.warn(&format!(
+        "warning: this is the official vendor image, not this unit's backup. Writing it \
+         replaces the unit's {} bytes of per-unit data with the vendor values and leaves the \
+         WNRO fix off: the vendor V1.13 epoch is 315964800 and its marker is V1.13, so dates \
+         are 7168 days behind until the image is patched. The backup is still required and is \
+         compared with the unit before the DA is loaded",
+        VENDOR_PER_UNIT_DATA_BYTES
+    ));
+}
+
 /// The label for `plan`'s image against its backup.
 ///
 /// A zero-diff image is the backup itself, which is a distinct case from a WNRO
@@ -827,6 +848,7 @@ fn print_write_report(
             "acceptance": acceptance_label(plan),
             "vendor_image": plan.vendor,
             "per_unit_data_overwritten": plan.vendor,
+            "vendor_image_unpatched": plan.vendor,
             "start": format!("0x{:08X}", report.start),
             "length": report.length,
             "packets": report.packets,
@@ -852,6 +874,10 @@ fn print_write_report(
         console.result(&format!(
             "{:<12}: yes; the unit's {} bytes of per-unit data were overwritten",
             "vendor image", VENDOR_PER_UNIT_DATA_BYTES
+        ));
+        console.result(&format!(
+            "{:<12}: no (the vendor V1.13 image is unpatched; dates are 7168 days behind)",
+            "wnro patch"
         ));
     }
     console.result(&format!("{:<12}: 0x{:08X}", "start", report.start));
@@ -933,6 +959,7 @@ fn print_write_plan(
             "acceptance": acceptance_label(plan),
             "vendor_image": plan.vendor,
             "per_unit_data_overwritten": plan.vendor,
+            "vendor_image_unpatched": plan.vendor,
             "size": plan.size,
             "device_type": plan.device_type,
             "write_length": plan.write_length,
@@ -968,12 +995,11 @@ fn print_write_plan(
             "{:<12}: yes; the unit's {} bytes of per-unit data will be overwritten",
             "vendor image", VENDOR_PER_UNIT_DATA_BYTES
         ));
-        console.warn(&format!(
-            "warning: this is the official vendor image, not this unit's backup. Writing it \
-             replaces the unit's {} bytes of per-unit data with the vendor values; the backup \
-             is still required and is compared with the unit before the DA is loaded",
-            VENDOR_PER_UNIT_DATA_BYTES
+        console.result(&format!(
+            "{:<12}: no (the vendor V1.13 image is unpatched; dates are 7168 days behind)",
+            "wnro patch"
         ));
+        warn_vendor_write(console, plan);
     }
     console.result(&format!(
         "{:<12}: {} bytes ({} packets of {} bytes)",
@@ -2507,14 +2533,15 @@ mod tests {
 
     /// Rebuild the documented 17-byte diff against a unit's own dump.
     ///
-    /// This is the fixture the user described: 14 bytes of per-unit data, the
-    /// two WNRO bytes and the version-marker digit. It lets the fake unit match
-    /// the backup while the vendor image stays the pinned vendor file.
+    /// The per-unit values here are synthetic, not a real unit's data
+    /// (`AGENTS.md` §6). They let the fake unit match the backup while the
+    /// vendor image stays the pinned vendor file; the count (14 per-unit +
+    /// WNRO 2 + marker 1) is what the test pins.
     fn vendor_backup(vendor: &[u8]) -> Vec<u8> {
         assert_eq!(vendor.len(), PROFILE_V1_13.size);
         let mut backup = vendor.to_vec();
-        backup[0x5C..0x60].copy_from_slice(&[0x91, 0x1B, 0xD4, 0xCF]);
-        backup[0xF8..0xFE].copy_from_slice(&[0x8B, 0xCD, 0x07, 0xC1, 0x1B, 0x00]);
+        backup[0x5C..0x60].copy_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        backup[0xF8..0xFE].copy_from_slice(&[0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22]);
         let after = GPS_EPOCH_UNIX_WNRO.to_le_bytes();
         backup[EFFECTIVE_EPOCH_OFFSET + 2] = after[2];
         backup[EFFECTIVE_EPOCH_OFFSET + 3] = after[3];
@@ -3012,10 +3039,19 @@ mod tests {
             "the plan warns about the per-unit bytes: {stdout}"
         );
         assert!(
+            stdout.contains("wnro patch") && stdout.contains("7168 days behind"),
+            "the plan warns that the vendor image is unpatched: {stdout}"
+        );
+        assert!(
             console
                 .stderr()
                 .contains("warning: this is the official vendor image"),
             "the warning is on stderr: {}",
+            console.stderr()
+        );
+        assert!(
+            console.stderr().contains("7168 days behind"),
+            "the warning says the WNRO fix is absent: {}",
             console.stderr()
         );
         assert!(
@@ -3089,6 +3125,22 @@ mod tests {
             stdout.contains("per-unit data were overwritten"),
             "success states the per-unit overwrite: {stdout}"
         );
+        assert!(
+            stdout.contains("wnro patch") && stdout.contains("7168 days behind"),
+            "success states that the vendor image is unpatched: {stdout}"
+        );
+        assert!(
+            console
+                .stderr()
+                .contains("warning: this is the official vendor image"),
+            "the real path warns before the port is opened: {}",
+            console.stderr()
+        );
+        assert!(
+            console.stderr().contains("7168 days behind"),
+            "the real warning says the WNRO fix is absent: {}",
+            console.stderr()
+        );
         assert!(stdout.contains("verified    : 406620"), "got {stdout}");
     }
 
@@ -3152,6 +3204,46 @@ mod tests {
         assert!(matches!(err, Error::Safety { .. }), "got {err}");
         assert!(format!("{err}").contains("--yes"), "got {err}");
         assert_eq!(ports.opens(), 0, "no port may be opened");
+        assert_eq!(chip.borrow().read_bytes(), 0);
+    }
+
+    #[test]
+    fn flash_allow_vendor_warns_before_a_missing_da_file() {
+        // The warning must be before the DA file and the port, so a failure
+        // still shows that the vendor image's per-unit/WNRO effects were known.
+        let Some(vendor) = vendor_image() else {
+            return;
+        };
+        let backup = vendor_backup(&vendor);
+        let scratch = crate::testing::Scratch::new("flash-vendor-warn-before-da");
+        let case = flash_case(&scratch, &vendor, &backup);
+        let chip = m241_flash::FakeDa::with_firmware(&backup);
+        let links = da_write::DaWritePorts::new(chip);
+        let ports = links.clone();
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.allow_vendor = true;
+        options.yes = true;
+        options.da = Some(scratch.join("absent.bin"));
+
+        let err = flash(&options, session).expect_err("the DA file is missing");
+        assert!(matches!(err, Error::Io { .. }), "got {err}");
+        assert!(
+            console
+                .stderr()
+                .contains("warning: this is the official vendor image"),
+            "the warning must precede the DA-file failure: {}",
+            console.stderr()
+        );
+        assert!(
+            console.stderr().contains("7168 days behind"),
+            "the warning must name the WNRO effect: {}",
+            console.stderr()
+        );
+        assert_eq!(ports.opens(), 0, "the port must not be opened");
         assert_eq!(chip.borrow().read_bytes(), 0);
     }
 

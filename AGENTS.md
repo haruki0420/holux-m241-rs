@@ -141,6 +141,10 @@ check:
   vendor image;
 * the command prints which per-unit data is overwritten before writing and on
   success;
+* the vendor V1.13 image is the **stock, unpatched** release: epoch
+  `315964800`, marker `V1.13`. Writing it leaves the date 7168 days behind
+  until the image is patched, so the dry run, the pre-write warning and the
+  success output all say so;
 * `--allow-vendor --yes` is inside §2.5. The strict `check_image` must not gain a
   digest branch: `accept_vendor_image` is the only way to obtain the
   `VendorImage` token `write_vendor` accepts.

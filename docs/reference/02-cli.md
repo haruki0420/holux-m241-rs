@@ -111,7 +111,9 @@ image**, not a backup-diff exception. It accepts only the image whose full
 SHA-256 is `32fe52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435`
 and whose length is 406,620 bytes; V1.12 and every other build are refused. The
 normal `--backup` and unit comparison remain mandatory, and the command warns
-that the vendor image overwrites the unit's 14 bytes of per-unit data. This is
+that the vendor image overwrites the unit's 14 bytes of per-unit data and is
+the unpatched stock V1.13 release (epoch `315964800`, marker `V1.13`), so dates
+are 7168 days behind until the image is patched. This is
 the explicit user decision recorded in `AGENTS.md` §2.3, and it is covered by
 §2.5.
 

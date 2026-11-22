@@ -44,9 +44,9 @@
 //!    the separate, explicit vendor gate ([`accept_vendor_image`]): only the
 //!    pinned V1.13 vendor image with a fixed full SHA-256 can obtain a
 //!    [`VendorImage`] token, and [`DownloadAgent::write_vendor`] is the only
-//!    writer that accepts it. It still requires the same backup check by the
-//!    caller, and it overwrites the unit's per-unit data by design
-//!    (`AGENTS.md` §2.3, user decision).
+//!    writer that accepts it. The caller must still run `verify_device` against
+//!    the same backup before loading the DA, and the write overwrites the
+//!    unit's per-unit data by design (`AGENTS.md` §2.3, user decision).
 //! 4. **The write is read back and compared.**
 //!    [`PendingWrite::verify_written`] restarts the chip (`0xD9`), hands the
 //!    transport to the caller's BootROM re-entry step, and compares the span
@@ -2253,12 +2253,13 @@ pub struct AcceptedImage<'a> {
 pub const VENDOR_V1_13_SHA256: &str =
     "32fe52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435";
 
-/// How many per-unit bytes the vendor image replaces with `0xFF`.
+/// How many per-unit bytes differ between the vendor image and a unit's dump.
 ///
 /// The V1.13 vendor file differs from a unit's own dump in 14 per-unit bytes:
 /// `0x5C`–`0x5F` (4), `0xF8`–`0xFD` (6), and the four-byte trailer at
-/// `0x63458`–`0x6345B`. The CLI warning quotes this number; the token and
-/// writer do not derive a range from it.
+/// `0x63458`–`0x6345B`. With the two WNRO bytes (`0x402F6`–`0x402F7`) and the
+/// marker digit (`0x59C2C`), the full vendor/unit diff is 17 bytes. The CLI
+/// warning quotes the 14; the token and writer do not derive a range from it.
 pub const VENDOR_PER_UNIT_DATA_BYTES: usize = 14;
 
 /// An official vendor image that passed the fixed-SHA gate.
@@ -2341,8 +2342,9 @@ pub fn accept_vendor_image<'a>(
 /// How many differing offsets [`WritePlan`] keeps.
 ///
 /// A WNRO patch changes three bytes, so the limit never hides a patched backup;
-/// a large diff (for example a whole vendor image) is refused before a plan is
-/// built, but the limit still keeps a diagnostic short.
+/// a large diff (for example a whole vendor image on the strict path) is
+/// refused before a strict plan is built, but the vendor plan uses the same
+/// limit to keep its diagnostic short.
 pub const PLAN_DIFF_LIMIT: usize = 16;
 
 /// Everything `fw flash --dry-run` reports that can be decided without a wire.

@@ -220,7 +220,8 @@ pub struct FlashOptions {
 
     /// Allow the pinned official V1.13 vendor image, identified by its full
     /// SHA-256. This is not the normal backup-diff path: it overwrites the
-    /// unit's per-unit data. Requires `--yes`; `AGENTS.md` §2.3 / §2.5.
+    /// unit's per-unit data. A real write requires `--yes`; `--dry-run` does
+    /// not. `AGENTS.md` §2.3 / §2.5.
     #[arg(long, conflicts_with = "recover")]
     pub allow_vendor: bool,
 

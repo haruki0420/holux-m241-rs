@@ -46,8 +46,9 @@ The device check belongs to the CLI route, not to the library `write`. After
 that it refuses unless all three of these hold:
 
 1. the image matches a known firmware profile and is either identical to
-   `--backup` or differs from it only at that profile's patch offsets. There is
-   no vendor-package or cross-model exception;
+   `--backup` or differs from it only at that profile's patch offsets. The
+   strict path has no vendor-package or cross-model exception; the explicit
+   `--allow-vendor` gate (fixed V1.13 SHA-256) is separate and is not used here;
 2. the layout gate accepts the pinned start `0x00000000` and length `406620`;
 3. you passed `--yes` (this build has no typed `WRITE` prompt; `AGENTS.md` §2.5
    governs who may pass it).
