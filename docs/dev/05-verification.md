@@ -213,9 +213,142 @@ verbatim; each is the line the client printed.
   is no fix. The stock image reported `06-01-80` in the same session, so this is a
   measured difference between the two images, not a guess from the write.
 * **未検証: the date with a real fix.** With no satellites indoors the unit
-  reports its default time, not a GPS-derived one; that a live fix now produces
-  today's date has not been observed. Recording a track and reading it back with
-  the WNRO-corrected timestamp is the next step, and it needs sky, not a cable.
+  reported its default time right after the write, not a GPS-derived one; that a
+  live fix now produces today's date has not been observed. Later on 2026-11-22
+  the same unit, still with no fix, reported the current UTC date — see
+  "The no-fix date matches the host clock" below — so the no-fix clock does move
+  past the constant, but how it gets set is not established. Recording a track
+  and reading it back with the WNRO-corrected timestamp is the next step, and it
+  needs sky, not a cable.
+
+#### The no-fix date matches the host clock (2026-11-22)
+
+Device: the same retail M-241, running the patched V1.14 image written above.
+Host: Linux, the unit over USB serial. The host clock stood at
+`2026-11-22T15:23:11Z`–`2026-11-22T15:23:22Z` across the captures.
+
+| Step | Result | Status |
+|---|---|---|
+| `m241 device info` | `B-core_1.20` / `0043` / `01017-00F` / sdk 1.0 | ✅ |
+| raw NMEA, first sentence of the window | `$GPRMC,152314.586,V,8960.0000,N,00000.0000,E,0.00,0.00,221126,,,N*7E` | ✅ |
+| raw NMEA, the `$GPGGA` of the same second | `$GPGGA,152314.586,8960.0000,N,00000.0000,E,0,0,,137.0,M,13.0,M,,*48` | ✅ |
+| the same stream through `m241 nmea proxy` | `$GPRMC,152322.586,V,…221126,,,N*7B` at host `15:23:22Z`; the proxy applied no offset | ✅ |
+| fix state | `$GPGGA` quality `0`, `0` satellites; `$GPRMC` status `V` | ✅ |
+| date and time against the host | both dates `221126` (2026-11-22); sentence time within a few seconds of the host clock | ✅ |
+
+* **Without a fix the unit reports the current UTC date and time.** Eight
+  `$GPRMC` and eight `$GPGGA` sentences were captured between host
+  `15:23:11Z` and `15:23:19Z`; every date field was `221126`, and the time
+  fields ran from `152314.586` to `152321.586`, i.e. with the host clock. A
+  second capture through `m241 nmea proxy` at `15:23:22Z` printed
+  `$GPRMC,152322.586,V,…221126…`. A separate pass about 46 s before the host
+  window above (`$GPRMC,152224.586,…,221126,…`; its `$GPGGA` sentence read
+  `15:22:25Z`, which is the sentence's own time — that pass's host clock was
+  not recorded) agrees.
+* **This is not the constant.** The stock image reported `06-01-80` (its epoch
+  `315964800`) and the patched image reported `22-08-99` (its epoch
+  `935280000`) when the unit was started with no fix (above). Today's `221126`
+  is neither, so the sentence is carrying a clock value, not just the constant.
+* **What is still 未検証.** Whether the clock behind this date is a free-running
+  RTC, a value set by an earlier GPS fix, or something else is not established;
+  the unit was not observed from a known-unset clock to this state, and no
+  unpatched image with a running clock was observed. How much of the correct
+  date comes from the patch and how much from the clock's current value is
+  therefore not separated. The date from a **live fix** remains unobserved, and
+  the source of the time (RTC or GPS time) is not established.
+* The raw capture and the command output were written to a temporary directory
+  outside the repository and are not committed (`AGENTS.md` §6); the sentences
+  above are verbatim.
+
+#### The nmea proxy over TCP (2026-11-22/23)
+
+Device: the same unit. The proxy ran with `--bind` on `127.0.0.1:10110`; the
+client's note line read `relaying repaired NMEA on tcp://127.0.0.1:10110`.
+
+| Step | Result | Status |
+|---|---|---|
+| TCP relay | 9 sentences reached a TCP client at `tcp://127.0.0.1:10110` | ✅ |
+| checksums | 9 of 9 valid after the repair | ✅ |
+| date | `221126` (2026-11-22), the unit's no-fix clock | ✅ |
+| `--offset-days 1` | the date became `231126` | ✅ |
+
+* The TCP path relays the same repaired lines as stdout. The listener refuses a
+  non-loopback address unless `--allow-non-loopback` is passed
+  (`bind_checked_listener` in `crates/m241-cli/src/nmea.rs`).
+* **未検証**: a long-running relay, more than one client at a time, a
+  non-loopback bind, and a stream that carries a real fix. The date above comes
+  from the unit's no-fix clock, not from a fix.
+* The raw capture is not committed (`AGENTS.md` §6).
+
+#### The log read back after the writes (2026-11-22)
+
+Device: the same unit, still recording. The read is
+`m241 log download --port <port> --output <file>`, run twice about ten seconds
+apart; nothing was erased or written.
+
+| Step | Result | Status |
+|---|---|---|
+| first download | 3,228 bytes, no framing error; the client counted 135 "records" | ✅ |
+| second download | 3,260 bytes; the client counted 137 "records" | ✅ |
+| what the bytes are | no track point at all: a settings / state journal (141 × 16-byte entries of `AA`×7 + a type + a `u32` value + `BB`×4, and 23 × 20-byte `HOLUXGR241LOGGER` strings; 141 × 16 + 23 × 20 = 2,716 = 3,228 − `0x200`) | ✅ (offline analysis) |
+| block / record checksums | the client printed `1 of 1 blocks failed their header checksum` in both; every record checksum failed (`bad checksums: 135`, then `137`) | ✅ |
+| decoded span | `2060-09-25T04:18:50Z`–`2015-05-08T05:53:12Z`, then `1974-01-28T17:15:22Z` | ⚠️ not trustworthy |
+| log usage through the GUI minutes later | `3,292 B`, recording 「有効」 | ✅ |
+
+* The transport was clean: neither run hit a framing error, and the unit's log
+  usage grew between them (3,228 → 3,260 bytes), so the log was written between
+  the two reads. The GUI then reported `3,292 B`.
+* **The downloads contain no track points.** The block holds the unit's
+  settings / state journal, not position records. The parser takes a 20-byte
+  record from the block header's mask and reads the journal as 135 / 137
+  points, which is why every per-record checksum fails. The same misread
+  reproduces on a log downloaded before the write (2026-11-21, 225,028 bytes;
+  4,481 of 11,088 record checksums failed, and block 1 had none — blocks 0, 2
+  and 3 mix in the journal and lose record sync), so the data does not support
+  "the write damaged the log area". The parser fix is in a separate PR; nothing
+  here moves the post-write timestamp to ✅.
+* **The warning wording is wrong.** The code has no header checksum: the
+  message `N of M blocks failed their header checksum` counts the blocks that
+  contain record-checksum mismatches. A fix is in progress in a separate PR.
+* **The download still cannot be used as evidence of a post-flash timestamp.**
+  The decoded dates are nonsense and are not used anywhere. Whether the unit
+  records track points after the write — with or without a fix — remains
+  **未検証**.
+* The raw dump is not committed: it is the user's track data (`AGENTS.md` §6).
+
+#### The GUI on a real unit (2026-11-22)
+
+Device: the same unit, running the patched V1.14 image. Host: Linux, X11.
+Binary: `target/debug/m241-gui` built from this working tree; the exact commit
+it was built from was not recorded.
+
+| Step | Result | Status |
+|---|---|---|
+| start the window with the unit attached | the Connect screen listed the host's serial ports and had the unit's port selected by default; its diagnostic line named the CP210x / PL2303 / FTDI / CH340 cable types | ✅ |
+| 「接続して確認」 | 「接続済み（読み取り専用）」; firmware `B-core_1.20`, build `0043`, model `01017-00F`, SDK `1.0`; the capture was cut off at the SDK line, so the 状態 row drawn under it is not in the capture | ✅ |
+| log usage through the same probe | `3,292 B`, recording 「有効」 | ✅ |
+| open a downloaded log in the Log screen | not exercised: its file-path field needs keyboard input, and no keyboard could be injected into the X11 window in this session | ⚠️ |
+| 追従 render on a real track | not exercised (it needs a log loaded in the previous row) | ⚠️ |
+| photo geotag / JPEG write through the GUI | not exercised: needs a real camera JPEG and a photo folder; that path is still covered by synthetic JPEGs only | ⚠️ |
+
+* The connect probe **reads** only: the screen says 読み取り専用, and the probe
+  path never pulses DTR/RTS (`AGENTS.md` §2.1). It opened the port, read
+  `$PMTK705`, then asked the unit for its log usage.
+* The 状態 row is drawn immediately after the SDK line
+  (`crates/m241-gui/src/screens/connect.rs`, `figure_row(ui, "状態", …)`); the
+  capture ends below the SDK line, so the row was not visible in it and this
+  page does not record it as observed. The code would show
+  「既知リリース（日付修正対象）」 for this unit, because `is_known_release()`
+  accepts any release starting `B-core_1.` (`crates/m241-core/src/types.rs`).
+* The usage the GUI showed (`3,292 B`) agrees with the `log download` byte
+  counts of the same minutes (3,228 then 3,260), so the GUI and the CLI read the
+  same log.
+* The button was reached through AT-SPI: the driver resolved the accessible
+  under the clicked point and dispatched its `click` action, and the screen then
+  changed as shown. This records how the screen was driven, not that the GUI is
+  operable by keyboard or screen reader.
+* The screenshots were taken but are not committed: they show this host's port
+  list (`AGENTS.md` §6).
 
 #### The vendor write completes but the read-back differs at `0x5C`
 
@@ -237,7 +370,9 @@ restored by the firmware: after the vendor write they held the vendor values.
 
 未検証: where the restored four bytes come from (a second copy in the chip, or a
 derivation), and whether the vendor read-back should ignore the
-firmware-managed offsets — a design decision that has not been made.
+firmware-managed offsets — a design decision that has not been made. The
+options, their effect on the safety gate and a recommendation are recorded in
+[`06-open-questions.md`](06-open-questions.md) §8; the choice is the user's.
 
 #### V1.12 is refused before a port is opened
 
@@ -277,11 +412,12 @@ nothing on this page makes the final head verified.
 | Claim | Why it is still open |
 |---|---|
 | The OLED after flashing | never observed; the display was not photographed |
-| The binary log's timestamps after flashing | inferred from the shared NMEA conversion path; no post-flash log was downloaded |
-| The NMEA date from a live GPS fix after patching | 2026-11-22 (§1.5) showed the patched default date `22-08-99` (epoch `935280000`) with no fix; no fix was available indoors, so a GPS-derived date after patching has not been observed |
+| The binary log's timestamps after flashing | ⚠️ a post-flash log **was** downloaded on 2026-11-22 (§1.5), but it holds only the settings / state journal and no track point; the parser reads the journal as 20-byte records, which is why every record checksum failed, and the decoded dates are nonsense (offline analysis; the parser fix is in a separate PR). The download therefore does not verify a timestamp, and whether the unit records track points after the write — with or without a fix — is still 未検証 |
+| The NMEA date from a live GPS fix after patching | ⚠️ with no fix the unit reported the then-current UTC date on 2026-11-22 (§1.5), but that is a clock value, not a fix-derived one; the patched default with a zero clock is `22-08-99` (epoch `935280000`). No fix was available indoors, so a GPS-derived date after patching is still unobserved |
+| The GUI's Log screen, 追従 render and photo write on a real unit | ⚠️ not exercised. The Connect screen and 「接続して確認」 did run against the unit on 2026-11-22 (§1.5); the Log screen needs a log opened through its keyboard-driven path field (no keyboard could be injected into the X11 window) and the photo write needs a real camera JPEG |
 | `m241 device doctor` against a unit | the command and its tests exist, but no hardware session in §1 ran the port probe, the drop scan or the DA extraction on a unit |
 | `m241 log geotag` on a real camera JPEG | only synthetic JPEGs are written by the tests; no file from a real camera has been geotagged, and a real camera's IFD0 layout has not been read |
-| `m241 nmea proxy` on a live stream | `nmea repair` is an offline transform covered by unit tests; relaying a live NMEA stream over stdout or TCP has never been run against a unit |
+| `m241 nmea proxy` on a live stream | ✅ stdout relay on 2026-11-22 and TCP `--bind` relay on 2026-11-22/23 (§1.5): 9 sentences over `tcp://127.0.0.1:10110`, checksums valid on 9 of 9, date `221126` = 2026-11-22, and `--offset-days 1` corrected it to `231126`. Long runs, multiple clients, a non-loopback bind and a stream carrying a fix are 未検証 |
 | Linux BootROM / firmware dump & flash with a real logger | ✅ measured 2026-11-22 (§1.5): `fw dump`, `fw probe-da`, three `fw flash` runs and their read-backs all ran on Linux over `/dev/ttyUSB0` |
 | macOS with a real logger | ⚠️ never measured: every hardware session in §1 and §1a was Linux over USB; no macOS host was used and the binary was never launched on a Mac |
 | Bluetooth SPP | all hardware work went over USB |
@@ -292,7 +428,7 @@ nothing on this page makes the final head verified.
 | The Rust `fw flash` command on a unit | ✅ the 2026-11-15 flash was an earlier manual/v1 run; on 2026-11-22 the Rust client completed two writes and read each written range back identical (§1.5). The write, erase, restart and backup-diff gates are no longer covered by the simulator only |
 | The final `0xD5` packet sent short (92 + 2) | ✅ measured 2026-11-22 (§1.5): the zero-padded final packet failed on hardware (§1.4); the client that sends the remainder plus its sum completed two writes and read both back identical |
 | What `0x01` means in a `0xD5` reply | observed 2026-11-22 (§1.4); the disassembly page explains why a padded final packet cannot pass the checksum, but not which DA status reaches the wire as `0x01` |
-| Writing the official V1.13 vendor image (`--allow-vendor`) | ⚠️ written 2026-11-22 (§1.5): all 1589 packets acknowledged, 406,620 bytes programmed, and the unit booted the stock V1.13 (NMEA default date `06-01-80`). The read-back then differed at `0x5C`, because the booted firmware restores its four per-unit bytes; the 14-byte overwrite was therefore observed, but the read-back gate cannot confirm a vendor write as it stands |
+| Writing the official V1.13 vendor image (`--allow-vendor`) | ⚠️ written 2026-11-22 (§1.5): all 1589 packets acknowledged, 406,620 bytes programmed, and the unit booted the stock V1.13 (NMEA default date `06-01-80`). The read-back then differed at `0x5C`, because the booted firmware restores its four per-unit bytes; the 14-byte overwrite was therefore observed, but the read-back gate cannot confirm a vendor write as it stands (the options are in [`06-open-questions.md`](06-open-questions.md) §8) |
 | The firmware restoring per-unit bytes at boot | ✅ observed 2026-11-22 (§1.5): after the vendor write the unit held `91 1B D4 CF` at `0x5C`–`0x5F` — its own earlier values — where the image has `FF`. Where those bytes come from and whether the vendor read-back should skip them are 未検証 |
 | The `0xD9` → NMEA probe → `$PMTK180*3B` re-entry and read-back | ✅ measured 2026-11-22 (§1.5): after both successful writes the client restarted the chip, re-entered the BootROM through the NMEA hand-over and read the whole range back. The 2026-11-15 row recorded that the unit booted, not that this read-back ran |
 | The automatic `0xD9` restart and one retry after a `0xD3` failure | still not exercised on a unit: with the final-packet fix in place no `0xD3` failure occurred, so the restart-and-retry path ran only against the fake. The retry uses the same `FLASH_WRITE_START` / `FLASH_WRITE_LENGTH` and never recomputes the range |
