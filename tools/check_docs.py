@@ -30,10 +30,21 @@ FENCE_RE = re.compile(r"^\s*(```|~~~)")
 INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 SKIP_PREFIXES = ("http://", "https://", "mailto:", "#", "data:")
 #: Directories that are not part of this checkout's documentation. `.worktrees`
-#: holds the parallel work trees, each a full copy of the repository: scanning
-#: them would check every page once per tree and report paths that are only
-#: missing because that tree is on an older commit.
-SKIP_DIRS = {".git", "target", ".cargo-home", "node_modules", ".worktrees", "vendor", "_scratch", ".inbox"}
+#: holds the parallel work trees and `.agents` the agent work trees, each a full
+#: copy of the repository on its own branch: scanning one would check every page
+#: once per tree and report paths that are only missing because that branch has
+#: not received them yet.
+SKIP_DIRS = {
+    ".git",
+    "target",
+    ".cargo-home",
+    "node_modules",
+    ".worktrees",
+    ".agents",
+    "vendor",
+    "_scratch",
+    ".inbox",
+}
 
 #: Directories whose contents are referenced by path in the docs.
 PATH_ROOTS = ("docs/", "crates/", "tools/", ".github/")
