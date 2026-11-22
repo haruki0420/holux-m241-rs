@@ -11,7 +11,7 @@ write or erase routine. That is not a property the compiler can verify on its
 own: nothing stops someone adding `0xD3` back to a helper in `m241-core`, or
 naming the write crate in its manifest. This gate is the mechanical half.
 
-Seven checks, each for a different way the split can rot:
+Eight checks, each for a different way the split can rot:
 
 1. **No destructive command in `m241-core`'s sources or tests.** `$PMTK182,6`
    (erase the log) and the DA opcodes `0xD3` / `0xD4` / `0xD5` / `0xD9` (record
@@ -62,6 +62,15 @@ Seven checks, each for a different way the split can rot:
    covered, and a future public writer is found by its range call rather than by
    its name. The check looks inside each body only, so a call in another
    function, a comment, or an uncalled nested function does not satisfy it.
+8. **The DA digest token has one production constructor.** `DaDigest` is what
+   `check_da_image_against` / `DaLoader::load_against` take, and the only
+   constructor that exists in a normal build is `DaDigest::vendor()`, which is
+   the pinned vendor `DA_v3.8.4.bin` digest. `DaDigest::for_test_da` is the one
+   other constructor, for this crate's tests and a dependent crate's end-to-end
+   tests; it must stay directly gated by
+   `#[cfg(any(test, feature = "simulator"))]`. If the attribute comes off, a
+   shipped binary could build a token for any digest, and `AGENTS.md` §2.5's
+   "the DA must be the vendor image" would stop being a property of the type.
 
 A rule enforced only by review is a rule that holds until the reviewer is busy.
 These are mechanical so they hold every commit.
@@ -139,6 +148,13 @@ CONTROL_LINE_ALLOWED = {
 ACCEPTANCE_FUNCTIONS = ("check_image", "all_within")
 DIGEST_ACCEPTANCE = re.compile(
     r"(?i)(?:firmware\s*::\s*digest|digest\s*::\s*matches|sha256(?:_hex)?\b)"
+)
+
+#: The one constructor of the DA digest token that a shipped build must not
+#: have. `DaDigest::vendor()` is the pinned value; this is the test-only one.
+DA_DIGEST_TEST_CTOR = re.compile(r"\bpub\s+fn\s+for_test_da\s*\(")
+DA_DIGEST_TEST_CFG = re.compile(
+    r'^\s*#\[cfg\(any\(test,\s*feature\s*=\s*"simulator"\)\)\]\s*$'
 )
 
 #: Start of a Rust raw string literal (`r"`, `r#"`, `br#"`, `cr#"`).
@@ -537,6 +553,43 @@ def check_flash_acceptance() -> list[str]:
     return problems
 
 
+def check_da_digest_gate() -> list[str]:
+    """The test-only DA digest constructor must stay cfg-gated.
+
+    `DaDigest` is the token the DA check and the loader take instead of a digest
+    string. A normal build can construct one only with `DaDigest::vendor()`, the
+    pinned vendor `DA_v3.8.4.bin` digest, which is what makes "only the vendor DA
+    is loaded" a property of the type rather than a rule the call sites follow.
+    `DaDigest::for_test_da` exists for this crate's tests and a dependent crate's
+    end-to-end tests (the simulator-feature pattern `FakeDa` uses) and must stay
+    behind `#[cfg(any(test, feature = "simulator"))]`. A type cannot be checked
+    for "how many constructors does the shipped build see", so the gate reads the
+    attribute: without it, any downstream build could require any digest.
+    """
+    if not FLASH_DA.is_file():
+        return [f"{relative(FLASH_DA)} is missing; cannot verify the DA digest gate"]
+    lines = FLASH_DA.read_text(encoding="utf-8").splitlines()
+    problems = []
+    found = False
+    for index, line in enumerate(lines):
+        if not DA_DIGEST_TEST_CTOR.search(line):
+            continue
+        found = True
+        previous = lines[index - 1] if index > 0 else ""
+        if not DA_DIGEST_TEST_CFG.match(previous):
+            problems.append(
+                f"{relative(FLASH_DA)}:{index + 1}: `DaDigest::for_test_da` is not directly "
+                'gated by `#[cfg(any(test, feature = "simulator"))]`; a shipped build could '
+                "then name any digest as the DA's"
+            )
+    if not found:
+        problems.append(
+            f"{relative(FLASH_DA)}: `DaDigest::for_test_da` is missing; cannot verify that a "
+            "shipped build has only the pinned DA digest"
+        )
+    return problems
+
+
 def cargo_tree(package: str) -> list[str] | None:
     """The package names in `cargo tree -p <package>`, or None when cargo failed.
 
@@ -635,11 +688,12 @@ def main() -> int:
         + check_flash_acceptance()
         + check_dependency_direction()
         + check_write_layout_gate()
+        + check_da_digest_gate()
     )
     print(
         f"checked {len(files)} m241-core source/test file(s) for destructive commands, "
         "write identifiers and the dependency direction, and the flash write path for "
-        "its layout gate"
+        "its layout gate and its DA digest token"
     )
     for problem in problems:
         print(f"  [!] {problem}")
@@ -649,7 +703,8 @@ def main() -> int:
     print(
         "no write path in m241-core or m241-gui; the dependency runs one way; "
         "the strict image path accepts only the backup diff; the vendor gate is a separate "
-        "fixed-SHA function; every public writer runs check_layout() first"
+        "fixed-SHA function; every public writer runs check_layout() first; the DA digest "
+        "token has no production constructor but the pinned one"
     )
     return 0
 

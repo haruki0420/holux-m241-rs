@@ -130,8 +130,11 @@ Before writing it checks, and refuses on any failure:
 4. the layout gate accepts the pinned start `0x00000000` and length `406620`;
 5. `--da` names a 14,896-byte vendor `DA_v3.8.4.bin` starting `00 00 A0 E1`
    whose **full SHA-256** equals the pinned value in `AGENTS.md` §2.5. The
-   command still prints the file's full SHA-256, and a file with the right
-   length and head but any other digest is refused before a port is opened.
+   expected digest is a `DaDigest` token: a normal build can obtain one only
+   with `DaDigest::vendor()`, so `--da` cannot be pointed at another DA through
+   this command. The command still prints the file's full SHA-256, and a file
+   with the right length and head but any other digest is refused before a port
+   is opened.
 
 A real run then enters the BootROM, compares the whole backup span with the
 unit's flash (**before any erase**), loads the DA into the chip's RAM, sends
@@ -192,13 +195,16 @@ are never sent, and the DA is gone at the next power-on.
 
 The client sends no destructive opcode, but the DA it jumps to can erase or
 program flash itself. `--yes` is therefore an approval gate, not a formality:
-`AGENTS.md` §2.5 covers this command, and `check_da_image` refuses any `--da`
-that is not the pinned vendor image — exact length, exact first four bytes and
-the **full SHA-256** — before a port is opened. §2.5 applies the same
-independent-review rule as `fw flash`.
+`AGENTS.md` §2.5 covers this command, and the DA gate refuses any `--da` that is
+not the pinned vendor image — exact length, exact first four bytes and the
+**full SHA-256** — before a port is opened (`check_da_image_against` /
+`DaLoader::load_against`, given `da_digest()`, which returns the
+`DaDigest::vendor()` token; the pinned `check_da_image` / `DaLoader::load` run the
+same check). §2.5 applies the same independent-review rule as `fw flash`.
 
 Flags: `--da <FILE>` (the vendor `DA_v3.8.4.bin`, exactly 14,896 bytes starting
-`00 00 A0 E1`; never committed here), `--port <PORT|auto>` (default `auto`),
+`00 00 A0 E1` and hashing to the pinned value in `AGENTS.md` §2.5; never
+committed here), `--port <PORT|auto>` (default `auto`),
 `--yes` (required: without it the command stops before opening a port; there is
 no typed prompt for this command), `--assume-brom` (the same route
 `fw dump --assume-brom` takes when the chip is already in BootROM), `--json`.

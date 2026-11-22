@@ -870,3 +870,58 @@ Stage 2 の差分は本節と同じコミットで、範囲は `crates/m241-core
 ### Stage 3 検証
 
 未検証（別エージェントが記入する）。
+
+---
+
+## 2026-11-22 / W2a DA 全文 SHA-256（PR #24、Stage 1 → Stage 2）
+
+対象: `feat-da-digest`（base `origin/main` = `40efd53`）。Stage 1 は仕様検収
+（Must 0 / Should 3 / Could 4）と可読性（Must 2 / Should 4）の 2 本で、レビューした
+head は `6945728`。この節は Stage 2 の対応記録で、Stage 3 は別エージェントが記入する。
+
+### 対応表（Must）
+
+| 指摘 | 対応 |
+|---|---|
+| 可読性 M1: `check_da_image_against` / `DaLoader::load_against` が生 `&str` を受け取り、rustdoc が pin の差し替えを正当化している。機械ゲートも無い | `DaDigest` トークンに変更。フィールドは private で、通常ビルドの構築子は `DaDigest::vendor()`（= `DA_IMAGE_SHA256`）だけ。テスト用 `DaDigest::for_test_da` は `#[cfg(any(test, feature = "simulator"))]` の下（`FakeDa` と同じ feature 慣習）。CLI の本番 5 箇所は `da_digest()` が返す `DaDigest::vendor()` だけを渡せる。`tools/check_safety.py` に検査 8「`DaDigest::for_test_da` の直前が `#[cfg(any(test, feature = "simulator"))]`」を追加し、`docs/dev/11-safety-review.md` の ✓ 表に追記。`crates/m241-flash/tests/safety_gate.rs` に `a_da_digest_constructor_outside_its_cfg_gate_is_reported` を追加（cfg を外す変異で落ちる） |
+| 可読性 M2: `the_vendor_da_hashes_to_the_pinned_digest_and_loads` が env 無しで無言 skip し、`docs/dev/11-safety-review.md` が 🧪 として引用している | テスト名を `the_vendor_da_matches_the_pinned_digest_and_loads_when_the_vendor_da_is_available` に変更。skip 時に `eprintln!` で理由を出す。`docs/dev/11-safety-review.md` の該当行を「条件付き（CI では未実行）」に変更し、pin 値そのものは CI で走る `the_loader_constants_are_pinned_to_the_documents_and_the_read_crate` がリテラル固定することを明記 |
+
+### 対応表（Should / Could）
+
+| 指摘 | 対応 |
+|---|---|
+| 仕様 S1 / 可読性 S1: pin 値の CI 回帰が無い | `the_loader_constants_are_pinned_to_the_documents_and_the_read_crate` に `DA_IMAGE_SHA256` のリテラル比較と `DaDigest::vendor().sha256()` の比較を追加（CI で常に走る） |
+| 仕様 S2: public な逃げ道（M1 と同じ） | `DaDigest` トークン化で解消（上記） |
+| 仕様 S3: ベンダーファイル無し環境で skip する検証の記録 | `M241_VENDOR_IMAGE` を設定して `./tools/check.sh` を実行し 6/6 を確認（下記「ゲート」）。CI では条件付きテストが skip することを `docs/dev/11-safety-review.md` に明記 |
+| 仕様 C1: `fw flash` 側に「正しい先頭・誤 digest」テストが無い | `flash_refuses_a_same_size_da_with_the_right_head_but_a_different_digest` を追加 |
+| 仕様 C2 / 可読性 S1: `digest::matches` を再利用していない・拒否文が常に「pinned vendor digest」と言い切る | 比較を `m241_core::firmware::digest::matches` に変更。拒否文は期待値が pin 値のときだけ「the pinned DA_v3.8.4.bin digest」、それ以外は「the expected digest」と表示し、次の行動（ベンダーパッケージの `DA_v3.8.4.bin` を使う）を書く |
+| 仕様 C4: `--da` フラグ説明に digest が無い | `docs/reference/02-cli.md` の `fw probe-da` フラグ行に追記 |
+| 可読性 S2: docs が実際は呼ばない `check_da_image` を名指し | `AGENTS.md` §2.5、`docs/reference/02-cli.md`、`docs/dev/11-safety-review.md` を、CLI が `check_da_image_against` / `load_against` に `da_digest()` を渡し、`check_da_image` / `load` は同じ pin 済みチェックである、という記述に更新 |
+| 可読性 S3: fingerprint / digest / hash / SHA-256 の語の揺れ | 概念語を `digest` に統一（`DaDigest`、`da_digest()`、テスト名を `..._wrong_digest` / `..._different_digest` / `..._matches_the_pinned_digest_...` に改名） |
+| 可読性 S4: `cfg(not(test))` の本番分岐がテストで実行されない | `da_digest()` の doc に「この分岐は `cargo test` ではコンパイルされない（テストは `#[cfg(test)]` 側を通る）」と明記し、フィクスチャで通るテスト名に条件（`with_the_test_fixture_da`）を付けた |
+| 可読性 C1: モジュール doc の 4+1 チェックが数えにくい | 「ジャンプ前の 4 チェック + その後 DA 自身が返す 20 バイト report が 5 番目」と明記 |
+| 可読性 C2 / C4: fixture doc の主語が移動後になっていない・2 つの fixture の差が不明 | `da_fixture_bytes` の doc を「書き込む合成 DA」に直し、`m241-flash` の `da_image()` との差（`DA_REPORT_OFFSET` の fake report のみ）を明記 |
+| 可読性 C3: `pub(super)` の理由が無い | `da_fixture_bytes` の doc に「親の `da_digest` が同じバイトをハッシュするため」と明記 |
+| 可読性 C5: `run_against` の doc が実装詳細に読める | `load` の check を切り出したものであり、`DaDigest` トークンにより逃げ道ではない、という主語に書き直した |
+
+### 却下・見送り
+
+- 仕様 C3（`fw probe-da` も DA の SHA-256 を表示する）: `fw probe-da` の標準出力・
+  `--json` 契約と `docs/reference/02-cli.md` の出力節を変える別変更になる。§2.5 の承認
+  成果物はもともと承認者が `--da` のパスから独立に SHA-256 を再計算する運用で、
+  W2a（安全ゲートの強化）の範囲外。別 follow-up 候補として残す。
+- 可読性 C6（`assert_eq!(opcodes(), &[] as &[u8])` を `is_empty()` に）: 新規テストは
+  `is_empty()` にしたが、既存行（旧テスト）はファイル内の既存パターンを揃えるため
+  そのまま。全置換は本 PR の目的（安全ゲート）と無関係な差分を増やす。
+
+### ゲート
+
+`M241_VENDOR_IMAGE=".../M-241 Firmware V1.13 update package/01017-01C ... V1.13_GR-241_HLX.bin" ./tools/check.sh`
+→ 6/6（fmt / clippy / test / docs / design / safety）。実機ポートは開いていない。
+この設定では `M241_VENDOR_IMAGE` の隣の `DA_v3.8.4.bin` が使われ、条件付きの
+実 DA 受理テストも実行される（CI ではベンダーファイルが無いため skip。skip は
+`eprintln!` で出力され、pin 値のリテラル回帰は CI でも走る）。
+
+### Stage 3 検証
+
+未検証（別エージェントが記入する）。

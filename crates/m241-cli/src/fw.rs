@@ -34,7 +34,7 @@ use m241_core::protocol::pmtk::{NMEA_BAUD, PmtkClient, StreamState};
 use m241_core::protocol::port::Transport;
 use m241_core::{Error, FirmwareProfile, PatchPlan, Result};
 use m241_flash::da::{
-    Confirmation, DaLoadId, DaLoader, DownloadAgent, FLASH_WRITE_START, PROBE_ADDRESSES,
+    Confirmation, DaDigest, DaLoadId, DaLoader, DownloadAgent, FLASH_WRITE_START, PROBE_ADDRESSES,
     PROBE_PAGE_SIZE, PendingWrite, VECTOR, VENDOR_PER_UNIT_DATA_BYTES, VendorImage, WritePlan,
     WriteReport, accept_vendor_image, check_da_image_against, check_image, check_layout,
     read_candidates, write_plan, write_plan_vendor,
@@ -57,27 +57,35 @@ const EFFECTIVE_EPOCH_HIGH_TOP: usize = EFFECTIVE_EPOCH_OFFSET + 3;
 const V1_13_VERSION_DIGIT: usize = PROFILE_V1_13.version_marker + VERSION_MARKER_LEN - 1;
 const V1_12_VERSION_DIGIT: usize = PROFILE_V1_12.version_marker + VERSION_MARKER_LEN - 1;
 
-/// The DA fingerprint `fw flash` and `fw probe-da` require of `--da`
-/// (`AGENTS.md` §2.5).
+/// The digest `fw flash` and `fw probe-da` require of `--da` (`AGENTS.md` §2.5).
 ///
-/// A normal build pins the vendor value from `m241_flash::da` — the same digest
-/// `check_da_image_against` compares — so the DA these commands load is only
-/// ever the vendor `DA_v3.8.4.bin`. The tests cannot use that value: the binary
-/// is never committed (`AGENTS.md` §6), and every CLI write test drives the
-/// command with a synthetic 14,896-byte fixture. The test build therefore pins
-/// the fixture's own digest, computed from the bytes the test writes
-/// (`tests::da_fixture_bytes`): the comparison is still the full SHA-256, it
-/// just checks a value a test can produce. Production never takes that path.
+/// A normal build has one value to hand back: [`DaDigest::vendor`], the pinned
+/// vendor `DA_v3.8.4.bin` digest, and `m241_flash::da` exposes no other
+/// constructor in this build, so the commands cannot be told to accept a
+/// different DA. [`DaDigest::for_test_da`] does not exist here.
+///
+/// **This branch is not compiled by `cargo test`.** The test harness always
+/// takes the `#[cfg(test)]` branch below, so a shipped-binary test of this
+/// function is not possible; the shipped value is fixed at compile time and the
+/// call sites below cannot pass anything else.
 #[cfg(not(test))]
-fn da_sha256() -> &'static str {
-    m241_flash::da::DA_IMAGE_SHA256
+fn da_digest() -> DaDigest {
+    DaDigest::vendor()
 }
 
+/// The same digest in a test build: the CLI fixture's own.
+///
+/// The vendor binary is never committed (`AGENTS.md` §6), so every CLI write test
+/// drives the command with the synthetic DA in [`tests::da_fixture_bytes`].
+/// Computing that fixture's digest here keeps the full comparison running — it
+/// just requires a value a test can produce. The shipped binary takes the branch
+/// above and never this one.
 #[cfg(test)]
-fn da_sha256() -> &'static str {
+fn da_digest() -> DaDigest {
     use std::sync::OnceLock;
     static DIGEST: OnceLock<String> = OnceLock::new();
-    DIGEST.get_or_init(|| sha256_hex(&tests::da_fixture_bytes()))
+    let hex = DIGEST.get_or_init(|| sha256_hex(&tests::da_fixture_bytes()));
+    DaDigest::for_test_da(hex)
 }
 
 /// Read the firmware off the device, twice, and save it once both reads agree.
@@ -670,7 +678,7 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
         )));
     };
     let da = fileio::read(da_path)?;
-    check_da_image_against(&da, da_sha256())?;
+    check_da_image_against(&da, da_digest())?;
     session.console.note(&format!(
         "DA file {} is {} bytes with SHA-256 {}; it is the pinned DA_v3.8.4.bin digest \
          (AGENTS.md §2.5), so the DA may be loaded",
@@ -711,7 +719,7 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
         );
     }
     let mut loader = DaLoader::new(rom.transport_mut());
-    let id = loader.load_against(confirmation, &da, da_sha256())?;
+    let id = loader.load_against(confirmation, &da, da_digest())?;
     session.console.note(&format!(
         "DA v{}.{} answered; programming {} bytes in {} packets",
         id.version >> 8,
@@ -939,7 +947,7 @@ fn reload_for_retry(
         .console
         .note("BootROM re-entered after the restart; reloading the DA into RAM");
     let mut loader = DaLoader::new(rom.transport_mut());
-    let _id = loader.load_against(confirmation, da, da_sha256())?;
+    let _id = loader.load_against(confirmation, da, da_digest())?;
     Ok(DownloadAgent::new(rom.into_transport()))
 }
 
@@ -1553,7 +1561,7 @@ pub fn probe_da(options: &ProbeDaOptions, session: Session<'_>) -> Result<()> {
     // Everything that can be checked without a device is checked first.
     let confirmation = Confirmation::of_probe_command_line(options.yes)?;
     let da = fileio::read(&options.da)?;
-    check_da_image_against(&da, da_sha256())?;
+    check_da_image_against(&da, da_digest())?;
 
     let port = link::resolve(session.links, &options.port)?;
     session.console.note(&format!(
@@ -1572,7 +1580,7 @@ pub fn probe_da(options: &ProbeDaOptions, session: Session<'_>) -> Result<()> {
     // The loader borrows the transport from the synced client; the DA
     // conversation then takes it back, so the port has one owner throughout.
     let mut loader = DaLoader::new(rom.transport_mut());
-    let id = loader.load_against(confirmation, &da, da_sha256())?;
+    let id = loader.load_against(confirmation, &da, da_digest())?;
     session.console.note(&format!(
         "DA v{}.{} answered (region 0x{:02X}, flash {:04X}:{:04X}, {} bytes); reading",
         id.version >> 8,
@@ -2674,13 +2682,12 @@ mod tests {
     }
 
     #[test]
-    fn probe_da_with_a_valid_da_reaches_the_port_step_and_refuses_without_one() {
+    fn probe_da_with_the_test_fixture_da_reaches_the_port_step_and_refuses_without_one() {
         // The DA path itself is exercised against the fake in `m241-flash`; here
         // the point is that the command gets past its own refusals and then
         // reports the missing port as a port error, not a safety one. The fixture
-        // carries a digest the test build pins (`da_sha256`), so the check is
-        // satisfied here the way the vendor file satisfies the pinned value in a
-        // real run.
+        // carries a digest the test build pins (`da_digest`); the shipped binary
+        // pins the vendor value instead and rejects this file.
         let scratch = Scratch::new("probe-port");
         let path = da_file(scratch.path());
         let links = FakePorts::empty();
@@ -2694,7 +2701,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_da_refuses_a_same_size_da_with_the_right_head_but_a_different_hash() {
+    fn probe_da_refuses_a_same_size_da_with_the_right_head_but_a_different_digest() {
         // Follow-up W2a: length and head used to be the whole gate, so any
         // 14,896-byte file starting `00 00 A0 E1` would be loaded and jumped to.
         // This file is exactly that — the fixture with one byte changed — and it
@@ -3238,6 +3245,42 @@ mod tests {
         assert!(
             format!("{err}").contains("A0 E1"),
             "the refusal names the first bytes it wanted: {err}"
+        );
+        assert_eq!(
+            chip.borrow().read_bytes(),
+            0,
+            "the DA file is checked before the port is opened"
+        );
+    }
+
+    #[test]
+    fn flash_refuses_a_same_size_da_with_the_right_head_but_a_different_digest() {
+        // The same-length, right-head, wrong-content file the head check cannot
+        // see: `fw probe-da` has its own test for this, and `fw flash` reaches
+        // the same gate through the same helper. Nothing is opened or sent.
+        let scratch = crate::testing::Scratch::new("flash-real-lookalike-da");
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let image = flash_image(&PROFILE_V1_13, true);
+        let case = flash_case(&scratch, &image, &backup);
+        let da = scratch.join("DA_v3.8.4.bin");
+        let mut lookalike = da_fixture_bytes();
+        let last = lookalike.last_mut().expect("a 14,896-byte image");
+        *last ^= 0xFF;
+        fileio::write(&da, &lookalike).expect("write a same-length lookalike");
+        let chip = m241_flash::FakeDa::with_firmware(&backup);
+        let links = da_write::DaWritePorts::new(chip);
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.yes = true;
+        options.da = Some(da);
+        let err = flash(&options, session).expect_err("a lookalike DA is not loaded");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        assert!(
+            format!("{err}").contains("SHA-256"),
+            "the refusal names the digest check: {err}"
         );
         assert_eq!(
             chip.borrow().read_bytes(),
@@ -4259,12 +4302,20 @@ mod tests {
 
     // -- fw probe-da, end to end against a fake DA -------------------------
 
-    /// The DA file `probe_da` reads: the vendor length and first bytes, with
-    /// every other byte distinct so a wrong relay shows up in the read-back.
+    /// The synthetic DA every CLI write test writes, and then reads back: the
+    /// vendor's length and first four bytes, with every other byte distinct so a
+    /// wrong relay shows up in the read-back.
     ///
-    /// The bytes are the synthetic DA every CLI write test uses. The vendor
-    /// binary is never committed (`AGENTS.md` §6), so [`da_sha256`] pins this
-    /// fixture's own digest in the test build instead of the vendor value.
+    /// The vendor binary is never committed (`AGENTS.md` §6), so [`da_digest`]
+    /// requires this fixture's own digest in the test build instead of the vendor
+    /// value. It differs from `m241-flash`'s `da_image()` fixture in the bytes at
+    /// `DA_REPORT_OFFSET` only: the fake DA there answers the 20-byte report from
+    /// the image it kept in RAM, and the CLI's fake supplies its own. Both share
+    /// the `index % 251` pattern and this head, so neither can be mistaken for
+    /// the vendor file.
+    ///
+    /// `pub(super)`: [`da_digest`] in the parent module is the only caller
+    /// outside this test module, and it needs the same bytes to hash.
     pub(super) fn da_fixture_bytes() -> Vec<u8> {
         let mut image: Vec<u8> = (0..m241_flash::da::DA_IMAGE_SIZE)
             .map(|index| (index % 251) as u8)

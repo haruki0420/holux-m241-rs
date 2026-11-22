@@ -180,14 +180,19 @@ on destructive changes **always** takes precedence and overrides this section.
 
 `fw probe-da` is covered even though this client never sends `0xD3` / `0xD4` /
 `0xD5` / `0xD9`: it loads the DA into RAM and jumps to it with `0xA8`, and the
-loaded DA can erase or program flash itself. `da.rs::check_da_image` requires the
-`--da` file to be exactly 14,896 bytes, to start `00 00 A0 E1`, **and** to hash
-to the pinned vendor full SHA-256
+loaded DA can erase or program flash itself. The DA gate requires the `--da` file
+to be exactly 14,896 bytes, to start `00 00 A0 E1`, **and** to hash to the pinned
+vendor full SHA-256
 `190d7064cf2320752d8eb65681142730b21cddc90e0d1491d4e8379c3f2e89aa`
-(the V1.12 and V1.13 vendor packages ship the same 14,896-byte DA). A file with
-the right length and head but any other digest is refused before the port is
-opened, so the approval's digest requirement is enforced by the code rather than
-only checked by a person. Any other value is still not approvable.
+(the V1.12 and V1.13 vendor packages ship the same 14,896-byte DA). The expected
+digest is a `DaDigest` token: a normal build can construct one only with
+`DaDigest::vendor()`, so neither command can be told to accept another DA. The
+CLI calls `check_da_image_against` / `DaLoader::load_against` with `da_digest()`,
+which returns that vendor token; `check_da_image` / `DaLoader::load` are the same
+pinned check. A file with the right length and head but any other digest is
+refused before the port is opened, so the approval's digest requirement is
+enforced by the code rather than only checked by a person. Any other value is
+still not approvable.
 
 When delegated, the agent preparing the run asks an **independent**
 reviewer session — not the preparing session and **not forked** from the

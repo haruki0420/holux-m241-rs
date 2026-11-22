@@ -156,16 +156,26 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
    ただしロード後の DA は次のコマンドでフラッシュを操作できるため、`--yes` による
    確認と独立レビュー（`AGENTS.md` §2.5、`--da` の完全な SHA-256 照合を含む）は
    必須のままにした。`fw probe-da` にタイプ入力のプロンプトは無く、`--yes` が唯一の
-   入口である。`check_da_image` はサイズ（14,896 バイト）・先頭 4 バイト・**全文
-   SHA-256**（`DA_IMAGE_SHA256`、`AGENTS.md` §2.5 のベンダー値）の 3 つを照合し、
-   長さと先頭だけ一致するファイルはポートを開く前に拒否する（W2a で実装）。
+   入口である。DA ゲート（`check_da_image` / `DaLoader::load` と、CLI が呼ぶ
+   同じ本体の `check_da_image_against` / `load_against`）はサイズ（14,896 バイト）・
+   先頭 4 バイト・**全文 SHA-256**（`DA_IMAGE_SHA256`、`AGENTS.md` §2.5 のベンダー値）の
+   3 つを照合し、長さと先頭だけ一致するファイルはポートを開く前に拒否する（W2a で実装）。
+   期待ダイジェストは生の `&str` ではなく `DaDigest` トークンで渡す: 通常ビルドで
+   構築できるのは `DaDigest::vendor()`（= `DA_IMAGE_SHA256`）だけで、テスト用の
+   `DaDigest::for_test_da` は `#[cfg(any(test, feature = "simulator"))]` の下にある。
+   CLI の本番経路は `da_digest()` が返す `DaDigest::vendor()` しか渡せない。
    *固定するテスト:* `the_loader_writes_the_whole_image_to_the_da_base_and_starts_it`
    が偽 DA の受けた opcode を `0xA1` / `0xAF` / `0xA8` に限り、
    `the_read_path_never_sends_a_write_opcode` が読み出し経路の opcode を `0xD6` に限る。
    長さと先頭 4 バイトだけが正しいファイルの拒否は
-   `a_same_size_image_with_the_right_head_but_the_wrong_hash_is_refused` が、
-   実 DA のダイジェスト一致は（ベンダーファイルがある環境で）
-   `the_vendor_da_hashes_to_the_pinned_digest_and_loads` が固定する。🧪
+   `a_same_size_image_with_the_right_head_but_the_wrong_digest_is_refused` が固定する
+   （CI で常に走る）。pin 値そのものは
+   `the_loader_constants_are_pinned_to_the_documents_and_the_read_crate` が
+   リテラルで固定する（CI で常に走る）。実 DA のダイジェスト一致は、ベンダー
+   `DA_v3.8.4.bin` がある環境でのみ
+   `the_vendor_da_matches_the_pinned_digest_and_loads_when_the_vendor_da_is_available`
+   が確認する（無い環境では `eprintln!` で skip を明示する条件付きテスト。CI では
+   この性質は未実行）。🧪（条件付き）
    ロード範囲が BootROM のスタック `0x00100000`–`0x001007FF` と重ならないことは
    `the_load_range_does_not_touch_the_bootrom_stack` が区間として固定する。🧪
 2. **probe は `0xD3` / `0xD4` / `0xD5` / `0xD9` を呼ばない。** 👁
@@ -269,6 +279,7 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
 | `set_control_lines` が `crates/m241-core/src/protocol/brom.rs` / `crates/m241-core/src/protocol/port.rs` / `crates/m241-core/src/protocol/simulator.rs` 以外に無い | DTR/RTS を触る場所が増えていない（同名別パスのすり抜けも防ぐ） |
 | `crates/m241-flash/src/da.rs` の `check_image` / `all_within` 本体に `firmware::digest` / `digest::matches` / `sha256(_hex)` が無い | strict なバックアップ差分経路に digest 受理が戻らない（差分ヘルパーへ移しても検出。vendor は固定 SHA の別関数 `accept_vendor_image`、`check_da_image` の DA 用 SHA-256 は対象外） |
 | `crates/m241-flash/src/da.rs` の `pub fn write` / `write_vendor` が本体のトップレベル（brace depth 1）で `write_range` / `write_range_accepted` より前に `check_layout()?` を含む | 開始アドレスのゲートが書き込み経路から外れていない（コメント・別関数・未呼び出しの入れ子関数では通らない。`write_range(_accepted)` に到達する公開関数を名前ではなく呼び出しで探す） |
+| `crates/m241-flash/src/da.rs` の `DaDigest::for_test_da` の直前が `#[cfg(any(test, feature = "simulator"))]` である | DA の期待ダイジェストが type で pin されている状態を保つ（この属性が外れると出荷ビルドが任意の digest のトークンを構築でき、`AGENTS.md` §2.5 の「ベンダー DA のみ」が型の性質でなくなる。通常ビルドの唯一の構築子は `DaDigest::vendor()`） |
 
 すべての検査と `tools/check.sh` への配線は
 `crates/m241-flash/tests/safety_gate.rs` で自動検証している。違反を植えた一時
