@@ -1532,7 +1532,7 @@ Could 9）と可読性（Must 4 / Should 17 / Could 13）の 2 本で、レビ�
 
 - 対象: Stage 1 head `20a9f42`（base `origin/main` = `e934157`）への 2 レビュー、仕様検収 `#issuecomment-7084469149`（Must 1 / Should S1–S6）と可読性 `#issuecomment-7084367266`（Must M1–M7、Should S1–S8）。
 - Stage 2 修正（別エージェント）: 変更は `crates/m241-gui`（`tiles.rs` / `log.rs` / `settings.rs` / `Cargo.toml`）、`DESIGN.md`、`PRODUCT.md`、`DISCLAIMER.md`、`README.md`、本ファイルのみ。`m241-core` / `m241-cli` / `m241-flash` と connect / firmware 画面は未変更。実機ポートは開いていない。
-- 修正 head: `20a9f42` → `<SHA はコミット後に追記>`。
+- 修正コミット: `80f4f62`（コードと本節）。本節に自分の SHA を書くため、SHA の追記だけを後続の小さなコミットにしている。最終 head は PR #39 のコメントを参照。
 
 ### Must への対応
 
