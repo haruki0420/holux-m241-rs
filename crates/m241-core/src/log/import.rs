@@ -136,33 +136,64 @@ pub fn import_gpx(text: &str) -> Result<Track> {
     })
 }
 
-/// Parse NMEA 0183 text (`$GPRMC` and `$GPGGA` sentences) into a [`Track`].
+/// What an NMEA import read, kept and dropped.
 ///
-/// Each line's NMEA checksum is verified via [`parse_sentence`]; malformed
-/// lines, broken checksums, unsupported sentence kinds, and no-fix sentences
-/// (`V` in RMC, quality `0` in GGA) are skipped cleanly. Consecutive `$GPRMC`
-/// and `$GPGGA` sentences sharing the same `HHMMSS` timestamp are merged so
-/// both date/speed (RMC) and altitude (GGA) survive together, in either order.
+/// The counts separate an empty capture from a non-empty one that produced no
+/// point. `dropped` deliberately mixes two causes — a sentence that could not be
+/// read (broken checksum, missing fields) and a well-formed sentence that
+/// carried no fix — because both mean "this line gave us no position"; the
+/// message that quotes the counts names both possibilities.
+#[derive(Debug, Clone)]
+pub struct NmeaImport {
+    pub track: Track,
+    /// `$GPRMC` / `$GPGGA` lines whose fields parsed, including a merged pair.
+    pub imported: usize,
+    /// `$GPRMC` / `$GPGGA` lines that produced no point: a broken checksum, a
+    /// no-fix sentence, or missing coordinates.
+    pub dropped: usize,
+    /// Lines never turned into a point: blank, free text, another kind.
+    ///
+    /// The address is read before the checksum, so a `$GPGSA` line with a broken
+    /// checksum is still `ignored`: this reader never reads that sentence, and
+    /// its checksum is not its concern.
+    pub ignored: usize,
+}
+
+/// Parse NMEA 0183 text (`$GPRMC` and `$GPGGA` sentences) into a [`NmeaImport`].
 ///
-/// Skipped lines are **not counted or reported**: a file whose every checksum is
-/// broken returns a track with no points, and the caller cannot tell that apart
-/// from a file that held no sentences. The input is checkable before the call if
-/// that distinction matters; the return type has nowhere to put a count.
+/// Malformed lines, broken checksums, unsupported kinds and no-fix sentences are
+/// skipped and counted; sentences sharing a `HHMMSS` are merged so date/speed
+/// (RMC) and altitude (GGA) survive together. Only `$GPRMC` / `$GPGGA` lines can
+/// be `imported` or `dropped`: the address is read first, so a line of another
+/// kind is `ignored` whatever its checksum says.
 ///
 /// # Errors
 ///
-/// Currently infallible for well-typed `&str` input, returning `Result<Track>`
-/// for symmetry with [`import_gpx`].
-pub fn import_nmea(text: &str) -> Result<Track> {
+/// Never fails on text input: a malformed line is counted, not returned. The
+/// `Result` mirrors [`import_gpx`] so a caller can handle both importers the
+/// same way.
+pub fn import_nmea(text: &str) -> Result<NmeaImport> {
     let mut points: Vec<TrackPoint> = Vec::new();
     let mut last_bucket: Option<String> = None;
+    let mut imported = 0usize;
+    let mut dropped = 0usize;
+    let mut ignored = 0usize;
 
     for raw_line in text.lines() {
         let line = raw_line.trim();
         if !line.starts_with('$') {
+            ignored += 1;
+            continue;
+        }
+        // The address decides the counter before `parse_sentence` checks the
+        // checksum: a sentence this reader does not read is `ignored` even when
+        // its checksum is wrong, and only RMC/GGA lines can be `dropped`.
+        if !is_position_sentence(line) {
+            ignored += 1;
             continue;
         }
         let Ok(sentence) = parse_sentence(line) else {
+            dropped += 1;
             continue;
         };
         let parsed = match sentence.kind.as_str() {
@@ -173,15 +204,41 @@ pub fn import_nmea(text: &str) -> Result<Track> {
                 .map(|(bucket, point)| Merged::Rmc(Rmc { bucket, point })),
             "GPGGA" => parse_gpgga(&sentence.fields)
                 .map(|(bucket, point)| Merged::Gga(Gga { bucket, point })),
-            _ => None,
+            // A sentence of another kind is not one this reader failed to read;
+            // it carries no position this importer could use.
+            _ => {
+                ignored += 1;
+                continue;
+            }
         };
+        if parsed.is_some() {
+            imported += 1;
+        } else {
+            dropped += 1;
+        }
         merge_sentence(&mut points, &mut last_bucket, parsed);
     }
 
-    Ok(Track {
-        points,
-        damaged_blocks: Vec::new(),
+    Ok(NmeaImport {
+        track: Track {
+            points,
+            damaged_blocks: Vec::new(),
+        },
+        imported,
+        dropped,
+        ignored,
     })
+}
+
+/// Is `line`'s address `$GPRMC` or `$GPGGA`?
+///
+/// Reads only the address field, before the checksum is verified: this decides
+/// which counter a line belongs to, and a sentence of another kind must count as
+/// ignored whether or not its checksum is valid.
+fn is_position_sentence(line: &str) -> bool {
+    line.strip_prefix('$')
+        .and_then(|rest| rest.split(',').next())
+        .is_some_and(|kind| matches!(kind, "GPRMC" | "GPGGA"))
 }
 
 /// One parsed RMC sentence: its `HHMMSS` bucket and the point it carries.
@@ -731,9 +788,14 @@ mod tests {
         let original = sample_track();
         let nmea = to_nmea(&original);
         let imported = import_nmea(&nmea).expect("import exported nmea");
-        assert_eq!(imported.points.len(), 2);
+        assert_eq!(
+            (imported.imported, imported.dropped, imported.ignored),
+            (2, 0, 0),
+            "both exported sentences are usable"
+        );
+        assert_eq!(imported.track.points.len(), 2);
 
-        for (got, want) in imported.points.iter().zip(&original.points) {
+        for (got, want) in imported.track.points.iter().zip(&original.points) {
             assert_eq!(got.utc, want.utc);
             assert!(
                 (got.latitude.unwrap() - want.latitude.unwrap()).abs() < 1e-4,
@@ -768,7 +830,7 @@ mod tests {
             sentence("GPGSA,A,3,01,02,03,,,,,,,,,1.5,1.0,1.2"),
             String::from("not an nmea line"),
         ];
-        let track = import_nmea(&lines.join("\r\n")).expect("import nmea");
+        let track = import_nmea(&lines.join("\r\n")).expect("import nmea").track;
         assert_eq!(track.points.len(), 1);
         let p = track.points[0];
         assert_eq!(p.utc, Some(1_700_000_000));
@@ -788,7 +850,7 @@ mod tests {
             sentence("GPGGA,221320.00,3540.8742,N,13946.0275,E,1,08,0.9,80.5,M,0.0,M,,"),
         ]
         .join("\r\n");
-        let track = import_nmea(&text).expect("import nmea");
+        let track = import_nmea(&text).expect("import nmea").track;
         assert_eq!(track.points.len(), 1);
         let p = track.points[0];
         assert_eq!(p.utc, Some(1_700_000_000), "the RMC supplies the date");
@@ -813,7 +875,7 @@ mod tests {
             sentence("GPGGA,221320.00,3540.8742,N,13946.0275,E,1,08,0.9,80.5,M,0.0,M,,"),
         ]
         .join("\r\n");
-        let track = import_nmea(&text).expect("import nmea");
+        let track = import_nmea(&text).expect("import nmea").track;
         assert_eq!(
             track.points.len(),
             1,
@@ -829,7 +891,7 @@ mod tests {
     fn a_void_rmc_with_no_following_sentence_is_not_a_point() {
         use crate::protocol::pmtk::sentence;
         let text = sentence("GPRMC,221320.00,V,3540.8742,N,13946.0275,E,10.00,,141123,,");
-        let track = import_nmea(&text).expect("import nmea");
+        let track = import_nmea(&text).expect("import nmea").track;
         assert!(
             track.points.is_empty(),
             "a no-fix RMC must be dropped, not kept and overwritten: {:?}",
@@ -841,7 +903,7 @@ mod tests {
     fn a_gga_of_quality_zero_is_not_a_point() {
         use crate::protocol::pmtk::sentence;
         let text = sentence("GPGGA,221320.00,3540.8742,N,13946.0275,E,0,00,99.9,80.0,M,0.0,M,,");
-        assert!(import_nmea(&text).expect("import").points.is_empty());
+        assert!(import_nmea(&text).expect("import").track.points.is_empty());
     }
 
     #[test]
@@ -856,15 +918,87 @@ mod tests {
         for body in bad {
             let line = crate::protocol::pmtk::sentence(body);
             assert!(
-                import_nmea(&line).expect("import").points.is_empty(),
+                import_nmea(&line).expect("import").track.points.is_empty(),
                 "an unreadable hemisphere must drop the sentence: {body}"
             );
         }
         let south = crate::protocol::pmtk::sentence(
             "GPRMC,120000.00,A,3540.8742,S,13946.0275,W,0.00,,141123,,",
         );
-        let track = import_nmea(&south).expect("import");
+        let track = import_nmea(&south).expect("import").track;
         assert!(track.points[0].latitude.unwrap() < 0.0);
         assert!(track.points[0].longitude.unwrap() < 0.0);
+    }
+
+    #[test]
+    fn an_nmea_import_reports_imported_dropped_and_ignored_lines() {
+        // One line of each outcome, so a reader can tell "nothing arrived" from
+        // "everything was rejected" without inspecting the track.
+        let lines = [
+            crate::protocol::pmtk::sentence(
+                "GPRMC,221320.00,A,3540.8742,N,13946.0275,E,10.00,,141123,,",
+            ),
+            // Broken checksum: dropped.
+            String::from("$GPRMC,221320.00,A,3540.8742,N,13946.0275,E,10.00,,141123,,*00"),
+            // No fix: dropped.
+            crate::protocol::pmtk::sentence("GPRMC,221320.00,V,,,,,0.00,,141123,,"),
+            // Another sentence kind: not this reader's, counted as ignored.
+            crate::protocol::pmtk::sentence("GPGSA,A,3,01,02,03,,,,,,,,,1.5,1.0,1.2"),
+            // Blank and free text: ignored.
+            String::new(),
+            String::from("not an nmea line"),
+        ];
+        let imported = import_nmea(&lines.join("\r\n")).expect("import nmea");
+        assert_eq!(imported.imported, 1);
+        assert_eq!(imported.dropped, 2);
+        assert_eq!(imported.ignored, 3);
+        assert_eq!(imported.imported + imported.dropped + imported.ignored, 6);
+        assert_eq!(imported.track.points.len(), 1);
+    }
+
+    #[test]
+    fn an_nmea_import_counts_a_merged_pair_as_two_imported_sentences() {
+        // The pair becomes one point, but both lines were read and accepted;
+        // reporting one would make the counts disagree with the input.
+        let text = [
+            crate::protocol::pmtk::sentence(
+                "GPGGA,221320.00,3540.8742,N,13946.0275,E,1,08,0.9,80.5,M,0.0,M,,",
+            ),
+            crate::protocol::pmtk::sentence(
+                "GPRMC,221320.00,A,3540.8742,N,13946.0275,E,10.00,,141123,,",
+            ),
+        ]
+        .join("\r\n");
+        let imported = import_nmea(&text).expect("import nmea");
+        assert_eq!(imported.imported, 2);
+        assert_eq!(imported.dropped, 0);
+        assert_eq!(imported.track.points.len(), 1);
+    }
+
+    #[test]
+    fn another_sentence_kind_with_a_broken_checksum_is_ignored_not_dropped() {
+        // The address decides the counter before the checksum is verified: a
+        // sentence this reader never reads is `ignored` even when its checksum
+        // is wrong, and only RMC/GGA lines can be `dropped`.
+        let text = [
+            String::from("$GPGSA,A,3,01,02,03,,,,,,,,,1.5,1.0,1.2*00"),
+            String::from("$GPGSV,1,1,00"),
+            crate::protocol::pmtk::sentence(
+                "GPRMC,221320.00,A,3540.8742,N,13946.0275,E,10.00,,141123,,",
+            ),
+        ]
+        .join("\r\n");
+        let imported = import_nmea(&text).expect("import nmea");
+        assert_eq!(imported.imported, 1);
+        assert_eq!(imported.dropped, 0, "another kind is not this reader's");
+        assert_eq!(imported.ignored, 2);
+        assert_eq!(imported.imported + imported.dropped + imported.ignored, 3);
+    }
+
+    #[test]
+    fn an_empty_nmea_capture_is_zero_lines_not_an_error() {
+        let imported = import_nmea("").expect("import empty nmea");
+        assert!(imported.track.points.is_empty());
+        assert_eq!(imported.imported + imported.dropped + imported.ignored, 0);
     }
 }

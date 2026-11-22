@@ -2338,7 +2338,7 @@ mod tests {
         for (format, needle) in [
             (ExportFormat::Gpx, "<gpx"),
             (ExportFormat::Kml, "<kml"),
-            (ExportFormat::Csv, "index,utc,lat,lon"),
+            (ExportFormat::Csv, "INDEX,TRACK NUMBER,UTC DATE"),
         ] {
             screen.set_export_format(format);
             let out_path = PathBuf::from(&screen.destination);

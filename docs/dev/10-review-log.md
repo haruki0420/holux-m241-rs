@@ -1085,3 +1085,87 @@ Could 9）と可読性（Must 4 / Should 17 / Could 13）の 2 本で、レビ�
 ### Stage 3 検証
 
 未検証（別エージェントが記入する）。
+
+---
+
+## 2026-11-22 / PR #28 `feat-p2-compat` の Stage 2 修正
+
+- 対象: `feat-p2-compat`（base `origin/main` = `b0456df`、Stage 1 レビュー head `7474798`）。修正コードの head は `959ab2a`、本節はその次の commit。
+- Stage 1: [仕様検収](https://github.com/haruki0420/holux-m241-rs/pull/28#issuecomment-7080543382) と[可読性](https://github.com/haruki0420/holux-m241-rs/pull/28#issuecomment-7080553810)。実装者はどちらのレビューにも参加していない。
+- 実機は使っていない（3 項目ともオフライン機能）。実機未検証の挙動を検証済みにはしていない。
+- `m241-flash` / `m241-gui` は未変更（今回 CSV ヘッダを変えないため GUI の例外 1 行も不要）。
+
+### 仕様検収 Must への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| Must 1 | save は入力をそのまま、load は project 親基準で join するため往復が壊れる | `save` が相対パスを project 親基準へ正規化して保存（絶対パスは絶対のまま）。`load` は同じ基準で join。`02-cli.md` も「保存される文字列は常に project 基準」に修正 | `a_project_in_a_subdirectory_round_trips_relative_paths`, `a_relative_path_is_stored_against_the_project_directory` |
+
+### 可読性 Must への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| M1 | NMEA 全却下でも exit 0 で空 GPX | 非空キャプチャで 1 点も取れなければエラー（`Error::State`、ファイル名と件数、出力なし）。部分的な dropped は `console.warn`。空ファイルは従来どおり 0 点で成功。`02-cli.md` に明記 | `read_nmea_refuses_a_capture_that_yields_no_point`, `read_nmea_refuses_a_file_that_is_not_a_capture`, `read_nmea_converts_a_capture_and_reports_dropped_lines`（warning を追加検証） |
+| M2 | `--nmea` の件数が JSON に無い | `--format json` のオブジェクトに `"nmea": {"imported", "dropped", "ignored"}` を追加（`offset_days` と同じ規約: 事実がある時だけ） | `read_nmea_json_carries_the_line_counts`, `read_json_without_a_shift_carries_no_offset_field`（dump に `nmea` が無いことも固定） |
+| M3 | project の相対パスが save/load で非対称 | Must 1 と同じ（パス基準を 1 つにした） | 同上 |
+| M4 | project が入力種別を記録しない | `"input": "dump" \| "nmea"` を保存し、`project save --nmea` を追加。`load` はその種別で `log read` する。kmz は dump 必須（`--nmea` と排他、kmz project で nmea はエラー） | `a_project_records_the_input_kind_and_load_reads_it_back`, `a_kmz_project_cannot_read_an_nmea_capture`, `log_project_save_and_load_parse_their_documented_arguments` |
+| M5 | project のエラーがパスも version も出さない | すべての refusal が project パスを名指し、version 不一致は「見つけた version と対応 version」を表示。欠落/型違いフィールドは推測せず拒否。serialize エラーの文言も write 失敗と読ませない形に修正 | `a_project_error_names_the_file_and_the_version_it_found`, `every_required_field_is_refused_when_missing_and_the_file_is_named`, `a_project_that_is_not_one_is_refused_not_guessed`, `an_unknown_export_format_in_a_project_is_refused`, `a_kmz_project_without_a_photo_folder_is_refused_on_load` |
+
+`Error::State` のままにした理由: project 専用 variant を足すには
+`crates/m241-core/src/error.rs` の変更が要り、この PR の変更範囲外。代わりに
+メッセージがファイル・version・次の行動を含むようにした（`fileio` の
+「失敗は必ずファイルを名指す」規約に合わせる）。
+
+### 仕様検収 Should への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| Should 2 | load 挙動のテストが無い | 一覧のほぼ全てをテスト化: 未知 export_format / 読込時 kmz+写真なし / 非ゼロ offset の適用と stderr 告知 / 相対パスの project 基準解決 / save がログを開かない / 既存 project の置換 / photos null / kmz の export_format | `saving_a_project_does_not_open_the_log`, `saving_a_project_replaces_an_existing_file`, `a_project_load_applies_the_stored_day_correction_and_announces_it`, `a_kmz_project_records_the_kmz_export_format_and_photo_folder`, 上記 Must 1 / M4 / M5 の各テスト |
+| Should 3 | dropped/ignored の境界が doc と違う | 種別を checksum より先に読む実装に変更。`$GPGSA` 等は checksum 不正でも `ignored`、`$GPRMC`/`$GPGGA` だけが `dropped`。doc の記述はそのまま正しくなった | `another_sentence_kind_with_a_broken_checksum_is_ignored_not_dropped` |
+| Should 4 | `02-cli.md` の `§1.5` は存在しない | `§1, §8 item 12` に修正 | docs ゲート（節アンカーは `check_docs.py` の対象外なので目視） |
+| Should 5 | doc の JSON 例 `"log": "capture.nmea"` が load 不能 | 入力種別を実装したので例を `"input": "nmea"` として実際に読める形に更新 | `a_project_records_the_input_kind_and_load_reads_it_back` |
+| Should 6 | `utc_offset_days` 欠落を黙って 0 に | 必須フィールドとして拒否（欠落・文字列・範囲外）。doc も「nothing is guessed」と整合 | `every_required_field_is_refused_when_missing_and_the_file_is_named` |
+
+### 可読性 Should の対応（任意対応分）
+
+- S3: `import_nmea` の `# Errors` 節を復活（失敗しない理由を明記）。
+- S4: `utc_date_and_time` を追加し、`to_csv` の文字列手術を削除。`utc_iso` も同じ変換を通す。テスト `the_csv_date_and_time_agree_with_the_iso_rendering`。
+- S5: `TRACK_NUMBER` 定数と、`INDEX` の基点・消えた列（`rcr` / `fix` / `waypoint`）の理由を `to_csv` doc に明記。
+- S6: テストの CSV ヘッダ重複を `CSV_COLUMNS` 参照に縮小（project / logcmd）。`cli.rs` の parse テストは実在する入力名に修正。
+- S7: 実 ezTour 出力との突き合わせは未検証と doc に明記（「互換」と断定しない）。
+- S8: モジュール doc に 8 キー一覧と「`.itm` と相互運用しない」を追記。
+- S9: `load` から文書検証を `ProjectDocument::read` に分離、`read` から NMEA の報告を `report_nmea_import` に分離。
+- S10: project が log / output と同一パスなら `Error::Safety` で拒否。テスト `saving_a_project_over_the_files_it_names_is_refused`。
+- C2 / C3 / C6 / C7 / C8 も併せて修正（`LogProjectLoadOptions.project` の doc、Project サブコマンドの説明、project 定数の可視性、`csv_optional` の doc、`log/mod.rs` の import 行）。
+
+### 見送った指摘と理由
+
+- 可読性 S1（`dropped` を rejected / no_fix に分割）: `02-cli.md` が 3 区分を仕様として定めており、区分の追加はこの修正ラウンドの範囲を超える仕様変更。代わりに「dropped は破損と no-fix の両方を含む」ことを型 doc と全却下エラー文に明記した。
+- 可読性 S2（`NmeaImport` を `NmeaReport` + タプル戻り値へ改名）: 公開 API と既存テスト多数を書き換える変更で、指摘の本質（名前の揃え）に対してリスクが大きい。Stage 3 の判断材料として残す。
+- 可読性 S8 の kmz 成功経路テスト: 写真フォルダと実 JPEG の用意が要り、今回の Must 修正とは独立。拒否経路と `export_format` の保存はテスト済み。
+- 仕様検収 Could 9（未確定事項を `06-open-questions.md` へ登録）: 内容は `12-progress-summary.md` に既にあり、今回はコード修正に集中した。別タスクで台帳へ移す。
+
+### 却下した指摘
+
+なし。Must 6 件（仕様 1 + 可読性 5）はいずれも実装で再現でき、事実と一致した。
+
+### 変異で確認したこと
+
+いずれも変異を入れて対応テストが落ちることを確認し、そのあと元に戻した
+（`git diff` が変異前と同じ内容に戻ったことを確認済み）。
+
+- `stored_path` が入力をそのまま返す（修正前の挙動）に戻すと
+  `a_project_in_a_subdirectory_round_trips_relative_paths` が `"track.bin"` と
+  `"../track.bin"` の不一致で落ちる。
+- `report_nmea_import` の全却下ガードを無効にすると
+  `read_nmea_refuses_a_capture_that_yields_no_point` と
+  `read_nmea_refuses_a_file_that_is_not_a_capture` が落ちる。
+
+### ゲート
+
+`./tools/check.sh` 6/6（`M241_VENDOR_IMAGE` を設定した状態。実機ポートは開いていない）。
+修正コード head `959ab2a` で実行。
+
+### Stage 3 検証
+
+未検証（別エージェントが記入する）。
