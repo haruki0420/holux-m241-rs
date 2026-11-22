@@ -32,8 +32,8 @@ use m241_core::{Error, Result};
 
 use crate::da::{
     Confirmation, DaDigest, DaLoadId, DaLoader, DownloadAgent, FLASH_WRITE_LENGTH,
-    FLASH_WRITE_START, PROBE_ADDRESSES, PROBE_PAGE_SIZE, PendingWrite, VECTOR, VendorImage,
-    WriteReport, check_da_image_against, read_candidates,
+    FLASH_WRITE_START, PROBE_ADDRESSES, PendingWrite, VECTOR, VendorImage, WriteReport,
+    check_da_image_against, read_candidates,
 };
 
 /// Bytes a GUI dump reads: the shipped firmware range.
@@ -45,9 +45,14 @@ pub const FIRMWARE_DUMP_LENGTH: usize = FLASH_WRITE_LENGTH;
 /// How long the unit is given to boot its firmware after `0xD9` before the
 /// BootROM re-entry probe.
 ///
-/// The CLI's value (`BOOTROM_REENTRY_SETTLE`), deliberately the same: a GUI
-/// read-back and a CLI read-back must not depend on two numbers. ⚠️ 未検証 on
-/// hardware because the write path has not run on a real unit.
+/// **Intended** to be the CLI's value (`BOOTROM_REENTRY_SETTLE`), but the two are
+/// independent literals: this one and `m241-cli/src/fw.rs`'s must be kept equal
+/// by hand, and a change to one does not change the other. A shared constant
+/// would be better; until then, "the same value" is a convention, not a fact the
+/// compiler enforces.
+///
+/// ⚠️ 未検証 for this combination: the CLI's write route has run on hardware
+/// (docs/dev/05-verification.md), but a GUI-driven write and read-back have not.
 pub const REENTRY_SETTLE: Duration = Duration::from_millis(250);
 
 /// Where a session has got to, for a progress line.
@@ -226,27 +231,42 @@ fn written_image<'a>(request: &FlashRequest<'a>) -> &'a [u8] {
     }
 }
 
-/// One `0xD3` + `0xD5` attempt on the strict or the vendor path.
+/// One `0xD3` + `0xD5` attempt on the strict, recovery or vendor path.
+///
+/// Every arm reports progress: a recovery write is the moment the user most needs
+/// to see that packets are moving, and a bar that stays at 0 % because the sink
+/// was only wired to the strict arm is a display that lies about the state.
 fn write_once<T: Transport>(
     da: &mut DownloadAgent<T>,
     request: &FlashRequest<'_>,
     on_event: &mut dyn FnMut(Event),
 ) -> Result<PendingWrite> {
     let total = written_image(request).len();
+    let mut progress = |packets: usize, bytes: usize| {
+        on_event(Event::Write {
+            packets,
+            bytes,
+            total,
+        });
+    };
     match request.vendor {
-        Some(vendor) => da.write_vendor(request.confirmation, request.backup, vendor),
-        None if request.recover => da.write(request.confirmation, request.backup, request.backup),
+        Some(vendor) => da.write_vendor_with_progress(
+            request.confirmation,
+            request.backup,
+            vendor,
+            &mut progress,
+        ),
+        None if request.recover => da.write_with_progress(
+            request.confirmation,
+            request.backup,
+            request.backup,
+            &mut progress,
+        ),
         None => da.write_with_progress(
             request.confirmation,
             request.backup,
             request.image,
-            &mut |packets, bytes| {
-                on_event(Event::Write {
-                    packets,
-                    bytes,
-                    total,
-                });
-            },
+            &mut progress,
         ),
     }
 }
@@ -391,10 +411,26 @@ pub struct ProbeDaReport {
     pub settled: Option<u32>,
 }
 
+/// The single address a probe settles on, or `None` when 0 or 2+ pages matched.
+///
+/// Pulled out of [`probe_da`] so the rule — exactly one match settles the range,
+/// none or several do not — is testable without a transport. A probe that matched
+/// two pages must not pick one: the whole point of the probe is that the evidence
+/// is ambiguous.
+fn settled_address(matches: &[u32]) -> Option<u32> {
+    match matches {
+        [only] => Some(*only),
+        _ => None,
+    }
+}
+
 /// Load the DA into RAM and read both candidate addresses. Writes no flash.
 ///
 /// `confirmation` is the GUI's typed `PROBE` acknowledgement, constructed by the
 /// screen; the DA loader refuses an ungranted token before writing RAM.
+/// `da_digest` is the file's digest token, as in [`flash`]: production callers
+/// pass [`DaDigest::vendor`], and the simulator feature's token makes the probe
+/// path testable against a fake DA.
 ///
 /// # Errors
 ///
@@ -403,18 +439,19 @@ pub struct ProbeDaReport {
 pub fn probe_da<T: Transport>(
     transport: T,
     da: &[u8],
+    da_digest: DaDigest,
     confirmation: Confirmation,
     assume_brom: bool,
     on_event: &mut dyn FnMut(Event),
 ) -> Result<ProbeDaReport> {
-    check_da(da)?;
+    check_da_image_against(da, da_digest.clone())?;
     on_event(Event::Stage(Stage::Entering));
     let transport = enter_bootrom(transport, assume_brom)?;
     let mut rom = MtkBootRom::new(transport);
     rom.sync()?;
     on_event(Event::Stage(Stage::LoadingDa));
     let mut loader = DaLoader::new(rom.transport_mut());
-    let id = loader.load_against(confirmation, da, DaDigest::vendor())?;
+    let id = loader.load_against(confirmation, da, da_digest)?;
     on_event(Event::DaLoaded {
         version: id.version,
         region: id.region,
@@ -450,22 +487,13 @@ pub fn probe_da<T: Transport>(
         .filter(|page| page.matches_vector)
         .map(|page| page.address)
         .collect();
-    let settled = match matches.as_slice() {
-        [only] => Some(*only),
-        _ => None,
-    };
+    let settled = settled_address(&matches);
     let pages: [ProbePage; PROBE_ADDRESSES.len()] = pages.try_into().map_err(|_| {
         Error::State(String::from(
             "the DA probe returned a different number of pages than addresses",
         ))
     })?;
     Ok(ProbeDaReport { id, pages, settled })
-}
-
-/// Read the page size the probe asks for, for a caller that prints it.
-#[must_use]
-pub fn probe_page_size() -> usize {
-    PROBE_PAGE_SIZE
 }
 
 #[cfg(test)]
@@ -706,32 +734,62 @@ mod tests {
     }
 
     #[test]
-    fn a_page_that_does_not_start_like_the_vector_is_not_settled() {
-        let report = ProbeDaReport {
-            id: DaLoadId {
-                version: 0x0308,
-                region: 0x49,
-                flash_bytes: 0x8_0000,
-                manufacturer: 0x00C2,
-                device: 0x22BA,
-            },
-            pages: [
-                ProbePage {
-                    address: PROBE_ADDRESSES[0],
-                    first_bytes: Some(VECTOR),
-                    matches_vector: true,
-                    error: None,
-                },
-                ProbePage {
-                    address: PROBE_ADDRESSES[1],
-                    first_bytes: None,
-                    matches_vector: false,
-                    error: Some(String::from("timeout")),
-                },
-            ],
-            settled: Some(PROBE_ADDRESSES[0]),
-        };
-        assert_eq!(report.settled, Some(PROBE_ADDRESSES[0]));
-        assert_eq!(report.pages[1].address, PROBE_ADDRESSES[1]);
+    fn a_probe_settles_only_on_exactly_one_matching_page() {
+        // The rule the `fw probe-da` report turns into "the image is at 0x…".
+        // Zero matches and two matches are both "cannot tell", and picking one
+        // of two would be a guess dressed as a measurement.
+        assert_eq!(settled_address(&[]), None);
+        assert_eq!(
+            settled_address(&[PROBE_ADDRESSES[1]]),
+            Some(PROBE_ADDRESSES[1])
+        );
+        assert_eq!(
+            settled_address(&[PROBE_ADDRESSES[0], PROBE_ADDRESSES[1]]),
+            None
+        );
+    }
+
+    #[test]
+    fn probe_da_reads_both_candidate_pages_through_the_fake_and_writes_no_flash() {
+        let stock = stock_image();
+        let (da, digest) = fake_da();
+        let fake = Rc::new(RefCell::new(FakeDa::with_firmware(&stock)));
+        let report = probe_da(
+            SharedDa(fake.clone()),
+            &da,
+            digest,
+            Confirmation::granted(),
+            true,
+            &mut |_| {},
+        )
+        .expect("the DA probe succeeds against the fake");
+        assert_eq!(report.id.version, 0x0308);
+        assert_eq!(
+            report.settled,
+            Some(PROBE_ADDRESSES[0]),
+            "the fake holds the image at the DA's own view of offset 0"
+        );
+        assert_eq!(report.pages[0].first_bytes, Some(VECTOR));
+        assert!(report.pages[0].matches_vector);
+        assert!(
+            !report.pages[1].matches_vector,
+            "the second candidate is past the fixture and must not match"
+        );
+        assert!(
+            fake.borrow().packets().is_empty(),
+            "a probe sent a 0xD3/0xD5 packet"
+        );
+    }
+
+    #[test]
+    fn probe_bootrom_confirms_the_sync_without_touching_the_device() {
+        let stock = stock_image();
+        let fake = Rc::new(RefCell::new(FakeDa::with_firmware(&stock)));
+        probe_bootrom(SharedDa(fake.clone()), true).expect("the fake answers the four sync probes");
+        assert!(fake.borrow().packets().is_empty(), "a packet was sent");
+        assert!(
+            fake.borrow().control_lines().is_empty(),
+            "the BootROM probe pulsed DTR/RTS"
+        );
     }
 }

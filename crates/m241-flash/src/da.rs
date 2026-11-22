@@ -1950,6 +1950,26 @@ impl<T: Transport> DownloadAgent<T> {
         backup: &[u8],
         vendor: VendorImage<'_>,
     ) -> Result<PendingWrite> {
+        self.write_vendor_with_progress(confirmation, backup, vendor, &mut |_, _| {})
+    }
+
+    /// [`Self::write_vendor`], reporting every accepted packet to `on_progress`.
+    ///
+    /// Same checks, same range, same order as [`Self::write_vendor`]; the sink is
+    /// reporting only. The GUI's recovery and vendor writes need it too: without
+    /// a progress sink the recovery bar sits at 0 % for the whole write, which is
+    /// the moment the user most needs to see that something is happening.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write_vendor`].
+    pub fn write_vendor_with_progress(
+        &mut self,
+        confirmation: Confirmation,
+        backup: &[u8],
+        vendor: VendorImage<'_>,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<PendingWrite> {
         if !confirmation.is_given() {
             return Err(Error::Safety {
                 reason: String::from(
@@ -1970,7 +1990,7 @@ impl<T: Transport> DownloadAgent<T> {
         // The backup is not the image here; it only has to be a structurally
         // valid V1.13 dump. `verify_device` is the caller's step.
         check_image(vendor.profile(), backup, backup)?;
-        self.write_range_accepted(FLASH_WRITE_START, vendor.image())
+        self.write_range_accepted_with_progress(FLASH_WRITE_START, vendor.image(), on_progress)
     }
 
     /// The strict write at an explicit start; test-only.
@@ -1978,7 +1998,7 @@ impl<T: Transport> DownloadAgent<T> {
     /// Private and **strict**: it runs [`check_image`] against `backup`, which
     /// is `AGENTS.md` §2.3's backup-diff rule. Vendor images do not come through
     /// this function; [`Self::write_vendor`] reaches
-    /// [`Self::write_range_accepted`] only with a [`VendorImage`] token.
+    /// `write_range_accepted_with_progress` only with a [`VendorImage`] token.
     #[cfg(test)]
     fn write_range(&mut self, backup: &[u8], start: u32, image: &[u8]) -> Result<PendingWrite> {
         self.write_range_with_progress(backup, start, image, &mut |_, _| {})
@@ -1998,16 +2018,6 @@ impl<T: Transport> DownloadAgent<T> {
         // not the profile's, and the profile is V1.13.
         let accepted = check_image(&PROFILE_V1_13, backup, image)?;
         self.write_range_accepted_with_progress(start, accepted.image, on_progress)
-    }
-
-    /// Program an image whose acceptance the caller has already established.
-    ///
-    /// Private. The only callers are [`Self::write_range`] (strict backup diff)
-    /// and [`Self::write_vendor`] (a [`VendorImage`] token). This is the one
-    /// place that can reach `0xD3` without repeating a check, so it must not
-    /// become public.
-    fn write_range_accepted(&mut self, start: u32, image: &[u8]) -> Result<PendingWrite> {
-        self.write_range_accepted_with_progress(start, image, &mut |_, _| {})
     }
 
     /// The one body that reaches `0xD3` and `0xD5`, with a progress sink.

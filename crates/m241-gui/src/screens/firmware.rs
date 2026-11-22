@@ -22,20 +22,43 @@
 //! firmware, writes the patched range through `DownloadAgent`, restarts the unit,
 //! reads the range back and compares it. The GUI does not have a second write
 //! path: `tools/check_safety.py` requires `m241-gui` to depend on `m241-flash`, and
-//! this screen's write actions are the only place a `Confirmation` is built. That
-//! token is built after the user types [`FirmwareScreen::CONFIRMATION`] in the
-//! field below — there is no `--yes` equivalent, and no agent may type it.
+//! requires the token [`Confirmation`] to be built only in the screens that check
+//! a typed word — this screen for `WRITE`, `screens/connect.rs` for `PROBE` (that
+//! action loads the DA into RAM, which can program flash itself). The token is
+//! built after the user types [`FirmwareScreen::CONFIRMATION`] in the field below
+//! — there is no `--yes` equivalent, and no agent may type it.
 //!
-//! The screen still labels an unmeasured path 未検証: the write sequence has not
-//! run on a real unit (docs/dev/05-verification.md), and that is a fact about the
-//! hardware, not about whether this code compiles.
+//! The token is not proof: [`Confirmation::granted`] takes no argument and cannot
+//! know who typed. What refuses an untyped write is the re-check at the top of
+//! [`FirmwareScreen::start_write`] (and `ConnectScreen::start_probe_da`), and a
+//! unit test pins that the button's disabled state is not the only gate. The
+//! checker proves the token exists in the right file, not that a person produced
+//! it; `docs/dev/10-review-log.md` records the limit.
+//!
+//! Nothing on this screen claims the write path has run on hardware. The write
+//! step carries the word 未検証, and the success panel says the read-back matched
+//! while the hardware verification is still outstanding. That is a fact about the
+//! hardware (docs/dev/05-verification.md), not about whether this code compiles.
+//!
+//! # Why the old gate is gone
+//!
+//! `m241-gui` used to be forbidden from linking `m241-flash`: the dependency
+//! graph was the gate, and no edit inside this crate could bypass it. The user
+//! asked for the CLI's write capability in the GUI (2026-11-23, AGENTS.md §0), so
+//! the rule was removed deliberately. What replaces it is a textual check in
+//! `tools/check_safety.py` — the `flow::flash(` call, the typed-word constants,
+//! the absence of a destructive opcode, and where the token/job may be built.
+//! That is **weaker** than a missing dependency edge: an edit can weaken a text
+//! check. The invariants that still hold structurally are the ones inside
+//! `m241-flash`: the fixed range, `check_layout`, `check_image`, `verify_device`
+//! and the read-back. `device.rs`'s module doc records the same trade.
 
 use egui::{Color32, RichText, Sense, Stroke, Ui, Vec2};
 use m241_core::firmware::{self, FirmwareImage, PROFILE_V1_13};
 use m241_core::{PatchPlan, VERSION};
 use m241_flash::da::{
     Confirmation, FLASH_WRITE_END, FLASH_WRITE_LENGTH, FLASH_WRITE_START,
-    VENDOR_PER_UNIT_DATA_BYTES, WriteReport,
+    VENDOR_PER_UNIT_DATA_BYTES,
 };
 use std::path::Path;
 use std::sync::mpsc;
@@ -178,22 +201,29 @@ impl Destructive {
 
 /// What the last dump attempt produced.
 ///
-/// The power-cycle states are kept from the two-read dump the CLI performs. The
-/// GUI's dump is the same read-only session, saved once; the states still render
-/// (a wizard that only draws the happy path is a wizard whose failure layout is
-/// never reviewed).
+/// A dump is two reads from two boots, the same shape the CLI uses. The first
+/// pass leaves the screen in [`DumpState::WaitingForPowerCycle`]; the user
+/// power-cycles the unit and starts the second pass, and only two matching
+/// digests produce [`DumpState::Verified`] and a file. A single read that
+/// truncated still parses as an image, and the backup is the only way back, so a
+/// one-read "verified" would be a claim the evidence does not support.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DumpState {
     /// Nothing has been read.
     #[default]
     Idle,
-    /// The read is running: `read` of `total` bytes.
+    /// A read is running: `read` of `total` bytes.
     FirstPass { read: usize, total: usize },
-    /// The first pass finished; the unit must be power-cycled before the second.
-    WaitingForPowerCycle { total: usize },
-    /// The read finished and the image is saved.
+    /// The first read finished; the unit must be power-cycled before the second.
+    WaitingForPowerCycle {
+        /// Bytes the first read returned.
+        total: usize,
+        /// SHA-256 of the first read, compared with the second.
+        digest: String,
+    },
+    /// Both reads finished and agreed; the image is saved.
     Verified { bytes: usize, digest: String },
-    /// Two reads differed.
+    /// The two reads differed. Nothing was saved.
     Mismatch { first: String, second: String },
     /// The read was refused or failed. The device's words are kept verbatim.
     Failed(String),
@@ -276,6 +306,9 @@ fn progress_bar(ui: &mut Ui, fraction: f32, caption: String) {
         egui::ProgressBar::new(fraction)
             .desired_width(ui.available_width())
             .corner_radius(theme::RADIUS)
+            // The fraction is a measurement of bytes acknowledged, not motion to
+            // be animated: animating it would draw a position the device never
+            // reported.
             .animate(false)
             .text(RichText::new(caption).size(size::CAPTION)),
     );
@@ -419,10 +452,13 @@ impl FirmwareScreen {
     }
 
     /// Fill the sample at the write step, with the patched image in memory and
-    /// the confirmation armed.
+    /// the confirmation field filled.
     ///
-    /// Screenshot-side state: it never writes the patched file to disk, and the
-    /// screen still labels every figure 見本.
+    /// Screenshot-side state: it never writes the patched file to disk, never
+    /// opens a port and never starts a job — every figure on the screen stays
+    /// labelled 見本. Filling the field is only how the armed button becomes
+    /// renderable; the sample has no port, so [`Self::write_armed`] is still
+    /// false and the real gate (the action's re-check) is untouched.
     pub(crate) fn show_sample_write(&mut self) -> Result<(), String> {
         self.show_sample()?;
         let patched = {
@@ -491,6 +527,10 @@ impl FirmwareScreen {
     }
 
     /// Read an image from disk and plan it.
+    ///
+    /// The size cap is a guard against pointing the text field at a disk image
+    /// or a video by mistake: reading it would take a long time and parse as
+    /// garbage. The largest release is under half a megabyte.
     fn open(&mut self, path: &str) -> Result<(), String> {
         let path = path.trim();
         if path.is_empty() {
@@ -511,6 +551,10 @@ impl FirmwareScreen {
     }
 
     /// Apply the plan and write the patched image beside the source.
+    ///
+    /// The source file is never modified: the dump is the only way back, and a
+    /// patch that overwrote it would destroy the recovery image at the moment
+    /// the user is preparing to write.
     fn write_patched(&mut self) -> Result<(), String> {
         let (Some(plan), Some(image)) = (self.plan.as_ref(), self.image.as_ref()) else {
             return Err(String::from("先にイメージを読み込んでください"));
@@ -550,6 +594,48 @@ impl FirmwareScreen {
             total: m241_flash::flow::FIRMWARE_DUMP_LENGTH,
         };
         self.message = Some((Status::Info, String::from("吸い出しています…")));
+        self.start_job(JobKind::Dump, job);
+        Ok(())
+    }
+
+    /// Start the second read of the dump, after the user power-cycled the unit.
+    ///
+    /// The first pass's digest is the comparison target. This is a separate job
+    /// rather than a loop inside one job because the physical step between the
+    /// reads is the user's: a background thread cannot ask them to pull the
+    /// battery.
+    ///
+    /// # Errors
+    ///
+    /// No first pass to compare against, a missing port or path, or a job
+    /// already running.
+    pub fn start_dump_second(&mut self) -> Result<(), String> {
+        if self.job.is_some() {
+            return Err(String::from("別の処理が動いています"));
+        }
+        if self.port.trim().is_empty() {
+            return Err(String::from("ポートを入力してください"));
+        }
+        if self.dump_path.trim().is_empty() {
+            return Err(String::from("保存先を入力してください"));
+        }
+        let DumpState::WaitingForPowerCycle { digest, .. } = &self.dump else {
+            return Err(String::from(
+                "先に 1 回目の読み取りを終わらせてください（2 回目はそのハッシュと比較します）",
+            ));
+        };
+        let first_digest = digest.clone();
+        let job = crate::device::Job::DumpSecond {
+            port: self.port.trim().to_owned(),
+            output: self.dump_path.trim().to_owned(),
+            assume_brom: self.assume_brom,
+            first_digest,
+        };
+        self.dump = DumpState::FirstPass {
+            read: 0,
+            total: m241_flash::flow::FIRMWARE_DUMP_LENGTH,
+        };
+        self.message = Some((Status::Info, String::from("2 回目を読み取っています…")));
         self.start_job(JobKind::Dump, job);
         Ok(())
     }
@@ -713,35 +799,30 @@ impl FirmwareScreen {
         let Some(kind) = self.job.as_ref().map(|(kind, _)| *kind) else {
             return false;
         };
+        let (events, disconnected) = match self.job.as_ref() {
+            Some((_, rx)) => crate::device::poll_channel(rx),
+            None => return false,
+        };
         let mut finished = false;
-        loop {
-            let received = match self.job.as_ref() {
-                Some((_, rx)) => match rx.try_recv() {
-                    Ok(event) => Some(Ok(event)),
-                    Err(mpsc::TryRecvError::Empty) => None,
-                    Err(mpsc::TryRecvError::Disconnected) => Some(Err(())),
-                },
-                None => None,
-            };
-            match received {
-                Some(Ok(event)) => {
-                    if self.apply_event(kind, event) {
-                        finished = true;
-                        break;
-                    }
-                }
-                Some(Err(())) => {
-                    // The worker sends its own failure before returning; a
-                    // disconnect without one is a thread that died.
-                    self.fail(
-                        kind,
-                        String::from("処理が結果を返さずに終了しました。もう一度お試しください"),
-                    );
-                    finished = true;
-                    break;
-                }
-                None => break,
+        for event in events {
+            if self.apply_event(kind, event) {
+                finished = true;
+                break;
             }
+        }
+        if !finished && disconnected {
+            // The worker sends its own failure before returning; a disconnect
+            // without one is a thread that died. A write that died mid-packet
+            // leaves the unit in an unknown state, so the message must not
+            // suggest pressing the same button again.
+            self.fail(
+                kind,
+                String::from(
+                    "処理が結果を返さずに終了しました。端末の状態は不明です。\
+                     吸い出しで確認するか、復旧の手順に進んでください",
+                ),
+            );
+            finished = true;
         }
         if finished {
             self.job = None;
@@ -755,6 +836,31 @@ impl FirmwareScreen {
             crate::device::JobEvent::Flow(event) => {
                 self.apply_flow_event(&event);
                 false
+            }
+            crate::device::JobEvent::DumpFirst { digest, bytes } => {
+                self.dump = DumpState::WaitingForPowerCycle {
+                    total: bytes,
+                    digest,
+                };
+                self.message = Some((
+                    Status::Waiting,
+                    String::from(
+                        "1 回目を読みました。電池を抜いて 10 秒待ち、入れ直して電源を入れてから\
+                         2 回目を読み取ってください。2 回のハッシュが一致したときだけ保存します",
+                    ),
+                ));
+                true
+            }
+            crate::device::JobEvent::DumpMismatch { first, second } => {
+                self.dump = DumpState::Mismatch { first, second };
+                self.message = Some((
+                    Status::Err,
+                    String::from(
+                        "2 回の読み取りが一致しません。保存していません。ケーブルと USB ポートを\
+                         変えて、吸い出しをやり直してください",
+                    ),
+                ));
+                true
             }
             crate::device::JobEvent::Dumped(bytes) => {
                 let digest = firmware::sha256_hex(&bytes);
@@ -779,7 +885,7 @@ impl FirmwareScreen {
                 self.message = Some((
                     Status::Ok,
                     format!(
-                        "書き込みと読み戻しが一致しました（{} バイト）",
+                        "書き込みと読み戻しが一致しました（{} バイト。実機での書き込み検証は別途）",
                         common::grouped(report.verified)
                     ),
                 ));
@@ -965,11 +1071,11 @@ impl FirmwareScreen {
                 Step::Flash => {
                     // The running / result block sits above the panel, not under
                     // it: at 1280x800 the panel alone fills the page, and a
-                    // progress bar below the fold is not a progress bar.
-                    if !matches!(self.flash, FlashState::Idle) {
-                        self.write_state_panel(ui);
-                        ui.add_space(space::M);
-                    }
+                    // progress bar below the fold is not a progress bar. It is
+                    // drawn here once — `flash_step` does not repeat it (the
+                    // duplicate was a review finding).
+                    self.write_state_panel(ui);
+                    ui.add_space(space::M);
                     self.flash_step(ui);
                 }
             }
@@ -1111,11 +1217,9 @@ impl FirmwareScreen {
             ui.add_space(space::S);
             ui.checkbox(
                 &mut self.assume_brom,
-                RichText::new(is_meaning(
-                    "端末はすでに BootROM にいる（--assume-brom 相当）",
-                ))
-                .size(size::CAPTION)
-                .color(theme::MUTE),
+                RichText::new("端末はすでに BootROM にいる（--assume-brom 相当）")
+                    .size(size::CAPTION)
+                    .color(theme::MUTE),
             );
 
             ui.add_space(space::M);
@@ -1127,7 +1231,7 @@ impl FirmwareScreen {
                         common::grouped(*read),
                         common::grouped(*total)
                     ),
-                    DumpState::WaitingForPowerCycle { total } => format!(
+                    DumpState::WaitingForPowerCycle { total, .. } => format!(
                         "{} / {} バイト（読み取り完了）",
                         common::grouped(*total),
                         common::grouped(*total)
@@ -1145,22 +1249,34 @@ impl FirmwareScreen {
                     ui.add_space(space::S);
                     ui.label(
                         RichText::new(
-                            "電池を抜いて 10 秒待ち、入れ直してから続行してください。\
-                             2 回目は電源を入れ直した状態から読みます。",
+                            "電池を抜いて 10 秒待ち、入れ直して電源を入れてから、\
+                             2 回目の読み取りを始めてください。2 回のハッシュが一致したときだけ\
+                             保存します。",
                         )
                         .size(size::UI)
                         .color(theme::INK),
                     );
+                    ui.add_space(space::S);
+                    let ready = !self.busy();
+                    if common::primary_button(ui, "2 回目を読み取る", ready).clicked()
+                        && let Err(reason) = self.start_dump_second()
+                    {
+                        self.message = Some((Status::Err, reason));
+                    }
                 }
                 DumpState::Verified { bytes, digest } => {
-                    common::status_line(ui, Status::Ok, "本体から読み取りました");
+                    common::status_line(
+                        ui,
+                        Status::Ok,
+                        "本体から読み取りました（2 回のハッシュが一致）",
+                    );
                     ui.add_space(space::S);
                     common::figure_row(ui, "サイズ", &common::bytes(*bytes));
                     common::figure_row(ui, "SHA-256", digest);
                     common::figure_row(ui, "保存先", self.dump_path.trim());
                 }
                 DumpState::Mismatch { first, second } => {
-                    common::status_line(ui, Status::Err, "2 回の読み取りが一致しません");
+                    common::status_line(ui, Status::Err, "2 回の読み取りが一致しません（未保存）");
                     ui.add_space(space::S);
                     common::figure_row(ui, "1 回目", first);
                     common::figure_row(ui, "2 回目", second);
@@ -1188,7 +1304,8 @@ impl FirmwareScreen {
             ui.add_space(space::S);
             ui.label(
                 RichText::new(
-                    "書き込みの前に必ず吸い出してください。このイメージが復旧用のバックアップになります。",
+                    "2 回読み（1 回目のあと電池を抜き差し）でハッシュを比較します。\
+                     一致したイメージだけを保存し、これが復旧用のバックアップになります。",
                 )
                 .size(size::CAPTION)
                 .color(theme::MUTE),
@@ -1351,6 +1468,11 @@ impl FirmwareScreen {
     }
 
     /// Step 3: write to the device. The only destructive act in the product.
+    ///
+    /// Kept as one function because the panel is read top to bottom before the
+    /// typed word (range, image, diff, vendor gate, confirmation); splitting it
+    /// would hide that order. The rows all borrow different fields of `self`,
+    /// which is why they are drawn inline rather than through row helpers.
     fn flash_step(&mut self, ui: &mut Ui) {
         let (border, voice_title) = Destructive::WriteStep.voice();
         let title = if self.sample {
@@ -1366,6 +1488,15 @@ impl FirmwareScreen {
                 )
                 .size(size::UI)
                 .color(theme::INK),
+            );
+            // The same 未検証 word the Connect screen shows for this row: the
+            // write sequence has run on a unit through the CLI, but this GUI
+            // route has not (docs/dev/05-verification.md). A read-back match is
+            // not hardware verification, so the screen must not imply it is.
+            common::status_line(
+                ui,
+                Status::Unverified,
+                "この書き込み経路は実機で未検証です（CLI の書き込みは実機で実行済み）",
             );
             ui.add_space(space::M);
             self.port_row(ui);
@@ -1440,11 +1571,9 @@ impl FirmwareScreen {
             ui.horizontal(|ui| {
                 ui.checkbox(
                     &mut self.allow_vendor,
-                    RichText::new(is_meaning(
-                        "ベンダーイメージを書き込む（--allow-vendor 相当）",
-                    ))
-                    .size(size::CAPTION)
-                    .color(theme::MUTE),
+                    RichText::new("ベンダーイメージを書き込む（--allow-vendor 相当）")
+                        .size(size::CAPTION)
+                        .color(theme::MUTE),
                 );
             });
             if self.allow_vendor {
@@ -1474,11 +1603,9 @@ impl FirmwareScreen {
             }
             ui.checkbox(
                 &mut self.assume_brom,
-                RichText::new(is_meaning(
-                    "端末はすでに BootROM にいる（--assume-brom 相当）",
-                ))
-                .size(size::CAPTION)
-                .color(theme::MUTE),
+                RichText::new("端末はすでに BootROM にいる（--assume-brom 相当）")
+                    .size(size::CAPTION)
+                    .color(theme::MUTE),
             );
 
             ui.add_space(space::M);
@@ -1502,9 +1629,6 @@ impl FirmwareScreen {
                     .color(theme::MUTE),
             );
         });
-
-        ui.add_space(space::M);
-        self.write_state_panel(ui);
     }
 
     /// Progress, result, or the failure's next steps.
@@ -1534,7 +1658,11 @@ impl FirmwareScreen {
                 );
             }
             FlashState::Succeeded { packets, verified } => {
-                common::status_line(ui, Status::Ok, "読み戻し一致（検証済み）");
+                common::status_line(
+                    ui,
+                    Status::Ok,
+                    "読み戻しが一致しました（実機での書き込み検証は未実施）",
+                );
                 ui.add_space(space::S);
                 common::figure_row(ui, "パケット", &common::grouped(packets));
                 common::figure_row(
@@ -1711,11 +1839,6 @@ fn cli_note(command: &str) -> String {
     format!("CLI の {command} と同じ処理です")
 }
 
-/// A label for a checkbox: spelled out so the meaning is on screen.
-fn is_meaning(text: &str) -> String {
-    String::from(text)
-}
-
 /// A synthesised stock V1.13 image, for the sample.
 fn sample_image() -> Vec<u8> {
     use m241_core::firmware::image::{
@@ -1783,24 +1906,6 @@ fn file_label(path: &str) -> String {
         .unwrap_or_else(|| String::from(path))
 }
 
-/// The command that restores a unit from its own dump, for the CLI-equivalence
-/// note. The GUI itself performs the write; this is only the sentence a reader
-/// who wants a terminal would type.
-#[cfg(test)]
-fn recovery_command(source: &str, patched: &str) -> String {
-    let backup = if source.trim().is_empty() {
-        "backup/stock.bin"
-    } else {
-        source.trim()
-    };
-    let image = if patched.trim().is_empty() {
-        "fixed.bin"
-    } else {
-        patched.trim()
-    };
-    format!("m241 fw flash {image} --da DA_v3.8.4.bin --backup {backup} --port PORT --yes")
-}
-
 /// The write button's (surface, label) pair for its two states.
 #[must_use]
 fn confirm_button_colours(amber: Color32, armed: bool) -> (Color32, Color32) {
@@ -1817,15 +1922,10 @@ pub fn version() -> &'static str {
     VERSION
 }
 
-/// The host's read-back count, for a caller that only has a [`WriteReport`].
-#[must_use]
-pub fn verified_bytes(report: &WriteReport) -> usize {
-    report.verified
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use m241_flash::da::{PACKET_SIZE, WriteReport};
 
     fn screen() -> FirmwareScreen {
         FirmwareScreen::default()
@@ -2072,14 +2172,14 @@ mod tests {
             crate::device::JobEvent::WriteDone(WriteReport {
                 start: FLASH_WRITE_START,
                 length: FLASH_WRITE_LENGTH,
-                packets: FLASH_WRITE_LENGTH.div_ceil(256),
+                packets: FLASH_WRITE_LENGTH.div_ceil(PACKET_SIZE),
                 verified: FLASH_WRITE_LENGTH,
             }),
         );
         assert_eq!(
             screen.flash,
             FlashState::Succeeded {
-                packets: FLASH_WRITE_LENGTH.div_ceil(256),
+                packets: FLASH_WRITE_LENGTH.div_ceil(PACKET_SIZE),
                 verified: FLASH_WRITE_LENGTH,
             }
         );
@@ -2104,6 +2204,121 @@ mod tests {
     }
 
     #[test]
+    fn a_dump_is_two_reads_and_the_second_pass_needs_the_first() {
+        // The GUI's dump is the CLI's two reads: a first pass that reports its
+        // digest, a physical power cycle, then a second pass compared against it.
+        // A one-read dump would mark a truncated read as verified, and the
+        // backup is the only way back.
+        let mut screen = screen();
+        screen.port = String::from("/dev/ttyUSB0");
+        screen.dump_path = String::from("backup/stock.bin");
+        screen.dump = DumpState::Idle;
+        let error = screen
+            .start_dump_second()
+            .expect_err("the second pass must not start before the first");
+        assert!(
+            error.contains("1 回目"),
+            "the refusal does not say why: {error}"
+        );
+        assert!(!screen.busy(), "a refused second pass started a job");
+
+        // The first pass's event is what arms the second one, and the digest it
+        // reports is what the comparison will use.
+        screen.apply_event(
+            JobKind::Dump,
+            crate::device::JobEvent::DumpFirst {
+                digest: String::from("aaaa"),
+                bytes: 406_620,
+            },
+        );
+        assert_eq!(
+            screen.dump,
+            DumpState::WaitingForPowerCycle {
+                total: 406_620,
+                digest: String::from("aaaa"),
+            }
+        );
+        assert!(
+            screen.start_dump_second().is_ok(),
+            "the second pass must start once the first finished"
+        );
+        assert!(screen.busy(), "the second pass did not start a job");
+    }
+
+    #[test]
+    fn two_reads_that_disagree_are_shown_and_nothing_is_verified() {
+        let mut screen = screen();
+        screen.apply_event(
+            JobKind::Dump,
+            crate::device::JobEvent::DumpMismatch {
+                first: String::from("aaaa"),
+                second: String::from("bbbb"),
+            },
+        );
+        assert_eq!(
+            screen.dump,
+            DumpState::Mismatch {
+                first: String::from("aaaa"),
+                second: String::from("bbbb"),
+            }
+        );
+        assert!(
+            !matches!(screen.dump, DumpState::Verified { .. }),
+            "a mismatched pair must never look verified"
+        );
+        assert!(
+            screen.image.is_none(),
+            "a mismatched pair must not become the loaded backup image"
+        );
+    }
+
+    #[test]
+    fn two_reads_that_agree_become_the_loaded_backup() {
+        let mut screen = screen();
+        screen.dump_path = String::from("backup/stock.bin");
+        screen.apply_event(
+            JobKind::Dump,
+            crate::device::JobEvent::Dumped(sample_image()),
+        );
+        let DumpState::Verified { bytes, digest } = &screen.dump else {
+            panic!("an agreeing pair must be verified, got {:?}", screen.dump);
+        };
+        assert_eq!(*bytes, PROFILE_V1_13.size);
+        assert!(!digest.is_empty(), "the saved digest is empty");
+        assert!(
+            screen.image.is_some(),
+            "the verified dump must become the backup image"
+        );
+    }
+
+    #[test]
+    fn the_write_success_text_does_not_claim_hardware_verification() {
+        // `検証済み` is the repository's word for a hardware measurement, so a
+        // read-back match must not use it (readability Must 1). The screen says
+        // 未検証 in the write step and qualifies the success line instead.
+        let mut screen = screen();
+        screen.apply_event(
+            JobKind::Write,
+            crate::device::JobEvent::WriteDone(WriteReport {
+                start: FLASH_WRITE_START,
+                length: FLASH_WRITE_LENGTH,
+                packets: FLASH_WRITE_LENGTH.div_ceil(PACKET_SIZE),
+                verified: FLASH_WRITE_LENGTH,
+            }),
+        );
+        let (status, text) = screen.message.clone().expect("a result message was set");
+        assert_eq!(status, Status::Ok);
+        assert!(
+            text.contains("未実施") || text.contains("検証は別途"),
+            "the success line claims more than a read-back match: {text}"
+        );
+        assert!(
+            !text.contains("検証済み"),
+            "the success line uses the hardware word 検証済み: {text}"
+        );
+    }
+
+    #[test]
     fn the_file_write_keeps_the_backup_and_names_the_copy() {
         assert_eq!(
             Path::new(&default_patched_name("backup/stock.bin")),
@@ -2123,21 +2338,12 @@ mod tests {
     }
 
     #[test]
-    fn the_recovery_command_names_both_images() {
-        let command = recovery_command("backup/stock.bin", "backup/stock.fixed.bin");
-        assert!(command.contains("backup/stock.bin"), "got {command}");
-        assert!(command.contains("backup/stock.fixed.bin"), "got {command}");
-        assert!(command.trim_start().starts_with("m241 "), "got {command}");
-        assert!(
-            command.contains("--backup backup/stock.bin"),
-            "got {command}"
-        );
-    }
-
-    #[test]
     fn the_waiting_state_holds_the_dump_progress_at_one_hundred_percent() {
         assert_eq!(
-            dump_progress(&DumpState::WaitingForPowerCycle { total: 406_620 }),
+            dump_progress(&DumpState::WaitingForPowerCycle {
+                total: 406_620,
+                digest: String::from("first"),
+            }),
             Some(1.0)
         );
         assert_eq!(dump_progress(&DumpState::Idle), Some(0.0));

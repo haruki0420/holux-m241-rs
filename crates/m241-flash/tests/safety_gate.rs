@@ -8,7 +8,10 @@
 //!
 //! * the GUI's write route: its manifest and tree must reach `m241-flash`,
 //!   `device.rs` must call `flow::flash(`, and `firmware.rs` must build the
-//!   confirmation from its typed word; a destructive opcode in GUI code fails;
+//!   confirmation from its typed word; the connect screen must do the same for
+//!   its typed `PROBE` word; a destructive opcode in GUI code fails in all three
+//!   of its forms (bare hex literal, `\xNN` escape, `$PMTK182,6`), while the
+//!   screen's operator prose and the colour/fixture literals pass;
 //! * each forbidden command, escape form, write-shaped identifier, misplaced
 //!   `set_control_lines` reference, reversed dependency, and digest-based image
 //!   acceptance fails and names the violated rule;
@@ -171,6 +174,13 @@ impl FakeRepo {
             "pub const CONFIRMATION: &str = \"WRITE\";\npub fn c() { Confirmation::granted(); }\n",
         )
         .unwrap();
+        // The `fw probe-da` half of the same rule: the DA loads into RAM and can
+        // program flash itself, so its typed word is the only gate too.
+        std::fs::write(
+            gui.join("src").join("screens").join("connect.rs"),
+            "pub const PROBE_CONFIRMATION: &str = \"PROBE\";\npub fn p() { Confirmation::granted(); }\n",
+        )
+        .unwrap();
 
         let repo = Self { root };
         for (relative, source) in core_files {
@@ -268,11 +278,6 @@ fn without_layout_gate_in(da_rs: &str, function: &str) -> String {
     let (head, tail) = normalized.split_at(start);
     let tail = tail.replacen("        check_layout()?;\n", "", 1);
     format!("{head}{tail}")
-}
-
-/// Remove `DownloadAgent::write`'s layout-gate line, accepting LF or CRLF.
-fn without_layout_gate(da_rs: &str) -> String {
-    without_layout_gate_in(da_rs, "write")
 }
 
 #[test]
@@ -538,9 +543,10 @@ fn write_path_identifiers_in_src_and_tests_are_reported() {
 #[test]
 fn removing_check_layout_from_the_real_write_body_is_reported() {
     // The exact regression this gate exists for: the call is deleted from
-    // `DownloadAgent::write` and every unit test still passes, because they
-    // exercise `write_range` directly. The temporary workspace holds the real
-    // file with only that line removed.
+    // `DownloadAgent::write_with_progress` and every unit test still passes,
+    // because they exercise `write_range` directly. The temporary workspace holds
+    // the real file with only that line removed. `write` itself now delegates to
+    // `write_with_progress`, so the guarded body is the `_with_progress` one.
     let real = std::fs::read_to_string(
         repo_root()
             .join("crates")
@@ -550,7 +556,7 @@ fn removing_check_layout_from_the_real_write_body_is_reported() {
     )
     .expect("crates/m241-flash/src/da.rs is missing");
     let normalized = real.replace("\r\n", "\n");
-    let without = without_layout_gate(&real);
+    let without = without_layout_gate_in(&real, "write_with_progress");
     assert_ne!(
         without, normalized,
         "the `check_layout()?;` line was not found in the real write body"
@@ -558,14 +564,15 @@ fn removing_check_layout_from_the_real_write_body_is_reported() {
 
     let repo = FakeRepo::new("da-real-minus-layout", &[]);
     repo.write_flash_da(&without);
-    repo.assert_reports("does not call `check_layout()?`");
+    repo.assert_reports("`pub fn write_with_progress` does not call `check_layout()?`");
 }
 
 #[test]
 fn removing_check_layout_from_the_real_write_vendor_body_is_reported() {
-    // `write_vendor` reaches `write_range_accepted`, not `write_range`; the
-    // gate must cover it too. Remove only its own line, leaving `write`'s line
-    // intact, so a gate that still checked only `pub fn write(` would pass.
+    // `write_vendor_with_progress` reaches `write_range_accepted_with_progress`,
+    // not `write_range`; the gate must cover it too. Remove only its own line,
+    // leaving the strict writer's line intact, so a gate that still checked only
+    // `pub fn write_with_progress` would pass.
     let real = std::fs::read_to_string(
         repo_root()
             .join("crates")
@@ -574,16 +581,16 @@ fn removing_check_layout_from_the_real_write_vendor_body_is_reported() {
             .join("da.rs"),
     )
     .expect("crates/m241-flash/src/da.rs is missing");
-    let without = without_layout_gate_in(&real, "write_vendor");
+    let without = without_layout_gate_in(&real, "write_vendor_with_progress");
     assert_ne!(without, real.replace("\r\n", "\n"));
     assert!(
         without.contains("        check_layout()?;\n"),
-        "the `write` layout-gate line must remain for this mutation"
+        "the strict writer's layout-gate line must remain for this mutation"
     );
 
     let repo = FakeRepo::new("da-real-minus-vendor-layout", &[]);
     repo.write_flash_da(&without);
-    repo.assert_reports("`pub fn write_vendor` does not call `check_layout()?`");
+    repo.assert_reports("`pub fn write_vendor_with_progress` does not call `check_layout()?`");
 }
 
 #[test]
@@ -614,14 +621,14 @@ fn a_crlf_checkout_detects_the_removed_layout_gate() {
         "the safety gate rejected a compliant CRLF da.rs:\n{report}"
     );
 
-    let without = without_layout_gate(&crlf);
+    let without = without_layout_gate_in(&crlf, "write_with_progress");
     assert!(
         without.contains("check_layout()?;"),
         "the other writer's layout-gate line must remain: {without}"
     );
     assert!(
-        without_layout_gate_in(&crlf, "write_vendor").contains("check_layout()?;"),
-        "the write_vendor layout-gate line must remain"
+        without_layout_gate_in(&crlf, "write_vendor_with_progress").contains("check_layout()?;"),
+        "the vendor writer's layout-gate line must remain"
     );
     // Feed the gate a CRLF file that is missing the call, not an LF one.
     let without_crlf = without.replace('\n', "\r\n");
@@ -799,6 +806,192 @@ fn a_destructive_opcode_in_gui_code_is_reported() {
     )
     .unwrap();
     repo.assert_reports("destructive command");
+}
+
+#[test]
+fn a_bare_hex_opcode_in_gui_code_is_reported() {
+    // The shape the old gate missed entirely: a literal in GUI code, with and
+    // without an integer suffix. Both are valid Rust and neither contains a
+    // backslash, so the escape pattern could never see them.
+    for (label, snippet, token) in [
+        ("gui-bare-d3", "let _: u8 = 0xD3;", "0xD3"),
+        ("gui-bare-d5-suffix", "let _: u8 = 0xD5u8;", "0xD5u8"),
+        ("gui-bare-d9", "let _: u8 = 0xD9;", "0xD9"),
+    ] {
+        let repo = FakeRepo::new(label, &[]);
+        std::fs::write(
+            repo.root
+                .join("crates")
+                .join("m241-gui")
+                .join("src")
+                .join("device.rs"),
+            format!("pub fn go() {{ flow::flash(); {snippet} }}\n"),
+        )
+        .unwrap();
+        repo.assert_reports(token);
+    }
+}
+
+#[test]
+fn a_hex_escape_opcode_in_gui_code_is_reported() {
+    // `\xNN` only ever appears inside a string or byte literal. The old gate
+    // masked string contents before matching, so this pattern was dead on
+    // arrival; scanning comment-stripped source with the strings kept is what
+    // makes it fire.
+    for (label, snippet, token) in [
+        ("gui-escape-d3", "let _ = b\"\\xd3\";", "\\xd3"),
+        ("gui-escape-d5", "let _ = b\"\\xD5\\x00\";", "\\xD5"),
+        ("gui-escape-d9", "let _ = \"\\xD9\";", "\\xD9"),
+    ] {
+        let repo = FakeRepo::new(label, &[]);
+        std::fs::write(
+            repo.root
+                .join("crates")
+                .join("m241-gui")
+                .join("src")
+                .join("device.rs"),
+            format!("pub fn go() {{ flow::flash(); {snippet} }}\n"),
+        )
+        .unwrap();
+        repo.assert_reports(token);
+    }
+}
+
+#[test]
+fn a_pmtk_erase_in_gui_code_is_reported() {
+    let repo = FakeRepo::new("gui-pmtk182-6", &[]);
+    std::fs::write(
+        repo.root
+            .join("crates")
+            .join("m241-gui")
+            .join("src")
+            .join("device.rs"),
+        "pub fn go() { flow::flash(); let _ = \"$PMTK182,6\"; }\n",
+    )
+    .unwrap();
+    repo.assert_reports("PMTK182,6");
+}
+
+#[test]
+fn gui_operator_prose_naming_an_opcode_is_not_a_finding() {
+    // The screen says `0xD9` to the user on purpose, and a comment explains why
+    // the GUI has none. The first is a masked string, the second is stripped
+    // with the comment. `$PMTK182,6` inside a string is deliberately still a
+    // finding (a GUI that carries the erase sentence in its code is one edit
+    // away from sending it); use a comment for that prose.
+    let repo = FakeRepo::new("gui-prose", &[]);
+    std::fs::write(
+        repo.root
+            .join("crates")
+            .join("m241-gui")
+            .join("src")
+            .join("screens")
+            .join("firmware.rs"),
+        "pub const CONFIRMATION: &str = \"WRITE\";\npub fn c() { Confirmation::granted(); }\n\
+         // 0xD3 is sent by m241-flash, never here; neither is $PMTK182,6.\n\
+         pub const NOTE: &str = \"0xD9 を送りました\";\n",
+    )
+    .unwrap();
+    let (passed, report) = repo.run();
+    assert!(
+        passed,
+        "the safety gate treated the screen's prose as a destructive command:\n{report}"
+    );
+}
+
+#[test]
+fn a_colour_or_journal_fixture_literal_is_not_an_opcode() {
+    // `0xD9` is also an RGB channel and a byte of the journal fixture. Those two
+    // files are the documented exemption; removing it would make the gate cry
+    // wolf and the next person would delete the rule.
+    let repo = FakeRepo::new("gui-colour", &[]);
+    std::fs::write(
+        repo.root
+            .join("crates")
+            .join("m241-gui")
+            .join("src")
+            .join("theme.rs"),
+        "pub const PINK: (u8, u8, u8) = (0xD9, 0x85, 0xA8);\n",
+    )
+    .unwrap();
+    let (passed, report) = repo.run();
+    assert!(
+        passed,
+        "the safety gate reported an RGB channel as an opcode:\n{report}"
+    );
+
+    let journal = FakeRepo::new("gui-journal-fixture", &[]);
+    std::fs::write(
+        journal
+            .root
+            .join("crates")
+            .join("m241-gui")
+            .join("src")
+            .join("screens")
+            .join("log.rs"),
+        "pub fn fixture() -> Vec<u8> { vec![0xFF, 0xD9] }\n",
+    )
+    .unwrap();
+    let (passed, report) = journal.run();
+    assert!(
+        passed,
+        "the safety gate reported a journal fixture byte as an opcode:\n{report}"
+    );
+}
+
+#[test]
+fn a_gui_write_job_outside_the_firmware_screen_is_reported() {
+    // The token and the job together are the write route. Building the job in
+    // another screen would skip that screen's typed-word check, even though
+    // both files are listed as allowed for the token itself.
+    let repo = FakeRepo::new("gui-job-outside", &[]);
+    std::fs::write(
+        repo.root
+            .join("crates")
+            .join("m241-gui")
+            .join("src")
+            .join("screens")
+            .join("connect.rs"),
+        "pub const PROBE_CONFIRMATION: &str = \"PROBE\";\n\
+         pub fn p() { Confirmation::granted(); Job::Flash(FlashJob {}); }\n",
+    )
+    .unwrap();
+    repo.assert_reports("`Job::Flash` constructed outside the Firmware screen");
+}
+
+#[test]
+fn a_gui_confirmation_outside_the_typed_word_screens_is_reported() {
+    let repo = FakeRepo::new("gui-token-outside", &[]);
+    std::fs::write(
+        repo.root
+            .join("crates")
+            .join("m241-gui")
+            .join("src")
+            .join("lib.rs"),
+        "pub fn arm() { Confirmation::granted(); }\n",
+    )
+    .unwrap();
+    repo.assert_reports("outside the screens that check the typed word");
+}
+
+#[test]
+fn a_gui_probe_without_its_typed_word_is_reported() {
+    // `fw probe-da` loads the DA into RAM; the loaded DA can erase and program
+    // flash itself, so `PROBE` is its only gate. A connect screen that builds
+    // the token without the typed-word constant must fail even when the
+    // firmware screen is intact.
+    let repo = FakeRepo::new("gui-probe-no-word", &[]);
+    std::fs::write(
+        repo.root
+            .join("crates")
+            .join("m241-gui")
+            .join("src")
+            .join("screens")
+            .join("connect.rs"),
+        "pub fn p() { Confirmation::granted(); }\n",
+    )
+    .unwrap();
+    repo.assert_reports("typed `PROBE` word");
 }
 
 #[test]

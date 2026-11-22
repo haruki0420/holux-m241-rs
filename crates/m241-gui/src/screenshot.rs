@@ -454,6 +454,27 @@ fn composite(target: &mut [u8], source: [f32; 4]) {
     }
 }
 
+/// Render one frame and write it as a PNG.
+///
+/// The repeated render → encode → write → record step of [`write_all`]. Pulled
+/// out so a frame that silently fails to encode cannot be lost in a copy of the
+/// sequence; every failure keeps the path it was writing.
+fn write_frame(
+    directory: &Path,
+    name: &str,
+    app: &mut App,
+    screen: Screen,
+    size: Vec2,
+) -> Result<std::path::PathBuf, String> {
+    let image = render(app, screen, size);
+    let path = directory.join(name);
+    let png = image
+        .to_png()
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    std::fs::write(&path, png).map_err(|err| format!("{} を書けません: {err}", path.display()))?;
+    Ok(path)
+}
+
 /// Render every screen at both sizes DESIGN.md §8 names, into `directory`.
 ///
 /// # Errors
@@ -469,24 +490,19 @@ pub fn write_all(directory: &Path) -> Result<Vec<std::path::PathBuf>, String> {
         for screen in Screen::ALL {
             let mut app = App::default();
             prepare(&mut app, screen);
-            let image = render(&mut app, screen, Vec2::new(width, height));
-            let path = directory.join(format!(
-                "{}-{}x{}.png",
-                slug(screen),
-                width as u32,
-                height as u32
-            ));
-            let png = image
-                .to_png()
-                .map_err(|err| format!("{}: {err}", path.display()))?;
-            std::fs::write(&path, png)
-                .map_err(|err| format!("{} を書けません: {err}", path.display()))?;
-            written.push(path);
+            let name = format!("{}-{}x{}.png", slug(screen), width as u32, height as u32);
+            written.push(write_frame(
+                directory,
+                &name,
+                &mut app,
+                screen,
+                Vec2::new(width, height),
+            )?);
         }
     }
-    // The write step has four layouts a device is needed to produce: running,
-    // read-back verified, and the recovery state after a failure. The review is
-    // of the flow, not of one frame, so they are rendered beside the screens.
+    // The write step has three layouts a device is needed to produce: running,
+    // a read-back match, and the recovery state after a failure. The review is of
+    // the flow, not of one frame, so they are rendered beside the screens.
     for (suffix, state, undefined) in [
         (
             "write-progress",
@@ -501,7 +517,7 @@ pub fn write_all(directory: &Path) -> Result<Vec<std::path::PathBuf>, String> {
         (
             "write-result",
             FlashState::Succeeded {
-                packets: m241_flash::da::FLASH_WRITE_LENGTH.div_ceil(256),
+                packets: m241_flash::da::FLASH_WRITE_LENGTH.div_ceil(m241_flash::da::PACKET_SIZE),
                 verified: m241_flash::da::FLASH_WRITE_LENGTH,
             },
             false,
@@ -524,14 +540,54 @@ pub fn write_all(directory: &Path) -> Result<Vec<std::path::PathBuf>, String> {
                 "32fe52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435",
             ),
         });
-        let image = render(&mut app, Screen::Firmware, Vec2::new(1280.0, 800.0));
-        let path = directory.join(format!("firmware-{suffix}-1280x800.png"));
-        let png = image
-            .to_png()
-            .map_err(|err| format!("{}: {err}", path.display()))?;
-        std::fs::write(&path, png)
-            .map_err(|err| format!("{} を書けません: {err}", path.display()))?;
-        written.push(path);
+        let name = format!("firmware-{suffix}-1280x800.png");
+        written.push(write_frame(
+            directory,
+            &name,
+            &mut app,
+            Screen::Firmware,
+            Vec2::new(1280.0, 800.0),
+        )?);
+    }
+    // The two-read dump's intermediate states: the power-cycle prompt between the
+    // reads, and the mismatch that must never be saved. Neither is reachable
+    // without a unit, so they are rendered with injected state like the write
+    // frames.
+    for (suffix, state) in [
+        (
+            "dump-power-cycle",
+            DumpState::WaitingForPowerCycle {
+                total: 406_620,
+                digest: String::from(
+                    "32fe52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435",
+                ),
+            },
+        ),
+        (
+            "dump-mismatch",
+            DumpState::Mismatch {
+                first: String::from(
+                    "32fe52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435",
+                ),
+                second: String::from(
+                    "aa3e52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435",
+                ),
+            },
+        ),
+    ] {
+        let mut app = App::default();
+        prepare(&mut app, Screen::Firmware);
+        app.firmware_mut()
+            .set_step(crate::screens::firmware::Step::Dump);
+        app.firmware_mut().set_dump_state(state);
+        let name = format!("firmware-{suffix}-1280x800.png");
+        written.push(write_frame(
+            directory,
+            &name,
+            &mut app,
+            Screen::Firmware,
+            Vec2::new(1280.0, 800.0),
+        )?);
     }
     // The Connect screen's three device-side actions need a device to produce
     // their finished states, so the review image is taken with a sample report.
@@ -561,7 +617,7 @@ pub fn write_all(directory: &Path) -> Result<Vec<std::path::PathBuf>, String> {
                 files: vec![crate::device::DropFile {
                     path: String::from("vendor/DA_v3.8.4.bin"),
                     size: 14_896,
-                    kind: String::from("DA_v3.8.4.bin（DA）"),
+                    kind: crate::device::DropKind::Da,
                 }],
                 da_source: Some(String::from("vendor/DA_v3.8.4.bin")),
                 ..crate::device::DoctorReport::default()
@@ -591,14 +647,13 @@ pub fn write_all(directory: &Path) -> Result<Vec<std::path::PathBuf>, String> {
                 ],
                 settled: Some(m241_flash::da::PROBE_ADDRESSES[0]),
             }));
-        let image = render(&mut app, Screen::Connect, Vec2::new(1280.0, 800.0));
-        let path = directory.join("connect-diagnostics-1280x800.png");
-        let png = image
-            .to_png()
-            .map_err(|err| format!("{}: {err}", path.display()))?;
-        std::fs::write(&path, png)
-            .map_err(|err| format!("{} を書けません: {err}", path.display()))?;
-        written.push(path);
+        written.push(write_frame(
+            directory,
+            "connect-diagnostics-1280x800.png",
+            &mut app,
+            Screen::Connect,
+            Vec2::new(1280.0, 800.0),
+        )?);
     }
     // The DA probe's result needs its own frame: with the full doctor report on
     // screen it lands below the fold, and a result a reviewer cannot see is not
@@ -632,14 +687,13 @@ pub fn write_all(directory: &Path) -> Result<Vec<std::path::PathBuf>, String> {
                 ],
                 settled: Some(m241_flash::da::PROBE_ADDRESSES[0]),
             }));
-        let image = render(&mut app, Screen::Connect, Vec2::new(1280.0, 800.0));
-        let path = directory.join("connect-probe-da-1280x800.png");
-        let png = image
-            .to_png()
-            .map_err(|err| format!("{}: {err}", path.display()))?;
-        std::fs::write(&path, png)
-            .map_err(|err| format!("{} を書けません: {err}", path.display()))?;
-        written.push(path);
+        written.push(write_frame(
+            directory,
+            "connect-probe-da-1280x800.png",
+            &mut app,
+            Screen::Connect,
+            Vec2::new(1280.0, 800.0),
+        )?);
     }
     Ok(written)
 }

@@ -351,30 +351,28 @@ impl ConnectScreen {
         let Some(kind) = self.job.as_ref().map(|(kind, _)| *kind) else {
             return false;
         };
+        let (events, disconnected) = match self.job.as_ref() {
+            Some((_, rx)) => device::poll_channel(rx),
+            None => return false,
+        };
         let mut finished = false;
-        loop {
-            let received = match self.job.as_ref() {
-                Some((_, rx)) => match rx.try_recv() {
-                    Ok(event) => Some(Ok(event)),
-                    Err(mpsc::TryRecvError::Empty) => None,
-                    Err(mpsc::TryRecvError::Disconnected) => Some(Err(())),
-                },
-                None => None,
-            };
-            match received {
-                Some(Ok(event)) => {
-                    if self.apply_job_event(kind, event) {
-                        finished = true;
-                        break;
-                    }
-                }
-                Some(Err(())) => {
-                    self.fail(kind, String::from("処理が結果を返さずに終了しました"));
-                    finished = true;
-                    break;
-                }
-                None => break,
+        for event in events {
+            if self.apply_job_event(kind, event) {
+                finished = true;
+                break;
             }
+        }
+        if !finished && disconnected {
+            // The worker sends its own failure before returning; a disconnect
+            // without one is a thread that died, and the unit's state is unknown.
+            self.fail(
+                kind,
+                String::from(
+                    "処理が結果を返さずに終了しました。端末の状態は不明です。\
+                     吸い出しで確認するか、復旧の手順に進んでください",
+                ),
+            );
+            finished = true;
         }
         if finished {
             self.job = None;
@@ -417,6 +415,8 @@ impl ConnectScreen {
             }
             JobEvent::Flow(_)
             | JobEvent::Dumped(_)
+            | JobEvent::DumpFirst { .. }
+            | JobEvent::DumpMismatch { .. }
             | JobEvent::WriteDone(_)
             | JobEvent::RecoverDone(_)
             | JobEvent::BootRomAnswered => true,
@@ -773,7 +773,9 @@ impl ConnectScreen {
     ///
     /// The CLI's three device-side commands, without a terminal. Every control
     /// says which command it is the same as, so a reader who has only the manual
-    /// can still tell what will happen.
+    /// can still tell what will happen. Kept as one function because the three
+    /// sections share one `message` line and one busy flag; splitting them would
+    /// pass the same `&mut self` to three pieces of one panel.
     fn diagnostics_panel(&mut self, ui: &mut Ui) {
         // Collapsed by default: the port list and the device panels are the
         // screen's first answer, and an always-open block pushed them below the
@@ -1100,6 +1102,9 @@ fn doctor_report(ui: &mut Ui, report: &DoctorReport) {
             &format!("{name}  {}", if *likely { "候補" } else { "—" }),
         );
     }
+    if let Some(reason) = &report.ports_error {
+        common::status_line(ui, Status::Err, reason);
+    }
     match (&report.identity, &report.probe_error) {
         (Some(identity), _) => {
             common::figure_row(ui, "ファーム", &identity.release);
@@ -1117,7 +1122,12 @@ fn doctor_report(ui: &mut Ui, report: &DoctorReport) {
             common::figure_row(
                 ui,
                 " ",
-                &format!("{kind}  {}  {}", common::bytes(*size), file_name(path)),
+                &format!(
+                    "{}  {}  {}",
+                    kind.label(),
+                    common::bytes(*size),
+                    file_name(path)
+                ),
             );
         }
         if let Some(source) = &report.da_source {
@@ -1222,6 +1232,7 @@ fn sample_summary() -> LogSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device::DropKind;
 
     fn screen() -> ConnectScreen {
         ConnectScreen::default()
@@ -1508,7 +1519,7 @@ mod tests {
             files: vec![DropFile {
                 path: String::from("vendor/DA_v3.8.4.bin"),
                 size: 14_896,
-                kind: String::from("DA_v3.8.4.bin（DA）"),
+                kind: DropKind::Da,
             }],
             ..DoctorReport::default()
         };

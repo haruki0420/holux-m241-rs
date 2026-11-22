@@ -67,11 +67,21 @@ GUI 側の新しい不変条件は次のとおり。
 
 - GUI の書き込みは `m241_flash::flow::flash` を通る（`crates/m241-gui/src/device.rs`）。
   GUI が独自に `0xD3` / `0xD5` を送る第 2 の実装を持たない。
-- `Confirmation` はファーム画面の「`WRITE` と入力」からしか作らない。`--yes` 相当の
-  省略経路は GUI に存在しない。`probe-da` も `PROBE`、`0xD9` 再起動も `RESTART` の
-  入力なしには実行できない。
-- GUI のコードに破壊的オペコード（`OPCODE_*`、`\xNN` 形式、`$PMTK182,6`）が
-  現れない。UI 文言中の `0xD9` などはコメント・文字列をマスクして除外する。
+- `Confirmation` を作れる GUI ファイルを限定する: ファーム画面は「`WRITE` と入力」、
+  接続画面は「`PROBE` と入力」から作る。`Confirmation::granted` はこの 2 画面
+  （とジョブ enum を持つ `device.rs` のテスト）以外では検出され、`Job::Flash` は
+  ファーム画面以外での構築が検出される。`--yes` 相当の省略経路は GUI に存在しない。
+  `0xD9` 再起動も `RESTART` の入力なしには実行できない（これはゲートの対象外で、
+  アクション先頭の再検査と単体テストで固定する）。
+- GUI のコードに破壊的オペコード（`OPCODE_*`、裸の `0xD3` 等の整数リテラル、
+  `\xNN` 形式、`$PMTK182,6`）が現れない。走査は 2 系統: 識別子と裸リテラルは
+  コメント・文字列の中身をマスクしたソース（画面の運用文 `0xD9` を誤検出しない）、
+  `\xNN` と `$PMTK182,6` はコメントのみ除いたソース（この 2 形態は文字列の中に
+  しか現れないため、マスクすると死んだパターンになる — Stage 1 の Must 1）。
+  `theme.rs` の RGB 値とログ fixture の `0xD9` だけはパスを限定して除外する。
+- GUI の吸い出しは CLI と同じ **2 回読み**（1 回目の後に電池を抜き差し）で、
+  SHA-256 が一致したときだけファイルを保存する。1 回読みの切り詰めを
+  「検証済み」にしない。
 
 ## GUI からの書き込み（2026-11-23 の設計変更）
 
@@ -86,9 +96,16 @@ GUI を主要な操作面にするよう明示的に指示したため、この�
   `WRITE` を入力したときだけ構築され、`--yes` に相当するボタンや自動化経路は無い。
   `fw probe-da` は `PROBE`、`fw da-restart` は `RESTART` の入力で確認する。
 - GUI は破壊的オペコードを自分では持たない（`tools/check_safety.py` がコード中の
-  `OPCODE_*` / `\xNN` / `$PMTK182,6` を検査）。UI 文言・コメントは対象外。
-- 実機での GUI 書き込みは未検証である。シミュレータで「ダンプ→パッチ→書き込み→
-  読み戻し一致」「不一致→復旧」「WRITE 未入力では書かない」を固定している。
+  `OPCODE_*` / 裸の整数リテラル / `\xNN` / `$PMTK182,6` を検査）。UI 文言・コメントは
+  対象外。**このゲートは旧ゲート（依存グラフで構造的に禁止）より弱い。** 旧ゲートは
+  GUI 内の変更では迂回できなかったが、新しいゲートはテキスト検査であり、チェッカー
+  自身を弱める編集と一緒なら通る。構造で残っている保証は `m241-flash` 側
+  （固定範囲・`check_layout`・`check_image`・`verify_device`・読み戻し）だけ。
+- GUI の吸い出しは CLI と同じ 2 回読みで、ハッシュが一致したときだけ保存する。
+  1 回読みの切り詰めを「検証済み」にしない。
+- 実機での GUI 書き込みは未検証である。シミュレータで「2 回読み→ダンプ→パッチ→
+  書き込み→読み戻し一致」「2 回の読み取り不一致は保存しない」「不一致→復旧」
+  「WRITE 未入力では書かない」を固定している。
 
 ## 書き込み経路のレビュー（必須）
 
@@ -308,7 +325,8 @@ GUI を主要な操作面にするよう明示的に指示したため、この�
 | `cargo tree -p m241-flash --edges normal,build,dev` に `m241-core` がある | 正しい向きの依存が消えていない |
 | `crates/m241-core/Cargo.toml` が `m241-flash` を名指ししない | 解決結果に出ない形の依存（dev 依存など）も塞ぐ。読み取り専用バイナリが書き込みルーチンを持たない |
 | `crates/m241-gui/Cargo.toml` が `m241-flash` を名指しし、`device.rs` が `flow::flash(` を呼び、`firmware.rs` が `Confirmation::granted` と `CONFIRMATION` を持つ | GUI の書き込みが共有経路を通り、`WRITE` 入力からしか確認トークンを作らない |
-| `crates/m241-gui/src`・`tests` のコード（コメント・文字列を除く）に `OPCODE_*` / `\xNN` / `$PMTK182,6` が無い | GUI が破壊的オペコードを自分で送る第 2 の実装を持たない |
+| `crates/m241-gui/src`・`tests` のコードに `OPCODE_*` / 裸の `0xD3` 等の整数リテラル / `\xNN` / `$PMTK182,6` が無い（裸リテラルと識別子は文字列をマスク、`\xNN` と PMTK は文字列を保持して走査） | GUI が破壊的オペコードを自分で送る第 2 の実装を持たない |
+| `Confirmation::granted` が `firmware.rs` / `connect.rs` / `device.rs`（テスト）以外に無く、`Job::Flash` が `device.rs` / `firmware.rs` 以外に無い | タイプ語を検査しない画面から書き込み経路を作れない（テキスト検査であり、型による証明ではない） |
 | `set_control_lines` が `crates/m241-core/src/protocol/brom.rs` / `crates/m241-core/src/protocol/port.rs` / `crates/m241-core/src/protocol/simulator.rs` 以外に無い | DTR/RTS を触る場所が増えていない（同名別パスのすり抜けも防ぐ） |
 | `crates/m241-flash/src/da.rs` の `check_image` / `all_within` 本体に `firmware::digest` / `digest::matches` / `sha256(_hex)` が無い | strict なバックアップ差分経路に digest 受理が戻らない（差分ヘルパーへ移しても検出。vendor は固定 SHA の別関数 `accept_vendor_image`、`check_da_image` の DA 用 SHA-256 は対象外） |
 | `crates/m241-flash/src/da.rs` の `pub fn write` / `write_vendor` が本体のトップレベル（brace depth 1）で `write_range` / `write_range_accepted` より前に `check_layout()?` を含む | 開始アドレスのゲートが書き込み経路から外れていない（コメント・別関数・未呼び出しの入れ子関数では通らない。`write_range(_accepted)` に到達する公開関数を名前ではなく呼び出しで探す） |

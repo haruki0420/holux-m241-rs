@@ -37,11 +37,22 @@ because `m241-flash` builds on them.
 `m241-flash` on purpose: the Firmware screen is the primary operator surface,
 and the user asked for the CLI's write capability there. The gate therefore
 requires the GUI's dependency tree to contain `m241-flash`, requires its write
-actions to call `m241_flash::flow::flash`, and requires the Firmware screen to
-build `Confirmation` only from its own typed word; it also fails if a
-destructive opcode (`0xD3` / `0xD4` / `0xD5` / `0xD9`, `PMTK182,6`) appears in
-the GUI's code. The reverse edge stays forbidden: `m241-core` still must not
-reach the write crate, so a read-only binary cannot erase or program. See
+actions to call `m241_flash::flow::flash`, requires the Firmware screen to build
+the `WRITE` confirmation and the Connect screen the `PROBE` confirmation from
+their own typed words, and refuses `Confirmation::granted` / `Job::Flash` in any
+other GUI file. It also fails if a destructive opcode (`0xD3` / `0xD4` / `0xD5`
+/ `0xD9`, `PMTK182,6`) appears in the GUI's *code* — bare hex literal, `\xNN`
+escape or the PMTK erase string — while the screens' operator prose in strings
+and comments stays allowed. The reverse edge stays forbidden: `m241-core` still
+must not reach the write crate, so a read-only binary cannot erase or program.
+
+**That new gate is weaker than the one it replaced, and this is deliberate.**
+The old rule was the dependency graph (`m241-gui` did not link `m241-flash`), so
+no edit inside the GUI could bypass it. The replacement is a text check; an edit
+that also weakens `tools/check_safety.py` would pass it. What still holds
+structurally is everything inside `m241-flash`: the fixed range,
+`check_layout`, `check_image`, `verify_device` and the full read-back. Do not
+describe the GUI's gates as equivalent to the removed edge. See
 [`docs/dev/11-safety-review.md`](docs/dev/11-safety-review.md).
 
 **Long commands go in the background.** A first `cargo build` of the GUI pulls
@@ -139,11 +150,14 @@ Rules:
 * the prompt is for the user. An agent must not answer it — not even by driving
   a PTY or clicking the GUI field — because typing `WRITE` is the user's own
   acknowledgement, not an approval an agent can supply. The GUI has no `--yes`
-  equivalent: its buttons stay disabled until the user types the word, and the
-  action re-checks it so no other call path can skip it. The only route an
-  agent may take is `--yes` in the CLI, and only once the approval §2.5
-  requires has been obtained (by default the user; when delegated, the
-  independent reviewer);
+  equivalent: its buttons stay disabled until the user types the word, the
+  action re-checks it, and `tools/check_safety.py` refuses `Job::Flash` /
+  `Confirmation::granted` outside the screens that own the typed word. Those are
+  source checks, not a type: the token proves a call-site acknowledgement, not
+  that a person typed the word (`da.rs`'s `Confirmation` says so itself). The
+  only route an agent may take is `--yes` in the CLI, and only once the
+  approval §2.5 requires has been obtained (by default the user; when
+  delegated, the independent reviewer);
 * an agent may pass `--yes` to `fw flash` **or `fw probe-da`** only when the
   approval §2.5 requires has been obtained. `fw probe-da` loads the DA into RAM
   and jumps to it, so the loaded DA can erase or program flash itself; it is
