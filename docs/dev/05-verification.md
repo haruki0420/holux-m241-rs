@@ -189,7 +189,7 @@ comparison is skipped; checking only the M-241 vector and family markers`).
 | recovery write | `m241 fw flash --recover` (the unit's own dump) | 1589 packets, `verified: 406620 bytes read back and identical` | ✅ |
 | patch | `m241 fw patch` on a fresh V1.13 dump | 3 bytes changed (`0x402F6`, `0x402F7`, `0x59C2C`), epoch `935280000`, marker V1.14 | ✅ |
 | patched write | `m241 fw flash --yes` (patched image, backup = the fresh dump) | 1589 packets, `verified: 406620 bytes read back and identical` | ✅ |
-| boot of V1.14 | `device info` answered; the NMEA default date was `22-08-99` (1999-08-22, the patched epoch `935280000`; unpatched would be `06-01-80`) | ✅ |
+| boot of V1.14 | `m241 device info` + NMEA | `device info` answered; the NMEA default date was `22-08-99` (1999-08-22, the patched epoch `935280000`; unpatched would be `06-01-80`) | ✅ |
 
 The raw command output quoted on this page was captured in the session that ran
 the commands and is not committed here: the captures are device transcripts and
@@ -210,7 +210,7 @@ verbatim; each is the line the client printed.
   client answered: `device info` returned `B-core_1.20` / `0043` /
   `01017-00F`, and the NMEA stream reported the default date `22-08-99`
   (1999-08-22) — the value the patched constant `935280000` produces when there
-  is no fix. The stock image reported `06-01-80` in the same room, so this is a
+  is no fix. The stock image reported `06-01-80` in the same session, so this is a
   measured difference between the two images, not a guess from the write.
 * **未検証: the date with a real fix.** With no satellites indoors the unit
   reports its default time, not a GPS-derived one; that a live fix now produces
