@@ -298,6 +298,27 @@ hardware-tested write in `docs/dev/03-hardware-facts.md` ends on a 92-byte
 packet — and the length must be even, because the payload is checksummed as
 16-bit pairs.
 
+**The receive length of the final packet is the remainder, not the length
+argument.** `0x00102474` decides how many payload bytes the DA reads for the
+packet it is waiting for. It takes the range index in `r0`, the packet index in
+`r1` and the packet count in `r2`, compares `r2 - 1` with `r1`, and returns
+`(end - start + 1) mod length` **only when `r1 == r2 - 1`**; for every other
+packet it returns `length`. The receive loop itself is `FUN_001019F0`.
+
+For the retail image — 406,620 bytes at `0x100` per packet — the last of the
+1,589 packets is therefore read as **92 payload bytes**, and the host must put
+its two-byte sum straight after those 92 bytes. Sending 256 payload bytes and
+the sum after them does not work: the DA reads the first 92 as payload and the
+next two (the host's padding) as the sum, so the sums disagree. The 2026-11-22
+hardware runs ended exactly there, 1,588 packets in, and the final packet was
+answered `0x01` (`docs/dev/05-verification.md` §1.4). ⚠️ Which DA status `0x01`
+represents is **not** established.
+
+⚠️ The `r1 == r2 - 1` branch is the whole of what is known here: what
+`0x00102474` returns when the remainder is zero (the range divides evenly) is
+not established. The shipped range never hits that case; the simulator models
+it as `length`.
+
 ### 4.4 Does the DA verify the sum-of-bytes, or only echo it?
 
 **It verifies. Nothing is merely echoed.** There are two independent checks.
@@ -315,6 +336,14 @@ packet — and the length must be even, because the payload is checksummed as
 
    A mismatch never produces `0x69`; it falls into the write handler's retry
    logic, which ends in `0xA5` and a chip restart.
+
+   The comparison is over **exactly the bytes read for that packet** — the
+   receive length `0x00102474` returns (§4.3), not the command's length
+   argument. A zero-padded final packet therefore feeds two bytes of padding
+   into the trailer and cannot match: that is the failure the 2026-11-22
+   hardware runs recorded (`docs/dev/05-verification.md` §1.4). ⚠️ The
+   hardware read back `0x01` there rather than `0xA5`, so what `0x01` is
+   remains open (§7 item 8).
 
 2. **Per transfer, before the final acknowledgement.** `FUN_00101F08`
    (`0x00101F08`–`0x00101F90`) re-reads the recorded ranges from the flash
@@ -535,7 +564,7 @@ The command is a small protocol of its own:
 | erase the sector holding the first range's start | `0x0010251C`–`0x00102540` | internal | — |
 | erase failed | `0x0010253C`–`0x0010254C` | DA → host | `0xA5`, then restart |
 | erase succeeded | `0x00102560` | DA → host | `0x5A` |
-| per packet: payload, then 16-bit sum | `0x001025E0`, `0x001019F0` | host → DA | `length` + 2 |
+| per packet: payload, then 16-bit sum | `0x001025E0`, `0x001019F0` | host → DA | `length` + 2; the **last** packet is the remainder + 2 (§4.3) |
 | per packet accepted | `0x00102734`–`0x00102738` | DA → host | `0x69` |
 | transfer complete | `0x00102898` | DA → host | `0x5A` |
 | final sum check failed | `0x001028A0`–`0x001028B8` | DA → host | `0xA5` |
@@ -672,6 +701,13 @@ Recorded honestly rather than guessed.
    completion branch; a client should be prepared to see more `0x69` bytes than
    packets it sent only if it also sees a retry, and no hardware measurement
    exists for that case.
+8. **What `0x01` means in a `0xD5` reply.** The 2026-11-22 runs read `0x01` for
+   the final, zero-padded packet and `0x69` for all 1,588 before it
+   (`docs/dev/05-verification.md` §1.4). The receive length in §4.3 explains why
+   that packet cannot pass the checksum, and §4.4's mismatch path ends in `0xA5`
+   — but the wire carried `0x01`, so the status' own meaning is not established
+   by either page. A client must not retry on it: the byte is a failure to
+   report, not a condition to act on.
 
 ## 8. Hazards for the implementation
 
@@ -703,9 +739,13 @@ points somewhere else.
 8. **`0xD3`'s `end` is an address, not a length.** A client that passes a length
    records a range of `end - start + 1` bytes, and the following `0xD5` erases
    all of it.
-9. **A short final packet is normal.** The hardware-verified image is 406,620
-   bytes and ends on a 92-byte packet; the DA accepts it and the length argument
-   is what drives the `0x69` accounting.
+9. **A short final packet is normal, and it must be sent short.** The
+   hardware-verified image is 406,620 bytes and ends on a 92-byte packet; the DA
+   accepts it and the length argument is what drives the `0x69` accounting. But
+   the DA reads the final packet at `(end - start + 1) mod length` (§4.3), not
+   at `length`: a client that zero-pads the final packet puts its sum past the
+   bytes the DA reads, and the 2026-11-22 runs saw that packet answered `0x01`
+   at 99% (`docs/dev/05-verification.md` §1.4).
 
 ## 9. Method
 
@@ -749,3 +789,7 @@ not committed.
   transmitted.
 - The region entry's `+0x0C` word is a descriptor count in its low half and the
   manufacturer id in its high half, not a sector count (section 6).
+- **The final `0xD5` packet is read at `(end - start + 1) mod length`, not at
+  the length argument** (`0x00102474`, section 4.3). The host must send the
+  final packet short (92 bytes plus the sum for the retail image) and must not
+  zero-pad it (section 8, item 9).

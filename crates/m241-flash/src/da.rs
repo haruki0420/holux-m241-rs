@@ -188,9 +188,19 @@
 //!   (§5.6) — read from the disassembly; the fake models it, no unit did;
 //! * whether the DA answers anything to `0xD9` (§4.5, §8 item 4) — the
 //!   disassembly says it never returns; this driver does not read after it;
-//! * whether the DA zero-fills the short final packet before programming (§4.4
-//!   reads that padding off the *read* serialiser) — the client pads it, which
-//!   is accepted either way because the sum covers the padded payload.
+//! * what the DA does when `0x00102474`'s remainder is zero, i.e. the range
+//!   divides evenly by the packet length — the shipped range does not (its
+//!   remainder is 92 bytes), so this client never asks;
+//! * whether the DA zero-fills the short final packet before *programming*
+//!   (§4.4 reads that padding off the *read* serialiser). The client sends the
+//!   final packet at the receive length `0x00102474` returns — 92 payload bytes
+//!   plus the sum — instead of padding it, because padding it is what the
+//!   2026-11-22 hardware runs answered `0x01` (`docs/dev/05-verification.md`
+//!   §1.4);
+//! * what `0x01` is. The receive length explains why a padded final packet
+//!   cannot pass the packet checksum, but which DA status produces `0x01` is
+//!   not established, so this client retries nothing on it and records the byte
+//!   as a framing failure.
 //!
 //! And for the two additions above:
 //!
@@ -300,6 +310,13 @@ pub const MEM_CMD_STATUS_OK: u8 = 0x00;
 /// `docs/reference/01-da-protocol.md` §4.3, which records that the DA imposes
 /// no maximum and that `0x100` is a host convention. §8 item 9 records that
 /// the 406,620-byte image ends on a 92-byte packet.
+///
+/// This is the length the DA reads for every packet **but the last**:
+/// `0x00102474` returns the remainder `(end - start + 1) mod length` for the
+/// final packet (`docs/reference/01-da-protocol.md` §4.3), which is 92 bytes for
+/// the shipped range. [`DownloadAgent`]'s final packet is therefore
+/// [`FLASH_WRITE_LENGTH`] `% PACKET_SIZE` bytes plus its two-byte sum, not a
+/// zero-padded [`PACKET_SIZE`] bytes.
 pub const PACKET_SIZE: usize = 0x100;
 
 /// Start of the span this driver writes, in the **DA's** linear flash view.
@@ -1966,7 +1983,7 @@ impl<T: Transport> DownloadAgent<T> {
         self.await_first_erase()?;
         for (index, chunk) in image.chunks(PACKET_SIZE).enumerate() {
             self.send_packet(chunk)?;
-            self.await_packet_reply(index, start)?;
+            self.await_packet_reply(index, start, chunk.len())?;
             *packets = index.saturating_add(1);
             // `UpTo` is exclusive, which is exactly the address the next packet
             // would start at, so `bytes(start)` counts the accepted payloads.
@@ -2015,33 +2032,35 @@ impl<T: Transport> DownloadAgent<T> {
         Ok(())
     }
 
-    /// One packet: its payload zero-filled to [`PACKET_SIZE`], then the sum.
+    /// One packet: the chunk's own bytes, then their sum.
     ///
-    /// §5.6, §4.4: the raw payload may be shorter than the command's length; a
-    /// test pins that it is zero-filled before the sum, which is what the DA's
-    /// read serialiser does (§4.4, 未検証 for the write direction).
+    /// The command's length argument ([`packet_length`]) is the size the DA
+    /// reads for every packet **except the last**. `0x00102474` compares the
+    /// packet index with the packet count and returns the remainder
+    /// `(end - start + 1) mod length` for the last packet only
+    /// (`docs/reference/01-da-protocol.md` §4.3); for the shipped range that
+    /// remainder is 92 bytes, so the final packet is sent as 92 payload bytes
+    /// plus its two-byte sum. Padding it back up to [`PACKET_SIZE`] puts the sum
+    /// past the bytes the DA reads — it takes the first two padding bytes as the
+    /// trailer — and the 2026-11-22 hardware runs answered that packet `0x01`
+    /// (`docs/dev/05-verification.md` §1.4).
     fn send_packet(&mut self, chunk: &[u8]) -> Result<()> {
-        let mut payload = vec![0u8; PACKET_SIZE];
-        payload
-            .iter_mut()
-            .zip(chunk.iter())
-            .for_each(|(slot, byte)| *slot = *byte);
-        let mut packet = Vec::with_capacity(PACKET_SIZE + 2);
-        packet.extend_from_slice(&payload);
-        packet.extend_from_slice(&byte_sum(&payload).to_be_bytes());
+        let mut packet = Vec::with_capacity(chunk.len() + 2);
+        packet.extend_from_slice(chunk);
+        packet.extend_from_slice(&byte_sum(chunk).to_be_bytes());
         self.transport.write_all(&packet)?;
         self.transport.flush()
     }
 
     /// The `0x69` that acknowledges one packet, or the error that replaces it.
-    fn await_packet_reply(&mut self, index: usize, start: u32) -> Result<()> {
+    fn await_packet_reply(&mut self, index: usize, start: u32, bytes: usize) -> Result<()> {
         let reply = self.read_byte(&format!("0xD5 packet {index} reply"))?;
         if reply == NAK {
             // §4.4: a checksum mismatch never produces `0x69`; the handler
             // ends in `0xA5` and a chip restart.
             return Err(Error::Rejected {
                 what: format!(
-                    "0xD5 packet {index} ({PACKET_SIZE} bytes at DA address 0x{:08X}) was refused",
+                    "0xD5 packet {index} ({bytes} bytes at DA address 0x{:08X}) was refused",
                     packet_address(index, start)
                 ),
             });
@@ -3854,15 +3873,19 @@ mod tests {
     }
 
     #[test]
-    fn the_final_packet_is_the_short_one_and_is_zero_filled() {
-        // §8 item 9: the image ends on a 92-byte packet, and the client pads it
-        // to PACKET_SIZE before the sum (§4.4). The padding is observed on the
-        // wire — what the fake received — not recomputed from the constants.
+    fn the_final_packet_is_the_short_one_and_is_not_zero_filled() {
+        // `0x00102474` (`docs/reference/01-da-protocol.md` §4.3): `0xD5` reads
+        // the command's length for every packet but the last, where the receive
+        // length is `(end - start + 1) mod length` — 92 bytes for the 406,620-byte
+        // image. The final packet goes out as those 92 bytes plus their sum; the
+        // 2026-11-22 hardware runs answered the padded form with `0x01`
+        // (`docs/dev/05-verification.md` §1.4).
         let backup = stock_image();
         let image = patched_image();
-        // `stock_image` fills the body with `0xFF`, so a padded zero is
-        // distinguishable from a payload byte.
+        // `stock_image` fills the body with `0xFF`, so a padded zero would be
+        // distinguishable from a payload byte if the client still padded.
         assert_eq!(image.get(FLASH_WRITE_LENGTH - 92), Some(&0xFF));
+        assert_eq!(FLASH_WRITE_LENGTH % PACKET_SIZE, 92);
 
         let mut da = DownloadAgent::new(fake_in_da(&backup));
         write_at_wire_start(&mut da, &backup, &image).expect("accepted");
@@ -3873,29 +3896,64 @@ mod tests {
         let final_packet = packets.last().expect("at least one packet");
         assert_eq!(
             final_packet.len(),
-            PACKET_SIZE,
-            "every payload is a full packet"
+            92,
+            "the final packet is the remainder, not a padded PACKET_SIZE"
         );
-        let (tail, padding) = final_packet.split_at(92);
         assert_eq!(
-            tail,
+            final_packet,
             image.get(FLASH_WRITE_LENGTH - 92..).expect("92 bytes"),
             "the short packet carries the image's last 92 bytes, in order"
         );
-        assert!(
-            padding.iter().all(|byte| *byte == 0),
-            "the client must zero-fill the final packet to PACKET_SIZE: {padding:02X?}"
-        );
 
-        // The sum covers the padded payload: the trailer on the wire is the sum
-        // of the 256 bytes above, padding included.
-        let padded_sum: u16 = final_packet
+        // The trailer is the sum of exactly those 92 bytes, not of a padded
+        // payload: the fake verified it independently with `sum_of_bytes`, so
+        // acceptance already means the two agree — this pins the value the test
+        // can see on the wire.
+        let tail_sum: u16 = final_packet
             .iter()
             .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)));
         let trailer = device
             .last_packet_trailer()
             .expect("the trailer the client sent");
-        assert_eq!(u16::from_be_bytes(trailer), padded_sum);
+        assert_eq!(u16::from_be_bytes(trailer), tail_sum);
+        let padded_sum: u16 = image
+            .get(FLASH_WRITE_LENGTH - PACKET_SIZE..)
+            .expect("a full packet's worth of image")
+            .iter()
+            .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)));
+        assert_ne!(
+            tail_sum, padded_sum,
+            "the 0xFF padding bytes must change the sum, or this test cannot tell \
+             the two forms apart"
+        );
+    }
+
+    #[test]
+    fn a_full_packet_is_still_the_packet_length_plus_its_sum() {
+        // The change above must not shrink the full packets: every packet but
+        // the last is `PACKET_SIZE` payload bytes plus the two-byte big-endian
+        // sum — 258 bytes on the wire.
+        assert_eq!(PACKET_SIZE, 0x100);
+        assert_eq!(PACKET_SIZE + 2, 258);
+
+        let backup = stock_image();
+        let mut da = DownloadAgent::new(fake_in_da(&backup));
+        write_at_wire_start(&mut da, &backup, &backup).expect("accepted");
+        let device = da.transport_mut();
+        let packets = device.packets();
+        assert_eq!(packets.len(), FLASH_WRITE_LENGTH.div_ceil(PACKET_SIZE));
+        let last = packets.len().saturating_sub(1);
+        for (index, packet) in packets.iter().enumerate().take(last) {
+            assert_eq!(packet.len(), PACKET_SIZE, "packet {index} is a full packet");
+            let sum: u16 = packet
+                .iter()
+                .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)));
+            assert_eq!(
+                device.trailer_of(index),
+                Some(sum.to_be_bytes()),
+                "packet {index}'s two-byte trailer follows its {PACKET_SIZE} bytes"
+            );
+        }
     }
 
     #[test]

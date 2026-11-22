@@ -15,8 +15,13 @@
 //! * `0xD3`: a count byte and count pairs of `(start, end)`. Success is `5A 00`,
 //!   a refusal is a **single** `A5`, and a refused command records nothing, so
 //!   the ranges of an earlier accepted command stay in place (§4.1, §5.3);
-//! * `0xD5`: a length `u32`, two `5A`, then per packet `length` bytes plus a
+//! * `0xD5`: a length `u32`, two `5A`, then per packet the bytes the DA reads
+//!   for that packet — `length` for every packet but the last, the remainder
+//!   `(end - start + 1) mod length` for the last (`0x00102474`, §4.3) — plus a
 //!   16-bit sum, answered with `0x69` and finally two `5A` (§5.6);
+//! * a packet whose sum does not match ends the command with a single `A5`, and
+//!   the fake then drops the bytes still in flight because the DA restarted
+//!   (§4.4);
 //! * `0xD9`: no argument and **no reply** (§5).
 //!
 //! Two facts the earlier notes got wrong are modelled deliberately, each with a
@@ -186,8 +191,10 @@ pub struct FakeDa {
     /// Every payload a `0xD5` packet carried, in arrival order.
     ///
     /// Recorded so a test can see what the client actually put on the wire —
-    /// the zero padding of the short final packet, and its checksum — rather
-    /// than inferring it from the flash window.
+    /// the final packet's short length and its checksum — rather than inferring
+    /// it from the flash window. Each entry is the payload only, so the final
+    /// entry is the remainder (92 bytes for the shipped range), not a padded
+    /// packet.
     packets: Vec<Vec<u8>>,
     /// The DA's own RAM, addressed from zero, so a `0xA1` BootROM write before
     /// the jump lands somewhere and a `0xAF` read can see it.
@@ -287,6 +294,15 @@ pub struct FakeDa {
     fail_first_erase: bool,
     /// Whether the sector erase inside a `0xD5` has failed.
     erase_failed: bool,
+    /// Whether a `0xD5` packet failed its checksum and the DA restarted.
+    ///
+    /// `docs/reference/01-da-protocol.md` §4.4: a mismatch ends in `0xA5` and a
+    /// chip restart, so the bytes still in flight belong to no command. The fake
+    /// drops them instead of parsing them as further packets — otherwise the
+    /// tail of a **zero-padded** final packet can be read as one more packet and
+    /// its zero padding can pass a zero checksum, hiding the very failure the
+    /// model exists to catch.
+    packet_checksum_failed: bool,
     /// Whether a `0xD5` arrived while the recorded range was still `(0, 0)`.
     ///
     /// That is the command that erases the reset vector; recording it lets a
@@ -406,6 +422,7 @@ impl FakeDa {
             ranges_recorded: Vec::new(),
             fail_first_erase: false,
             erase_failed: false,
+            packet_checksum_failed: false,
             wrote_an_empty_range: false,
             last_read_address: None,
             echo_frame: true,
@@ -515,8 +532,9 @@ impl FakeDa {
 
     /// Every `0xD5` payload the fake received, in arrival order.
     ///
-    /// Each entry holds `da_packet_len` bytes as the client sent them,
-    /// padding included. Empty before the first packet.
+    /// Each entry holds the bytes the DA read for that packet: `da_packet_len`
+    /// for a full packet, the range remainder for the last one. Empty before
+    /// the first packet.
     #[must_use]
     pub fn packets(&self) -> &[Vec<u8>] {
         &self.packets
@@ -748,6 +766,7 @@ impl FakeDa {
             Modelled::DownloadAgent => {
                 self.mode = Mode::DownloadAgent;
                 self.da_stage = DaStage::Command;
+                self.packet_checksum_failed = false;
                 let report = self.da_info_report();
                 self.queue_bytes(&report);
             }
@@ -1277,6 +1296,11 @@ impl FakeDa {
     }
 
     fn process_download_agent(&mut self, byte: u8) {
+        if self.packet_checksum_failed {
+            // The DA restarted on a packet checksum mismatch: nothing after the
+            // `0xA5` is a command or part of a packet.
+            return;
+        }
         self.line.push(byte);
         // A `0xD6` conversation's advance and retry bytes never reach this
         // function: `consume` routes them to `answer_page` first, so every byte
@@ -1415,6 +1439,7 @@ impl FakeDa {
                 // `set_modelled` directly.
                 self.restarted = true;
                 self.mode = Mode::Firmware;
+                self.packet_checksum_failed = false;
                 self.firmware_line.clear();
                 self.firmware_served = false;
                 self.line.clear();
@@ -1433,18 +1458,19 @@ impl FakeDa {
     }
 
     fn dispatch_da_packet(&mut self) {
-        if self.erase_failed {
+        if self.erase_failed || self.packet_checksum_failed {
             // After `0xA5` the DA restarted; whatever the host sends next is
             // not part of this command, and the fake must not answer it.
             self.line.clear();
             return;
         }
-        let needed = self.da_packet_len.saturating_add(2);
+        let receive_len = self.packet_receive_len();
+        let needed = receive_len.saturating_add(2);
         if self.line.len() < needed {
             return;
         }
         let frame = std::mem::take(&mut self.line);
-        let Some((payload, trailer)) = frame.split_at_checked(self.da_packet_len) else {
+        let Some((payload, trailer)) = frame.split_at_checked(receive_len) else {
             return;
         };
         if self.accepted_packets >= self.refuse_from
@@ -1467,6 +1493,9 @@ impl FakeDa {
         // the client's arithmetic is a disagreement, not two sides agreeing on
         // the same mistake.
         if checksum != sum_of_bytes(payload) {
+            // §4.4: no `0x69`; the handler ends in `0xA5` and a chip restart.
+            self.packet_checksum_failed = true;
+            self.da_stage = DaStage::Command;
             self.queue_bytes(&[NAK]);
             return;
         }
@@ -1485,16 +1514,18 @@ impl FakeDa {
             self.queue_bytes(&[NAK]);
             return;
         }
-        // The packet is programmed at the cursor. A packet can be shorter than
-        // the command length only if the host sent fewer bytes, and then the
-        // DA zero-fills it before programming (`0x001019C0`–`0x001019D8`,
-        // §4.4); the cursor therefore advances by the command's length, not by
-        // what the host happened to send. That is also why the packet count and
-        // "the cursor passed `end`" are not the same rule: with a short final
-        // packet the cursor overruns the range before the count is reached.
+        // The packet is programmed at the cursor. The last packet arrives
+        // **short**: `0x00102474` (`docs/reference/01-da-protocol.md` §4.3)
+        // returns `(end - start + 1) mod length` for the final packet, so the
+        // client sends the range's last 92 bytes for the shipped image, not a
+        // zero-padded 256. The DA zero-fills the rest before programming
+        // (`0x001019C0`–`0x001019D8`, §4.4) and the cursor advances by the
+        // command's length, not by what the host sent. That is also why the
+        // packet count and "the cursor passed `end`" are not the same rule: the
+        // cursor overruns the range before the count is reached.
         // ⚠️ 未検証 for the *write* direction: §4.4 reads that padding off the
-        // read serialiser, and `docs/dev/05-verification.md` §1 did not record
-        // whether the final 92-byte packet's tail is padded.
+        // read serialiser, and no hardware run has watched the final short
+        // packet be programmed.
         let offset = self.da_cursor as usize;
         let mut programmed = vec![0u8; self.da_packet_len];
         programmed
@@ -1525,6 +1556,34 @@ impl FakeDa {
         let (start, end) = self.da_range;
         let bytes = usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX) + 1;
         bytes.div_ceil(self.da_packet_len.max(1)).max(1)
+    }
+
+    /// How many payload bytes the DA reads for the packet it is waiting for.
+    ///
+    /// `0x00102474` (`docs/reference/01-da-protocol.md` §4.3) takes the range
+    /// index, the packet index and the packet count, compares the packet index
+    /// with `count - 1`, and returns `(end - start + 1) mod length` for the
+    /// **last** packet; every earlier packet is the command's `length`. For the
+    /// retail image that remainder is 92 bytes, so a host that pads the final
+    /// packet to `0x100` sends 164 bytes the DA will read as the next packet's
+    /// payload — the checksum then disagrees, which is what the fake must
+    /// reproduce rather than paper over.
+    ///
+    /// ⚠️ 未検証 what the DA does when the remainder is zero (the range divides
+    /// evenly): the excerpt describes only the `r1 == r2 - 1` branch. The model
+    /// uses `length` there, because a zero-byte packet cannot be read; the
+    /// shipped range never reaches it.
+    fn packet_receive_len(&self) -> usize {
+        let length = self.da_packet_len.max(1);
+        let (start, end) = self.da_range;
+        let bytes = usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX) + 1;
+        if self.accepted_packets.saturating_add(1) < self.expected_packets() {
+            return length;
+        }
+        match bytes % length {
+            0 => length,
+            remainder => remainder,
+        }
     }
 
     /// Erase the modelled sector that holds `address`, as `0xD5` does before it
@@ -1570,12 +1629,15 @@ impl Transport for FakeDa {
             self.restart_requests = self.restart_requests.saturating_add(1);
             self.restarted = true;
             self.mode = Mode::Firmware;
+            self.packet_checksum_failed = false;
             self.line.clear();
             self.output.clear();
             return Ok(());
         }
         // A `0xD5` header is the only five-byte write that starts with the write
-        // opcode; the packets that follow are `PACKET_SIZE + 2` bytes.
+        // opcode; the packets that follow are the bytes the DA reads for that
+        // packet plus two (`PACKET_SIZE + 2` for every packet but the last,
+        // where the receive length is the range's remainder).
         if self.fail_write_command && buf.len() == 5 && buf.first().copied() == Some(OPCODE_WRITE) {
             self.fail_write_command = false;
             return Err(m241_core::Error::Io {
@@ -2147,14 +2209,15 @@ mod tests {
     }
 
     #[test]
-    fn one_byte_range_with_a_full_size_packet_is_one_packet_not_a_cursor_walk() {
+    fn a_short_range_with_a_long_packet_length_is_one_packet_read_at_the_remainder() {
         // The sharpest case where the DA's `ceil((end - start + 1) / length)` and
         // "the cursor passed `end`" are different questions: a *short* range with
-        // a long packet is `ceil` = 1, while one `0x100`-byte packet lifts the
-        // cursor far past `end`. The DA ends the command on the count, so the fake
-        // must finish after exactly one packet and refuse a second — it must not
-        // work out "the cursor is somewhere past the end, so keep going" or "the
-        // range is short, so take more packets".
+        // a long packet is `ceil` = 1, and that one packet is read at the
+        // remainder — two bytes here — while the DA zero-fills it before
+        // programming and the cursor jumps a full `0x100`. The DA ends the
+        // command on the count, so the fake must finish after exactly one packet
+        // and refuse a second; it must not work out "the cursor is somewhere past
+        // the end, so keep going" or "the range is short, so take more packets".
         //
         // `(0, 0)` cannot be used: the fake reads it as "nothing recorded" and
         // refuses the `0xD5`, which is the safety property its own test pins.
@@ -2165,17 +2228,17 @@ mod tests {
         write_command(&mut device, 0x100);
         assert_eq!(read_reply(&mut device, 2), [ACK, ACK]);
 
-        write_packet(&mut device, &[0x44; 0x100]);
+        write_packet(&mut device, &[0x44; 2]);
         assert_eq!(
             read_reply(&mut device, 3),
             [CONT, ACK, ACK],
-            "a range shorter than one packet is one packet"
+            "a range shorter than one packet is one packet, read at its remainder"
         );
         assert_eq!(device.accepted_packets(), 1);
         assert_eq!(device.memory()[0], 0x44);
 
-        write_packet(&mut device, &[0x55; 0x100]);
-        let after = read_reply(&mut device, 0x100 + 2);
+        write_packet(&mut device, &[0x55; 2]);
+        let after = read_reply(&mut device, 4);
         assert!(
             after.iter().all(|byte| *byte == NAK),
             "a packet past the count is refused, never acknowledged: {after:02X?}"
@@ -2194,18 +2257,18 @@ mod tests {
 
     #[test]
     fn a_packet_beyond_a_short_range_is_refused_before_it_is_programmed() {
-        // A two-byte range at `0x100` per packet is `ceil` = 1: the command is
-        // over after the first packet, and the packet stage has ended. The
-        // fixture's pre-packet guard is what answers the stray packet with a
-        // single `A5` *and keeps it out of flash*; without it the bytes would be
-        // parsed as unknown commands, drawing one `A5` per byte and possibly
-        // reaching the next write's range.
+        // A two-byte range at `0x100` per packet is `ceil` = 1, and its one
+        // packet is read at the remainder (two bytes). The command is over after
+        // it, and the packet stage has ended. The fixture's pre-packet guard is
+        // what answers the stray packet with a single `A5` *and keeps it out of
+        // flash*; without it the bytes would be parsed as unknown commands,
+        // drawing one `A5` per byte and possibly reaching the next write's range.
         let mut device = download_agent(&vec![0xFFu8; 0x200]);
         device.write_all(&memory_range(0, 1)).expect("range");
         assert_eq!(read_reply(&mut device, 2), [ACK, STATUS_OK]);
         write_command(&mut device, 0x100);
         assert_eq!(read_reply(&mut device, 2), [ACK, ACK]);
-        write_packet(&mut device, &[0x44; 0x100]);
+        write_packet(&mut device, &[0x44; 2]);
         assert_eq!(read_reply(&mut device, 3), [CONT, ACK, ACK]);
         assert_eq!(
             device.mode(),
@@ -2213,7 +2276,7 @@ mod tests {
             "the transfer ends, it does not restart the chip"
         );
 
-        write_packet(&mut device, &[0x99; 0x100]);
+        write_packet(&mut device, &[0x99; 2]);
         let after = read_reply(&mut device, 0x102);
         assert!(
             after.iter().all(|byte| *byte == NAK),
@@ -2310,13 +2373,12 @@ mod tests {
     }
 
     #[test]
-    fn the_packet_count_is_the_range_and_the_final_packet_zfills_the_rest() {
+    fn the_packet_count_is_the_range_and_the_final_packet_is_read_short_and_zfilled() {
         // Range `0..=9` (10 bytes) at 4 bytes per packet: `ceil(10/4)` = 3
-        // packets, and the last carries 2 bytes that the DA zero-fills to 4.
-        // A packet is always read as `length + 2` bytes, so the client cannot
-        // send a frame shorter than the command length — the fill happens
-        // inside the DA, which is why the packet count, not the cursor, is the
-        // rule that ends the command.
+        // packets. The last is read at `10 mod 4` = 2 bytes (`0x00102474`, §4.3),
+        // so the host sends 2 payload bytes plus the sum; the DA zero-fills that
+        // to 4 before programming, which is why the flash holds `9, 10, 0, 0`.
+        // The packet count, not the cursor, is the rule that ends the command.
         let mut device = download_agent(&[0xFFu8; 16]);
         device.write_all(&memory_range(0, 9)).expect("range");
         assert_eq!(read_reply(&mut device, 2), [ACK, STATUS_OK]);
@@ -2326,7 +2388,7 @@ mod tests {
         assert_eq!(read_reply(&mut device, 1), [CONT]);
         write_packet(&mut device, &[5, 6, 7, 8]);
         assert_eq!(read_reply(&mut device, 1), [CONT]);
-        write_packet(&mut device, &[9, 10, 0, 0]);
+        write_packet(&mut device, &[9, 10]);
         assert_eq!(
             read_reply(&mut device, 3),
             [CONT, ACK, ACK],
@@ -2335,6 +2397,63 @@ mod tests {
         assert_eq!(
             &device.memory()[..12],
             &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 0, 0]
+        );
+        // What arrived for the final packet: two bytes, not four.
+        assert_eq!(
+            device.packets().last().map(Vec::len),
+            Some(2),
+            "the final packet is read at the remainder"
+        );
+    }
+
+    #[test]
+    fn a_zero_padded_final_packet_is_refused() {
+        // Regression pin for the 2026-11-22 hardware failure
+        // (`docs/dev/05-verification.md` §1.4): the client used to pad the short
+        // final packet to the command's length and checksum the padding. The DA
+        // reads `(end - start + 1) mod length` bytes for the final packet
+        // (`0x00102474`, §4.3), so it takes the first two padding bytes as its
+        // trailer, the sums disagree and the packet is refused. Range `0..=9` at
+        // 4 bytes per packet makes the final read length 2.
+        let mut device = download_agent(&[0xFFu8; 16]);
+        device.write_all(&memory_range(0, 9)).expect("range");
+        assert_eq!(read_reply(&mut device, 2), [ACK, STATUS_OK]);
+        write_command(&mut device, 4);
+        assert_eq!(read_reply(&mut device, 2), [ACK, ACK]);
+        write_packet(&mut device, &[1, 2, 3, 4]);
+        assert_eq!(read_reply(&mut device, 1), [CONT]);
+        write_packet(&mut device, &[5, 6, 7, 8]);
+        assert_eq!(read_reply(&mut device, 1), [CONT]);
+
+        // Exactly the old client's final frame: 4 payload bytes (2 real + 2 zero
+        // padding) and the sum of the padded payload.
+        let padded = [9u8, 10, 0, 0];
+        let sum = padded
+            .iter()
+            .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)));
+        let mut frame = padded.to_vec();
+        frame.extend_from_slice(&sum.to_be_bytes());
+        device.write_all(&frame).expect("the padded final packet");
+
+        assert_eq!(
+            read_reply(&mut device, 4),
+            [NAK],
+            "a zero-padded final packet must be refused, not acknowledged"
+        );
+        assert_eq!(
+            device.accepted_packets(),
+            2,
+            "only two packets were accepted"
+        );
+        assert!(
+            device.memory()[8..12].iter().all(|byte| *byte == 0xFF),
+            "the refused packet must not be programmed: {:02X?}",
+            &device.memory()[8..12]
+        );
+        assert_eq!(
+            device.packets().len(),
+            2,
+            "the rest of the padded frame is not parsed as another packet"
         );
     }
 
