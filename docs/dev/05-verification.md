@@ -162,10 +162,73 @@ m241: error: framing error: 0xD5 packet 1588 answered 0x01, expected 0x69. packe
   is not confirmed by these logs. The flash is partly erased and programmed at
   this point; the recovery path (`m241 fw dump`, then `fw flash --recover`) is
   the documented next step.
-* **The fix has not been re-run on a unit.** The client now sends the final
-  packet at the receive length — 92 payload bytes plus the sum — instead of
-  padding it. That change is exercised by the fake and the unit tests only
-  (§3), so it is ⚠️ 未検証, not ✅.
+* **The fix was re-run on a unit later the same day and completed**; §1.5
+  records the runs, the read-back and the boot. This section is the failure
+  that motivated the change.
+
+### 1.5 The writes that completed (2026-11-22)
+
+Device: the same retail M-241 (`B-core_1.20`, build `0043`, model `01017-00F`,
+flash `00C2:22BA`). Host: Linux, `/dev/m241` (udev symlink to `/dev/ttyUSB0`).
+Binary: the branch head `b8d91ee` — the client that sends the final `0xD5`
+packet at the DA's receive length (§1.4). Every write below was approved per
+execution by an independent reviewer (`AGENTS.md` §2.5) and the unit matched the
+backup before any erase (`verify_device`).
+
+| Step | Command | Result | Status |
+|---|---|---|---|
+| identity | `m241 device info` | `B-core_1.20` / `0043` / `01017-00F` / sdk 1.0 | ✅ |
+| dump | `m241 fw dump` | 406,620 bytes, two reads identical, SHA-256 `9f192786…` | ✅ |
+| DA base | `m241 fw probe-da` | DA v3.8, `0x00000000` = `18 F0 9F E5`, `0x00200000` = `02 02 20 42`, `flash write : no` | ✅ |
+| vendor write | `m241 fw flash --allow-vendor` | 1589/1589 packets, 406,620 bytes programmed; read-back differed at `0x5C` (see below) | ⚠️ |
+| recovery write | `m241 fw flash --recover` (the unit's own dump) | 1589 packets, `verified: 406620 bytes read back and identical` | ✅ |
+| patch | `m241 fw patch` on a fresh V1.13 dump | 3 bytes changed (`0x402F6`, `0x402F7`, `0x59C2C`), epoch `935280000`, marker V1.14 | ✅ |
+| patched write | `m241 fw flash --yes` (patched image, backup = the fresh dump) | 1589 packets, `verified: 406620 bytes read back and identical` | ✅ |
+| boot of V1.14 | not run: the unit was left in the BootROM by the read-back | — | ⚠️ |
+
+* **The write path completed on a unit for the first time.** Both successful
+  runs reached the final packet, were acknowledged, restarted the chip with
+  `0xD9`, re-entered the BootROM through the NMEA / `$PMTK180*3B` route and read
+  the whole 406,620-byte range back; the read-back matched the written image
+  exactly. The fake and the unit tests are no longer the only evidence.
+* **The patched image came from a unit dump, not from the vendor file.**
+  `fw patch` was run on the fresh V1.13 dump, so the patched image carries the
+  unit's current per-unit bytes; the strict write compared it with that dump and
+  only the three patch bytes differ.
+* **未検証: the boot of V1.14.** The patched image was written and read back
+  identical, but the unit was still in the BootROM when attention moved on, so
+  nothing here shows that the patched firmware boots or that the date is
+  corrected. It has to be checked before any row above is read as "the WNRO fix
+  runs on a unit".
+
+#### The vendor write completes but the read-back differs at `0x5C`
+
+The stock V1.13 vendor image was written 100% (all 1589 packets acknowledged,
+406,620 of 406,620 bytes), and the unit booted it: `device info` answered and
+the NMEA default date was `06-01-80` (epoch `315964800`, unpatched). The
+read-back still failed, at one byte: the unit held `0x91` at `0x5C` where the
+vendor image has `0xFF`.
+
+A fresh dump taken after that boot shows the unit restored exactly `0x5C`–`0x5F`
+to the values of its own earlier dump. Those four bytes are inside the 14 bytes
+of per-unit data the vendor gate warns about, and the booted firmware re-creates
+them. The read-back is taken after a restart and a BootROM re-entry, so a vendor
+write cannot compare equal at those offsets even when the write itself is
+correct.
+
+The other ten per-unit bytes (`0xF8`–`0xFD`, `0x63458`–`0x6345B`) are not
+restored by the firmware: after the vendor write they held the vendor values.
+
+未検証: where the restored four bytes come from (a second copy in the chip, or a
+derivation), and whether the vendor read-back should ignore the
+firmware-managed offsets — a design decision that has not been made.
+
+#### V1.12 is refused before a port is opened
+
+Measured, not assumed: with the 406,620-byte backup, `fw flash` refuses the
+V1.12 release (`the backup is 406620 bytes; profile V1.12 is 406312 bytes`), and
+`--allow-vendor` refuses it because the gate accepts only the pinned V1.13
+digest.
 
 ## 1a. The Linux log-erase hardware session (2026-11-21)
 
@@ -192,23 +255,24 @@ nothing on this page makes the final head verified.
 |---|---|
 | The OLED after flashing | never observed; the display was not photographed |
 | The binary log's timestamps after flashing | inferred from the shared NMEA conversion path; no post-flash log was downloaded |
-| Linux BootROM / firmware dump & flash with a real logger | `log download` and `log erase` ran on Linux on 2026-11-21 (§1a); BootROM / DA paths have not been recorded on Linux yet |
+| Linux BootROM / firmware dump & flash with a real logger | ✅ measured 2026-11-22 (§1.5): `fw dump`, `fw probe-da`, three `fw flash` runs and their read-backs all ran on Linux over `/dev/ttyUSB0` |
 | macOS with a real logger | same |
 | Bluetooth SPP | all hardware work went over USB |
 | 4 MiB units and GR-245 variants | geometry maths is implemented and unit-tested; no device was available |
-| V1.11 and V1.12 on hardware | no V1.11 image to profile, V1.12 was never flashed |
+| V1.11 and V1.12 on hardware | no V1.11 image to profile. The V1.12 release was measured as **refused before opening a port** on 2026-11-22 (§1.5), so it was never flashed by this client |
 | The V1.12 patch offsets (`0x402F6`, `0x402F7`, `0x59B18`) | derived from the V1.12 vendor package's layout (`0x59B14` marker, size and SHA-256 in `03-hardware-facts.md`), not from a V1.12 unit; V1.12 was never dumped or flashed here |
 | Any timing figure | nothing in this repository is a stopwatch measurement |
-| The Rust `fw flash` command on a unit | the 2026-11-15 flash was an earlier manual/v1 run; this Rust client has never opened a port for a write. The 2026-11-22 runs (§1.4) reached the `0xD5` phase and stopped on the last packet, so the write path still has not completed on a unit. The write, erase, restart and backup-diff gates are covered only by the simulator |
-| The final `0xD5` packet sent short (92 + 2) | the zero-padded final packet failed on hardware on 2026-11-22 (§1.4); the fix that sends the remainder plus its sum is exercised by the fake and the unit tests only, and no unit has run it |
+| The Rust `fw flash` command on a unit | ✅ the 2026-11-15 flash was an earlier manual/v1 run; on 2026-11-22 the Rust client completed two writes and read each written range back identical (§1.5). The write, erase, restart and backup-diff gates are no longer covered by the simulator only |
+| The final `0xD5` packet sent short (92 + 2) | ✅ measured 2026-11-22 (§1.5): the zero-padded final packet failed on hardware (§1.4); the client that sends the remainder plus its sum completed two writes and read both back identical |
 | What `0x01` means in a `0xD5` reply | observed 2026-11-22 (§1.4); the disassembly page explains why a padded final packet cannot pass the checksum, but not which DA status reaches the wire as `0x01` |
-| Writing the official V1.13 vendor image (`--allow-vendor`) | the fixed-SHA gate, dry-run warning and fake write/read-back run in the simulator; no unit has been flashed with a vendor image, and the 14-byte per-unit overwrite has not been observed on hardware. The documented vendor/unit diff is 17 bytes: 14 per-unit + 2 WNRO + 1 version marker |
-| The `0xD9` → NMEA probe → `$PMTK180*3B` re-entry and read-back | implemented in the CLI and exercised against the fake only; no unit has been asked to boot its firmware and hand the BootROM back after a write. The 2026-11-15 row records that the unit booted, not that this read-back ran |
-| The automatic `0xD9` restart and one retry after a `0xD3` failure | implemented in the CLI and exercised against the fake only; no unit has run the retry. The retry uses the same `FLASH_WRITE_START` / `FLASH_WRITE_LENGTH`; it never recomputes the range |
-| `m241 fw da-restart` | implemented and exercised against the fake only; no unit has been sent a standalone `0xD9` after a failed DA phase |
-| The 406,620-byte BootROM read split into `DUMP_CHUNK` frames | the frame count and per-frame byte limits are fixed against the fake; no unit has been read at this size through the chunked path. A single 406,620-byte `0xA2` would exceed the five-second deadline at 115,200 8N1 |
+| Writing the official V1.13 vendor image (`--allow-vendor`) | ⚠️ written 2026-11-22 (§1.5): all 1589 packets acknowledged, 406,620 bytes programmed, and the unit booted the stock V1.13 (NMEA default date `06-01-80`). The read-back then differed at `0x5C`, because the booted firmware restores its four per-unit bytes; the 14-byte overwrite was therefore observed, but the read-back gate cannot confirm a vendor write as it stands |
+| The firmware restoring per-unit bytes at boot | ✅ observed 2026-11-22 (§1.5): after the vendor write the unit held `91 1B D4 CF` at `0x5C`–`0x5F` — its own earlier values — where the image has `FF`. Where those bytes come from and whether the vendor read-back should skip them are 未検証 |
+| The `0xD9` → NMEA probe → `$PMTK180*3B` re-entry and read-back | ✅ measured 2026-11-22 (§1.5): after both successful writes the client restarted the chip, re-entered the BootROM through the NMEA hand-over and read the whole range back. The 2026-11-15 row recorded that the unit booted, not that this read-back ran |
+| The automatic `0xD9` restart and one retry after a `0xD3` failure | still not exercised on a unit: with the final-packet fix in place no `0xD3` failure occurred, so the restart-and-retry path ran only against the fake. The retry uses the same `FLASH_WRITE_START` / `FLASH_WRITE_LENGTH` and never recomputes the range |
+| `m241 fw da-restart` | ✅ measured once 2026-11-22: after `fw probe-da` left the DA running in RAM, the standalone `0xD9` was sent and the next `device info` answered, so the unit had booted its firmware. The command sends one byte, waits for no reply and never touches DTR/RTS; a unit sitting in the BootROM is not restarted by it (measured the same day) |
+| The 406,620-byte BootROM read split into `DUMP_CHUNK` frames | ✅ measured 2026-11-22 (§1.5): `fw dump` read 406,620 bytes in two independent passes that were identical, and the write read-back read the same range in one pass. A single 406,620-byte `0xA2` would exceed the five-second deadline at 115,200 8N1 |
 | The DA's `0xD6` read across multiple pages | one page per address was read on 2026-11-21; the advance between pages, the advance after the **last** page of a multi-page read, and any bytes the DA sends between pages are unmeasured (`docs/reference/01-da-protocol.md` §5.5, §7 item 4) |
-| The four bytes after the DA banner | observed 2026-11-21; their origin is not established. They were read as `0xBB` by the first `0xD3` on 2026-11-22 (§1.3). The client now clears the input before `0xD6` and before the first `0xD3`, and resynchronises the `0xD3` reply (skips up to 8 non-ACK bytes); the fix is not yet re-run on hardware |
+| The four bytes after the DA banner | origin is still not established. They were read as `0xBB` by the first `0xD3` on 2026-11-22 (§1.3); with the resynchronising read in place, every later run that day reached and passed the `0xD3` phase (§1.5). The client clears the input before `0xD6` and before the first `0xD3` and resynchronises the `0xD3` reply (skips up to 8 non-ACK bytes) |
 | `0xD6`'s page length for arguments other than 64 | only a 64-byte page-length argument was measured (64 data bytes + 2-byte trailer) |
 | `fw probe-da` on stock V1.13 and on a second unit | the 2026-11-21 run read the unit from §1.1, which already carries the WNRO patch (the version marker is patched to V1.14); its first 64 bytes match the vendor V1.13 image's, but no stock unit and no second unit were probed |
 | The `0xA8` jump frame's count word | the protocol page gives it no meaning; the only client that ran the jump on a unit sent `0`, and this crate does too. Whether the BootROM reads the field at all is not established (`docs/dev/03-hardware-facts.md` "DA jump") |

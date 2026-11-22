@@ -41,7 +41,7 @@
 | テスト | **709 件全緑**（`cargo test --workspace`） |
 | ゲート | **6/6 PASS**（`./tools/check.sh`: fmt / clippy / test / docs / design / safety） |
 | CI | Linux / Windows / macOS |
-| **実機検証** | `log erase` のみ [`05-verification.md`](05-verification.md) §1a（バイナリは `bf41c2e`、最終 head は未検証）。他は未検証 |
+| **実機検証** | 読み取り・`log erase`（[`05-verification.md`](05-verification.md) §1a）に加え、2026-11-22 の書き込みセッション（同 §1.5）で `fw dump` / `fw probe-da` / `fw flash --recover` / `fw flash --allow-vendor` / `fw patch` / strict 書き込みが実機で通り、**2 回の書き込みが全長読み戻し一致**。残りはパッチ済み V1.14 の起動確認と GUI の実機検証 |
 
 ### 完成・`main` 統合済み（三段構成で検証済み、[`10-review-log.md`](10-review-log.md) 記録済み）
 
@@ -51,7 +51,7 @@
 | **ezTour 仕様化** | 完了（`docs/dev/07-eztour-spec.ja.md` 615 行、クリーンルーム仕様） |
 | **読み書き分離 + safety ゲート** | 完了（`m241-core` / `m241-flash` 分離、`tools/check_safety.py` + 配線・検出力テスト 19 件） |
 | **コア読み取り・変換・EXIF/ジオタグ基盤** | 完了（PMTK / BootROM / ログ解析 / GPX・KML・CSV・NMEA・JSON 出力 / パッチ計画 / 自前 EXIF・geotag） |
-| **CLI 15 コマンド** | 完了（`device ports` / `info` / `doctor`、`fw dump` / `patch` / `flash` / `probe-da` / `da-restart`、`log info` / `download` / `read` / `erase` / `geotag`、`nmea repair` / `proxy`。`fw flash` は DA 書き込みと読み戻しまで配線済み・**実機未検証**。`log erase` は PR #12 で配線済み、実機記録は [`05-verification.md`](05-verification.md) §1a。スタブは残っていない） |
+| **CLI 15 コマンド** | 完了（`device ports` / `info` / `doctor`、`fw dump` / `patch` / `flash` / `probe-da` / `da-restart`、`log info` / `download` / `read` / `erase` / `geotag`、`nmea repair` / `proxy`。`fw flash` は 2026-11-22 に実機で書き込み・読み戻しまで通った（[`05-verification.md`](05-verification.md) §1.5）。`log erase` は PR #12 で配線済み、実機記録は同 §1a。スタブは残っていない） |
 | **GUI 4 画面（実データ接続・再生・写真同期）** | 完了（接続 / ログ / ファーム / 設定。実ポート probe・実ログ読込・再生・写真同期・POI・始点終点・設定反映。132 テスト。実機未検証） |
 
 - **2026-11-21 のマージ**: review-gate (#2)、CLI 非破壊 3 コマンド (#3)、GUI 実データ接続 (#4)、
@@ -78,18 +78,16 @@
 | **P1** | **トラック編集** | 分割（Split）・結合（Merge）・点削除・Undo/Redo は `edit.rs` に実装済み（PR #5）。GUI の操作体系（範囲選択）は未着手 |
 | **P2** | **互換・移行機能** | GPX 1.0/1.1 読込（`<wpt>` は読まない）・NMEA 読込→トラック化・座標形式切替（度分秒 / 10 進度 / UTM）は実装済み（PR #5）。CSV 列の ezTour 互換確認・プロジェクト保存が未着手。NMEA 読込は落ちた行数を返さない（doc に明記） |
 
-### 3.3 実機検証（まだ一度も実施していない）
+### 3.3 実機検証の到達点
 
-最初は**読み取りのみ**（危険ゼロ）から開始し、結果は [`05-verification.md`](05-verification.md) に記録する：
+読み取りと書き込みの主要経路は実機で通った。結果は [`05-verification.md`](05-verification.md) §1.5 に記録：
 
-```bash
-m241 device ports
-m241 device info
-m241 fw dump -o backup/stock.bin
-m241 fw patch backup/stock.bin --dry-run
-```
+- `fw dump`（2 回一致）、`fw probe-da`（DA 側ベース `0`）、`fw patch`（3 バイト）
+- `fw flash --recover` と strict 書き込み（パッチ済み V1.14）: 1589 パケット完走、406,620 バイト読み戻し一致
+- `fw flash --allow-vendor`（ベンダー V1.13）: 書込みは完了したが、起動したファームが個体データ 4 バイトを復元するため読み戻しが `0x5C` で不一致（設計課題）
+- V1.12 の書き込み拒否を実測
 
-書き込み検証はその次。バックアップから復旧できることも必ず確認する。
+残る実機検証: パッチ済み V1.14 の起動と日付、GUI（実ポート probe・追従描画・GUI 経由の JPEG 書き込み）、402KiB ではないユニット形状・Bluetooth SPP。
 
 ---
 
