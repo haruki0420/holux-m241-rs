@@ -64,20 +64,24 @@
 //! `07-eztour-spec.ja.md` §6.1-7 records that ezTour's `Shift photo time…`
 //! dialog shifts by days, hours, minutes and seconds, and offers three scopes:
 //! every photo (`allPhotos`), the selected photos (`selPhotos`) and the photos
-//! from one camera (`byCamera`). [`PhotoTimeShift`] is the first and
-//! [`PhotoShiftScope`] the second, taken by [`plan_with_time_shift`].
+//! from one camera (`byCamera`). The dialog therefore has two independent
+//! inputs: how far to shift, carried by [`PhotoTimeShift`] in those four units,
+//! and which photos to move, carried by [`PhotoShiftScope`] as one of the three
+//! scopes. [`plan_with_time_shift`] takes both.
 //! [`plan_with_shift`] and [`GeotagOptions::photo_shift_seconds`] remain the
 //! all-photos, one-total path, so a caller that predates the scopes is
 //! unchanged. The spec does not say which Exif tags identify "one camera" or how
 //! two spellings of a camera fold together, so [`CameraModel`] and
 //! [`PhotoShiftScope::SelectedPhotos`] compare exact values and the matching
-//! rule is recorded as unconfirmed in `docs/dev/12-progress-summary.md`.
+//! rule is recorded as unconfirmed in `docs/dev/06-open-questions.md`.
 //!
 //! # Not verified on camera files
 //!
 //! Nothing in this module has been run against a real photo: the tests build
 //! their JPEGs byte by byte. See the same caveat in [`exif`], which produces the
-//! bytes this module writes.
+//! bytes this module writes. That caveat also covers [`CameraModel`]: the IFD0
+//! layout its walk accepts is the one the test fixture builds, and whether real
+//! cameras place `Make` and `Model` there the same way is unverified.
 
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -202,12 +206,6 @@ impl PhotoTimeShift {
             .checked_add(self.minutes.checked_mul(60)?)?
             .checked_add(self.seconds)
     }
-
-    /// Whether the shift moves nothing.
-    #[must_use]
-    pub fn is_zero(self) -> bool {
-        self.days == 0 && self.hours == 0 && self.minutes == 0 && self.seconds == 0
-    }
 }
 
 /// The camera a photo came from, as its Exif `Make` and `Model` tags carry it.
@@ -215,15 +213,21 @@ impl PhotoTimeShift {
 /// [`PhotoShiftScope::ByCamera`] compares this value exactly. The spec records
 /// that ezTour can shift "by camera" but not which tag it groups on, nor how two
 /// spellings of one camera are folded together, so no normalisation is invented
-/// here: the tags have their trailing NUL and space padding trimmed and are
-/// otherwise compared byte for byte.
+/// here: a tag's **trailing** NUL and space padding is trimmed and the rest is
+/// compared byte for byte, with no case folding and nothing removed from the
+/// front. A tag that is not valid UTF-8 is unreadable (`None`) rather than
+/// decoded with replacement characters, because a lossy decode would make two
+/// different raw names compare equal — and a `byCamera` scope that moves photos
+/// from a camera the user did not name is worse than one that recognises fewer
+/// names. The matching rule is recorded as unconfirmed in
+/// `docs/dev/06-open-questions.md`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CameraModel {
     /// Exif IFD0 `Make` (tag 0x010F), trailing padding trimmed. `None` when the
-    /// photo does not name a maker.
+    /// photo does not name a maker, or names one that is not valid UTF-8.
     pub make: Option<String>,
     /// Exif IFD0 `Model` (tag 0x0110), trailing padding trimmed. `None` when the
-    /// photo does not name a model.
+    /// photo does not name a model, or names one that is not valid UTF-8.
     pub model: Option<String>,
 }
 
@@ -231,12 +235,12 @@ impl CameraModel {
     /// Read the camera identity from a JPEG's Exif block.
     ///
     /// `None` when the bytes are not a JPEG, carry no Exif block this function
-    /// can walk, or name neither tag. A photo with no readable camera is never
-    /// selected by [`PhotoShiftScope::ByCamera`]; it is still planned, at its
-    /// unshifted time.
+    /// can walk, or name neither tag in valid UTF-8. A photo with no readable
+    /// camera is never selected by [`PhotoShiftScope::ByCamera`]; it is still
+    /// planned, at its unshifted time.
     #[must_use]
     pub fn from_jpeg(jpeg: &[u8]) -> Option<Self> {
-        let tiff = exif_tiff_block(jpeg)?;
+        let tiff = exif::exif_tiff_block(jpeg)?;
         let make = ifd0_ascii(tiff, TAG_MAKE);
         let model = ifd0_ascii(tiff, TAG_MODEL);
         (make.is_some() || model.is_some()).then_some(Self { make, model })
@@ -272,8 +276,11 @@ impl PhotoShiftScope {
     /// `camera` is the photo's identity from [`CameraModel::from_jpeg`]. Only
     /// [`Self::ByCamera`] reads it; a caller using another scope passes `None`,
     /// and one that already read the photo can pass it for any scope.
-    #[must_use]
-    pub fn includes(&self, photo: &Path, camera: Option<&CameraModel>) -> bool {
+    ///
+    /// Private because the matching rule is a decision this module owns and the
+    /// spec has not settled: exposing it would freeze "exact value" as public
+    /// API before the spec says what "same camera" means.
+    fn includes(&self, photo: &Path, camera: Option<&CameraModel>) -> bool {
         match self {
             Self::AllPhotos => true,
             Self::SelectedPhotos(selection) => {
@@ -703,6 +710,10 @@ pub fn plan_with_shift(
 /// policy (gap, grouping, backup, KMZ limit). [`plan_with_shift`] does the same
 /// for every photo.
 ///
+/// The spec has not settled what "same camera" or "same path" mean beyond the
+/// exact comparisons this module makes; both rules are recorded as unconfirmed
+/// in `docs/dev/06-open-questions.md`.
+///
 /// # Errors
 ///
 /// [`Error::State`] when the fields of `shift` do not add up to a number of
@@ -718,7 +729,9 @@ pub fn plan_with_time_shift(
 ) -> Result<Vec<GeotagPlan>> {
     let shift_seconds = shift.total_seconds().ok_or_else(|| {
         Error::State(format!(
-            "the photo clock shift {shift:?} does not fit in a number of seconds"
+            "the photo clock shift ({} days, {} hours, {} minutes, {} seconds) does not fit \
+             in a number of seconds; use smaller values",
+            shift.days, shift.hours, shift.minutes, shift.seconds
         ))
     })?;
     // Reading Make/Model for every photo is only needed by `byCamera`; doing it
@@ -964,14 +977,10 @@ fn nearest_positioned_point(track: &Track, utc: u32) -> Option<(TrackPoint, u32)
 // Camera identity (Exif IFD0 `Make` / `Model`)
 // ---------------------------------------------------------------------------
 
-// `exif` owns the TIFF walk, but its reader is private to that module and its
-// public functions read only the GPS IFD and `DateTimeOriginal`. `Make` and
-// `Model` live in IFD0, so [`PhotoShiftScope::ByCamera`] would have no way to
-// resolve a photo's camera without a small read-only walk here. It reads only
-// those two tags and returns `None` on anything it cannot follow: a photo whose
-// camera is unreadable must not make a whole folder run fail. A future change
-// should move this into `exif` beside the other readers so the TIFF walk has one
-// implementation.
+// The JPEG segment walk is shared through [`exif::exif_tiff_block`]; what is
+// left here is the IFD0 entry layout, which `exif`'s own readers (GPS and
+// `DateTimeOriginal`) never look at. A camera name that cannot be read is
+// `None`, not an error: one anonymous photo must not fail a folder run.
 
 /// TIFF field type 2: a NUL-terminated ASCII string.
 const TIFF_TYPE_ASCII: u16 = 2;
@@ -990,6 +999,17 @@ enum Endian {
 }
 
 impl Endian {
+    /// The byte order `tiff` declares, or `None` when it declares neither.
+    fn of(tiff: &[u8]) -> Option<Self> {
+        if tiff.starts_with(b"II") {
+            Some(Self::Little)
+        } else if tiff.starts_with(b"MM") {
+            Some(Self::Big)
+        } else {
+            None
+        }
+    }
+
     fn read_u16(self, bytes: [u8; 2]) -> u16 {
         match self {
             Self::Little => u16::from_le_bytes(bytes),
@@ -1005,86 +1025,66 @@ impl Endian {
     }
 }
 
-/// The TIFF block inside the first Exif APP1 segment, or `None`.
-///
-/// Walks JPEG segments the way [`crate::log::kmz`] walks them for the frame
-/// size: `FF <marker>` then, for every marker that carries one, a two-byte
-/// big-endian length that includes itself. The walk stops at the first Exif
-/// APP1, at start-of-scan, or at end-of-image.
-fn exif_tiff_block(jpeg: &[u8]) -> Option<&[u8]> {
-    let mut cursor = jpeg.strip_prefix(&[0xFF, exif::JPEG_MARKER_SOI])?;
-    loop {
-        let marker = loop {
-            let next = *cursor.first()?;
-            cursor = cursor.get(1..)?;
-            if next != 0xFF {
-                break next;
-            }
-        };
-        match marker {
-            // Restart markers and TEM stand alone, without a length.
-            0x01 | 0xD0..=exif::JPEG_MARKER_SOI => {}
-            // Start of scan or end of image: no Exif segment can follow.
-            0xDA | exif::JPEG_MARKER_EOI => return None,
-            _ => {
-                let length = u16::from_be_bytes([*cursor.first()?, *cursor.get(1)?]);
-                let payload_len = usize::from(length).checked_sub(2)?;
-                let payload = cursor.get(2..2usize.checked_add(payload_len)?)?;
-                if marker == 0xE1
-                    && let Some(tiff) = payload.strip_prefix(exif::EXIF_HEADER)
-                {
-                    return Some(tiff);
-                }
-                cursor = cursor.get(usize::from(length)..)?;
-            }
-        }
-    }
+/// A two-byte field at `at`, or `None` when the block ends first.
+fn read_u16_at(endian: Endian, bytes: &[u8], at: usize) -> Option<u16> {
+    let field = bytes.get(at..at.checked_add(2)?)?.try_into().ok()?;
+    Some(endian.read_u16(field))
+}
+
+/// A four-byte field at `at`, or `None` when the block ends first.
+fn read_u32_at(endian: Endian, bytes: &[u8], at: usize) -> Option<u32> {
+    let field = bytes.get(at..at.checked_add(4)?)?.try_into().ok()?;
+    Some(endian.read_u32(field))
 }
 
 /// The first IFD0 entry `wanted`, when it is an ASCII string.
 ///
-/// `tiff` starts at the TIFF header (`II`/`MM`). Only the fields needed to reach
-/// that one value are read; a value longer than four bytes lives at an offset
-/// from the header, which is the layout cameras use for `Make` and `Model`.
+/// `tiff` starts at the TIFF header (`II`/`MM`, the fixed `42`, then the IFD0
+/// offset). Only the fields needed to reach that one value are read. A value of
+/// four bytes or fewer lives inside the entry; a longer one is at an offset from
+/// the TIFF header. That is the layout this walk accepts — whether real cameras
+/// place `Make` and `Model` there the same way is unverified, because every test
+/// JPEG in this crate is built by [`crate::log::fixture`].
 fn ifd0_ascii(tiff: &[u8], wanted: u16) -> Option<String> {
-    let endian = if tiff.starts_with(b"II") {
-        Endian::Little
-    } else if tiff.starts_with(b"MM") {
-        Endian::Big
-    } else {
-        return None;
-    };
-    let ifd_offset = usize::try_from(endian.read_u32(tiff.get(4..8)?.try_into().ok()?)).ok()?;
-    let count_at = tiff.get(ifd_offset..ifd_offset.checked_add(2)?)?;
-    let entry_count = usize::from(endian.read_u16(count_at.try_into().ok()?));
+    let endian = Endian::of(tiff)?;
+    let ifd_offset = usize::try_from(read_u32_at(endian, tiff, 4)?).ok()?;
+    let entry_count = usize::from(read_u16_at(endian, tiff, ifd_offset)?);
     for index in 0..entry_count {
+        // IFD entry: tag (2 bytes), type (2), count (4), value or offset (4).
         let at = ifd_offset
             .checked_add(2)?
             .checked_add(index.checked_mul(12)?)?;
-        let entry = tiff.get(at..at.checked_add(12)?)?;
-        if endian.read_u16(entry.get(..2)?.try_into().ok()?) != wanted {
+        if read_u16_at(endian, tiff, at)? != wanted {
             continue;
         }
-        if endian.read_u16(entry.get(2..4)?.try_into().ok()?) != TIFF_TYPE_ASCII {
+        let field_type = read_u16_at(endian, tiff, at.checked_add(2)?)?;
+        if field_type != TIFF_TYPE_ASCII {
             return None;
         }
-        let value_len = usize::try_from(endian.read_u32(entry.get(4..8)?.try_into().ok()?)).ok()?;
-        let field = entry.get(8..12)?;
+        let value_len = usize::try_from(read_u32_at(endian, tiff, at.checked_add(4)?)?).ok()?;
+        let field_at = at.checked_add(8)?;
         let value = if value_len <= 4 {
-            field.get(..value_len)?
+            tiff.get(field_at..field_at.checked_add(value_len)?)?
         } else {
-            let value_offset = usize::try_from(endian.read_u32(field.try_into().ok()?)).ok()?;
+            let value_offset = usize::try_from(read_u32_at(endian, tiff, field_at)?).ok()?;
             tiff.get(value_offset..value_offset.checked_add(value_len)?)?
         };
-        let text = String::from_utf8_lossy(value);
-        let trimmed = text.trim_end_matches(['\0', ' ']).trim();
-        return if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_owned())
-        };
+        return camera_string(value);
     }
     None
+}
+
+/// The camera name `value` carries, or `None` when it is empty or not UTF-8.
+///
+/// Only the trailing NUL and space padding a fixed-width ASCII field adds is
+/// removed; the front is kept, because a leading space is part of the raw name
+/// and dropping it would fold two different names into one. Invalid UTF-8 is
+/// unreadable rather than repaired with replacement characters, for the same
+/// reason: `U+FFFD` would make two different raw names compare equal.
+fn camera_string(value: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(value).ok()?;
+    let trimmed = text.trim_end_matches(['\0', ' ']);
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 /// Write `bytes` over `path` through a sibling temporary file.
@@ -2012,9 +2012,11 @@ mod tests {
             Some(86_400 + 7_200 + 180 + 4)
         );
         assert_eq!(time_shift(0, 0, 0, 0).total_seconds(), Some(0));
-        assert!(time_shift(0, 0, 0, 0).is_zero());
-        assert!(!time_shift(0, 0, 0, 1).is_zero());
-        assert!(PhotoTimeShift::default().is_zero());
+        assert_eq!(
+            PhotoTimeShift::default(),
+            time_shift(0, 0, 0, 0),
+            "the default is the zero shift"
+        );
         // The seconds-only form the old API carried is still exact.
         assert_eq!(PhotoTimeShift::from_seconds(-90).total_seconds(), Some(-90));
     }
@@ -2029,17 +2031,29 @@ mod tests {
     }
 
     #[test]
-    fn a_shift_that_overflows_seconds_is_refused_before_any_photo_is_planned() {
+    fn the_default_scope_is_every_photo() {
+        // The spec does not say which scope is the default; this module chose
+        // `allPhotos`. A derived `Default` would move the choice silently, so it
+        // is pinned here.
+        assert_eq!(PhotoShiftScope::default(), PhotoShiftScope::AllPhotos);
+    }
+
+    #[test]
+    fn a_shift_that_overflows_seconds_is_refused_before_any_photo_is_read() {
         let shift = PhotoTimeShift {
             days: i64::MAX,
             ..PhotoTimeShift::default()
         };
         assert_eq!(shift.total_seconds(), None, "the sum must report overflow");
 
+        // The path does not exist on purpose: if the shift were checked after
+        // opening the photos, this would be `Error::Io` instead of `Error::State`.
+        // The order is a promise `plan_with_time_shift`'s doc makes, so the test
+        // would fail if the implementation started reading first.
         let dir = TempDir::new("shift-overflow");
-        let photo = dir.photo("a.jpg", &photo_taken_at(SHUTTER));
+        let missing = dir.0.join("does-not-exist.jpg");
         let err = plan_with_time_shift(
-            std::slice::from_ref(&photo),
+            std::slice::from_ref(&missing),
             &track_at(&[SHUTTER]),
             &GeotagOptions::default(),
             shift,
@@ -2238,6 +2252,79 @@ mod tests {
     }
 
     #[test]
+    fn a_scoped_shift_writes_the_clock_into_the_scoped_photos_only() {
+        // End to end (spec §6.1-7 and §6.2): the scoped plan is only a decision,
+        // so what the scope means is what `apply` writes. Each case plans and
+        // applies the same shape, with one photo whose clock is an hour slow
+        // (inside the scope, so it matches and is rewritten) and one an hour fast
+        // (outside the scope, so it stays outside the gap and its file is not
+        // touched).
+        for use_camera in [false, true] {
+            let label = if use_camera {
+                "apply-camera"
+            } else {
+                "apply-selected"
+            };
+            let dir = TempDir::new(label);
+            let (early, late) = if use_camera {
+                (
+                    dir.photo(
+                        "early.jpg",
+                        &photo_taken_by(SHUTTER - 3_600, "TestCam", "Model X"),
+                    ),
+                    dir.photo(
+                        "late.jpg",
+                        &photo_taken_by(SHUTTER + 3_600, "OtherCam", "Model Y"),
+                    ),
+                )
+            } else {
+                (
+                    dir.photo("early.jpg", &photo_taken_at(SHUTTER - 3_600)),
+                    dir.photo("late.jpg", &photo_taken_at(SHUTTER + 3_600)),
+                )
+            };
+            let late_bytes = std::fs::read(&late).expect("read the unselected photo");
+            let scope = if use_camera {
+                PhotoShiftScope::ByCamera(camera_of(Some("TestCam"), Some("Model X")))
+            } else {
+                PhotoShiftScope::SelectedPhotos(vec![early.clone()])
+            };
+
+            let plans = plan_with_time_shift(
+                &[early.clone(), late.clone()],
+                &track_at(&[SHUTTER, SHUTTER + 7_200]),
+                &GeotagOptions::default(),
+                time_shift(0, 1, 0, 0),
+                &scope,
+            )
+            .expect("plan");
+            let written = apply(&plans).expect("apply");
+            assert_eq!(
+                written,
+                vec![early.clone()],
+                "{label}: only the photo inside the scope may be written"
+            );
+
+            let early_now = std::fs::read(&early).expect("read the selected photo");
+            assert_eq!(
+                exif::read_datetime_original(&early_now).expect("read DateTimeOriginal"),
+                Some(SHUTTER),
+                "{label}: the selected photo's clock moves by the shift"
+            );
+            assert_eq!(
+                std::fs::read(&late).expect("read the unselected photo back"),
+                late_bytes,
+                "{label}: a photo outside the scope keeps its bytes"
+            );
+            assert_eq!(
+                exif::read_datetime_original(&late_bytes).expect("read the late photo"),
+                Some(SHUTTER + 3_600),
+                "{label}: a photo outside the scope keeps its DateTimeOriginal"
+            );
+        }
+    }
+
+    #[test]
     fn the_camera_model_is_read_from_ifd0_make_and_model_in_both_byte_orders() {
         for order in [ByteOrder::Little, ByteOrder::Big] {
             let jpeg = fixture::exif_jpeg(
@@ -2273,6 +2360,99 @@ mod tests {
         assert_eq!(
             CameraModel::from_jpeg(&jpeg),
             Some(camera_of(Some("AB"), Some("M")))
+        );
+    }
+
+    #[test]
+    fn trailing_nul_and_space_padding_is_trimmed_from_camera_names() {
+        // A fixed-width ASCII field may pad with more than one byte; only the
+        // padding is removed, and the value after it is the name.
+        let jpeg = fixture::exif_jpeg(
+            ByteOrder::Little,
+            &[
+                fixture::Entry::ascii_bytes(TAG_MAKE, b"TestCam  \0\0"),
+                fixture::Entry::ascii(TAG_MODEL, "Model X"),
+            ],
+            None,
+            None,
+        );
+        assert_eq!(
+            CameraModel::from_jpeg(&jpeg),
+            Some(camera_of(Some("TestCam"), Some("Model X")))
+        );
+    }
+
+    #[test]
+    fn leading_whitespace_is_part_of_the_camera_name() {
+        // `trim()` used to remove it, so a name beginning with a space compared
+        // equal to one without; that would let a `byCamera` scope move photos
+        // from a camera the user did not name.
+        let name = " TestCam";
+        let jpeg = fixture::exif_jpeg(
+            ByteOrder::Little,
+            &[
+                fixture::Entry::ascii(TAG_MAKE, name),
+                fixture::Entry::ascii(TAG_MODEL, "Model X"),
+            ],
+            None,
+            None,
+        );
+        assert_eq!(
+            CameraModel::from_jpeg(&jpeg),
+            Some(camera_of(Some(name), Some("Model X")))
+        );
+
+        let dir = TempDir::new("camera-leading-space");
+        let photo = dir.photo("a.jpg", &photo_taken_by(SHUTTER - 3_600, name, "Model X"));
+        let plans = plan_with_time_shift(
+            std::slice::from_ref(&photo),
+            &track_at(&[SHUTTER]),
+            &GeotagOptions::default(),
+            time_shift(0, 1, 0, 0),
+            &PhotoShiftScope::ByCamera(camera_of(Some("TestCam"), Some("Model X"))),
+        )
+        .expect("plan");
+        assert_eq!(
+            plans[0].capture_time,
+            Some(CaptureTime::Exif(SHUTTER - 3_600)),
+            "a name with a leading space is a different camera"
+        );
+        assert!(
+            !plans[0].will_write(),
+            "the unselected photo keeps its own clock and stays outside the gap"
+        );
+    }
+
+    #[test]
+    fn camera_names_that_are_not_valid_utf8_are_unreadable_not_collapsed() {
+        // `from_utf8_lossy` turns both of these into one replacement-character
+        // string, which would make two different cameras compare equal. An
+        // unreadable tag is `None` instead; the other tag is still read.
+        let latin1 = fixture::exif_jpeg(
+            ByteOrder::Little,
+            &[
+                fixture::Entry::ascii_bytes(TAG_MAKE, b"Caf\xE9\0"),
+                fixture::Entry::ascii(TAG_MODEL, "Model X"),
+            ],
+            None,
+            None,
+        );
+        assert_eq!(
+            CameraModel::from_jpeg(&latin1),
+            Some(camera_of(None, Some("Model X"))),
+            "an invalid UTF-8 Make must be unknown, not repaired"
+        );
+
+        let other_byte = fixture::exif_jpeg(
+            ByteOrder::Little,
+            &[fixture::Entry::ascii_bytes(TAG_MAKE, b"Caf\xFF\0")],
+            None,
+            None,
+        );
+        assert_eq!(
+            CameraModel::from_jpeg(&other_byte),
+            None,
+            "a photo naming only an unreadable tag names no readable camera"
         );
     }
 

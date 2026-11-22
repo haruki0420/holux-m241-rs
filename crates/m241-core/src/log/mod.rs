@@ -61,10 +61,11 @@ pub use exif::{
 };
 pub use export::{export, to_csv, to_gpx, to_json, to_kml, to_nmea};
 pub use geotag::{
-    CaptureTime, GeotagOptions, GeotagPlan, apply as apply_geotags, group_matched_plans,
-    plan as plan_geotags, plan_with_shift,
+    CameraModel, CaptureTime, GeotagOptions, GeotagPlan, PhotoShiftScope, PhotoTimeShift,
+    apply as apply_geotags, group_matched_plans, plan as plan_geotags, plan_with_shift,
+    plan_with_time_shift,
 };
 pub use import::{import_gpx, import_nmea};
-pub use kmz::{KmzPhoto, export_kmz};
+pub use kmz::{KmzIconOptions, KmzPhoto, export_kmz, export_kmz_with_icons};
 pub use parse::{ParseReport, parse_dump};
 pub use record::{DEFAULT_RECORD_BYTES, MIN_RECORD_BYTES, decode};
