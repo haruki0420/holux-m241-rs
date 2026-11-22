@@ -8,7 +8,12 @@
 //! directory**, never the current directory. `save` therefore stores a relative
 //! path relative to that directory — the same string means the same file on
 //! load, from any cwd, and the project can be moved together with what it
-//! names. An absolute path is kept as an absolute path.
+//! names. An absolute path is kept as an absolute path, because its meaning is
+//! already specific to the machine it names.
+//!
+//! Stored paths use `/` as their separator on every platform: the file outlives
+//! the machine that wrote it, and `Path` accepts `/` everywhere this tool builds
+//! for, so `load` turns the string straight back into a path.
 //!
 //! `input` records whether the log is a raw dump (`log download`) or an NMEA
 //! 0183 capture (`log read --nmea`), so `load` reads it back the same way.
@@ -324,17 +329,34 @@ fn normalize(path: &Path) -> PathBuf {
 
 /// The string `save` stores for `path`.
 ///
-/// An absolute path is stored as given: it already means the same file from any
-/// directory. A relative path is resolved against the current directory once —
-/// that is what it meant when the user typed it — and stored relative to `base`,
-/// which is where `load` will resolve it.
+/// An absolute path is stored as an absolute path: it already means the same
+/// file from any directory on the machine it names. A relative path is resolved
+/// against the current directory once — that is what it meant when the user
+/// typed it — and stored relative to `base`, which is where `load` will resolve
+/// it. Both spellings use `/` separators (see [`stored_spelling`]).
 fn stored_path(base: &Path, path: &Path) -> Result<String> {
     if path.is_absolute() {
-        return Ok(path.display().to_string());
+        return Ok(stored_spelling(path));
     }
     let cwd = std::env::current_dir().map_err(|source| Error::io(".", source))?;
     let absolute = normalize(&cwd.join(path));
-    Ok(relative_from(base, &absolute).display().to_string())
+    Ok(stored_relative(base, &absolute))
+}
+
+/// `path` as `save` stores it, relative to `base`, with `/` separators.
+fn stored_relative(base: &Path, path: &Path) -> String {
+    stored_spelling(&relative_from(base, path))
+}
+
+/// The stored spelling of a path: `/` separators on every platform.
+///
+/// The project file is meant to move with the files it names, possibly to
+/// another OS, so it must not encode `std::path::MAIN_SEPARATOR`. Every platform
+/// this tool builds for accepts a `/` in a path, so `load` passes the string to
+/// [`std::path::Path`] unchanged.
+fn stored_spelling(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "/")
 }
 
 /// `path` written relative to `base`, with `..` components when it sits above it.
@@ -431,9 +453,8 @@ mod tests {
         let console = RecordingConsole::default();
         let confirm = AutoConfirm;
 
-        let log_text = log.display().to_string();
         save(
-            &options(project.clone(), log, output.clone()),
+            &options(project.clone(), log.clone(), output.clone()),
             Session::new(&links, &console, &confirm),
         )
         .expect("save the project");
@@ -449,10 +470,16 @@ mod tests {
             document.get("export_format").and_then(Value::as_str),
             Some("csv")
         );
+        // Compared as a path, not as the platform's spelling: the stored form
+        // uses `/` on every OS, and `Path` treats that as the same file.
+        let stored_log = document
+            .get("log")
+            .and_then(Value::as_str)
+            .expect("the log path is stored");
         assert_eq!(
-            document.get("log").and_then(Value::as_str),
-            Some(log_text.as_str()),
-            "an absolute path is stored as it was given"
+            Path::new(stored_log),
+            log.as_path(),
+            "an absolute path is stored as a path naming the same file"
         );
         assert_eq!(document["photos"], Value::Null, "no photo folder is null");
 
@@ -510,24 +537,26 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_path_is_stored_against_the_project_directory() {
+    fn a_relative_path_is_stored_against_the_project_directory_with_slashes() {
         // The case from the review, as pure path arithmetic: cwd `/work`,
         // project `/work/proj/trip.json`, log `track.bin` typed at that cwd.
+        // The expected strings use `/` on every platform, because that is what
+        // `save` writes into the (portable) project file.
         assert_eq!(
-            relative_from(Path::new("/work/proj"), Path::new("/work/track.bin")),
-            PathBuf::from("../track.bin")
+            stored_relative(Path::new("/work/proj"), Path::new("/work/track.bin")),
+            "../track.bin"
         );
         assert_eq!(
-            relative_from(Path::new("/work/proj"), Path::new("/work/proj/track.csv")),
-            PathBuf::from("track.csv")
+            stored_relative(Path::new("/work/proj"), Path::new("/work/proj/track.csv")),
+            "track.csv"
         );
         assert_eq!(
-            relative_from(Path::new("/work/proj"), Path::new("/other/track.bin")),
-            PathBuf::from("../../other/track.bin")
+            stored_relative(Path::new("/work/proj"), Path::new("/other/track.bin")),
+            "../../other/track.bin"
         );
         assert_eq!(
-            relative_from(Path::new("/work"), Path::new("/work")),
-            PathBuf::from("."),
+            stored_relative(Path::new("/work"), Path::new("/work")),
+            ".",
             "the directory itself is `.`, not an empty path"
         );
     }
@@ -845,7 +874,13 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&project).expect("read the project"))
                 .expect("one JSON object");
         assert_eq!(document["export_format"], "kmz");
-        assert_eq!(document["photos"], photos.display().to_string());
+        // The stored spelling is `/`-separated on every platform; compare it as
+        // a path so the assertion does not encode the host's separator.
+        let stored_photos = document
+            .get("photos")
+            .and_then(Value::as_str)
+            .expect("the photo folder is stored");
+        assert_eq!(Path::new(stored_photos), photos.as_path());
     }
 
     #[test]

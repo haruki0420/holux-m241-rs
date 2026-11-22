@@ -355,9 +355,12 @@ or the output: that would overwrite a file the project names.
 
 A relative `LOG`, `PHOTOS` or `OUTPUT` is resolved against the current directory
 once — what it meant when typed — and then stored **relative to the project
-file's directory**. An absolute path is stored as an absolute path. Either form
-means the same file when `load` resolves it, so a project directory can be moved
-as one unit with the files it names.
+file's directory**; an absolute path is stored as an absolute path. Stored paths
+use `/` as their separator on every platform, so the project file does not encode
+the one that wrote it, and `load` turns the string back into a path with its own
+separator rules. Either form means the same file when `load` resolves it, so a
+project directory can be moved as one unit with the files it names (an absolute
+path stays specific to the machine it names).
 
 The format is this project's own. ezTour's `.itm` is an undocumented SQLite
 database; this JSON neither reads nor writes it and only keeps the "one file plus
