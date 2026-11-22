@@ -349,7 +349,12 @@ fn the_firmware_screen_draws_every_dump_state() {
             read: 214_880,
             total: 406_620,
         },
-        DumpState::WaitingForPowerCycle { total: 406_620 },
+        DumpState::WaitingForPowerCycle {
+            total: 406_620,
+            digest: String::from(
+                "32fe52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435",
+            ),
+        },
         DumpState::Verified {
             bytes: 406_620,
             digest: String::from(
@@ -382,7 +387,12 @@ fn waiting_for_the_power_cycle_holds_the_progress_bar_at_one_hundred_percent() {
     app.select(Screen::Firmware);
     app.firmware_mut().set_step(Step::Dump);
     app.firmware_mut()
-        .set_dump_state(DumpState::WaitingForPowerCycle { total: 406_620 });
+        .set_dump_state(DumpState::WaitingForPowerCycle {
+            total: 406_620,
+            digest: String::from(
+                "32fe52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435",
+            ),
+        });
 
     let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
     let mut flat = Vec::new();

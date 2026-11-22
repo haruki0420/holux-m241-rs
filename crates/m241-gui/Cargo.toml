@@ -14,6 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 m241-core.workspace = true
+# The GUI's Firmware screen writes firmware, so it links the write crate. The
+# write path is the same `DownloadAgent` session the CLI uses, through
+# `m241_flash::flow`; `tools/check_safety.py` now requires this dependency
+# instead of forbidding it, and still forbids `m241-core` from reaching it.
+m241-flash.workspace = true
 egui.workspace = true
 eframe.workspace = true
 # The `log project save|load` JSON document the CLI defines. The GUI reads and
@@ -36,3 +41,9 @@ egui_system_font_provider = "0.37"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The write-path tests drive the same fake DA the write crate's protocol tests
+# use. The feature is off for the shipped binary, so the simulator is not linked
+# into `m241-gui` itself.
+m241-flash = { workspace = true, features = ["simulator"] }
