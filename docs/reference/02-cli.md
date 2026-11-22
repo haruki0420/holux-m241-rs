@@ -6,7 +6,7 @@ reads as a map of the device rather than a list of verbs.
 ```text
 m241 device  ports | info | doctor
 m241 fw      dump  | patch | flash | probe-da | da-restart
-m241 log     info  | download | read | erase | geotag
+m241 log     info  | download | read | edit | erase | geotag | kmz
 m241 nmea    repair | proxy
 ```
 
@@ -287,6 +287,33 @@ The shift, when one was applied, is announced on stderr and — for
 `--format json` — also carried as an `offset_days` field in the exported object.
 The field is absent when nothing was shifted.
 
+## `m241 log edit`
+
+Applies exactly one edit to a dumped log and exports the result in `read`'s
+formats (`--format`, default `gpx`). One of the three operations is required and
+two at once is a usage error (exit code 2):
+
+* `--split-at <N>` — the first N points become one track and the rest another.
+  The first goes to `-o/--output`; the second to a sibling named after it with
+  `-2` before the extension (`track.gpx` → `track-2.gpx`; with no extension,
+  `track` → `track-2`). N must leave both halves non-empty, otherwise the split
+  is refused with exit code 1. The sibling is a path the user did not name, so
+  an existing file there is not replaced: the split stops with exit code 5
+  before writing either half, and the file must be removed or renamed first.
+* `--merge <FILE>` — repeated once per dump to join. The log plus each dump are
+  joined in capture-time order (earliest timestamp first; a dump with no
+  timestamps sorts last). The merged track is written to `-o/--output`.
+* `--delete <INDICES>` — comma-separated zero-based point indices (`3,5,9`) are
+  removed from the track, which is written to `-o/--output`. An index the log
+  does not have is an error (exit code 1) rather than a silent no-op.
+
+The three operations are exclusive: none is a usage error (exit code 2), and so
+are two at once. `-o/--output` is required, because a split writes two files.
+**The input dump is never modified**, and neither is any `--merge` input.
+`--utc-offset-days` is not accepted here: the edit works on the timestamps as
+recorded, so run `log read --utc-offset-days` when the export needs a shifted
+clock.
+
 ## `m241 log erase`
 
 Erases the track log. **Destructive.**
@@ -327,6 +354,39 @@ Flags: `--max-gap <SECONDS>` (default `300`), `--utc-offset-days <DAYS|auto>`
 (default `auto`), `--tz-offset-minutes <MINUTES>` (default `0`, for cameras
 whose `DateTimeOriginal` is in local time), `--dry-run` (plan without modifying
 any photo), `--json`.
+
+## `m241 log kmz`
+
+Bundles `<LOG>` and its photos into a KMZ archive at `-o/--output <FILE>`: a
+Store (uncompressed) ZIP with `doc.kml` and each matched photo under `photo/`.
+
+`[PHOTOS]...` is optional and takes files or directories (a directory
+contributes its immediate regular files, in sorted path order). Photos are
+matched to track points by capture time with the same matcher `log geotag` uses,
+so `--max-gap <SECONDS>` (default `300`) decides how far a photo may be from the
+nearest point. A photo the matcher leaves out is not embedded, and the warning
+on stderr carries the matcher's reason (past the gap limit, not a JPEG, no
+usable capture time, and so on) rather than a guess at one, because the reason
+tells the user which next step would help. A photo that cannot be placed is
+never put at a coordinate it cannot support.
+
+`--utc-offset-days <DAYS|auto>` (default `auto`) applies to the track before
+matching, which is what makes a photo from an unpatched unit line up.
+
+`--tz-offset-minutes <MINUTES>` (default `0`) is for a camera whose
+`DateTimeOriginal` is local time, as in `log geotag`: matching moves a copy of
+the track into the camera's clock, while the archive and the times recorded for
+its photos stay UTC.
+
+`--max-photo-edge <PIXELS>` caps the long edge of every embedded photo
+(`kmzMaxPhotoEdgeSize`). A photo at or under the cap is stored byte for byte; one
+over it is scaled down and re-encoded as JPEG, which **drops its EXIF** (see
+[`kmz.rs`](../../crates/m241-core/src/log/kmz.rs)). A photo over the cap that
+cannot be decoded is an error naming the photo, not a full-size embed.
+
+The archive is checked by this project's own ZIP reader and CRC in `m241-core`'s
+tests; **Google Earth and `unzip` have not been run on the output**. The KML
+track style colour and width are this project's choice; see the same module.
 
 ## `m241 nmea repair`
 
