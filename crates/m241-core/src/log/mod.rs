@@ -65,7 +65,7 @@ pub use geotag::{
     apply as apply_geotags, group_matched_plans, plan as plan_geotags, plan_with_shift,
     plan_with_time_shift,
 };
-pub use import::{import_gpx, import_nmea};
+pub use import::{NmeaImport, import_gpx, import_nmea};
 pub use kmz::{KmzIconOptions, KmzPhoto, export_kmz, export_kmz_with_icons};
 pub use parse::{ParseReport, parse_dump};
 pub use record::{DEFAULT_RECORD_BYTES, MIN_RECORD_BYTES, decode};

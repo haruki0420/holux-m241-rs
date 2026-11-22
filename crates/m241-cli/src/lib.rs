@@ -15,6 +15,7 @@
 //!   device   ports, info, doctor
 //!   fw       dump, patch and flash
 //!   logcmd   download, info, read, edit, erase, geotag, kmz
+//!   project  save and load a project file
 //!   nmea     repair and proxy
 //! ```
 //!
@@ -58,6 +59,7 @@ mod link;
 mod logcmd;
 mod nmea;
 mod output;
+mod project;
 
 #[cfg(test)]
 // A fixture library: each command's tests take the doubles they need, so a
@@ -266,7 +268,7 @@ pub(crate) fn run_with(
     session: Session<'_>,
     command: Command,
 ) -> std::result::Result<(), CliError> {
-    use cli::{DeviceCommand, FwCommand, LogCommand, NmeaCommand};
+    use cli::{DeviceCommand, FwCommand, LogCommand, LogProjectCommand, NmeaCommand};
     match command {
         Command::Device { command } => match command {
             DeviceCommand::Ports(options) => device::ports(&options, session)?,
@@ -284,6 +286,10 @@ pub(crate) fn run_with(
             LogCommand::Info(options) => logcmd::info(&options, session)?,
             LogCommand::Download(options) => logcmd::download(&options, session)?,
             LogCommand::Read(options) => logcmd::read(&options, session)?,
+            LogCommand::Project { command } => match command {
+                LogProjectCommand::Save(options) => project::save(&options, session)?,
+                LogProjectCommand::Load(options) => project::load(&options, session)?,
+            },
             LogCommand::Edit(options) => logcmd::edit(&options, session)?,
             LogCommand::Erase(options) => logcmd::erase(&options, session)?,
             LogCommand::Geotag(options) => logcmd::geotag(&options, session)?,

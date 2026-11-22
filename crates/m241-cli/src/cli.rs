@@ -348,6 +348,11 @@ pub enum LogCommand {
     Download(DownloadOptions),
     /// Convert a dumped track log to GPX, KML, CSV, NMEA or JSON.
     Read(LogReadOptions),
+    /// Save or load the settings that make one track an output.
+    Project {
+        #[command(subcommand)]
+        command: LogProjectCommand,
+    },
     /// Split, merge or trim the points of a dumped track log.
     Edit(LogEditOptions),
     /// Erase the track log on the device (destructive).
@@ -674,10 +679,15 @@ pub struct EraseOptions {
     pub json: bool,
 }
 
+/// `m241 log read`: one dumped log, converted and written out.
 #[derive(Debug, Args)]
 pub struct LogReadOptions {
-    /// The raw dump `m241 log download` wrote.
+    /// The raw dump `m241 log download` wrote, or an NMEA 0183 capture with `--nmea`.
     pub file: PathBuf,
+
+    /// Read the input as an NMEA 0183 capture instead of a raw dump.
+    #[arg(long)]
+    pub nmea: bool,
 
     /// Output format.
     #[arg(long, value_parser = parse_format, default_value = "gpx")]
@@ -699,6 +709,43 @@ pub struct LogReadOptions {
         default_value = "auto"
     )]
     pub utc_offset_days: OffsetSpec,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LogProjectCommand {
+    /// Save the log, photo folder and export settings as one file.
+    Save(LogProjectSaveOptions),
+    /// Read the log a project names and write its export.
+    Load(LogProjectLoadOptions),
+}
+
+/// `m241 log project save`: write a project file without opening the log.
+#[derive(Debug, Args)]
+pub struct LogProjectSaveOptions {
+    /// Where to write the project file.
+    pub project: PathBuf,
+    /// The raw dump `project load` reads.
+    pub log: PathBuf,
+    /// Where `project load` writes the converted track.
+    pub output: PathBuf,
+    /// Export format `project load` writes.
+    #[arg(long, value_parser = parse_format, default_value = "gpx")]
+    pub format: ExportFormat,
+    /// Write a KMZ archive instead; requires `--photos`.
+    #[arg(long)]
+    pub kmz: bool,
+    /// Photo folder the project matches into a KMZ.
+    #[arg(long)]
+    pub photos: Option<PathBuf>,
+    /// Day correction stored for the log's timestamps.
+    #[arg(long, allow_hyphen_values = true, default_value_t = 0)]
+    pub utc_offset_days: i32,
+}
+
+/// `m241 log project load`: apply a saved project.
+#[derive(Debug, Args)]
+pub struct LogProjectLoadOptions {
+    pub project: PathBuf,
 }
 
 /// `m241 log edit`: one pure edit of a dumped track log, then export it.
@@ -1787,5 +1834,77 @@ mod tests {
             panic!("expected fw dump");
         };
         assert_eq!(options.length, 406_312);
+    }
+
+    #[test]
+    fn log_read_accepts_an_nmea_capture() {
+        let cli = Cli::try_parse_from(["m241", "log", "read", "capture.nmea", "--nmea"])
+            .expect("--nmea parses");
+        let Command::Log {
+            command: LogCommand::Read(options),
+        } = cli.command
+        else {
+            panic!("expected log read");
+        };
+        assert!(options.nmea);
+        assert_eq!(options.file, PathBuf::from("capture.nmea"));
+        assert_eq!(options.format, ExportFormat::Gpx);
+        assert_eq!(options.output, None);
+
+        let cli = Cli::try_parse_from(["m241", "log", "read", "track.bin"])
+            .expect("a dump is still the default");
+        let Command::Log {
+            command: LogCommand::Read(options),
+        } = cli.command
+        else {
+            panic!("expected log read");
+        };
+        assert!(!options.nmea);
+    }
+
+    #[test]
+    fn log_project_save_and_load_parse_their_documented_arguments() {
+        let cli = Cli::try_parse_from([
+            "m241",
+            "log",
+            "project",
+            "save",
+            "trip.json",
+            "capture.nmea",
+            "track.kmz",
+            "--kmz",
+            "--photos",
+            "photos",
+            "--utc-offset-days",
+            "-7168",
+        ])
+        .expect("project save parses");
+        let Command::Log {
+            command: LogCommand::Project { command },
+        } = cli.command
+        else {
+            panic!("expected log project");
+        };
+        let LogProjectCommand::Save(options) = command else {
+            panic!("expected project save");
+        };
+        assert_eq!(options.log, PathBuf::from("capture.nmea"));
+        assert_eq!(options.output, PathBuf::from("track.kmz"));
+        assert!(options.kmz);
+        assert_eq!(options.photos, Some(PathBuf::from("photos")));
+        assert_eq!(options.utc_offset_days, -7168);
+
+        let cli = Cli::try_parse_from(["m241", "log", "project", "load", "trip.json"])
+            .expect("project load parses");
+        let Command::Log {
+            command: LogCommand::Project { command },
+        } = cli.command
+        else {
+            panic!("expected log project");
+        };
+        let LogProjectCommand::Load(options) = command else {
+            panic!("expected project load");
+        };
+        assert_eq!(options.project, PathBuf::from("trip.json"));
     }
 }

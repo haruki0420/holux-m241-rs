@@ -5,7 +5,8 @@
 //!
 //! Downloading talks PMTK182 to the logger and saves the raw flash blocks;
 //! `info` summarises a dump without converting it so the user can check damage
-//! before exporting; `read` converts a dump to GPX, KML, CSV, NMEA or JSON,
+//! before exporting; `read` converts a dump (or, with `--nmea`, an NMEA 0183
+//! capture whose line counts it reports) to GPX, KML, CSV, NMEA or JSON,
 //! optionally shifting WNRO-stale timestamps; `edit` splits, merges or trims a
 //! dump and exports the result in the same formats; `erase` saves the log and
 //! then destroys it on the device through `m241-flash`; `geotag` matches photos
@@ -244,10 +245,27 @@ fn print_download(
 /// [`m241_core::Error::Io`] when the file cannot be read or the output written,
 /// [`m241_core::Error::Log`] when it is not a dump at all.
 pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
-    let bytes = fileio::read(&options.file)?;
-    let (mut track, report) = parse_dump(&bytes)?;
-    let summary = report.summary(&track);
-    warn_about_damage(session.console, &summary, &report, None);
+    let mut track = if options.nmea {
+        // The line counts are what tells "empty" from "all rejected".
+        let imported = m241_core::log::import_nmea(&fileio::read_text(&options.file)?)?;
+        session.console.note(&format!(
+            "read {}: {} sentence(s) imported, {} dropped, {} ignored",
+            count_label(
+                imported.imported + imported.dropped + imported.ignored,
+                "line"
+            ),
+            imported.imported,
+            imported.dropped,
+            imported.ignored
+        ));
+        imported.track
+    } else {
+        let bytes = fileio::read(&options.file)?;
+        let (track, report) = parse_dump(&bytes)?;
+        let summary = report.summary(&track);
+        warn_about_damage(session.console, &summary, &report, None);
+        track
+    };
 
     let shift = apply_utc_offset(&mut track, options.utc_offset_days, session.console);
 
@@ -1319,6 +1337,7 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Gpx,
                 output: Some(output.clone()),
@@ -1341,6 +1360,7 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Csv,
                 output: None,
@@ -1350,7 +1370,7 @@ mod tests {
         )
         .expect("read");
         assert!(
-            console.stdout().starts_with("index,utc,lat,lon"),
+            console.stdout().starts_with("INDEX,TRACK NUMBER,UTC DATE"),
             "got {}",
             console.stdout()
         );
@@ -1365,6 +1385,7 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Json,
                 output: None,
@@ -1402,6 +1423,7 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Json,
                 output: None,
@@ -1424,6 +1446,7 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Json,
                 output: None,
@@ -1452,6 +1475,7 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Csv,
                 output: None,
@@ -1461,7 +1485,7 @@ mod tests {
         )
         .expect("empty dump");
         assert!(
-            console.stdout().starts_with("index,utc,lat,lon"),
+            console.stdout().starts_with("INDEX,TRACK NUMBER,UTC DATE"),
             "the header is still written: {}",
             console.stdout()
         );
@@ -1482,6 +1506,7 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Csv,
                 output: None,
@@ -1577,6 +1602,7 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Json,
                 output: None,
@@ -1610,6 +1636,7 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Json,
                 output: None,
@@ -1640,6 +1667,7 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Json,
                 output: None,
@@ -2263,6 +2291,7 @@ mod tests {
         let kml_console = RecordingConsole::default();
         read(
             &LogReadOptions {
+                nmea: false,
                 file: path.clone(),
                 format: m241_core::ExportFormat::Kml,
                 output: None,
@@ -2280,6 +2309,7 @@ mod tests {
         let nmea_console = RecordingConsole::default();
         read(
             &LogReadOptions {
+                nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Nmea,
                 output: None,
@@ -3694,6 +3724,46 @@ mod tests {
         assert!(
             stderr.contains("merge-damaged.bin") && stderr.contains("checksum"),
             "the warning must name the damaged merge input: {stderr}"
+        );
+    }
+
+    #[test]
+    fn read_nmea_converts_a_capture_and_reports_dropped_lines() {
+        use m241_core::protocol::pmtk::sentence;
+
+        let scratch = Scratch::new("import-nmea");
+        let input = scratch.join("capture.nmea");
+        let output = scratch.join("track.gpx");
+        let good = sentence("GPRMC,221320.00,A,3540.8742,N,13946.0275,E,10.00,,141123,,");
+        let broken = String::from("$GPRMC,221320.00,A,3540.8742,N,13946.0275,E,10.00,,141123,,*00");
+        fileio::write_text(&input, &format!("{good}\r\n{broken}\r\n")).expect("write capture");
+
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        read(
+            &LogReadOptions {
+                nmea: true,
+                file: input,
+                format: m241_core::ExportFormat::Gpx,
+                output: Some(output.clone()),
+                utc_offset_days: crate::cal::OffsetSpec::Days(0),
+            },
+            Session::new(&links, &console, &confirm),
+        )
+        .expect("import nmea");
+
+        let written = std::fs::read_to_string(&output).expect("read the export");
+        assert!(written.contains("<gpx"), "got {written}");
+        assert_eq!(written.matches("<trkpt").count(), 1);
+        let notes = console.stderr();
+        assert!(
+            notes.contains("2 lines: 1 sentence(s) imported, 1 dropped, 0 ignored"),
+            "the counts must separate imported from dropped: {notes}"
+        );
+        assert!(
+            notes.contains("1 point"),
+            "the point count differs from the sentence count: {notes}"
         );
     }
 }
