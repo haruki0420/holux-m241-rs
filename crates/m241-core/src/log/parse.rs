@@ -2,22 +2,38 @@
 //!
 //! A real dump is not a clean file. It has blocks that were never written (all
 //! `0xFF`), blocks that were half-erased, a final record cut short by a power-off,
-//! and stale records from an earlier overwrite cycle. The reader's job is to
-//! return every point it can defend and to say — per block, and in totals — what
+//! and a **settings journal interleaved between the track records**. The reader
+//! returns every point it can defend and says — per block, and in totals — what
 //! it had to skip.
 //!
-//! This is deliberately forgiving in the same way `fsck` is forgiving: a track
-//! with one damaged block is still worth exporting, and refusing the whole dump
-//! because one checksum failed would throw away the trip. [`ParseReport`] carries
-//! the damage so the caller can warn instead of hiding it.
+//! This is deliberately forgiving in the same way `fsck` is forgiving: one
+//! damaged block is a track worth keeping. [`ParseReport`] carries the damage so
+//! the caller can warn instead of hiding it.
+//!
+//! Two rules keep the forgiveness from turning into invention: a record whose
+//! checksum does not match is **not** exported as a point, and the record length
+//! comes from checksum evidence rather than the header mask alone (a stale mask
+//! has been measured). A block that holds only the journal yields no points.
 
 use crate::error::{Error, Result};
 use crate::log::block::{
     self, BLOCK_HEADER_SIZE, BLOCK_SIZE, BlockHeader, POLICY_LOG_DISABLED, POLICY_LOG_ENABLED,
     is_padding, record_length,
 };
-use crate::log::record;
+use crate::log::{journal, record};
 use crate::types::{LogSummary, Track};
+
+/// The fixed record lengths tried when the header mask may be stale.
+///
+/// A mask that declares another fixed length is tried too, so this only has to
+/// cover the mismatch that has actually been seen.
+const DETECTED_RECORD_LENGTHS: [usize; 2] = [16, 20];
+
+/// Records the length-detection scan samples before it decides.
+const DETECTION_SAMPLE_RECORDS: usize = 256;
+
+/// Bytes a resync scan looks through for the next journal item or record grid.
+const RESYNC_SCAN_BYTES: usize = 0x1000;
 
 /// What the parser had to skip, in the same units as [`LogSummary`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -30,10 +46,16 @@ pub struct ParseReport {
     pub damaged_blocks: usize,
     /// Records that decoded and are in the track.
     pub records: usize,
-    /// Records whose checksum did not match (they are still in the track).
+    /// Records whose checksum did not match. They are **not** in the track.
     pub bad_checksums: usize,
     /// Records skipped because the bytes ran out, typically the final write.
     pub truncated_records: usize,
+    /// Settings-journal items skipped because they are not track records.
+    pub journal_items: usize,
+    /// Blocks whose header mask disagreed with the record length in the data.
+    pub layout_mismatches: usize,
+    /// Bytes no record grid or journal item could explain; they were skipped.
+    pub unparsed_bytes: usize,
     /// Bytes consumed by the last block, for a "how full is it" figure.
     pub used_bytes: usize,
 }
@@ -46,14 +68,24 @@ impl ParseReport {
         summary.damaged_block_count = self.damaged_blocks;
         summary
     }
+
+    /// Whether the dump held only the settings journal, with no track records.
+    ///
+    /// This is a configured or erased unit that has not recorded a point yet,
+    /// not a dump that contains nothing at all.
+    #[must_use]
+    pub fn is_journal_only(&self) -> bool {
+        self.records == 0 && self.journal_items > 0
+    }
 }
 
 /// Parse a raw log dump.
 ///
-/// The first block's header decides the record layout for that block; each later
-/// block carries its own, so a dump written across a configuration change parses
-/// correctly. A bad checksum marks the record but keeps it: the payload is almost
-/// always intact and the point is almost always worth keeping.
+/// Each block carries its own header, so a dump written across a configuration
+/// change parses correctly. Within a block the walk skips the settings journal,
+/// checks every record's checksum before it becomes a point, and — where the
+/// header mask and the data disagree about the record length — trusts the data
+/// and reports the disagreement.
 ///
 /// # Errors
 ///
@@ -100,6 +132,11 @@ pub fn parse_dump(data: &[u8]) -> Result<(Track, ParseReport)> {
         }
 
         let end = base.saturating_add(BLOCK_SIZE).min(data.len());
+        let mask = header.effective_bitmask();
+        // `None` means the mask selects the variable satellite block; that length
+        // is a property of each record, not of the block.
+        let declared_length = block::fixed_record_length(mask).filter(|length| *length > 0);
+        let mut detected_length: Option<usize> = None;
         let mut pos = header.data_offset();
         let mut in_block = 0usize;
         let mut block_damaged = false;
@@ -114,14 +151,54 @@ pub fn parse_dump(data: &[u8]) -> Result<(Track, ParseReport)> {
                 // unwritten and there is nothing to recover from it.
                 break;
             }
+            // Journal entries and the device name are configuration, not track
+            // records, and they sit between record runs. Skipping them is what
+            // keeps the read aligned with the records on the other side.
+            if let Some(length) = journal::item_len(rest) {
+                report.journal_items += 1;
+                pos += length;
+                continue;
+            }
             if header
                 .count
                 .is_some_and(|count| in_block >= usize::from(count))
             {
                 break;
             }
-            let length = record_length(header.effective_bitmask(), rest);
-            if length == 0 || rest.len() < length {
+            // The record boundary is declared by the mask, unless checksum
+            // evidence says the mask is stale; a variable-layout mask (the
+            // satellite block) says it per record instead.
+            let length = if let Some(mask_length) = declared_length {
+                match detected_length {
+                    Some(length) => length,
+                    None => {
+                        let Some(length) = detect_record_length(data, pos, end, mask_length) else {
+                            // Nothing here is a record. Resume at the next
+                            // journal item, padding, or record grid rather than
+                            // inventing a point from these bytes.
+                            let Some(next) = resync_offset(data, pos, end, mask_length) else {
+                                report.unparsed_bytes += end - pos;
+                                break;
+                            };
+                            report.unparsed_bytes += next - pos;
+                            pos = next;
+                            continue;
+                        };
+                        if length != mask_length {
+                            // The mask's field selection is still the only
+                            // evidence of what each field is, so the record is
+                            // decoded with it; only the boundary comes from the
+                            // data.
+                            report.layout_mismatches += 1;
+                        }
+                        detected_length = Some(length);
+                        length
+                    }
+                }
+            } else {
+                record_length(mask, rest)
+            };
+            if length == 0 {
                 report.truncated_records += 1;
                 break;
             }
@@ -129,14 +206,19 @@ pub fn parse_dump(data: &[u8]) -> Result<(Track, ParseReport)> {
                 report.truncated_records += 1;
                 break;
             };
-            // The trailer is checked here rather than in `record::decode`: a bad
-            // checksum marks a block, it does not discard a point whose fields
-            // are almost certainly intact.
-            if !block::checksum_matches(bytes, header.effective_bitmask()) {
+            // Fail closed: a record whose checksum does not match is not a
+            // point. It is counted so the block can be warned about, and the
+            // walk still advances by the record length because that much of the
+            // format is known.
+            if !block::checksum_matches_length(bytes, length) {
                 report.bad_checksums += 1;
                 block_damaged = true;
+                in_block += 1;
+                report.used_bytes += length;
+                pos += length;
+                continue;
             }
-            match record::decode(bytes, header.effective_bitmask()) {
+            match record::decode(bytes, mask) {
                 Ok(point) => {
                     // A record with neither a time nor a position carries no
                     // information, so it is dropped rather than exported as an
@@ -166,6 +248,119 @@ pub fn parse_dump(data: &[u8]) -> Result<(Track, ParseReport)> {
         base += BLOCK_SIZE;
     }
     Ok((track, report))
+}
+
+/// Checksum evidence for one candidate record length.
+#[derive(Debug, Clone, Copy, Default)]
+struct Evidence {
+    /// Records on the candidate grid whose trailer matched.
+    valid: usize,
+    /// Records on the candidate grid that were sampled.
+    tried: usize,
+    /// Records that matched at the start of the grid, before the first failure.
+    ///
+    /// This is the strong figure: a record run interrupted by a journal cluster
+    /// has few valid records out of many sampled, but a long unbroken leading run
+    /// cannot be random bytes.
+    leading: usize,
+}
+
+/// How much checksum evidence supports `length` as the record length.
+fn length_evidence(data: &[u8], pos: usize, end: usize, length: usize) -> Evidence {
+    let mut evidence = Evidence::default();
+    let mut at = pos;
+    let mut leading = true;
+    while at < end && evidence.tried < DETECTION_SAMPLE_RECORDS {
+        let Some(rest) = data.get(at..end) else {
+            break;
+        };
+        if is_padding(rest) {
+            break;
+        }
+        let Some(candidate) = rest.get(..length) else {
+            break;
+        };
+        evidence.tried += 1;
+        if block::checksum_matches_length(candidate, length) {
+            evidence.valid += 1;
+            if leading {
+                evidence.leading += 1;
+            }
+        } else {
+            leading = false;
+        }
+        at = at.saturating_add(length);
+    }
+    evidence
+}
+
+/// Decide the record length for a block whose header mask declares
+/// `mask_length`.
+///
+/// The mask is the device's own declaration, but a stale one has been measured:
+/// a block that says 16-byte records while every record is 20 bytes and only the
+/// 20-byte grid checksums. The mask's candidate is preferred when the evidence is
+/// equal; an alternative length has to be corroborated more strongly, and neither
+/// is accepted on evidence that random bytes could produce.
+fn detect_record_length(data: &[u8], pos: usize, end: usize, mask_length: usize) -> Option<usize> {
+    let mut candidates = vec![mask_length];
+    for length in DETECTED_RECORD_LENGTHS {
+        if !candidates.contains(&length) {
+            candidates.push(length);
+        }
+    }
+    let mut best: Option<(usize, Evidence)> = None;
+    for length in candidates {
+        let evidence = length_evidence(data, pos, end, length);
+        let trusted = if length == mask_length {
+            // The declared layout is believed on a short unbroken run, or when
+            // most of the sampled grid matches (a few damaged records at the
+            // start are normal).
+            evidence.leading >= 2 || (evidence.valid >= 1 && evidence.valid * 2 >= evidence.tried)
+        } else {
+            // A layout the header did not declare needs an unbroken run before
+            // the parser overrides the device's own mask.
+            evidence.leading >= 2
+        };
+        if !trusted {
+            continue;
+        }
+        if best.is_none_or(|(_, best_evidence)| evidence.leading > best_evidence.leading) {
+            best = Some((length, evidence));
+        }
+    }
+    best.map(|(length, _)| length)
+}
+
+/// Find the next offset that can be parsed: a journal item, the `0xFF` padding,
+/// or a record grid that [`detect_record_length`] accepts.
+///
+/// Used when the bytes at `pos` are neither a journal item nor a record grid, so
+/// the walk can resume instead of inventing a point. The scan is bounded; past
+/// `RESYNC_SCAN_BYTES` the rest of the block is reported as unparsed.
+fn resync_offset(data: &[u8], pos: usize, end: usize, mask_length: usize) -> Option<usize> {
+    let stop = end.min(pos.saturating_add(RESYNC_SCAN_BYTES));
+    let mut candidates = vec![mask_length, 16, 20];
+    candidates.sort_unstable();
+    candidates.dedup();
+    for at in (pos.saturating_add(1))..stop {
+        let Some(rest) = data.get(at..end) else {
+            break;
+        };
+        if journal::item_len(rest).is_some() || is_padding(rest) {
+            return Some(at);
+        }
+        // Cheap prefilter: without it, the evidence scan would run at every byte
+        // of the resync window.
+        let starts_a_record = candidates.iter().any(|length| {
+            rest.get(..*length)
+                .is_some_and(|record| block::checksum_matches_length(record, *length))
+        });
+        if starts_a_record && detect_record_length(data, at, end, mask_length).is_some() {
+            return Some(at);
+        }
+    }
+    None
 }
 
 /// Whether `policy` is one of the two values the log format defines.
@@ -220,11 +415,72 @@ mod tests {
         block
     }
 
+    /// The measured 20-byte mask: UTC + lat + lon + height + float speed.
+    const MASK20: u32 = 0x8000_003D;
+
     /// The repository's example coordinate. All three records share it on
     /// purpose: the log stores coordinates as `f32`, so a sub-metre difference
     /// would not survive the round trip and would make the fixture misleading.
     const LAT: f32 = 35.681_236;
     const LON: f32 = 139.767_13;
+
+    /// The device-name string the settings journal interleaves with its entries.
+    const JOURNAL_NAME: &[u8; 20] = b"HOLUXGR241LOGGER    ";
+
+    /// One 16-byte settings/state journal entry, in the shape a dump carries.
+    fn journal_entry(kind: u8, value: u32) -> [u8; 16] {
+        let mut entry = [0xAAu8; 16];
+        entry[7] = kind;
+        entry[8..12].copy_from_slice(&value.to_le_bytes());
+        entry[12..16].copy_from_slice(&[0xBB; 4]);
+        entry
+    }
+
+    /// One journal cluster: the device name, then six entries. Real dumps use
+    /// this shape between record runs.
+    fn push_journal_cluster(out: &mut Vec<u8>) {
+        out.extend_from_slice(JOURNAL_NAME);
+        for (kind, value) in [
+            (7u8, 0x0106u32),
+            (7, 0x0104),
+            (3, 50),
+            (4, 1000),
+            (3, 50),
+            (4, 0),
+        ] {
+            out.extend_from_slice(&journal_entry(kind, value));
+        }
+    }
+
+    /// Append a 20-byte record (UTC, lat, lon, height, speed) with a correct
+    /// checksum.
+    fn push_record20(out: &mut Vec<u8>, utc: u32) {
+        let mut body = Vec::new();
+        body.extend_from_slice(&utc.to_le_bytes());
+        body.extend_from_slice(&LAT.to_le_bytes());
+        body.extend_from_slice(&LON.to_le_bytes());
+        body.extend_from_slice(&[0x00, 0xA0, 0x42]);
+        body.extend_from_slice(&12.5f32.to_le_bytes());
+        let checksum = xor_checksum(&body);
+        body.push(checksum);
+        out.extend_from_slice(&body);
+    }
+
+    /// One block with an explicit mask, count and body, padded with `0xFF`.
+    fn build_custom_block(mask: u32, count: u16, body: &[u8]) -> Vec<u8> {
+        let mut block = vec![0xFFu8; BLOCK_SIZE];
+        block[0..2].copy_from_slice(&count.to_le_bytes());
+        block[2..6].copy_from_slice(&mask.to_le_bytes());
+        block[6..8].copy_from_slice(&POLICY_LOG_ENABLED.to_le_bytes());
+        block[8..12].copy_from_slice(&10u32.to_le_bytes());
+        block[BLOCK_HEADER_SIZE..BLOCK_HEADER_SIZE + body.len()].copy_from_slice(body);
+        block
+    }
+
+    fn parse_body(mask: u32, count: u16, body: &[u8]) -> (Track, ParseReport) {
+        let dump = build_custom_block(mask, count, body);
+        parse_dump(&dump).expect("a synthetic block")
+    }
 
     fn sample() -> Vec<(u32, f32, f32, [u8; 3])> {
         vec![
@@ -293,7 +549,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bad_checksum_marks_the_block_but_keeps_the_point() {
+    fn a_bad_checksum_marks_the_block_and_is_not_exported() {
         let records = sample();
         let mut dump = build_block(&records, 3);
         // Corrupt one field byte of the first record.
@@ -301,12 +557,13 @@ mod tests {
         let (track, report) = parse_dump(&dump).expect("the block structure is intact");
         assert_eq!(
             track.points.len(),
-            3,
-            "a bad checksum must not drop the point"
+            2,
+            "a bad checksum must not be exported as a point"
         );
         assert_eq!(report.bad_checksums, 1);
         assert_eq!(report.damaged_blocks, 1);
         assert_eq!(track.damaged_blocks, vec![0]);
+        assert_eq!(track.points[0].utc, Some(1_700_000_001));
     }
 
     #[test]
@@ -377,5 +634,142 @@ mod tests {
         let (track, _report) = parse_dump(&block).expect("valid block");
         assert_eq!(track.points.len(), 1);
         assert!(track.points[0].is_waypoint());
+    }
+
+    #[test]
+    fn a_hundred_twenty_byte_records_keep_every_point_and_no_damage() {
+        let mut body = Vec::new();
+        for index in 0..100u32 {
+            push_record20(&mut body, 1_700_000_000 + index);
+        }
+        let (track, report) = parse_body(MASK20, 100, &body);
+        assert_eq!(track.points.len(), 100);
+        assert_eq!(report.records, 100);
+        assert_eq!(report.bad_checksums, 0);
+        assert_eq!(report.damaged_blocks, 0);
+        assert_eq!(report.journal_items, 0);
+        assert_eq!(report.layout_mismatches, 0);
+        assert!(!report.is_journal_only());
+        assert!(track.damaged_blocks.is_empty());
+        assert_eq!(track.points[99].utc, Some(1_700_000_099));
+        assert_eq!(track.points[99].speed_kmh, Some(12.5));
+    }
+
+    #[test]
+    fn a_journal_only_dump_yields_no_points_at_all() {
+        // The 2026-11-22 dumps: a well-formed header, then nothing but settings
+        // journal. Every journal byte is a non-record, so no point may come out,
+        // and the result must say "journal only" rather than "empty log".
+        let mut body = Vec::new();
+        body.extend_from_slice(&journal_entry(3, 50));
+        body.extend_from_slice(&journal_entry(4, 1000));
+        for _ in 0..3 {
+            push_journal_cluster(&mut body);
+        }
+        let (track, report) = parse_body(MASK20, COUNT_NOT_FULL, &body);
+        assert!(track.is_empty(), "journal bytes are not track records");
+        assert_eq!(report.records, 0);
+        assert_eq!(report.bad_checksums, 0);
+        assert_eq!(report.damaged_blocks, 0);
+        assert_eq!(report.journal_items, 2 + 3 * 7);
+        assert_eq!(report.layout_mismatches, 0);
+        assert!(report.is_journal_only());
+        assert!(track.damaged_blocks.is_empty());
+    }
+
+    #[test]
+    fn journal_clusters_between_records_do_not_shift_the_points() {
+        let mut body = Vec::new();
+        let mut utc = 1_700_000_000u32;
+        let mut expected = 0usize;
+        for run in [10usize, 20, 5] {
+            for _ in 0..run {
+                push_record20(&mut body, utc);
+                utc += 1;
+                expected += 1;
+            }
+            push_journal_cluster(&mut body);
+        }
+        let (track, report) = parse_body(MASK20, expected as u16, &body);
+        assert_eq!(track.points.len(), expected);
+        assert_eq!(report.bad_checksums, 0);
+        assert_eq!(report.damaged_blocks, 0);
+        assert_eq!(report.journal_items, 3 * 7);
+        assert_eq!(report.layout_mismatches, 0);
+        // The points after each cluster keep their place and their time.
+        assert_eq!(track.points[10].utc, Some(1_700_000_010));
+        assert_eq!(track.points[30].utc, Some(1_700_000_030));
+    }
+
+    #[test]
+    fn a_stale_sixteen_byte_mask_still_reads_twenty_byte_records() {
+        // The 2026-11-21 block 0 shape: the header says 16-byte records, but the
+        // data is a journal lead followed by 20-byte records. The record length
+        // must come from the data, and the disagreement must be reported rather
+        // than silently guessed at.
+        let mut body = Vec::new();
+        for (kind, value) in [
+            (3u8, 50u32),
+            (4, 1000),
+            (2, 0x8000_003D),
+            (6, 0x0104),
+            (3, 50),
+            (4, 0),
+            (7, 0x0106),
+        ] {
+            body.extend_from_slice(&journal_entry(kind, value));
+        }
+        body.extend_from_slice(JOURNAL_NAME);
+        for index in 0..3u32 {
+            push_record20(&mut body, 1_700_000_000 + index);
+        }
+        let (track, report) = parse_body(0x8000_001D, 3, &body);
+        assert_eq!(track.points.len(), 3);
+        assert_eq!(report.bad_checksums, 0);
+        assert_eq!(report.damaged_blocks, 0);
+        assert_eq!(report.journal_items, 8);
+        assert_eq!(
+            report.layout_mismatches, 1,
+            "the stale mask must be reported, not silently trusted"
+        );
+        assert_eq!(track.points[0].utc, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn a_record_whose_checksum_fails_is_not_exported() {
+        let mut body = Vec::new();
+        for index in 0..3u32 {
+            push_record20(&mut body, 1_700_000_000 + index);
+        }
+        // Corrupt one field byte of the second record: that record is damage,
+        // not a point whose position happens to look plausible.
+        body[20 + 3] ^= 0xFF;
+        let (track, report) = parse_body(MASK20, 3, &body);
+        assert_eq!(track.points.len(), 2);
+        assert_eq!(report.bad_checksums, 1);
+        assert_eq!(report.damaged_blocks, 1);
+        assert_eq!(track.damaged_blocks, vec![0]);
+    }
+
+    #[test]
+    fn unreadable_bytes_before_the_records_are_skipped() {
+        // A short prefix the record grid cannot explain is skipped, and the
+        // records after it are still read.
+        let mut body = vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        for index in 0..4u32 {
+            push_record20(&mut body, 1_700_000_000 + index);
+        }
+        let (track, report) = parse_body(MASK20, 4, &body);
+        assert_eq!(track.points.len(), 4);
+        assert_eq!(report.bad_checksums, 0);
+        assert_eq!(report.unparsed_bytes, 7);
+    }
+
+    #[test]
+    fn an_erased_block_is_not_journal_only() {
+        let (track, report) = parse_dump(&vec![0xFFu8; BLOCK_SIZE]).expect("erased flash");
+        assert!(track.is_empty());
+        assert_eq!(report.journal_items, 0);
+        assert!(!report.is_journal_only());
     }
 }

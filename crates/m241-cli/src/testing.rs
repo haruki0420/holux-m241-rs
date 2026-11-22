@@ -628,6 +628,58 @@ pub fn synthetic_dump(points: usize) -> Vec<u8> {
     block
 }
 
+/// A one-block dump that holds only the settings/state journal: the shape a
+/// configured unit writes before it records a point.
+///
+/// It is what the 2026-11-22 dumps contained. The journal is not a track
+/// record, so this must parse to zero points and be reported as "journal only"
+/// rather than as an empty log.
+#[must_use]
+pub fn synthetic_journal_only_dump() -> Vec<u8> {
+    use m241_core::log::block::{BLOCK_HEADER_SIZE, BLOCK_SIZE, POLICY_LOG_DISABLED};
+
+    const NAME: &[u8] = b"HOLUXGR241LOGGER    ";
+    const MASK: u32 = 0x8800_003D;
+
+    /// One 16-byte journal entry: seven `0xAA`, a type, a `u32` value, four
+    /// `0xBB`. See `m241_core::log::journal` for what is and is not known about
+    /// the type meanings.
+    fn entry(kind: u8, value: u32) -> [u8; 16] {
+        let mut bytes = [0xAAu8; 16];
+        bytes[7] = kind;
+        bytes[8..12].copy_from_slice(&value.to_le_bytes());
+        bytes[12..16].copy_from_slice(&[0xBB; 4]);
+        bytes
+    }
+
+    let mut block = vec![0xFFu8; BLOCK_SIZE];
+    block[0..2].copy_from_slice(&u16::MAX.to_le_bytes());
+    block[2..6].copy_from_slice(&MASK.to_le_bytes());
+    block[6..8].copy_from_slice(&POLICY_LOG_DISABLED.to_le_bytes());
+    block[8..12].copy_from_slice(&50u32.to_le_bytes());
+
+    let mut body = Vec::new();
+    for (kind, value) in [(3u8, 50u32), (4, 1000)] {
+        body.extend_from_slice(&entry(kind, value));
+    }
+    for _ in 0..3 {
+        body.extend_from_slice(NAME);
+        for (kind, value) in [
+            (7u8, 0x0106u32),
+            (7, 0x0104),
+            (3, 50),
+            (4, 1000),
+            (3, 50),
+            (4, 0),
+        ] {
+            body.extend_from_slice(&entry(kind, value));
+        }
+    }
+    block.truncate(BLOCK_HEADER_SIZE + body.len());
+    block[BLOCK_HEADER_SIZE..].copy_from_slice(&body);
+    block
+}
+
 /// A fake chip for the one command that hands the unit to a Download Agent.
 ///
 /// `m241-flash`'s `FakeDa` is `#[cfg(test)]` inside that crate, so a test here

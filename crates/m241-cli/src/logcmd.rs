@@ -772,7 +772,7 @@ fn print_info(
     summary: LogSummary,
     report: &ParseReport,
 ) {
-    let lines = [
+    let mut lines = vec![
         ("file", file.display().to_string()),
         ("size", size.to_string()),
         ("records", summary.records.to_string()),
@@ -784,6 +784,21 @@ fn print_info(
         ("start", timestamp(summary.started_at)),
         ("end", timestamp(summary.ended_at)),
     ];
+    if report.journal_items > 0 {
+        lines.push(("journal items", report.journal_items.to_string()));
+    }
+    if report.layout_mismatches > 0 {
+        lines.push(("layout mismatches", report.layout_mismatches.to_string()));
+    }
+    if report.unparsed_bytes > 0 {
+        lines.push(("unparsed bytes", report.unparsed_bytes.to_string()));
+    }
+    if report.is_journal_only() {
+        lines.push((
+            "track",
+            String::from("no track points (settings journal only)"),
+        ));
+    }
     for (label, value) in lines {
         console.result(&format!("{label:<18}: {value}"));
     }
@@ -811,6 +826,10 @@ fn parse_document(report: &ParseReport) -> serde_json::Value {
         "records": report.records,
         "bad_checksums": report.bad_checksums,
         "truncated_records": report.truncated_records,
+        "journal_items": report.journal_items,
+        "journal_only": report.is_journal_only(),
+        "layout_mismatches": report.layout_mismatches,
+        "unparsed_bytes": report.unparsed_bytes,
         "used_bytes": report.used_bytes,
     })
 }
@@ -1146,8 +1165,29 @@ fn warn_about_damage(
     let source = source.map_or_else(String::new, |path| format!("{}: ", path.display()));
     if summary.damaged_block_count > 0 {
         console.warn(&format!(
-            "{source}{} of {} blocks failed their header checksum; their records are still exported",
+            "{source}{} of {} blocks contain records whose checksum did not match; those \
+             records were skipped",
             summary.damaged_block_count, report.blocks
+        ));
+    }
+    if report.layout_mismatches > 0 {
+        console.warn(&format!(
+            "{source}{} of {} blocks: the header mask disagreed with the record length in \
+             the data; the detected record length was used",
+            report.layout_mismatches, report.blocks
+        ));
+    }
+    if report.unparsed_bytes > 0 {
+        console.warn(&format!(
+            "{source}{} bytes could not be read as records or configuration journal entries \
+             and were skipped",
+            report.unparsed_bytes
+        ));
+    }
+    if report.is_journal_only() {
+        console.warn(&format!(
+            "{source}no track points (settings journal only): the dump holds only the \
+             configuration journal"
         ));
     }
     if report.truncated_records > 0 {
@@ -1159,7 +1199,7 @@ fn warn_about_damage(
     }
     if report.bad_checksums > 0 {
         console.warn(&format!(
-            "{source}{} records failed their per-record checksum; they are exported and marked",
+            "{source}{} records failed their per-record checksum; they were skipped",
             report.bad_checksums
         ));
     }
@@ -1172,7 +1212,7 @@ mod tests {
     use crate::link::PortEntry;
     use crate::testing::{
         AutoConfirm, DeviceHandle, FakePorts, RecordingConsole, Scratch, ScriptedLinks,
-        ScriptedTransport, synthetic_dump,
+        ScriptedTransport, synthetic_dump, synthetic_journal_only_dump,
     };
     use m241_core::Error;
     use m241_core::protocol::simulator::FakeDevice;
@@ -1256,6 +1296,66 @@ mod tests {
         assert_eq!(document["summary"]["records"], 2);
         assert_eq!(document["summary"]["fixes"], 2);
         assert_eq!(document["parse"]["blocks"], 1);
+    }
+
+    #[test]
+    fn info_reports_a_journal_only_dump_as_having_no_track_points() {
+        let scratch = Scratch::new("info-journal-only");
+        let path = scratch.join("journal-only.bin");
+        fileio::write(&path, &synthetic_journal_only_dump()).expect("write dump");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        info(
+            &LogInfoOptions {
+                file: path,
+                json: true,
+            },
+            Session::new(&links, &console, &confirm),
+        )
+        .expect("info");
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(document["summary"]["records"], 0);
+        assert_eq!(document["summary"]["fixes"], 0);
+        assert_eq!(document["parse"]["journal_only"], true);
+        assert_eq!(document["parse"]["journal_items"], 23);
+        assert_eq!(document["parse"]["bad_checksums"], 0);
+        assert_eq!(document["parse"]["damaged_blocks"], 0);
+        let stderr = console.stderr();
+        assert!(
+            stderr.contains("no track points (settings journal only)"),
+            "the result must say the dump is journal-only: {stderr}"
+        );
+        assert!(
+            !stderr.contains("header checksum"),
+            "a journal is not a failed header checksum: {stderr}"
+        );
+    }
+
+    #[test]
+    fn info_prints_the_journal_only_state_and_its_item_count() {
+        let scratch = Scratch::new("info-journal-only-text");
+        let path = scratch.join("journal-only.bin");
+        fileio::write(&path, &synthetic_journal_only_dump()).expect("write dump");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        info(
+            &LogInfoOptions {
+                file: path,
+                json: false,
+            },
+            Session::new(&links, &console, &confirm),
+        )
+        .expect("info");
+        let text = console.stdout();
+        assert!(text.contains("records           : 0"), "got {text}");
+        assert!(text.contains("journal items"), "got {text}");
+        assert!(
+            text.contains("no track points (settings journal only)"),
+            "got {text}"
+        );
     }
 
     #[test]
@@ -1598,6 +1698,16 @@ mod tests {
         assert!(
             console.stderr().contains("checksum"),
             "the warning is on stderr: {}",
+            console.stderr()
+        );
+        assert!(
+            !console.stderr().contains("header checksum"),
+            "the warning must describe record checksums, not a header checksum: {}",
+            console.stderr()
+        );
+        assert!(
+            console.stderr().contains("skipped"),
+            "a failed record must not be exported silently: {}",
             console.stderr()
         );
         assert!(

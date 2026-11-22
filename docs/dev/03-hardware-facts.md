@@ -87,6 +87,29 @@ what fills that cell. On the measured unit the report began
 | Log erase command | `$PMTK182,6,1*3E` (after `$PMTK182,5`, before `$PMTK182,4`), ACK `$PMTK001,182,6,3` |
 | Post-erase log usage (`$PMTK182,2,8`) | `528` bytes (`0x210`: fresh `0x200` block header + 16 B, 0 records / 0 fixes); bare `$PMTK182,6` without `,1` leaves the log untouched |
 
+## Log format
+
+A dump is a flat copy of the log area in 64 KiB blocks. Each block starts with a
+`0x200`-byte header whose bitmask says which fields a record carries, followed by
+the records and `0xFF` padding. The area is **not** a pure array of records: the
+unit also writes a settings/state journal between record runs.
+
+| Fact | Value | How it was established |
+|---|---|---|
+| Settings/state journal entry | 16 bytes: `AA`×7, type (1 byte), value (`u32` little-endian), `BB`×4 | runs of this exact template between record runs in the 2026-11-21 and both 2026-11-22 dumps |
+| Journal name separator | 20 bytes of ASCII `HOLUXGR241LOGGER    ` (four trailing spaces) | 2026-11-21 blocks 0/2/3 and both 2026-11-22 dumps |
+| Journal cluster | a name separator followed by six entries; one cluster is 116 bytes, and a block can start part-way into a cluster | 2026-11-21 block 2: two record runs (2,742 and 456 records) separated by a journal region holding nine name separators |
+| Journal types seen | 3, 4 and 7 | the values look like the block header's period (`50` = 5.0 s) and policy (`0x0104` / `0x0106`) words; the mapping is **inference from the values, not firmware-confirmed** |
+| Journal type 2 | ⚠️ 未検証 — suggested to overwrite the record mask, but never observed doing anything | not acted on anywhere in the parser |
+| Header mask vs data | the mask can disagree with the actual record length in the block | 2026-11-21 block 0: header mask `0x1D` says 16-byte records, while all 3,244 records are 20 bytes and only the 20-byte grid checksums |
+| Journal-only dump | a configured unit can hold a block header plus journal and no records at all (3,228 and 3,260 bytes) | both 2026-11-22 dumps; read as 20-byte records they produced 135 / 137 checksum-failing points |
+
+Journal bytes are not track records. Reading them as records is what produced the
+checksum-failing garbage points in the earlier parser. The parser recognises only
+the exact shapes above and skips them; anything unrecognised fails the per-record
+checksum and is dropped rather than guessed at. The type meanings are inference
+from the observed values and must not be used as a configuration source.
+
 ## UI languages
 
 English / French / German on the firmware; the release notes list TC / SC / DE /
