@@ -188,9 +188,19 @@
 //!   (§5.6) — read from the disassembly; the fake models it, no unit did;
 //! * whether the DA answers anything to `0xD9` (§4.5, §8 item 4) — the
 //!   disassembly says it never returns; this driver does not read after it;
-//! * whether the DA zero-fills the short final packet before programming (§4.4
-//!   reads that padding off the *read* serialiser) — the client pads it, which
-//!   is accepted either way because the sum covers the padded payload.
+//! * what the DA does when `0x00102474`'s remainder is zero, i.e. the range
+//!   divides evenly by the packet length — the shipped range does not (its
+//!   remainder is 92 bytes), so this client never asks;
+//! * whether the DA zero-fills the short final packet before *programming*
+//!   (§4.4 reads that padding off the *read* serialiser). The client sends the
+//!   final packet at the receive length `0x00102474` returns — 92 payload bytes
+//!   plus the sum — instead of padding it, because padding it is what the
+//!   2026-11-22 hardware runs answered `0x01` (`docs/dev/05-verification.md`
+//!   §1.4);
+//! * what `0x01` is. The receive length explains why a padded final packet
+//!   cannot pass the packet checksum, but which DA status produces `0x01` is
+//!   not established, so this client retries nothing on it and records the byte
+//!   as a framing failure.
 //!
 //! And for the two additions above:
 //!
@@ -300,6 +310,13 @@ pub const MEM_CMD_STATUS_OK: u8 = 0x00;
 /// `docs/reference/01-da-protocol.md` §4.3, which records that the DA imposes
 /// no maximum and that `0x100` is a host convention. §8 item 9 records that
 /// the 406,620-byte image ends on a 92-byte packet.
+///
+/// This is the length the DA reads for every packet **but the last**:
+/// `0x00102474` returns the remainder `(end - start + 1) mod length` for the
+/// final packet (`docs/reference/01-da-protocol.md` §4.3), which is 92 bytes for
+/// the shipped range. [`DownloadAgent`]'s final packet is therefore
+/// [`FLASH_WRITE_LENGTH`] `% PACKET_SIZE` bytes plus its two-byte sum, not a
+/// zero-padded [`PACKET_SIZE`] bytes.
 pub const PACKET_SIZE: usize = 0x100;
 
 /// Start of the span this driver writes, in the **DA's** linear flash view.
@@ -604,6 +621,15 @@ pub const PROBE_PAGE_SIZE: usize = 64;
 /// without bounding it. Three re-requests is enough for a marginal page and
 /// short enough that a wrong cable is reported instead of hammered.
 pub const READ_RETRIES: usize = 3;
+
+/// How many non-`0x5A` / non-`0xA5` bytes may precede the `0xD3` reply.
+///
+/// The 2026-11-22 hardware writes saw four banner-residue bytes, sometimes after
+/// the pre-command `clear_input` (`docs/dev/05-verification.md` §1.3). Four is
+/// the measured count, so **eight is margin, not a protocol value**; the same
+/// [`REPLY_TIMEOUT`] bounds the whole scan, so a genuinely desynchronised line
+/// is reported instead of scanned indefinitely.
+const D3_RESYNC_LIMIT: usize = 8;
 
 /// A call-site confirmation token indicating that `--yes` (or an interactive
 /// confirmation) was supplied for this operation.
@@ -1374,6 +1400,14 @@ impl PendingWrite {
 pub struct DownloadAgent<T: Transport> {
     transport: T,
     reply_timeout: Duration,
+    /// `true` once the first `0xD3` attempt has started.
+    range_attempted: bool,
+    /// `true` once the `0xD5` command may have reached the wire.
+    ///
+    /// Set before the header is written, not after it is acknowledged: a write
+    /// that fails part-way cannot prove that no byte was sent, so the safe
+    /// assumption is that programming may have started.
+    program_started: bool,
 }
 
 impl<T: Transport> DownloadAgent<T> {
@@ -1383,6 +1417,8 @@ impl<T: Transport> DownloadAgent<T> {
         Self {
             transport,
             reply_timeout: REPLY_TIMEOUT,
+            range_attempted: false,
+            program_started: false,
         }
     }
 
@@ -1398,6 +1434,26 @@ impl<T: Transport> DownloadAgent<T> {
         &mut self.transport
     }
 
+    /// Whether the first `0xD3` attempt has started.
+    ///
+    /// After a failed write the CLI uses this with [`Self::program_started`] to
+    /// decide whether the failure happened before any `0xD5` byte: only that
+    /// state is safe for the one automatic retry.
+    #[must_use]
+    pub fn range_attempted(&self) -> bool {
+        self.range_attempted
+    }
+
+    /// Whether the `0xD5` command may have reached the wire.
+    ///
+    /// Set before the header is written and never cleared on a failure of that
+    /// write: one byte that may have gone out is enough for a partial flash
+    /// write, so the CLI restarts the unit but does not retry automatically.
+    #[must_use]
+    pub fn program_started(&self) -> bool {
+        self.program_started
+    }
+
     /// Take the transport back, for the BootROM read-back.
     #[must_use]
     pub fn into_transport(self) -> T {
@@ -1409,7 +1465,9 @@ impl<T: Transport> DownloadAgent<T> {
     /// `docs/reference/01-da-protocol.md` §4.5 and §8 item 4: the handler jumps
     /// to `0x00101920`, sets the reset registers and never returns. The write
     /// path itself never calls this; [`PendingWrite::verify_written`] does,
-    /// immediately before the read that needs the restart.
+    /// immediately before the read that needs the restart. The CLI also uses it
+    /// after a failed DA phase to leave the chip in a defined restart state
+    /// instead of RAM-resident DA code.
     ///
     /// # Errors
     ///
@@ -1794,6 +1852,7 @@ impl<T: Transport> DownloadAgent<T> {
     /// place that can reach `0xD3` without repeating a check, so it must not
     /// become public.
     fn write_range_accepted(&mut self, start: u32, image: &[u8]) -> Result<PendingWrite> {
+        self.program_started = false;
         let mut packets = 0usize;
         let mut progress = Progress::NothingWritten;
         let end = range_end(start);
@@ -1801,6 +1860,7 @@ impl<T: Transport> DownloadAgent<T> {
         // stands on its own. Wrapping it in the partial-write paragraph would
         // tell the user the range is "now only partly erased and programmed"
         // when this run did not erase or program a byte.
+        self.range_attempted = true;
         self.record_range(start, end)?;
         let outcome = self.program(image, start, &mut packets, &mut progress);
         if let Err(err) = outcome {
@@ -1827,11 +1887,13 @@ impl<T: Transport> DownloadAgent<T> {
     fn record_range(&mut self, start: u32, end: u32) -> Result<()> {
         // The DA banner is followed by four bytes whose origin is not
         // established. They arrive before the first `0xD6`, and the 2026-11-22
-        // hardware write showed they also arrive before the first `0xD3`: that
-        // run read one as `0xBB` and reported "0xD3 answered 0xBB". The read
-        // path already drains before `0xD6`; the first write command must drain
-        // too, or the stale byte becomes the ACK. `clear_input` is the same
-        // operation in both places.
+        // hardware writes showed they also arrive before the first `0xD3`.
+        // The first fix cleared the input before sending `0xD3`, but the unit
+        // answered `0xBB` again: the residue can arrive **after** that clear.
+        // The acknowledgement is therefore resynchronised by
+        // [`Self::read_d3_reply`]; the read path does the same job for `0xD6`
+        // by clearing before the command, which is not enough here because the
+        // bytes may follow the command.
         self.transport.clear_input()?;
         let mut frame = Vec::with_capacity(10);
         // §5.3: one count byte, then one pair of big-endian u32 (start, end).
@@ -1848,7 +1910,8 @@ impl<T: Transport> DownloadAgent<T> {
         //
         // 未検証 the one-byte refusal: `0x0010202C` shows it in the instruction
         // sequence, but no unit was ever made to refuse a `0xD3`.
-        let first = self.read_byte("0xD3 reply")?;
+        let deadline = std::time::Instant::now() + self.reply_timeout;
+        let first = self.read_d3_reply(deadline)?;
         if first == NAK {
             return Err(Error::Rejected {
                 what: format!(
@@ -1858,13 +1921,10 @@ impl<T: Transport> DownloadAgent<T> {
                 ),
             });
         }
-        if first != ACK {
-            return Err(Error::Framing {
-                what: format!("0xD3 answered 0x{first:02X}; expected 0x5A or 0xA5"),
-                offset: None,
-            });
-        }
-        let status = self.read_byte("0xD3 status byte")?;
+        // The status is the second half of the reply and the reason a skipped
+        // residue byte cannot be taken for success on its own: only `5A 00` is
+        // accepted, so a residue `0x5A` followed by anything else fails here.
+        let status = self.read_byte_before(deadline, "0xD3 status byte")?;
         if status != MEM_CMD_STATUS_OK {
             return Err(Error::Framing {
                 what: format!("0xD3 status byte was 0x{status:02X}; the only value is 0x00"),
@@ -1872,6 +1932,39 @@ impl<T: Transport> DownloadAgent<T> {
             });
         }
         Ok(())
+    }
+
+    /// Read the first byte of the `0xD3` reply, skipping the banner residue.
+    ///
+    /// Up to [`D3_RESYNC_LIMIT`] non-reply bytes are skipped before the first
+    /// `0x5A` / `0xA5`, inside one [`Self::reply_timeout`] for the whole scan.
+    ///
+    /// This is only safe because `0x5A` alone is not success: the caller
+    /// requires the status byte after it to be [`MEM_CMD_STATUS_OK`], so a
+    /// residue byte of `0x5A` followed by any other value is refused. The
+    /// observed residue is four `0xBB` bytes (`docs/dev/05-verification.md`
+    /// §1.3); the one indistinguishable case, a residue reading exactly
+    /// `5A 00`, has not been seen. If it happened, the client would consume the
+    /// real reply and the following `0xD5` would stop before its first packet,
+    /// after the first-sector erase that `0xD5` already performs.
+    fn read_d3_reply(&mut self, deadline: std::time::Instant) -> Result<u8> {
+        let mut skipped = 0usize;
+        loop {
+            let byte = self.read_byte_before(deadline, "0xD3 reply")?;
+            if byte == ACK || byte == NAK {
+                return Ok(byte);
+            }
+            if skipped >= D3_RESYNC_LIMIT {
+                return Err(Error::Framing {
+                    what: format!(
+                        "0xD3 answered 0x{byte:02X} after skipping {skipped} non-reply byte(s); \
+                         expected 0x5A or 0xA5"
+                    ),
+                    offset: None,
+                });
+            }
+            skipped = skipped.saturating_add(1);
+        }
     }
 
     /// `0xD5`: the length, the two `0x5A`, one packet per `0x69`, two `0x5A`.
@@ -1882,11 +1975,15 @@ impl<T: Transport> DownloadAgent<T> {
         packets: &mut usize,
         progress: &mut Progress,
     ) -> Result<()> {
+        // Set before the header goes out: a write that fails part-way cannot
+        // prove that no byte of `0xD5` reached the wire, so this attempt must
+        // count as programming-started for the CLI's retry decision.
+        self.program_started = true;
         self.send_write_header()?;
         self.await_first_erase()?;
         for (index, chunk) in image.chunks(PACKET_SIZE).enumerate() {
             self.send_packet(chunk)?;
-            self.await_packet_reply(index, start)?;
+            self.await_packet_reply(index, start, chunk.len())?;
             *packets = index.saturating_add(1);
             // `UpTo` is exclusive, which is exactly the address the next packet
             // would start at, so `bytes(start)` counts the accepted payloads.
@@ -1935,33 +2032,35 @@ impl<T: Transport> DownloadAgent<T> {
         Ok(())
     }
 
-    /// One packet: its payload zero-filled to [`PACKET_SIZE`], then the sum.
+    /// One packet: the chunk's own bytes, then their sum.
     ///
-    /// §5.6, §4.4: the raw payload may be shorter than the command's length; a
-    /// test pins that it is zero-filled before the sum, which is what the DA's
-    /// read serialiser does (§4.4, 未検証 for the write direction).
+    /// The command's length argument ([`packet_length`]) is the size the DA
+    /// reads for every packet **except the last**. `0x00102474` compares the
+    /// packet index with the packet count and returns the remainder
+    /// `(end - start + 1) mod length` for the last packet only
+    /// (`docs/reference/01-da-protocol.md` §4.3); for the shipped range that
+    /// remainder is 92 bytes, so the final packet is sent as 92 payload bytes
+    /// plus its two-byte sum. Padding it back up to [`PACKET_SIZE`] puts the sum
+    /// past the bytes the DA reads — it takes the first two padding bytes as the
+    /// trailer — and the 2026-11-22 hardware runs answered that packet `0x01`
+    /// (`docs/dev/05-verification.md` §1.4).
     fn send_packet(&mut self, chunk: &[u8]) -> Result<()> {
-        let mut payload = vec![0u8; PACKET_SIZE];
-        payload
-            .iter_mut()
-            .zip(chunk.iter())
-            .for_each(|(slot, byte)| *slot = *byte);
-        let mut packet = Vec::with_capacity(PACKET_SIZE + 2);
-        packet.extend_from_slice(&payload);
-        packet.extend_from_slice(&byte_sum(&payload).to_be_bytes());
+        let mut packet = Vec::with_capacity(chunk.len() + 2);
+        packet.extend_from_slice(chunk);
+        packet.extend_from_slice(&byte_sum(chunk).to_be_bytes());
         self.transport.write_all(&packet)?;
         self.transport.flush()
     }
 
     /// The `0x69` that acknowledges one packet, or the error that replaces it.
-    fn await_packet_reply(&mut self, index: usize, start: u32) -> Result<()> {
+    fn await_packet_reply(&mut self, index: usize, start: u32, bytes: usize) -> Result<()> {
         let reply = self.read_byte(&format!("0xD5 packet {index} reply"))?;
         if reply == NAK {
             // §4.4: a checksum mismatch never produces `0x69`; the handler
             // ends in `0xA5` and a chip restart.
             return Err(Error::Rejected {
                 what: format!(
-                    "0xD5 packet {index} ({PACKET_SIZE} bytes at DA address 0x{:08X}) was refused",
+                    "0xD5 packet {index} ({bytes} bytes at DA address 0x{:08X}) was refused",
                     packet_address(index, start)
                 ),
             });
@@ -2004,8 +2103,17 @@ impl<T: Transport> DownloadAgent<T> {
     }
 
     fn read_byte(&mut self, what: &str) -> Result<u8> {
-        let mut byte = [0u8; 1];
         let deadline = std::time::Instant::now() + self.reply_timeout;
+        self.read_byte_before(deadline, what)
+    }
+
+    /// Read one byte, but never past `deadline`.
+    ///
+    /// `record_range` uses one deadline for the whole `0xD3` resynchronisation,
+    /// so skipped bytes and the eventual reply share the same `reply_timeout`
+    /// budget instead of each noise byte getting a fresh one.
+    fn read_byte_before(&mut self, deadline: std::time::Instant, what: &str) -> Result<u8> {
+        let mut byte = [0u8; 1];
         loop {
             if self.transport.read(&mut byte)? == 1 {
                 return byte.first().copied().ok_or_else(|| Error::Timeout {
@@ -2855,6 +2963,35 @@ mod tests {
     }
 
     #[test]
+    fn moving_only_the_pinned_start_is_refused_by_the_pin_rule() {
+        // The pin rule must be distinguishable from the rule that compares the
+        // write start with the pin. Delete the pin rule and the next one still
+        // refuses — with a message that also says "settled DA-side base" — so
+        // only text unique to the pin rule shows that the pin was the problem.
+        let moved = FLASH_WRITE_START + 0x0020_0000;
+        let err = check_layout_of(
+            FLASH_WRITE_START,
+            FLASH_WRITE_LENGTH,
+            moved,
+            FLASH_WRITE_LENGTH,
+        )
+        .expect_err("only the pinned start moved");
+        let text = format!("{err}");
+        assert!(
+            text.contains("the expected write start"),
+            "the refusal must name the moved pin: {text}"
+        );
+        assert!(
+            text.contains("the pin may not move"),
+            "the pin rule must be the one that failed: {text}"
+        );
+        assert!(
+            !text.contains("Refusing to write an unpinned range"),
+            "the write-start comparison must not have been reached: {text}"
+        );
+    }
+
+    #[test]
     fn a_pinned_range_that_disagrees_is_refused_on_its_own() {
         // The gate opens for exactly one range: the settled start and the
         // pinned length. Vary each number in turn and check the stage that owns
@@ -2984,6 +3121,204 @@ mod tests {
             (0, FLASH_WRITE_END),
             "write_vendor records the settled range after the drain"
         );
+    }
+
+    #[test]
+    fn the_first_d3_resyncs_past_late_banner_residue() {
+        // The second 2026-11-22 run still saw `0xBB`: the four bytes arrived
+        // after the pre-command clear. The fake stores them as a field and
+        // queues them when it receives `0xD3`, so `clear_input` cannot remove
+        // them. The client must skip them and reach the real `5A 00`.
+        let backup = stock_image();
+        let image = patched_image();
+        let mut device = FakeDa::with_firmware(&backup);
+        let report = enter_download_agent(&mut device);
+        assert_eq!(report.first().copied(), Some(0xC0), "the DA banner");
+        device.prefix_next_d3(&[0xBB; 4]);
+        let mut da = DownloadAgent::new(device);
+        let pending = da
+            .write(Confirmation::granted(), &backup, &image)
+            .expect("the first 0xD3 resynchronises past the late residue");
+        assert_eq!(pending.packets, 1_589);
+        assert_eq!(
+            da.transport_mut().recorded_range(),
+            (0, FLASH_WRITE_END),
+            "0xD3 records the settled range after resynchronising"
+        );
+    }
+
+    #[test]
+    fn the_first_d3_resyncs_past_late_banner_residue_for_a_vendor_write() {
+        let Some(vendor) = vendor_image() else {
+            return;
+        };
+        let backup = stock_image();
+        let token = accept_vendor_image(&PROFILE_V1_13, &vendor).expect("the pinned vendor image");
+        let mut device = FakeDa::with_firmware(&backup);
+        let report = enter_download_agent(&mut device);
+        assert_eq!(report.first().copied(), Some(0xC0), "the DA banner");
+        device.prefix_next_d3(&[0xBB; 4]);
+        let mut da = DownloadAgent::new(device);
+        let pending = da
+            .write_vendor(Confirmation::granted(), &backup, token)
+            .expect("write_vendor resynchronises past the late residue");
+        assert_eq!(pending.packets, 1_589);
+        assert_eq!(
+            da.transport_mut().recorded_range(),
+            (0, FLASH_WRITE_END),
+            "write_vendor records the settled range after resynchronising"
+        );
+    }
+
+    #[test]
+    fn the_d3_resync_accepts_eight_bytes_and_refuses_the_ninth() {
+        // The limit bounds what may be skipped before the reply: eight residue
+        // bytes must still reach the `5A 00`, and the ninth non-reply byte must
+        // stop the scan. Both halves are pinned so an off-by-one (`>` vs `>=`)
+        // or a moved limit fails here instead of only in a longer scan.
+        let backup = stock_image();
+        let image = patched_image();
+        let mut device = FakeDa::with_firmware(&backup);
+        let report = enter_download_agent(&mut device);
+        assert_eq!(report.first().copied(), Some(0xC0), "the DA banner");
+        device.prefix_next_d3(&[0xBB; D3_RESYNC_LIMIT]);
+        let mut da = DownloadAgent::new(device);
+        da.write(Confirmation::granted(), &backup, &image)
+            .expect("a full limit of residue bytes is still skipped");
+        assert_eq!(
+            da.transport_mut().recorded_range(),
+            (0, FLASH_WRITE_END),
+            "the reply after eight skipped bytes is accepted"
+        );
+
+        let mut device = FakeDa::with_firmware(&backup);
+        let report = enter_download_agent(&mut device);
+        assert_eq!(report.first().copied(), Some(0xC0), "the DA banner");
+        device.prefix_next_d3(&[0xBB; D3_RESYNC_LIMIT + 1]);
+        let mut da = DownloadAgent::new(device);
+        let err = da
+            .write(Confirmation::granted(), &backup, &image)
+            .expect_err("one byte past the limit is not skipped");
+        assert!(matches!(err, Error::Framing { .. }), "got {err}");
+        let text = format!("{err}");
+        assert!(
+            text.contains(&format!(
+                "after skipping {D3_RESYNC_LIMIT} non-reply byte(s)"
+            )),
+            "the refusal counts the skipped bytes: {text}"
+        );
+        assert!(text.contains("0xBB"), "the offending byte is named: {text}");
+        let device = da.transport_mut();
+        assert_eq!(device.accepted_packets(), 0, "nothing was programmed");
+        assert!(
+            !device.opcodes().contains(&OPCODE_WRITE),
+            "0xD5 must not go out for a range whose reply was not reached"
+        );
+    }
+
+    #[test]
+    fn a_non_zero_d3_status_is_a_framing_error_and_nothing_is_written() {
+        // §4.1: success is `5A 00`; the second byte is the fixed success
+        // marker, not a result code. Any other value means this reply is not a
+        // successful range command, so the range is treated as unrecorded and
+        // `0xD5` must not go out.
+        let backup = stock_image();
+        let image = patched_image();
+        let mut device = FakeDa::with_firmware(&backup);
+        let report = enter_download_agent(&mut device);
+        assert_eq!(report.first().copied(), Some(0xC0), "the DA banner");
+        device.set_d3_status(0x01);
+        let mut da = DownloadAgent::new(device);
+        let err = da
+            .write(Confirmation::granted(), &backup, &image)
+            .expect_err("the status byte is not 0x00");
+        assert!(matches!(err, Error::Framing { .. }), "got {err}");
+        let text = format!("{err}");
+        assert!(
+            text.contains("0xD3 status byte was 0x01"),
+            "the refusal names the status byte: {text}"
+        );
+        assert!(
+            text.contains("the only value is 0x00"),
+            "the refusal says only zero is success: {text}"
+        );
+        let device = da.transport_mut();
+        assert_eq!(device.accepted_packets(), 0, "nothing was programmed");
+        assert!(
+            !device.opcodes().contains(&OPCODE_WRITE),
+            "0xD5 must not go out without a successful 0xD3"
+        );
+    }
+
+    #[test]
+    fn a_residue_five_a_is_only_accepted_with_the_zero_status() {
+        // The resync accepts the first `0x5A` it sees, so a residue byte that
+        // happens to be `0x5A` would be taken for the ACK if the status were not
+        // checked. Pin the second defence: `5A 01` in the residue is refused.
+        let backup = stock_image();
+        let image = patched_image();
+        let mut device = FakeDa::with_firmware(&backup);
+        let report = enter_download_agent(&mut device);
+        assert_eq!(report.first().copied(), Some(0xC0), "the DA banner");
+        device.prefix_next_d3(&[0x99, ACK, 0x01]);
+        let mut da = DownloadAgent::new(device);
+        let err = da
+            .write(Confirmation::granted(), &backup, &image)
+            .expect_err("5A 01 in the residue is not a successful reply");
+        assert!(matches!(err, Error::Framing { .. }), "got {err}");
+        assert!(
+            format!("{err}").contains("0xD3 status byte was 0x01"),
+            "the status check is what refused it: {err}"
+        );
+        let device = da.transport_mut();
+        assert_eq!(device.accepted_packets(), 0, "nothing was programmed");
+        assert!(!device.opcodes().contains(&OPCODE_WRITE));
+    }
+
+    #[test]
+    fn a_residue_nak_is_read_as_the_refusal_it_looks_like() {
+        // `0xA5` in the residue is indistinguishable from a real refusal, and
+        // that is the safe reading: the write stops before `0xD5`.
+        let backup = stock_image();
+        let image = patched_image();
+        let mut device = FakeDa::with_firmware(&backup);
+        let report = enter_download_agent(&mut device);
+        assert_eq!(report.first().copied(), Some(0xC0), "the DA banner");
+        device.prefix_next_d3(&[0xBB, NAK]);
+        let mut da = DownloadAgent::new(device);
+        let err = da
+            .write(Confirmation::granted(), &backup, &image)
+            .expect_err("a residue A5 is read as a refusal");
+        assert!(matches!(err, Error::Rejected { .. }), "got {err}");
+        assert!(
+            format!("{err}").contains("the DA refused the range"),
+            "got {err}"
+        );
+        let device = da.transport_mut();
+        assert_eq!(device.accepted_packets(), 0);
+        assert!(!device.opcodes().contains(&OPCODE_WRITE));
+    }
+
+    #[test]
+    fn a_failed_d5_header_write_still_counts_as_program_started() {
+        // `program_started` is set before the header is written: a failed write
+        // cannot prove that no byte of `0xD5` reached the wire. If it were set
+        // only after a successful write, a port that died before the header
+        // would look like "0xD3 failed before 0xD5" and the CLI would retry.
+        let backup = stock_image();
+        let mut da = DownloadAgent::new(fake_in_da(&backup).failing_write_command());
+        let err = write_at_wire_start(&mut da, &backup, &patched_image())
+            .expect_err("the header write fails");
+        assert!(matches!(err, Error::State(_)), "got {err}");
+        assert!(
+            da.range_attempted(),
+            "the accepted range command was attempted"
+        );
+        assert!(
+            da.program_started(),
+            "a failed 0xD5 header write cannot prove that nothing was sent"
+        );
+        assert_eq!(da.transport_mut().accepted_packets(), 0);
     }
 
     #[test]
@@ -3538,15 +3873,19 @@ mod tests {
     }
 
     #[test]
-    fn the_final_packet_is_the_short_one_and_is_zero_filled() {
-        // §8 item 9: the image ends on a 92-byte packet, and the client pads it
-        // to PACKET_SIZE before the sum (§4.4). The padding is observed on the
-        // wire — what the fake received — not recomputed from the constants.
+    fn the_final_packet_is_the_short_one_and_is_not_zero_filled() {
+        // `0x00102474` (`docs/reference/01-da-protocol.md` §4.3): `0xD5` reads
+        // the command's length for every packet but the last, where the receive
+        // length is `(end - start + 1) mod length` — 92 bytes for the 406,620-byte
+        // image. The final packet goes out as those 92 bytes plus their sum; the
+        // 2026-11-22 hardware runs answered the padded form with `0x01`
+        // (`docs/dev/05-verification.md` §1.4).
         let backup = stock_image();
         let image = patched_image();
-        // `stock_image` fills the body with `0xFF`, so a padded zero is
-        // distinguishable from a payload byte.
+        // `stock_image` fills the body with `0xFF`, so a padded zero would be
+        // distinguishable from a payload byte if the client still padded.
         assert_eq!(image.get(FLASH_WRITE_LENGTH - 92), Some(&0xFF));
+        assert_eq!(FLASH_WRITE_LENGTH % PACKET_SIZE, 92);
 
         let mut da = DownloadAgent::new(fake_in_da(&backup));
         write_at_wire_start(&mut da, &backup, &image).expect("accepted");
@@ -3557,29 +3896,64 @@ mod tests {
         let final_packet = packets.last().expect("at least one packet");
         assert_eq!(
             final_packet.len(),
-            PACKET_SIZE,
-            "every payload is a full packet"
+            92,
+            "the final packet is the remainder, not a padded PACKET_SIZE"
         );
-        let (tail, padding) = final_packet.split_at(92);
         assert_eq!(
-            tail,
+            final_packet,
             image.get(FLASH_WRITE_LENGTH - 92..).expect("92 bytes"),
             "the short packet carries the image's last 92 bytes, in order"
         );
-        assert!(
-            padding.iter().all(|byte| *byte == 0),
-            "the client must zero-fill the final packet to PACKET_SIZE: {padding:02X?}"
-        );
 
-        // The sum covers the padded payload: the trailer on the wire is the sum
-        // of the 256 bytes above, padding included.
-        let padded_sum: u16 = final_packet
+        // The trailer is the sum of exactly those 92 bytes, not of a padded
+        // payload: the fake verified it independently with `sum_of_bytes`, so
+        // acceptance already means the two agree — this pins the value the test
+        // can see on the wire.
+        let tail_sum: u16 = final_packet
             .iter()
             .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)));
         let trailer = device
             .last_packet_trailer()
             .expect("the trailer the client sent");
-        assert_eq!(u16::from_be_bytes(trailer), padded_sum);
+        assert_eq!(u16::from_be_bytes(trailer), tail_sum);
+        let padded_sum: u16 = image
+            .get(FLASH_WRITE_LENGTH - PACKET_SIZE..)
+            .expect("a full packet's worth of image")
+            .iter()
+            .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)));
+        assert_ne!(
+            tail_sum, padded_sum,
+            "the 0xFF padding bytes must change the sum, or this test cannot tell \
+             the two forms apart"
+        );
+    }
+
+    #[test]
+    fn a_full_packet_is_still_the_packet_length_plus_its_sum() {
+        // The change above must not shrink the full packets: every packet but
+        // the last is `PACKET_SIZE` payload bytes plus the two-byte big-endian
+        // sum — 258 bytes on the wire.
+        assert_eq!(PACKET_SIZE, 0x100);
+        assert_eq!(PACKET_SIZE + 2, 258);
+
+        let backup = stock_image();
+        let mut da = DownloadAgent::new(fake_in_da(&backup));
+        write_at_wire_start(&mut da, &backup, &backup).expect("accepted");
+        let device = da.transport_mut();
+        let packets = device.packets();
+        assert_eq!(packets.len(), FLASH_WRITE_LENGTH.div_ceil(PACKET_SIZE));
+        let last = packets.len().saturating_sub(1);
+        for (index, packet) in packets.iter().enumerate().take(last) {
+            assert_eq!(packet.len(), PACKET_SIZE, "packet {index} is a full packet");
+            let sum: u16 = packet
+                .iter()
+                .fold(0u16, |acc, byte| acc.wrapping_add(u16::from(*byte)));
+            assert_eq!(
+                device.trailer_of(index),
+                Some(sum.to_be_bytes()),
+                "packet {index}'s two-byte trailer follows its {PACKET_SIZE} bytes"
+            );
+        }
     }
 
     #[test]

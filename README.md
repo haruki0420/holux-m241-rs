@@ -24,6 +24,7 @@ M-241 で動いた。`log erase` も 2026-11-21 の実機セッションで動�
 | ファームウェアを吸い出す（読み取りのみ、安全） | `m241 fw dump` |
 | PC 上で、吸い出したイメージに日付修正を当てる | `m241 fw patch` |
 | 修正したイメージを書き戻す | `m241 fw flash` |
+| DA が RAM に残った端末をソフトで再起動する（書き込みなし） | `m241 fw da-restart` |
 | 軌跡ログを端末から吸い出す | `m241 log download` |
 | 軌跡ログを GPX / KML / CSV / NMEA / JSON に変換する | `m241 log read` |
 | 軌跡ログを分割・結合・地点削除して書き出す | `m241 log edit` |
@@ -68,7 +69,7 @@ Holux のファームウェアイメージ、ダウンロードエージェン�
 [`docs/reference/01-da-protocol.md`](docs/reference/01-da-protocol.md) に記録してから実装する。
 ダウンロードエージェントのドライバは読み取り側とは別クレートの
 `crates/m241-flash/src/da.rs` にあり、書き込み範囲は DA 側の開始アドレス `0` に固定して
-`check_layout` で検査する。`fw flash` はまだ CLI に配線されておらず、実機への書き込みも
+`check_layout` で検査する。`fw flash` は CLI に配線済みだが、実機への書き込みは
 未検証である。読み取り専用の `m241-core` は書き込み・消去ルーチンを持たない。
 
 どこから何を取り入れたか、どの主張がまだ仮説かは

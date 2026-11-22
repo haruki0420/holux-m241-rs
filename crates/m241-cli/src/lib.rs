@@ -156,7 +156,7 @@ pub(crate) trait Confirm: std::fmt::Debug {
 /// Everything a command needs from the outside world.
 ///
 /// One struct rather than four parameters: every handler takes it, so adding a
-/// seam later does not touch thirteen signatures. `Debug` is written by hand
+/// seam later does not touch seventeen signatures. `Debug` is written by hand
 /// because the traits it holds are object-safe seams: deriving would put a
 /// `Debug` bound on every implementation, and a test double has nothing useful
 /// to print.
@@ -278,6 +278,7 @@ pub(crate) fn run_with(
             FwCommand::Patch(options) => fw::patch(&options, session)?,
             FwCommand::Flash(options) => fw::flash(&options, session)?,
             FwCommand::ProbeDa(options) => fw::probe_da(&options, session)?,
+            FwCommand::DaRestart(options) => fw::da_restart(&options, session)?,
         },
         Command::Log { command } => match command {
             LogCommand::Info(options) => logcmd::info(&options, session)?,

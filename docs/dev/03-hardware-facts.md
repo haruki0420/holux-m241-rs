@@ -34,6 +34,8 @@ view to the other without converting it; the measured DA-view row is under
 | `0xD3` on refusal | records nothing from the refused command, but **keeps the ranges recorded by earlier ones** | the handler returns before overwriting the range table |
 | WRITE16 echo | trails by one byte | after N bytes only N−1 echoes exist; the final byte's echo never arrives |
 | Write sequence | `0xD3` records the range, `0xD5` erases and writes: `0x100`-byte packets each + sum-of-bytes → `0x69`, then two `0x5A` | the only sequence that completed on hardware |
+| `0xD5` final packet's receive length | `(end - start + 1) mod length` — **92 bytes** for the 406,620-byte image; every earlier packet is `length` | `0x00102474` in `DA_v3.8.4.bin`: `r0` range index, `r1` packet index, `r2` packet count; returns the remainder only when `r1 == r2 - 1`. ⚠️ 未検証 on hardware — the 2026-11-22 runs failed on this packet — the instruction sequence is the source (`docs/reference/01-da-protocol.md` §4.3) |
+| 2026-11-22 write failure | 1,588 of 1,589 packets accepted, then the final zero-padded packet answered `0x01` at 99% (`406,528` of `406,620` bytes) | `fw flash --allow-vendor` and `fw flash --recover` on Linux over USB serial, `docs/dev/05-verification.md` §1.4. The client then padded the final packet to `0x100`; ⚠️ what `0x01` means inside the DA is not established |
 | DA jump (`0xA8`) | address `0x00100800`, **count `0`** | the only client that ran it on a unit sent zero (`python/src/m241/protocol/brom.py`, `BootRom.jump`). ⚠️ 未検証 whether the BootROM reads the count at all; a non-zero value has never been sent to a unit |
 
 The 20-byte info report is `>BHBLHHHHL`, but the field name "block geometry" that
