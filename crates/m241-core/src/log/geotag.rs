@@ -59,6 +59,20 @@
 //! [`plan_with_shift`] is the reviewable half of that operation — it returns
 //! the re-matched plans and writes nothing.
 //!
+//! # Shifting in the units the dialog offers, and only some photos
+//!
+//! `07-eztour-spec.ja.md` §6.1-7 records that ezTour's `Shift photo time…`
+//! dialog shifts by days, hours, minutes and seconds, and offers three scopes:
+//! every photo (`allPhotos`), the selected photos (`selPhotos`) and the photos
+//! from one camera (`byCamera`). [`PhotoTimeShift`] is the first and
+//! [`PhotoShiftScope`] the second, taken by [`plan_with_time_shift`].
+//! [`plan_with_shift`] and [`GeotagOptions::photo_shift_seconds`] remain the
+//! all-photos, one-total path, so a caller that predates the scopes is
+//! unchanged. The spec does not say which Exif tags identify "one camera" or how
+//! two spellings of a camera fold together, so [`CameraModel`] and
+//! [`PhotoShiftScope::SelectedPhotos`] compare exact values and the matching
+//! rule is recorded as unconfirmed in `docs/dev/12-progress-summary.md`.
+//!
 //! # Not verified on camera files
 //!
 //! Nothing in this module has been run against a real photo: the tests build
@@ -138,6 +152,134 @@ impl Default for GeotagOptions {
             photo_shift_seconds: 0,
             group_distance_meters: None,
             max_photo_edge_pixels: None,
+        }
+    }
+}
+
+/// A shift of a photo's clock, in the units ezTour's dialog offers.
+///
+/// `07-eztour-spec.ja.md` §6.1-7 records that `Shift photo time…` takes days,
+/// hours, minutes and seconds. A day here is 24 hours (86,400 seconds), not a
+/// calendar day: the value being moved is EXIF's zone-less wall clock, and
+/// whether ezTour steps across a daylight-saving change by the calendar rather
+/// than by the clock is unconfirmed.
+///
+/// Every field is signed and they are summed, so `days: -1, hours: 2` moves the
+/// clock 22 hours back. [`Self::total_seconds`] computes the sum with checked
+/// arithmetic and reports an overflow rather than wrapping it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PhotoTimeShift {
+    /// Whole days, each counted as 86,400 seconds.
+    pub days: i64,
+    /// Whole hours, each counted as 3,600 seconds.
+    pub hours: i64,
+    /// Whole minutes, each counted as 60 seconds.
+    pub minutes: i64,
+    /// Seconds.
+    pub seconds: i64,
+}
+
+impl PhotoTimeShift {
+    /// A shift expressed as one number of seconds: the shape
+    /// [`GeotagOptions::photo_shift_seconds`] already has.
+    #[must_use]
+    pub const fn from_seconds(seconds: i64) -> Self {
+        Self {
+            days: 0,
+            hours: 0,
+            minutes: 0,
+            seconds,
+        }
+    }
+
+    /// The shift as one number of seconds, or `None` when the fields add up to
+    /// something outside the range `i64` can hold.
+    #[must_use]
+    pub fn total_seconds(self) -> Option<i64> {
+        self.days
+            .checked_mul(86_400)?
+            .checked_add(self.hours.checked_mul(3_600)?)?
+            .checked_add(self.minutes.checked_mul(60)?)?
+            .checked_add(self.seconds)
+    }
+
+    /// Whether the shift moves nothing.
+    #[must_use]
+    pub fn is_zero(self) -> bool {
+        self.days == 0 && self.hours == 0 && self.minutes == 0 && self.seconds == 0
+    }
+}
+
+/// The camera a photo came from, as its Exif `Make` and `Model` tags carry it.
+///
+/// [`PhotoShiftScope::ByCamera`] compares this value exactly. The spec records
+/// that ezTour can shift "by camera" but not which tag it groups on, nor how two
+/// spellings of one camera are folded together, so no normalisation is invented
+/// here: the tags have their trailing NUL and space padding trimmed and are
+/// otherwise compared byte for byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CameraModel {
+    /// Exif IFD0 `Make` (tag 0x010F), trailing padding trimmed. `None` when the
+    /// photo does not name a maker.
+    pub make: Option<String>,
+    /// Exif IFD0 `Model` (tag 0x0110), trailing padding trimmed. `None` when the
+    /// photo does not name a model.
+    pub model: Option<String>,
+}
+
+impl CameraModel {
+    /// Read the camera identity from a JPEG's Exif block.
+    ///
+    /// `None` when the bytes are not a JPEG, carry no Exif block this function
+    /// can walk, or name neither tag. A photo with no readable camera is never
+    /// selected by [`PhotoShiftScope::ByCamera`]; it is still planned, at its
+    /// unshifted time.
+    #[must_use]
+    pub fn from_jpeg(jpeg: &[u8]) -> Option<Self> {
+        let tiff = exif_tiff_block(jpeg)?;
+        let make = ifd0_ascii(tiff, TAG_MAKE);
+        let model = ifd0_ascii(tiff, TAG_MODEL);
+        (make.is_some() || model.is_some()).then_some(Self { make, model })
+    }
+}
+
+/// Which photos a clock shift applies to.
+///
+/// `07-eztour-spec.ja.md` §6.1-7 names ezTour's three scopes: `allPhotos`,
+/// `selPhotos` and `byCamera`. [`Self::AllPhotos`] is the default and is also
+/// the behaviour of [`plan_with_shift`] and
+/// [`GeotagOptions::photo_shift_seconds`]; the narrower scopes are applied by
+/// [`plan_with_time_shift`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PhotoShiftScope {
+    /// Every photo: ezTour's `allPhotos`, and the default.
+    #[default]
+    AllPhotos,
+    /// Only the photos whose path equals one in this list: ezTour's
+    /// `selPhotos`.
+    ///
+    /// The comparison is exact rather than a canonicalised one: the list is the
+    /// caller's own selection, and silently matching a different spelling of
+    /// one path would hide the typo that made them differ.
+    SelectedPhotos(Vec<PathBuf>),
+    /// Only photos whose Exif names this camera: ezTour's `byCamera`.
+    ByCamera(CameraModel),
+}
+
+impl PhotoShiftScope {
+    /// Whether this scope moves `photo`'s clock.
+    ///
+    /// `camera` is the photo's identity from [`CameraModel::from_jpeg`]. Only
+    /// [`Self::ByCamera`] reads it; a caller using another scope passes `None`,
+    /// and one that already read the photo can pass it for any scope.
+    #[must_use]
+    pub fn includes(&self, photo: &Path, camera: Option<&CameraModel>) -> bool {
+        match self {
+            Self::AllPhotos => true,
+            Self::SelectedPhotos(selection) => {
+                selection.iter().any(|selected| selected.as_path() == photo)
+            }
+            Self::ByCamera(wanted) => camera == Some(wanted),
         }
     }
 }
@@ -249,11 +391,33 @@ impl GeotagPlan {
 ///
 /// [`Error::Io`] when a photo cannot be read.
 pub fn plan(photos: &[PathBuf], track: &Track, options: &GeotagOptions) -> Result<Vec<GeotagPlan>> {
+    plan_each(photos, track, options, |_, _| options.photo_shift_seconds)
+}
+
+/// Plan each photo, with `shift_for` deciding its clock shift from its path and
+/// its bytes.
+///
+/// The one loop [`plan`] and [`plan_with_time_shift`] share: read, choose the
+/// shift, decide, then group. Keeping it in one place is what makes a dry run
+/// and a real run take the same decisions.
+fn plan_each(
+    photos: &[PathBuf],
+    track: &Track,
+    options: &GeotagOptions,
+    shift_for: impl Fn(&Path, &[u8]) -> i64,
+) -> Result<Vec<GeotagPlan>> {
     let mut plans = Vec::with_capacity(photos.len());
     for photo in photos {
         let bytes = std::fs::read(photo)
             .map_err(|source| Error::io(photo.display().to_string(), source))?;
-        plans.push(plan_one(photo, &bytes, track, options));
+        // `options` is copied per photo with only the shift replaced, so every
+        // decision below (gap, backup, grouping) still comes from one options
+        // value the caller set once.
+        let shifted = GeotagOptions {
+            photo_shift_seconds: shift_for(photo, &bytes),
+            ..*options
+        };
+        plans.push(plan_one(photo, &bytes, track, &shifted));
     }
     if let Some(max_distance_meters) = options.group_distance_meters
         && max_distance_meters.is_finite()
@@ -502,6 +666,10 @@ pub fn apply(plans: &[GeotagPlan]) -> Result<Vec<PathBuf>> {
 /// The returned plans use `options` with [`GeotagOptions::photo_shift_seconds`]
 /// replaced by `shift_seconds`; distance grouping is applied as `options` asks.
 ///
+/// This is the all-photos form of [`plan_with_time_shift`], kept so the
+/// seconds-only API that predates the day/hour/minute/second dialog and the
+/// scopes does not change.
+///
 /// # Errors
 ///
 /// [`Error::Io`] when a photo cannot be read.
@@ -511,11 +679,63 @@ pub fn plan_with_shift(
     options: &GeotagOptions,
     shift_seconds: i64,
 ) -> Result<Vec<GeotagPlan>> {
-    let shifted = GeotagOptions {
-        photo_shift_seconds: shift_seconds,
-        ..*options
-    };
-    plan(photos, track, &shifted)
+    plan_with_time_shift(
+        photos,
+        track,
+        options,
+        PhotoTimeShift::from_seconds(shift_seconds),
+        &PhotoShiftScope::AllPhotos,
+    )
+}
+
+/// Shift the clock of the photos `scope` selects by `shift`, and match every
+/// photo again; writes nothing.
+///
+/// This is ezTour's `Shift photo time…` expressed as a plan
+/// (`07-eztour-spec.ja.md` §6.1-7): the shift lives in the returned plans and is
+/// written into `DateTimeOriginal` by [`apply`], so a dry run and a real shift
+/// take exactly the same decisions. A photo outside `scope` is planned at its
+/// existing capture time, because only the selected photos' clocks are meant to
+/// move.
+///
+/// [`GeotagOptions::photo_shift_seconds`] is replaced rather than added to: the
+/// shift argument is the operation, and `options` supplies the rest of the
+/// policy (gap, grouping, backup, KMZ limit). [`plan_with_shift`] does the same
+/// for every photo.
+///
+/// # Errors
+///
+/// [`Error::State`] when the fields of `shift` do not add up to a number of
+/// seconds `i64` can hold — checked before any photo is read, so a nonsense
+/// shift cannot leave a folder half-planned — and [`Error::Io`] when a photo
+/// cannot be read.
+pub fn plan_with_time_shift(
+    photos: &[PathBuf],
+    track: &Track,
+    options: &GeotagOptions,
+    shift: PhotoTimeShift,
+    scope: &PhotoShiftScope,
+) -> Result<Vec<GeotagPlan>> {
+    let shift_seconds = shift.total_seconds().ok_or_else(|| {
+        Error::State(format!(
+            "the photo clock shift {shift:?} does not fit in a number of seconds"
+        ))
+    })?;
+    // Reading Make/Model for every photo is only needed by `byCamera`; doing it
+    // for the other scopes would be work whose answer is then ignored.
+    let reads_camera = matches!(scope, PhotoShiftScope::ByCamera(_));
+    plan_each(photos, track, options, |photo, bytes| {
+        let camera = if reads_camera {
+            CameraModel::from_jpeg(bytes)
+        } else {
+            None
+        };
+        if scope.includes(photo, camera.as_ref()) {
+            shift_seconds
+        } else {
+            0
+        }
+    })
 }
 
 /// Write `<photo>_original` if it does not already exist.
@@ -740,6 +960,133 @@ fn nearest_positioned_point(track: &Track, utc: u32) -> Option<(TrackPoint, u32)
     best
 }
 
+// ---------------------------------------------------------------------------
+// Camera identity (Exif IFD0 `Make` / `Model`)
+// ---------------------------------------------------------------------------
+
+// `exif` owns the TIFF walk, but its reader is private to that module and its
+// public functions read only the GPS IFD and `DateTimeOriginal`. `Make` and
+// `Model` live in IFD0, so [`PhotoShiftScope::ByCamera`] would have no way to
+// resolve a photo's camera without a small read-only walk here. It reads only
+// those two tags and returns `None` on anything it cannot follow: a photo whose
+// camera is unreadable must not make a whole folder run fail. A future change
+// should move this into `exif` beside the other readers so the TIFF walk has one
+// implementation.
+
+/// TIFF field type 2: a NUL-terminated ASCII string.
+const TIFF_TYPE_ASCII: u16 = 2;
+/// Exif IFD0 tag holding the camera maker.
+const TAG_MAKE: u16 = 0x010F;
+/// Exif IFD0 tag holding the camera model.
+const TAG_MODEL: u16 = 0x0110;
+
+/// The byte order a TIFF header declares.
+#[derive(Debug, Clone, Copy)]
+enum Endian {
+    /// `II`: little-endian.
+    Little,
+    /// `MM`: big-endian.
+    Big,
+}
+
+impl Endian {
+    fn read_u16(self, bytes: [u8; 2]) -> u16 {
+        match self {
+            Self::Little => u16::from_le_bytes(bytes),
+            Self::Big => u16::from_be_bytes(bytes),
+        }
+    }
+
+    fn read_u32(self, bytes: [u8; 4]) -> u32 {
+        match self {
+            Self::Little => u32::from_le_bytes(bytes),
+            Self::Big => u32::from_be_bytes(bytes),
+        }
+    }
+}
+
+/// The TIFF block inside the first Exif APP1 segment, or `None`.
+///
+/// Walks JPEG segments the way [`crate::log::kmz`] walks them for the frame
+/// size: `FF <marker>` then, for every marker that carries one, a two-byte
+/// big-endian length that includes itself. The walk stops at the first Exif
+/// APP1, at start-of-scan, or at end-of-image.
+fn exif_tiff_block(jpeg: &[u8]) -> Option<&[u8]> {
+    let mut cursor = jpeg.strip_prefix(&[0xFF, exif::JPEG_MARKER_SOI])?;
+    loop {
+        let marker = loop {
+            let next = *cursor.first()?;
+            cursor = cursor.get(1..)?;
+            if next != 0xFF {
+                break next;
+            }
+        };
+        match marker {
+            // Restart markers and TEM stand alone, without a length.
+            0x01 | 0xD0..=exif::JPEG_MARKER_SOI => {}
+            // Start of scan or end of image: no Exif segment can follow.
+            0xDA | exif::JPEG_MARKER_EOI => return None,
+            _ => {
+                let length = u16::from_be_bytes([*cursor.first()?, *cursor.get(1)?]);
+                let payload_len = usize::from(length).checked_sub(2)?;
+                let payload = cursor.get(2..2usize.checked_add(payload_len)?)?;
+                if marker == 0xE1
+                    && let Some(tiff) = payload.strip_prefix(exif::EXIF_HEADER)
+                {
+                    return Some(tiff);
+                }
+                cursor = cursor.get(usize::from(length)..)?;
+            }
+        }
+    }
+}
+
+/// The first IFD0 entry `wanted`, when it is an ASCII string.
+///
+/// `tiff` starts at the TIFF header (`II`/`MM`). Only the fields needed to reach
+/// that one value are read; a value longer than four bytes lives at an offset
+/// from the header, which is the layout cameras use for `Make` and `Model`.
+fn ifd0_ascii(tiff: &[u8], wanted: u16) -> Option<String> {
+    let endian = if tiff.starts_with(b"II") {
+        Endian::Little
+    } else if tiff.starts_with(b"MM") {
+        Endian::Big
+    } else {
+        return None;
+    };
+    let ifd_offset = usize::try_from(endian.read_u32(tiff.get(4..8)?.try_into().ok()?)).ok()?;
+    let count_at = tiff.get(ifd_offset..ifd_offset.checked_add(2)?)?;
+    let entry_count = usize::from(endian.read_u16(count_at.try_into().ok()?));
+    for index in 0..entry_count {
+        let at = ifd_offset
+            .checked_add(2)?
+            .checked_add(index.checked_mul(12)?)?;
+        let entry = tiff.get(at..at.checked_add(12)?)?;
+        if endian.read_u16(entry.get(..2)?.try_into().ok()?) != wanted {
+            continue;
+        }
+        if endian.read_u16(entry.get(2..4)?.try_into().ok()?) != TIFF_TYPE_ASCII {
+            return None;
+        }
+        let value_len = usize::try_from(endian.read_u32(entry.get(4..8)?.try_into().ok()?)).ok()?;
+        let field = entry.get(8..12)?;
+        let value = if value_len <= 4 {
+            field.get(..value_len)?
+        } else {
+            let value_offset = usize::try_from(endian.read_u32(field.try_into().ok()?)).ok()?;
+            tiff.get(value_offset..value_offset.checked_add(value_len)?)?
+        };
+        let text = String::from_utf8_lossy(value);
+        let trimmed = text.trim_end_matches(['\0', ' ']).trim();
+        return if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        };
+    }
+    None
+}
+
 /// Write `bytes` over `path` through a sibling temporary file.
 ///
 /// A photo is the one file this crate modifies that cannot be regenerated, and a
@@ -889,6 +1236,41 @@ mod tests {
             ]),
             Some(&stamp),
         )
+    }
+
+    /// A synthetic JPEG taken at `utc` whose IFD0 names `make` and `model`.
+    fn photo_taken_by(utc: u32, make: &str, model: &str) -> Vec<u8> {
+        let stamp = format_datetime(utc);
+        fixture::exif_jpeg(
+            ByteOrder::Little,
+            &[
+                fixture::Entry::ascii(TAG_MAKE, make),
+                fixture::Entry::ascii(TAG_MODEL, model),
+            ],
+            Some(&[
+                fixture::Entry::ascii(exif::tag::GPS_LATITUDE_REF, "N"),
+                fixture::Entry::ascii(exif::tag::GPS_LONGITUDE_REF, "E"),
+            ]),
+            Some(&stamp),
+        )
+    }
+
+    /// A shift in the four units ezTour's dialog offers.
+    fn time_shift(days: i64, hours: i64, minutes: i64, seconds: i64) -> PhotoTimeShift {
+        PhotoTimeShift {
+            days,
+            hours,
+            minutes,
+            seconds,
+        }
+    }
+
+    /// A camera identity from the two Exif strings.
+    fn camera_of(make: Option<&str>, model: Option<&str>) -> CameraModel {
+        CameraModel {
+            make: make.map(str::to_owned),
+            model: model.map(str::to_owned),
+        }
     }
 
     /// `"YYYY:MM:DD HH:MM:SS"` for a Unix time, without pulling in a date crate.
@@ -1621,6 +2003,294 @@ mod tests {
         let underflow = plan(&[epoch_photo], &track, &underflow_opts).expect("underflow plan");
         assert!(!underflow[0].will_write());
         assert!(underflow[0].skipped.is_some());
+    }
+
+    #[test]
+    fn the_day_hour_minute_and_second_fields_add_up_to_one_total() {
+        assert_eq!(
+            time_shift(1, 2, 3, 4).total_seconds(),
+            Some(86_400 + 7_200 + 180 + 4)
+        );
+        assert_eq!(time_shift(0, 0, 0, 0).total_seconds(), Some(0));
+        assert!(time_shift(0, 0, 0, 0).is_zero());
+        assert!(!time_shift(0, 0, 0, 1).is_zero());
+        assert!(PhotoTimeShift::default().is_zero());
+        // The seconds-only form the old API carried is still exact.
+        assert_eq!(PhotoTimeShift::from_seconds(-90).total_seconds(), Some(-90));
+    }
+
+    #[test]
+    fn negative_shift_components_subtract_from_the_total() {
+        assert_eq!(
+            time_shift(-1, 2, -3, 4).total_seconds(),
+            Some(-86_400 + 7_200 - 180 + 4)
+        );
+        assert_eq!(time_shift(0, -1, 0, 0).total_seconds(), Some(-3_600));
+    }
+
+    #[test]
+    fn a_shift_that_overflows_seconds_is_refused_before_any_photo_is_planned() {
+        let shift = PhotoTimeShift {
+            days: i64::MAX,
+            ..PhotoTimeShift::default()
+        };
+        assert_eq!(shift.total_seconds(), None, "the sum must report overflow");
+
+        let dir = TempDir::new("shift-overflow");
+        let photo = dir.photo("a.jpg", &photo_taken_at(SHUTTER));
+        let err = plan_with_time_shift(
+            std::slice::from_ref(&photo),
+            &track_at(&[SHUTTER]),
+            &GeotagOptions::default(),
+            shift,
+            &PhotoShiftScope::AllPhotos,
+        )
+        .expect_err("an overflowing shift must be refused");
+        assert!(matches!(err, Error::State(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("does not fit"),
+            "the error must say why: {err}"
+        );
+    }
+
+    #[test]
+    fn a_day_shift_moves_the_match_by_twenty_four_hours() {
+        // The day field is 86,400 seconds: the photo a day early matches the
+        // track once the clock is moved forward by one day.
+        let dir = TempDir::new("shift-days");
+        let original = photo_taken_at(SHUTTER - 86_400);
+        let photo = dir.photo("a-day-early.jpg", &original);
+        let track = track_at(&[SHUTTER]);
+
+        let plans = plan_with_time_shift(
+            std::slice::from_ref(&photo),
+            &track,
+            &GeotagOptions::default(),
+            time_shift(1, 0, 0, 0),
+            &PhotoShiftScope::AllPhotos,
+        )
+        .expect("plan");
+        assert!(plans[0].will_write(), "skipped: {:?}", plans[0].skipped);
+        assert_eq!(plans[0].capture_time, Some(CaptureTime::Exif(SHUTTER)));
+        assert_eq!(plans[0].gap_seconds, Some(0));
+        assert_eq!(
+            std::fs::read(&photo).expect("read"),
+            original,
+            "planning a shift must not write the photo"
+        );
+    }
+
+    #[test]
+    fn an_all_photos_scope_shifts_every_photo() {
+        let dir = TempDir::new("scope-all");
+        let early = dir.photo("early.jpg", &photo_taken_at(SHUTTER - 3_600));
+        let late = dir.photo("late.jpg", &photo_taken_at(SHUTTER + 3_600));
+        let track = track_at(&[SHUTTER, SHUTTER + 7_200]);
+
+        // Without a shift neither photo is within the gap: one is an hour
+        // before its point and the other an hour after its own.
+        let unshifted = plan(
+            &[early.clone(), late.clone()],
+            &track,
+            &GeotagOptions::default(),
+        )
+        .expect("unshifted plan");
+        assert!(unshifted.iter().all(|plan| !plan.will_write()));
+
+        let plans = plan_with_time_shift(
+            &[early, late],
+            &track,
+            &GeotagOptions::default(),
+            time_shift(0, 1, 0, 0),
+            &PhotoShiftScope::AllPhotos,
+        )
+        .expect("plan");
+        assert!(
+            plans.iter().all(GeotagPlan::will_write),
+            "both clocks move under allPhotos: {:?}",
+            plans
+                .iter()
+                .map(|plan| plan.skipped.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(plans[0].capture_time, Some(CaptureTime::Exif(SHUTTER)));
+        assert_eq!(
+            plans[1].capture_time,
+            Some(CaptureTime::Exif(SHUTTER + 7_200))
+        );
+        assert_eq!(plans[0].gap_seconds, Some(0));
+        assert_eq!(plans[1].gap_seconds, Some(0));
+    }
+
+    #[test]
+    fn a_selected_photos_scope_shifts_only_the_listed_photos() {
+        let dir = TempDir::new("scope-selected");
+        let early = dir.photo("early.jpg", &photo_taken_at(SHUTTER - 3_600));
+        let late = dir.photo("late.jpg", &photo_taken_at(SHUTTER + 3_600));
+        let track = track_at(&[SHUTTER, SHUTTER + 7_200]);
+
+        let scope = PhotoShiftScope::SelectedPhotos(vec![early.clone()]);
+        let plans = plan_with_time_shift(
+            &[early, late],
+            &track,
+            &GeotagOptions::default(),
+            time_shift(0, 1, 0, 0),
+            &scope,
+        )
+        .expect("plan");
+        assert!(plans[0].will_write());
+        assert_eq!(plans[0].capture_time, Some(CaptureTime::Exif(SHUTTER)));
+        assert_eq!(
+            plans[1].capture_time,
+            Some(CaptureTime::Exif(SHUTTER + 3_600)),
+            "the unlisted photo keeps its own clock"
+        );
+        assert!(
+            !plans[1].will_write(),
+            "the unshifted late photo stays outside the gap"
+        );
+    }
+
+    #[test]
+    fn a_by_camera_scope_shifts_only_photos_from_that_camera() {
+        let dir = TempDir::new("scope-camera");
+        let from_test_cam = dir.photo(
+            "a.jpg",
+            &photo_taken_by(SHUTTER - 3_600, "TestCam", "Model X"),
+        );
+        let from_other = dir.photo(
+            "b.jpg",
+            &photo_taken_by(SHUTTER + 3_600, "OtherCam", "Model Y"),
+        );
+        let track = track_at(&[SHUTTER, SHUTTER + 7_200]);
+        let scope = PhotoShiftScope::ByCamera(camera_of(Some("TestCam"), Some("Model X")));
+
+        let plans = plan_with_time_shift(
+            &[from_test_cam, from_other],
+            &track,
+            &GeotagOptions::default(),
+            time_shift(0, 1, 0, 0),
+            &scope,
+        )
+        .expect("plan");
+        assert!(plans[0].will_write());
+        assert_eq!(plans[0].capture_time, Some(CaptureTime::Exif(SHUTTER)));
+        assert_eq!(
+            plans[1].capture_time,
+            Some(CaptureTime::Exif(SHUTTER + 3_600)),
+            "the other camera's photo keeps its own clock"
+        );
+        assert!(
+            !plans[1].will_write(),
+            "the unshifted other-camera photo stays outside the gap"
+        );
+    }
+
+    #[test]
+    fn a_photo_without_a_camera_tag_is_not_selected_by_a_camera_scope() {
+        let dir = TempDir::new("scope-no-camera");
+        let anonymous = dir.photo("anonymous.jpg", &photo_taken_at(SHUTTER - 3_600));
+        let scope = PhotoShiftScope::ByCamera(camera_of(Some("TestCam"), Some("Model X")));
+
+        let plans = plan_with_time_shift(
+            std::slice::from_ref(&anonymous),
+            &track_at(&[SHUTTER]),
+            &GeotagOptions::default(),
+            time_shift(0, 1, 0, 0),
+            &scope,
+        )
+        .expect("plan");
+        assert_eq!(
+            plans[0].capture_time,
+            Some(CaptureTime::Exif(SHUTTER - 3_600)),
+            "a photo naming no camera must keep its clock"
+        );
+        assert!(!plans[0].will_write());
+    }
+
+    #[test]
+    fn plan_with_shift_is_the_all_photos_form_of_the_scoped_plan() {
+        // Regression: the seconds-only entry point that predates the scopes
+        // must still produce the same plans, grouping included.
+        let dir = TempDir::new("shift-regression");
+        let early = dir.photo("early.jpg", &photo_taken_at(SHUTTER - 3_600));
+        let late = dir.photo("late.jpg", &photo_taken_at(SHUTTER + 3_600));
+        let track = track_at(&[SHUTTER, SHUTTER + 7_200]);
+        let options = GeotagOptions {
+            group_distance_meters: Some(50.0),
+            ..GeotagOptions::default()
+        };
+
+        let legacy = plan_with_shift(&[early.clone(), late.clone()], &track, &options, 3_600)
+            .expect("legacy plan");
+        let scoped = plan_with_time_shift(
+            &[early, late],
+            &track,
+            &options,
+            time_shift(0, 1, 0, 0),
+            &PhotoShiftScope::AllPhotos,
+        )
+        .expect("scoped plan");
+        assert_eq!(
+            legacy, scoped,
+            "the seconds-only call must be exactly the all-photos form"
+        );
+    }
+
+    #[test]
+    fn the_camera_model_is_read_from_ifd0_make_and_model_in_both_byte_orders() {
+        for order in [ByteOrder::Little, ByteOrder::Big] {
+            let jpeg = fixture::exif_jpeg(
+                order,
+                &[
+                    fixture::Entry::ascii(TAG_MAKE, "TestCam"),
+                    fixture::Entry::ascii(TAG_MODEL, "Model X"),
+                ],
+                None,
+                None,
+            );
+            assert_eq!(
+                CameraModel::from_jpeg(&jpeg),
+                Some(camera_of(Some("TestCam"), Some("Model X"))),
+                "{order:?}: both tags must be read from the value area"
+            );
+        }
+    }
+
+    #[test]
+    fn short_camera_names_that_fit_inline_are_read_too() {
+        // A value of four bytes or fewer lives in the entry itself, which is a
+        // different branch of the walk than the offset one above.
+        let jpeg = fixture::exif_jpeg(
+            ByteOrder::Little,
+            &[
+                fixture::Entry::ascii(TAG_MAKE, "AB"),
+                fixture::Entry::ascii(TAG_MODEL, "M"),
+            ],
+            None,
+            None,
+        );
+        assert_eq!(
+            CameraModel::from_jpeg(&jpeg),
+            Some(camera_of(Some("AB"), Some("M")))
+        );
+    }
+
+    #[test]
+    fn a_photo_that_names_no_camera_has_no_camera_model() {
+        assert_eq!(
+            CameraModel::from_jpeg(&photo_taken_at(SHUTTER)),
+            None,
+            "GPS and DateTimeOriginal do not name a camera"
+        );
+        assert_eq!(CameraModel::from_jpeg(&fixture::jpeg_without_exif()), None);
+        assert_eq!(CameraModel::from_jpeg(b"not a JPEG"), None);
+        let jpeg = photo_taken_by(SHUTTER, "TestCam", "Model X");
+        assert_eq!(
+            CameraModel::from_jpeg(&jpeg[..20]),
+            None,
+            "a truncated Exif block must be unknown, not a panic"
+        );
     }
 
     #[test]
