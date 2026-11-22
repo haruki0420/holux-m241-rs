@@ -216,12 +216,12 @@ verbatim; each is the line the client printed.
   reported its default time right after the write, not a GPS-derived one; that a
   live fix now produces today's date has not been observed. Later on 2026-11-22
   the same unit, still with no fix, reported the current UTC date — see
-  "The no-fix date follows the host clock" below — so the no-fix clock does move
+  "The no-fix date matches the host clock" below — so the no-fix clock does move
   past the constant, but how it gets set is not established. Recording a track
   and reading it back with the WNRO-corrected timestamp is the next step, and it
   needs sky, not a cable.
 
-#### The no-fix date follows the host clock (2026-11-22)
+#### The no-fix date matches the host clock (2026-11-22)
 
 Device: the same retail M-241, running the patched V1.14 image written above.
 Host: Linux, the unit over USB serial. The host clock stood at
@@ -241,8 +241,10 @@ Host: Linux, the unit over USB serial. The host clock stood at
   `15:23:11Z` and `15:23:19Z`; every date field was `221126`, and the time
   fields ran from `152314.586` to `152321.586`, i.e. with the host clock. A
   second capture through `m241 nmea proxy` at `15:23:22Z` printed
-  `$GPRMC,152322.586,V,…221126…`. A separate pass minutes earlier
-  (`$GPRMC,152224.586,…,221126,…` and `$GPGGA,…,0,0,…` at `15:22:25Z`) agrees.
+  `$GPRMC,152322.586,V,…221126…`. A separate pass about 46 s before the host
+  window above (`$GPRMC,152224.586,…,221126,…`; its `$GPGGA` sentence read
+  `15:22:25Z`, which is the sentence's own time — that pass's host clock was
+  not recorded) agrees.
 * **This is not the constant.** The stock image reported `06-01-80` (its epoch
   `315964800`) and the patched image reported `22-08-99` (its epoch
   `935280000`) when the unit was started with no fix (above). Today's `221126`
@@ -266,17 +268,16 @@ apart; nothing was erased or written.
 
 | Step | Result | Status |
 |---|---|---|
-| first download | 3,228 bytes, 135 records, exit 0, no framing error | ✅ |
+| first download | 3,228 bytes, 135 records, no framing error | ✅ |
 | second download | 3,260 bytes, 137 records | ✅ |
 | block header | `1 of 1 blocks failed their header checksum` in both | ✅ |
 | record checksums | every record failed (`bad checksums: 135`, then `137`) | ✅ |
 | decoded span | `2060-09-25T04:18:50Z`–`2015-05-08T05:53:12Z`, then `1974-01-28T17:15:22Z` | ⚠️ not trustworthy |
 | log usage through the GUI minutes later | `3,292 B`, recording 「有効」 | ✅ |
 
-* The transport was clean: both runs exited 0 with no framing error, and the
-  unit's log usage grew between them (3,228 → 3,260 bytes, 135 → 137 records),
-  so the log was being written while it was read. The GUI then reported
-  `3,292 B`.
+* The transport was clean: neither run hit a framing error, and the unit's log
+  usage grew between them (3,228 → 3,260 bytes, 135 → 137 records), so the log
+  was written between the two reads. The GUI then reported `3,292 B`.
 * **The download cannot be used as evidence of a post-flash timestamp.** The
   unit's only block fails its header checksum and every record fails its
   per-record checksum, and the spans the client decodes are nonsense. A 64 KiB
@@ -295,7 +296,7 @@ it was built from was not recorded.
 | Step | Result | Status |
 |---|---|---|
 | start the window with the unit attached | the Connect screen listed the host's serial ports and had the unit's port selected by default; its diagnostic line named the CP210x / PL2303 / FTDI / CH340 cable types | ✅ |
-| 「接続して確認」 | 「接続済み（読み取り専用）」; firmware `B-core_1.20`, build `0043`, model `01017-00F`, SDK `1.0`; log status 「既知リリース（日付修正対象）」 | ✅ |
+| 「接続して確認」 | 「接続済み（読み取り専用）」; firmware `B-core_1.20`, build `0043`, model `01017-00F`, SDK `1.0`; the capture was cut off at the SDK line, so the 状態 row drawn under it is not in the capture | ✅ |
 | log usage through the same probe | `3,292 B`, recording 「有効」 | ✅ |
 | open a downloaded log in the Log screen | not exercised: its file-path field needs keyboard input, and no keyboard could be injected into the X11 window in this session | ⚠️ |
 | 追従 render on a real track | not exercised (it needs a log loaded in the previous row) | ⚠️ |
@@ -304,6 +305,12 @@ it was built from was not recorded.
 * The connect probe **reads** only: the screen says 読み取り専用, and the probe
   path never pulses DTR/RTS (`AGENTS.md` §2.1). It opened the port, read
   `$PMTK705`, then asked the unit for its log usage.
+* The 状態 row is drawn immediately after the SDK line
+  (`crates/m241-gui/src/screens/connect.rs`, `figure_row(ui, "状態", …)`); the
+  capture ends below the SDK line, so the row was not visible in it and this
+  page does not record it as observed. The code would show
+  「既知リリース（日付修正対象）」 for this unit, because `is_known_release()`
+  accepts any release starting `B-core_1.` (`crates/m241-core/src/types.rs`).
 * The usage the GUI showed (`3,292 B`) agrees with the `log download` byte
   counts of the same minutes (3,228 then 3,260), so the GUI and the CLI read the
   same log.
@@ -334,7 +341,9 @@ restored by the firmware: after the vendor write they held the vendor values.
 
 未検証: where the restored four bytes come from (a second copy in the chip, or a
 derivation), and whether the vendor read-back should ignore the
-firmware-managed offsets — a design decision that has not been made.
+firmware-managed offsets — a design decision that has not been made. The
+options, their effect on the safety gate and a recommendation are recorded in
+[`06-open-questions.md`](06-open-questions.md) §8; the choice is the user's.
 
 #### V1.12 is refused before a port is opened
 
@@ -390,7 +399,7 @@ nothing on this page makes the final head verified.
 | The Rust `fw flash` command on a unit | ✅ the 2026-11-15 flash was an earlier manual/v1 run; on 2026-11-22 the Rust client completed two writes and read each written range back identical (§1.5). The write, erase, restart and backup-diff gates are no longer covered by the simulator only |
 | The final `0xD5` packet sent short (92 + 2) | ✅ measured 2026-11-22 (§1.5): the zero-padded final packet failed on hardware (§1.4); the client that sends the remainder plus its sum completed two writes and read both back identical |
 | What `0x01` means in a `0xD5` reply | observed 2026-11-22 (§1.4); the disassembly page explains why a padded final packet cannot pass the checksum, but not which DA status reaches the wire as `0x01` |
-| Writing the official V1.13 vendor image (`--allow-vendor`) | ⚠️ written 2026-11-22 (§1.5): all 1589 packets acknowledged, 406,620 bytes programmed, and the unit booted the stock V1.13 (NMEA default date `06-01-80`). The read-back then differed at `0x5C`, because the booted firmware restores its four per-unit bytes; the 14-byte overwrite was therefore observed, but the read-back gate cannot confirm a vendor write as it stands |
+| Writing the official V1.13 vendor image (`--allow-vendor`) | ⚠️ written 2026-11-22 (§1.5): all 1589 packets acknowledged, 406,620 bytes programmed, and the unit booted the stock V1.13 (NMEA default date `06-01-80`). The read-back then differed at `0x5C`, because the booted firmware restores its four per-unit bytes; the 14-byte overwrite was therefore observed, but the read-back gate cannot confirm a vendor write as it stands (the options are in [`06-open-questions.md`](06-open-questions.md) §8) |
 | The firmware restoring per-unit bytes at boot | ✅ observed 2026-11-22 (§1.5): after the vendor write the unit held `91 1B D4 CF` at `0x5C`–`0x5F` — its own earlier values — where the image has `FF`. Where those bytes come from and whether the vendor read-back should skip them are 未検証 |
 | The `0xD9` → NMEA probe → `$PMTK180*3B` re-entry and read-back | ✅ measured 2026-11-22 (§1.5): after both successful writes the client restarted the chip, re-entered the BootROM through the NMEA hand-over and read the whole range back. The 2026-11-15 row recorded that the unit booted, not that this read-back ran |
 | The automatic `0xD9` restart and one retry after a `0xD3` failure | still not exercised on a unit: with the final-packet fix in place no `0xD3` failure occurred, so the restart-and-retry path ran only against the fake. The retry uses the same `FLASH_WRITE_START` / `FLASH_WRITE_LENGTH` and never recomputes the range |
