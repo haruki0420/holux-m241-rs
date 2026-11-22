@@ -95,10 +95,11 @@
 //!
 //! The image is **not** acceptable from anywhere: [`DaLoader::load`] insists on
 //! exactly [`DA_IMAGE_SIZE`] bytes starting with the DA's own first four bytes
-//! ([`DA_IMAGE_HEAD`]), then reads the whole image back before it jumps. Those
-//! three checks are what turn "a 14,896-byte file" into "the DA v3.8.4 the rest
-//! of this crate was written against"; the 20-byte report afterwards is the
-//! fourth, and the only one the DA itself contributes.
+//! ([`DA_IMAGE_HEAD`]) **and** on the full SHA-256 being the pinned vendor value
+//! ([`DA_IMAGE_SHA256`]), then reads the whole image back before it jumps. Those
+//! four checks run before the jump and turn "a 14,896-byte file" into "the
+//! DA v3.8.4 the rest of this crate was written against"; the fifth check is the
+//! 20-byte report afterwards, the only one the DA itself contributes.
 //!
 //! # Reading the flash from the DA's side: `0xD6`
 //!
@@ -225,7 +226,7 @@ use std::time::Duration;
 
 use m241_core::Result;
 use m241_core::error::Error;
-use m241_core::firmware::digest::matches;
+use m241_core::firmware::digest::{matches, sha256_hex};
 use m241_core::firmware::image::{
     EFFECTIVE_EPOCH_OFFSET, FAMILY, FAMILY_OFFSET, FAMILY_SIZE, FirmwareImage,
 };
@@ -531,6 +532,63 @@ pub const DA_JUMP_COUNT: u32 = 0;
 /// "the DA v3.8.4 image", before the size check even has a port to write to.
 pub const DA_IMAGE_HEAD: [u8; 4] = [0x00, 0x00, 0xA0, 0xE1];
 
+/// The full SHA-256 of the vendor `DA_v3.8.4.bin`, as 64 lowercase hex digits.
+///
+/// `AGENTS.md` §2.5 records this value: the V1.12 and V1.13 vendor packages ship
+/// the same 14,896-byte DA, so one digest pins both. The binary is never
+/// committed (`AGENTS.md` §6); the digest is what turns "14,896 bytes starting
+/// `00 00 A0 E1`" into "the DA this crate drives", so a file that merely shares
+/// the length and the head cannot be loaded into RAM and jumped to.
+/// [`check_da_image`] compares it before anything goes on the wire.
+pub const DA_IMAGE_SHA256: &str =
+    "190d7064cf2320752d8eb65681142730b21cddc90e0d1491d4e8379c3f2e89aa";
+
+/// The full SHA-256 a DA image must have before it is loaded and jumped to.
+///
+/// A normal build has exactly one way to obtain one: [`DaDigest::vendor`], the
+/// pinned `DA_v3.8.4.bin` value from `AGENTS.md` §2.5. The other constructor,
+/// [`DaDigest::for_test_da`], is compiled only under
+/// `cfg(any(test, feature = "simulator"))` — the same gate [`crate::FakeDa`]
+/// uses — because the vendor binary is never committed (`AGENTS.md` §6) and the
+/// tests that drive the load path need a digest they can produce. A shipped
+/// build therefore cannot name a digest other than the pinned one, so "the DA is
+/// checked against the vendor value" is a property of the type rather than a
+/// rule every call site is trusted to follow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DaDigest {
+    expected_sha256: String,
+}
+
+impl DaDigest {
+    /// The pinned vendor `DA_v3.8.4.bin` digest ([`DA_IMAGE_SHA256`]).
+    #[must_use]
+    pub fn vendor() -> Self {
+        Self {
+            expected_sha256: String::from(DA_IMAGE_SHA256),
+        }
+    }
+
+    /// A digest for a DA image a test supplies instead of the vendor binary.
+    ///
+    /// The `simulator` feature is what lets a dependent crate's end-to-end tests
+    /// build one; a shipped binary has no constructor for any value but
+    /// [`DaDigest::vendor`]. `tools/check_safety.py` fails if the `cfg` below
+    /// ever comes off.
+    #[must_use]
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn for_test_da(sha256_hex: &str) -> Self {
+        Self {
+            expected_sha256: String::from(sha256_hex),
+        }
+    }
+
+    /// The digest an image is compared with, as hex.
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.expected_sha256
+    }
+}
+
 /// The DA version the 20-byte report must carry at bytes 1–2.
 ///
 /// `docs/reference/01-da-protocol.md` §2: `0x00102C40` and `0x00102C48` push the
@@ -775,8 +833,8 @@ impl<'a, T: Transport> DaLoader<'a, T> {
         self
     }
 
-    /// Check the image's size and first bytes, write it to [`DA_LOAD_ADDRESS`],
-    /// read it back, jump to it, and check the DA's report.
+    /// Check the image's size, first bytes and full SHA-256, write it to
+    /// [`DA_LOAD_ADDRESS`], read it back, jump to it, and check the DA's report.
     ///
     /// # Errors
     ///
@@ -787,10 +845,34 @@ impl<'a, T: Transport> DaLoader<'a, T> {
     /// 2. [`Error::Safety`] when the image is not exactly [`DA_IMAGE_SIZE`]
     ///    bytes.
     /// 3. [`Error::Safety`] when its first four bytes are not [`DA_IMAGE_HEAD`].
-    /// 4. [`Error::Framing`] when the write-back disagrees, or when the report
+    /// 4. [`Error::Safety`] when its full SHA-256 is not [`DA_IMAGE_SHA256`].
+    /// 5. [`Error::Framing`] when the write-back disagrees, or when the report
     ///    is not the DA this crate was written against.
-    /// 5. [`Error::Timeout`] / [`Error::Io`] from the transport.
+    /// 6. [`Error::Timeout`] / [`Error::Io`] from the transport.
     pub fn load(&mut self, confirmation: Confirmation, image: &[u8]) -> Result<DaLoadId> {
+        self.load_against(confirmation, image, DaDigest::vendor())
+    }
+
+    /// [`DaLoader::load`] with the expected digest handed in as a [`DaDigest`].
+    ///
+    /// The image is still checked by [`check_da_image_against`]: the same
+    /// length, head and full-SHA-256 rules. The digest is a token rather than a
+    /// string, and a normal build can only build one with [`DaDigest::vendor`],
+    /// so this is not a way around the pinned check — it is `load` with its
+    /// check split out for the callers that hold another token (this crate's
+    /// loader tests, and a dependent crate's end-to-end tests through the
+    /// `simulator` feature).
+    ///
+    /// # Errors
+    ///
+    /// As [`DaLoader::load`], with a refusal for any digest other than
+    /// `digest`'s.
+    pub fn load_against(
+        &mut self,
+        confirmation: Confirmation,
+        image: &[u8],
+        digest: DaDigest,
+    ) -> Result<DaLoadId> {
         if !confirmation.is_given() {
             return Err(Error::Safety {
                 reason: String::from(
@@ -798,7 +880,7 @@ impl<'a, T: Transport> DaLoader<'a, T> {
                 ),
             });
         }
-        check_da_image(image)?;
+        check_da_image_against(image, digest)?;
         self.write_image(image)?;
         self.read_back(image)?;
         self.jump()?;
@@ -1001,30 +1083,52 @@ pub const REPORT_SCAN_LIMIT: usize = 256;
 
 /// Refuse an image that is not the DA the rest of this crate is written for.
 ///
-/// Two checks, in this order, and both are cheap enough to run before a port is
-/// opened:
+/// Three checks, in this order, and all of them are cheap enough to run before a
+/// port is opened:
 ///
 /// 1. the file is exactly [`DA_IMAGE_SIZE`] bytes — the size check
 ///    `m241 device doctor` makes against the file name;
 /// 2. its first four bytes are [`DA_IMAGE_HEAD`], the vendor image's first
 ///    instruction (`mov r0, r0`), so a 14,896-byte file that is not the DA is
-///    refused before anything is written to RAM.
+///    refused before anything is written to RAM;
+/// 3. its full SHA-256 matches the [`DaDigest`], so a file that happens to share
+///    the length and the head is still refused. This is the check follow-up W2a
+///    added: `AGENTS.md` §2.5 recorded the digest as the approval requirement,
+///    and comparing it here closes the path where any lookalike could be loaded
+///    and jumped to.
 ///
-/// Content is not hashed **yet**. The DA is a user's own copy of a vendor
-/// binary, never committed here, but its SHA-256 is known (the full value is in
-/// `AGENTS.md` §2.5), so the hash can be checked without committing the image.
-/// A four-byte head still narrows "the right size" to "the right image"; adding
-/// the full SHA-256 comparison here is follow-up W2a, and until then the
-/// approval rule requires the approver to compare it manually. What makes the
-/// load safe in the meantime is still the steps after it
-/// ([`parse_report`] refusing any other version, flash part or region, and
-/// [`DaLoader::read_back`] refusing to jump at RAM that did not take the write).
+/// The digest is a [`DaDigest`] token, not a string: it can be built from the
+/// pinned vendor value, and in a normal build from nothing else, so no caller can
+/// substitute a different DA's digest. [`check_da_image_against`] runs the same
+/// body with the token it is handed; this function hands it
+/// [`DaDigest::vendor`]. What still makes the load safe after the check is
+/// [`parse_report`] refusing any other version, flash part or region, and
+/// [`DaLoader::read_back`] refusing to jump at RAM that did not take the write.
 ///
 /// # Errors
 ///
-/// [`Error::Safety`] for a wrong length, an empty image, or first bytes that are
-/// not [`DA_IMAGE_HEAD`].
+/// [`Error::Safety`] for a wrong length, an empty image, first bytes that are
+/// not [`DA_IMAGE_HEAD`], or bytes whose SHA-256 is not the pinned
+/// [`DA_IMAGE_SHA256`].
 pub fn check_da_image(image: &[u8]) -> Result<()> {
+    check_da_image_against(image, DaDigest::vendor())
+}
+
+/// [`check_da_image`]'s body, with the expected digest handed in as a
+/// [`DaDigest`].
+///
+/// The same length, head and full-SHA-256 rules; only the expected value is a
+/// parameter. It is a token rather than a string so the value is constructible
+/// from the pinned vendor digest alone in a normal build (see [`DaDigest`]); this
+/// function exists for the callers that legitimately hold a different token —
+/// the loader's split-off [`DaLoader::load_against`] and the tests that cannot
+/// carry the vendor binary.
+///
+/// # Errors
+///
+/// [`Error::Safety`] for a wrong length, first bytes that are not
+/// [`DA_IMAGE_HEAD`], or a digest that does not match `digest`.
+pub fn check_da_image_against(image: &[u8], digest: DaDigest) -> Result<()> {
     if image.len() != DA_IMAGE_SIZE {
         return Err(Error::Safety {
             reason: format!(
@@ -1040,6 +1144,23 @@ pub fn check_da_image(image: &[u8]) -> Result<()> {
             reason: format!(
                 "the DA image starts {head:02X?}; DA_v3.8.4.bin starts {DA_IMAGE_HEAD:02X?} \
                  (00 00 A0 E1, mov r0, r0). The size alone does not make a file the DA. Nothing \
+                 was written"
+            ),
+        });
+    }
+    let expected = digest.sha256().trim();
+    if !matches(image, expected) {
+        let actual = sha256_hex(image);
+        let expected_label = if expected.eq_ignore_ascii_case(DA_IMAGE_SHA256) {
+            format!("the pinned DA_v3.8.4.bin digest {expected}")
+        } else {
+            format!("the expected digest {expected}")
+        };
+        return Err(Error::Safety {
+            reason: format!(
+                "the DA image has SHA-256 {actual}; {expected_label} is required. The length and \
+                 the first bytes match, but only an image with that digest may be loaded and \
+                 jumped to; use the DA_v3.8.4.bin from the V1.12/V1.13 vendor package. Nothing \
                  was written"
             ),
         });
@@ -4424,6 +4545,44 @@ mod loader_tests {
         image
     }
 
+    /// The SHA-256 of the fixture [`da_image`], as hex.
+    ///
+    /// The fixture is not the vendor DA, so it cannot hash to
+    /// [`DA_IMAGE_SHA256`]; the tests that drive the load path wrap this value in
+    /// a [`DaDigest`] through [`DaDigest::for_test_da`]. The pinned value is
+    /// exercised on its own by
+    /// `a_same_size_image_with_the_right_head_but_the_wrong_digest_is_refused`
+    /// and, when the environment provides the file, by
+    /// `the_vendor_da_matches_the_pinned_digest_and_loads_when_the_vendor_da_is_available`.
+    fn da_image_digest() -> String {
+        sha256_hex(&da_image())
+    }
+
+    /// The fixture's digest as the token the loader and the check take.
+    fn fixture_digest() -> DaDigest {
+        DaDigest::for_test_da(&da_image_digest())
+    }
+
+    /// The vendor `DA_v3.8.4.bin`, when the environment can provide it.
+    ///
+    /// The binary is never committed (`AGENTS.md` §6), so CI cannot provide it.
+    /// `M241_VENDOR_DA` names the file directly; failing that it is looked for
+    /// beside the vendor firmware image that `M241_VENDOR_IMAGE` points at
+    /// (both ship in the same package). Tests that need the exact bytes print a
+    /// skip line and return when neither is set; the digest-refusal tests run
+    /// without it.
+    fn vendor_da() -> Option<Vec<u8>> {
+        if let Some(path) = std::env::var_os("M241_VENDOR_DA") {
+            return Some(std::fs::read(path).expect("M241_VENDOR_DA must be readable"));
+        }
+        let image = std::env::var_os("M241_VENDOR_IMAGE")?;
+        let path = std::path::PathBuf::from(image).with_file_name("DA_v3.8.4.bin");
+        if !path.is_file() {
+            return None;
+        }
+        Some(std::fs::read(path).expect("the DA beside M241_VENDOR_IMAGE must be readable"))
+    }
+
     /// A chip in the BootROM, past the sync, with nothing in flash.
     fn bootrom() -> FakeDa {
         let mut device = FakeDa::with_firmware(&[]);
@@ -4434,10 +4593,15 @@ mod loader_tests {
         device
     }
 
-    /// Load `image` on `device`.
+    /// Load `image` on `device`, requiring the fixture's own digest.
     fn load(device: &mut FakeDa, image: &[u8]) -> Result<DaLoadId> {
+        load_against(device, image, fixture_digest())
+    }
+
+    /// Load `image` on `device`, requiring an explicitly supplied digest.
+    fn load_against(device: &mut FakeDa, image: &[u8], digest: DaDigest) -> Result<DaLoadId> {
         let mut loader = DaLoader::new(device).with_reply_timeout(Duration::from_millis(50));
-        loader.load(Confirmation::granted(), image)
+        loader.load_against(Confirmation::granted(), image, digest)
     }
 
     #[test]
@@ -4477,6 +4641,19 @@ mod loader_tests {
         );
         assert_eq!(PROBE_PAGE_SIZE, 64);
         assert_eq!((DA_REPORT_SIZE, DA_REPORT_MARKER), (20, 0xC0));
+        // The literal, not just the length: rewriting one digit of the pinned
+        // digest must fail in CI, where no vendor DA is available for the
+        // acceptance test to hash. The value is recorded in `AGENTS.md` §2.5 and
+        // was checked against the V1.12 and V1.13 packages' `DA_v3.8.4.bin`.
+        assert_eq!(
+            DA_IMAGE_SHA256,
+            "190d7064cf2320752d8eb65681142730b21cddc90e0d1491d4e8379c3f2e89aa"
+        );
+        assert_eq!(
+            DaDigest::vendor().sha256(),
+            DA_IMAGE_SHA256,
+            "the only digest a normal build can require is the pinned one"
+        );
         assert_eq!(
             DA_IMAGE_SIZE % DA_LOAD_CHUNK,
             6,
@@ -4673,8 +4850,13 @@ mod loader_tests {
     fn the_loader_refuses_an_image_whose_first_bytes_are_not_the_da() {
         // The size-only check let any 14,896-byte file through to a RAM write
         // and a jump. `load` documents a first-bytes check; this is what makes
-        // that true, and the sizes below are all exactly right.
-        assert!(check_da_image(&da_image()).is_ok(), "the fixture is the DA");
+        // that true, and the sizes below are all exactly right. The fixture's
+        // own digest is required here so the head check is the one that speaks.
+        let digest = fixture_digest();
+        assert!(
+            check_da_image_against(&da_image(), digest.clone()).is_ok(),
+            "the fixture is the DA for its own digest"
+        );
 
         let wrong_head = {
             let mut image = da_image();
@@ -4683,7 +4865,8 @@ mod loader_tests {
         };
         // The firmware's vector at the DA's address: same length, right size,
         // and an image the old check would have loaded.
-        let err = check_da_image(&wrong_head).expect_err("the firmware head is not the DA");
+        let err = check_da_image_against(&wrong_head, digest.clone())
+            .expect_err("the firmware head is not the DA");
         assert!(matches!(err, Error::Safety { .. }), "got {err}");
         let text = format!("{err}");
         assert!(
@@ -4702,9 +4885,92 @@ mod loader_tests {
         let mut last_byte = da_image();
         last_byte[DA_IMAGE_HEAD.len() - 1] ^= 0xFF;
         assert!(matches!(
-            check_da_image(&last_byte),
+            check_da_image_against(&last_byte, digest),
             Err(Error::Safety { .. })
         ));
+    }
+
+    #[test]
+    fn a_same_size_image_with_the_right_head_but_the_wrong_digest_is_refused() {
+        // Follow-up W2a: the length and the four-byte head used to be the whole
+        // gate, so any 14,896-byte file starting `00 00 A0 E1` could be written
+        // into RAM and jumped to. The fixture is exactly that file: right size,
+        // right head, wrong content.
+        let image = da_image();
+        let fixture = fixture_digest();
+        assert_eq!(image.len(), DA_IMAGE_SIZE);
+        assert_eq!(
+            DA_IMAGE_SHA256.len(),
+            64,
+            "the pinned digest is 64 hex digits"
+        );
+        assert!(
+            DA_IMAGE_SHA256
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "the pinned digest is lowercase hex: {DA_IMAGE_SHA256}"
+        );
+
+        // The check itself is a real digest comparison: the right digest (the
+        // fixture's own) passes, the pinned vendor digest does not, and one hex
+        // digit away from the right value does not either.
+        assert!(check_da_image_against(&image, fixture.clone()).is_ok());
+        let err = check_da_image(&image).expect_err("the fixture is not the vendor DA");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        let text = format!("{err}");
+        assert!(
+            text.contains(DA_IMAGE_SHA256) && text.contains(&da_image_digest()),
+            "the refusal names both the actual and the expected digest: {text}"
+        );
+        let mut one_off = da_image_digest();
+        let last = one_off.pop().expect("a 64-digit digest");
+        one_off.push(if last == '0' { '1' } else { '0' });
+        assert!(
+            check_da_image_against(&image, DaDigest::for_test_da(&one_off)).is_err(),
+            "a digest that differs by one digit is refused"
+        );
+
+        // And through the loader, the refusal happens before any byte is sent.
+        let mut device = bootrom();
+        let err = load_against(&mut device, &image, DaDigest::vendor())
+            .expect_err("a lookalike DA is not loaded");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        assert!(device.opcodes().is_empty(), "nothing goes on the wire");
+        assert_eq!(device.bootrom_writes(), 0);
+        assert!(!device.started());
+    }
+
+    #[test]
+    #[allow(clippy::print_stderr)] // A silent skip is indistinguishable from a pass.
+    fn the_vendor_da_matches_the_pinned_digest_and_loads_when_the_vendor_da_is_available() {
+        // The binary is not committed (`AGENTS.md` §6), so this runs only where
+        // the environment can supply it: `M241_VENDOR_DA`, or the file beside
+        // `M241_VENDOR_IMAGE`. The skip is printed, and the test name says the
+        // condition, so a green CI run is not read as this property holding.
+        let Some(da) = vendor_da() else {
+            eprintln!(
+                "skipping the vendor-DA acceptance test: no vendor DA \
+                 (set M241_VENDOR_DA, or place DA_v3.8.4.bin beside M241_VENDOR_IMAGE)"
+            );
+            return;
+        };
+        assert_eq!(da.len(), DA_IMAGE_SIZE);
+        assert_eq!(
+            sha256_hex(&da),
+            DA_IMAGE_SHA256,
+            "the pinned digest is the vendor DA_v3.8.4.bin's"
+        );
+        assert!(check_da_image(&da).is_ok(), "the pinned gate accepts it");
+        let mut device = bootrom();
+        let id = load_against(&mut device, &da, DaDigest::vendor())
+            .expect("the vendor DA loads with the pinned digest");
+        assert_eq!(id.version, DA_VERSION);
+        assert_eq!(
+            device.ram().get(..DA_IMAGE_SIZE).map(<[u8]>::to_vec),
+            Some(da),
+            "every vendor byte reached RAM at the DA base"
+        );
+        assert!(device.started());
     }
 
     #[test]

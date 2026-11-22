@@ -156,11 +156,26 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
    ただしロード後の DA は次のコマンドでフラッシュを操作できるため、`--yes` による
    確認と独立レビュー（`AGENTS.md` §2.5、`--da` の完全な SHA-256 照合を含む）は
    必須のままにした。`fw probe-da` にタイプ入力のプロンプトは無く、`--yes` が唯一の
-   入口である。`check_da_image` は現状サイズと先頭 4 バイトしか見ないため、SHA-256
-   照合のコード化は follow-up W2a である。
+   入口である。DA ゲート（`check_da_image` / `DaLoader::load` と、CLI が呼ぶ
+   同じ本体の `check_da_image_against` / `load_against`）はサイズ（14,896 バイト）・
+   先頭 4 バイト・**全文 SHA-256**（`DA_IMAGE_SHA256`、`AGENTS.md` §2.5 のベンダー値）の
+   3 つを照合し、長さと先頭だけ一致するファイルはポートを開く前に拒否する（W2a で実装）。
+   期待ダイジェストは生の `&str` ではなく `DaDigest` トークンで渡す: 通常ビルドで
+   構築できるのは `DaDigest::vendor()`（= `DA_IMAGE_SHA256`）だけで、テスト用の
+   `DaDigest::for_test_da` は `#[cfg(any(test, feature = "simulator"))]` の下にある。
+   CLI の本番経路は `da_digest()` が返す `DaDigest::vendor()` しか渡せない。
    *固定するテスト:* `the_loader_writes_the_whole_image_to_the_da_base_and_starts_it`
    が偽 DA の受けた opcode を `0xA1` / `0xAF` / `0xA8` に限り、
    `the_read_path_never_sends_a_write_opcode` が読み出し経路の opcode を `0xD6` に限る。
+   長さと先頭 4 バイトだけが正しいファイルの拒否は
+   `a_same_size_image_with_the_right_head_but_the_wrong_digest_is_refused` が固定する
+   （CI で常に走る）。pin 値そのものは
+   `the_loader_constants_are_pinned_to_the_documents_and_the_read_crate` が
+   リテラルで固定する（CI で常に走る）。実 DA のダイジェスト一致は、ベンダー
+   `DA_v3.8.4.bin` がある環境でのみ
+   `the_vendor_da_matches_the_pinned_digest_and_loads_when_the_vendor_da_is_available`
+   が確認する（無い環境では `eprintln!` で skip を明示する条件付きテスト。CI では
+   この性質は未実行）。🧪（条件付き）
    ロード範囲が BootROM のスタック `0x00100000`–`0x001007FF` と重ならないことは
    `the_load_range_does_not_touch_the_bootrom_stack` が区間として固定する。🧪
 2. **probe は `0xD3` / `0xD4` / `0xD5` / `0xD9` を呼ばない。** 👁
@@ -238,7 +253,7 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
    `firmware::digest` / `digest::matches` / `sha256`（`sha256_hex` を含む）が
    戻らないことも検査する。`AGENTS.md` §2.3 のバックアップ差分だけが受理規則で
    あり、ベンダーイメージの digest で通す経路は削除済みである（`check_da_image`
-   の W2a 用 SHA-256 は対象外）。
+   の DA 用 SHA-256 は対象外）。
 3. **ポートを開いたまま落ちたとき、装置が recording 停止のままにならないか。** 👁
    `log_stop` の後は必ず `log_resume` が走ること。`download_log` は失敗経路でも
    resume する（`pmtk.rs` のテスト `logging_is_resumed_even_when_the_transfer_fails`
@@ -262,8 +277,9 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
 | `cargo tree -p m241-flash --edges normal,build,dev` に `m241-core` がある | 正しい向きの依存が消えていない |
 | `crates/m241-core/Cargo.toml` と `crates/m241-gui/Cargo.toml` が `m241-flash` を名指ししない | 解決結果に出ない形の依存（dev 依存など）も塞ぐ |
 | `set_control_lines` が `crates/m241-core/src/protocol/brom.rs` / `crates/m241-core/src/protocol/port.rs` / `crates/m241-core/src/protocol/simulator.rs` 以外に無い | DTR/RTS を触る場所が増えていない（同名別パスのすり抜けも防ぐ） |
-| `crates/m241-flash/src/da.rs` の `check_image` / `all_within` 本体に `firmware::digest` / `digest::matches` / `sha256(_hex)` が無い | strict なバックアップ差分経路に digest 受理が戻らない（差分ヘルパーへ移しても検出。vendor は固定 SHA の別関数 `accept_vendor_image`、`check_da_image` の W2a 用 SHA-256 は対象外） |
+| `crates/m241-flash/src/da.rs` の `check_image` / `all_within` 本体に `firmware::digest` / `digest::matches` / `sha256(_hex)` が無い | strict なバックアップ差分経路に digest 受理が戻らない（差分ヘルパーへ移しても検出。vendor は固定 SHA の別関数 `accept_vendor_image`、`check_da_image` の DA 用 SHA-256 は対象外） |
 | `crates/m241-flash/src/da.rs` の `pub fn write` / `write_vendor` が本体のトップレベル（brace depth 1）で `write_range` / `write_range_accepted` より前に `check_layout()?` を含む | 開始アドレスのゲートが書き込み経路から外れていない（コメント・別関数・未呼び出しの入れ子関数では通らない。`write_range(_accepted)` に到達する公開関数を名前ではなく呼び出しで探す） |
+| `crates/m241-flash/src/da.rs` の `DaDigest::for_test_da` の直前が `#[cfg(any(test, feature = "simulator"))]` である | DA の期待ダイジェストが type で pin されている状態を保つ（この属性が外れると出荷ビルドが任意の digest のトークンを構築でき、`AGENTS.md` §2.5 の「ベンダー DA のみ」が型の性質でなくなる。通常ビルドの唯一の構築子は `DaDigest::vendor()`） |
 
 すべての検査と `tools/check.sh` への配線は
 `crates/m241-flash/tests/safety_gate.rs` で自動検証している。違反を植えた一時
@@ -295,14 +311,13 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
 
 `fw probe-da --yes` は、クライアントが `0xD3` / `0xD4` / `0xD5` / `0xD9` を送らなくても
 対象に含む。DA を RAM にロードし `0xA8` で**実行**するため、ロードされた DA 自身が
-フラッシュを消去・書き込みできる。しかも `check_da_image` はサイズ（14,896 バイト）と
-先頭 4 バイト（`00 00 A0 E1`）しか見ないので、その条件を満たす任意のファイルが
-`--da` として実行され得る。したがって承認には `--da` の**完全な** SHA-256 が
+フラッシュを消去・書き込みできる。`check_da_image` はサイズ（14,896 バイト）・
+先頭 4 バイト（`00 00 A0 E1`）・**全文 SHA-256** を照合し、いずれかが合わない
+`--da` はポートを開く前に拒否する（W2a）。承認でも `--da` の**完全な** SHA-256 が
 ベンダー値
 `190d7064cf2320752d8eb65681142730b21cddc90e0d1491d4e8379c3f2e89aa`
-（V1.12 / V1.13 の公式パッケージで同一、14,896 バイト）と一致することを要し、
-一致しない DA は承認不可とする。`check_da_image` への SHA-256 照合の追加は
-follow-up **W2a** であり、それまでの承認は手動照合で行う（コードはまだ照合しない）。
+（V1.12 / V1.13 の公式パッケージで同一、14,896 バイト）と一致することを確認し、
+一致しない DA は承認不可とする。
 
 - **独立性と差し戻し禁止**: 承認者は対象の実行を準備したセッションと別であり、準備
   セッションから fork した履歴を持ってはならない。準備側の要約・結論・説明は渡さず、
