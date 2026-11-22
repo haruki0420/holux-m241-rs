@@ -5,7 +5,7 @@
 //!
 //! ```text
 //!   m241 device  ports | info | doctor
-//!   m241 fw      dump  | patch | flash
+//!   m241 fw      dump  | patch | flash | probe-da | da-restart
 //!   m241 log     info  | download | read | erase | geotag
 //!   m241 nmea    repair | proxy
 //! ```
@@ -13,7 +13,7 @@
 //! Nothing here does any work. The grammar is separate from the handlers so a
 //! test can assert what a command line parses to without opening a port, and so
 //! the handler for one verb is not buried in the middle of the enum that
-//! describes all thirteen.
+//! describes all fifteen.
 //!
 //! Two rules from `docs/reference/02-cli.md` are enforced here rather than in a
 //! handler, because clap can produce the documented exit code 2 for them:
@@ -181,6 +181,13 @@ pub enum FwCommand {
     /// two addresses the DA-side firmware base could be, so the start address
     /// `fw flash` refuses on can be settled by measurement.
     ProbeDa(ProbeDaOptions),
+    /// Restart a unit left running the DA (`0xD9`); writes no flash.
+    ///
+    /// Sends the one-byte `0xD9` and does not wait for a reply. `0xD9` boots
+    /// the firmware; it neither erases nor programs flash, so no `--yes` is
+    /// needed, and DTR/RTS are never touched. Use it when a failed DA phase
+    /// left the unit unresponsive instead of removing the battery.
+    DaRestart(DaRestartOptions),
 }
 
 /// `m241 fw flash`: check an image against a backup, or write it.
@@ -302,6 +309,14 @@ pub struct ProbeDaOptions {
     /// Print one JSON object instead of labelled lines.
     #[arg(long)]
     pub json: bool,
+}
+
+/// `m241 fw da-restart`: send the DA's one-byte `0xD9` restart.
+#[derive(Debug, Args)]
+pub struct DaRestartOptions {
+    /// Serial port, or `auto` to pick the only likely cable.
+    #[arg(long, default_value = "auto")]
+    pub port: String,
 }
 
 #[derive(Debug, Args)]
@@ -821,6 +836,34 @@ mod tests {
         assert!(flash.assume_brom);
         assert_eq!(flash.port, "COM3");
         assert!(flash.json);
+    }
+
+    #[test]
+    fn fw_da_restart_parses_the_port_and_takes_no_yes() {
+        let cli = Cli::try_parse_from(["m241", "fw", "da-restart"]).expect("parses");
+        let Command::Fw {
+            command: FwCommand::DaRestart(options),
+        } = cli.command
+        else {
+            panic!("expected fw da-restart");
+        };
+        assert_eq!(options.port, "auto", "the documented default");
+
+        let cli = Cli::try_parse_from(["m241", "fw", "da-restart", "--port", "COM3"])
+            .expect("a resolved port parses");
+        let Command::Fw {
+            command: FwCommand::DaRestart(options),
+        } = cli.command
+        else {
+            panic!("expected fw da-restart");
+        };
+        assert_eq!(options.port, "COM3");
+
+        // `0xD9` restarts the chip and writes no flash, so it is not a
+        // write-capable run and must not offer the confirmation flag.
+        let err = Cli::try_parse_from(["m241", "fw", "da-restart", "--yes"])
+            .expect_err("--yes is not part of da-restart");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[test]
