@@ -13,6 +13,13 @@
 //! unsolved problem (both need the session layer) — and a track arrived at from
 //! disk can only be written back into the photos and the export file, never the
 //! logger.
+//!
+//! Limits of the wiring this module holds: the map selects a point by clicking
+//! it, with no drag range selection; the CLI's `log kmz --utc-offset-days` and
+//! `--tz-offset-minutes` have no control here, so an uncorrected dump must be
+//! corrected with the CLI before the photo match means anything; and the KMZ
+//! icon option is not exposed because the core module records its spec as
+//! unconfirmed.
 
 // The write token lives one level down, where this module cannot construct it:
 // see `geotag_gate` for why the privacy below `log.rs` is what closes M2.

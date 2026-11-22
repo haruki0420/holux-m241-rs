@@ -1247,3 +1247,81 @@ Could 9）と可読性（Must 4 / Should 17 / Could 13）の 2 本で、レビ�
 ### Stage 3 検証
 
 未検証（別エージェントが記入する）。
+
+---
+
+## 2026-11-23 / PR #31 `feat-gui-wiring` の Stage 2 修正
+
+- 対象: `feat-gui-wiring`（base `origin/main` = `1b7da2e`、Stage 1 レビュー head `cc3d505`）。修正コードの head は `a8a8fbc`、本節とモジュール doc の追記はその次の commit。
+- Stage 1: [仕様検収](https://github.com/haruki0420/holux-m241-rs/pull/31#issuecomment-7081588691) と[可読性](https://github.com/haruki0420/holux-m241-rs/pull/31#issuecomment-7081553478)。実装者はどちらのレビューにも参加していない。
+- 実機は使っていない（GUI のオフライン配線のみ。実機ポートは開いていない）。Google Earth / `unzip` / 実カメラは未検証のまま。
+- 変更範囲: `crates/m241-gui` と `DESIGN.md` のみ。`m241-core` / `m241-flash` / `m241-cli` / `tools/` は無変更（`check_design.py` も無変更）。
+
+### 仕様検収 Must への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| Must 1 | 再計画失敗が描画されず、古い OK 表示だけが残り、一覧・コントロールごと消える | 失敗時も `photo_entries` とコントロールを残し、`photo_shift.status` を同じブロックに描画。古い計画には `plan_stale` を立て、`写真に位置` と KMZ の書き出しを拒否。空一覧の経路でも status を描く | `a_failed_replan_keeps_the_list_and_draws_the_reason_beside_the_controls`（一覧・拒否・コントロールが同一フレームに描かれることをテキスト収集で確認） |
+| Must 2 | byCamera の基準カメラが画面に出ず、ハイライト変更で再計画しない。`apply_geotags` と `export_kmz` が別計画 | 基準写真から Make/Model を解決してキャッシュし、`基準カメラ: …（未検証）` を表示。ハイライトが別カメラを指したら再計画（同一カメラならフォルダを読み直さない）。KMZ は画面の計画をそのまま使い、保存先フォルダが一覧と違えば拒否。シフトを arm したままの KMZ は `<TimeStamp>` と EXIF が食い違うため拒否し、先に「写真に位置」を促す | `the_camera_scope_shows_the_base_camera_and_replans_when_it_changes`, `a_kmz_export_refuses_a_folder_the_rail_was_not_loaded_from`, `a_kmz_export_while_a_shift_is_armed_asks_for_the_geotag_write_first` |
+| Must 3 | シフト成功メッセージが範囲と無関係に全書き込み枚を「シフト後の時刻」と言う | 書き込み前に範囲内・範囲外の枚数を数え、`…（シフト: 範囲内 N 枚 / 範囲外 M 枚。シフト値は 0 に戻しました）` と表示。確認プロンプトにも同じ内訳を出す | `a_shift_write_reports_the_in_scope_and_out_of_scope_counts` |
+
+### 可読性 Must への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| M1 | 写真ブロックだけ `見本` がなく、合成データが実読込に見える | `photo_rail_section` を `common::block_title(ui, "写真", self.sample)` に変更。`show_sample_photos` の status も `見本の写真 N 枚（未読込）` に変更 | `the_photo_block_is_captioned_as_sample`（同じ caption 行の右に `見本` があることを座標で確認） |
+| M2 | byCamera の基準写真が選択変更で更新されず、一覧と KMZ が別計画 | 仕様 Must 2 と同じ修正（再計画の契機・表示・単一計画化） | 同上 |
+| M3 | `relink_photos` が失敗を無言で捨て、編集で削除した点を指す古い計画が残る | 再計画の実装を `replan_photos` 1 本に寄せ、`relink_photos` は失敗時に一覧を破棄して `…。写真を読み込み直してください` を表示。成功可否を返す | `a_track_edit_that_breaks_the_photo_plan_drops_the_stale_list` |
+
+### 仕様検収 Should への対応
+
+| # | 指摘 | 対応 |
+|---|---|---|
+| S1 | KMZ が geotag のシフト／スコープを継承し、`<TimeStamp>` が写真 EXIF と食い違う | 画面の計画をそのまま使い、シフト arm 中の KMZ は拒否。空一覧のときだけ CLI と同じ「シフトなし・全写真」で計画する |
+| S2 | KMZ で同梱しなかった写真の理由が出ない | `kmz_export::skipped_reasons` を追加し、先頭 3 枚のファイル名と理由（撮影時刻が読めない／最も近い点と N 秒差）を成功文言に含める。テスト `a_kmz_export_names_the_first_photos_it_could_not_bundle` |
+| S3 | KMZ と byCamera に `未検証` 表示がない | KMZ 行に `未検証`（hover に Google Earth / unzip 未確認）、byCamera の rule に `（未検証）` を表示 |
+| S4 | `DESIGN.md` §10 の「KMZ 未対応」が実装と矛盾 | §10 を「KMZ チップは第六の writer。Google Earth / unzip 未検証のため `未検証`」に更新。rail のブロック順も 4 ブロック（トラック / 写真 / 集計 / 編集）に修正 |
+| S5 | KMZ 選択時に速度チャートが footer で切れる | footer の KMZ 入力を 1 行（写真・最大長辺・未検証）に畳み、5 分ルールは写真ブロックの status に移した。1280×800 でチャート下端 632px・footer 罫線 647px を実測 |
+| S6 | 編集 UI が両サイズで fold 下、スクショにも写らない | 集計を §5 の 3 番目に戻し、編集を最後にした。集計の図と編集 UI はスクロールで到達する（DESIGN §10 に追記）。**スクショにスクロール状態を足すのは今回の範囲外**（レンダラにスクロール引数がない） |
+| S7 | 写真ブロックが `見本` なしで合成の「一致」を表示 | 可読性 M1 と同じ |
+| S8 | `utc_offset_days` 未配線の帰結が画面に出ない | **見送り**。Connect 画面に既に「ファームの日付が 19.6 年ずれています」があり、Log の rail に警告行を足すと本 PR で直した fold を再び悪化させる。Log の module doc に「未補正ダンプは CLI で補正」と明記した |
+| S9 | `scope=選択` で 0 枚のとき無言 no-op | 非ゼロシフトでチェック 0 枚なら `時計を動かす写真がありません。一覧で写真をチェックしてください` を返す |
+| S10 | 仕様項目のテスト未整備 | Must の成功経路（byCamera・シフト枚数・relink 失敗・KMZ 拒否／理由）を追加。単一分割の正経路、redo、範囲分割 2 手 Undo、削除境界の内容、シフト書き込み後リセットのテストは **Stage 3 の候補として残す**（Must 修正と独立） |
+| S11 | PR 本文「Honest limits, also in the module docs」が事実と違う | `photo_shift.rs` / `kmz_export.rs` / `log.rs` の module doc に、カメラ規則・再計画コスト・tz 補正なし・map ドラッグなし・icon 未公開を追記 |
+
+### 可読性 Should への対応
+
+| # | 指摘 | 対応 |
+|---|---|---|
+| S1 | `log.rs` の肥大化と 20 行超関数 | 見送り。Stage 2 は指摘の解消を優先し、`photo_rail_section` / `export_bar` の分割は Stage 3 のリファクタ候補として残す |
+| S2 | `kmz: bool` と `format` の二重状態、拡張子の不整合 | 拡張子の不整合は export 時に拒否（`.kmz` 以外なら保存先を直す文言）。`Writer` 1 列挙への統合は screenshot setter とテストに波及するため Stage 3 候補 |
+| S3 | 再計画が 2 実装 | `replan_photos` 1 本に統合。`relink_photos` は「編集後は失敗時に一覧を捨てる」方針だけを持つ薄い関数にした |
+| S4 | `PhotoEntry` 構築の 4 重複 | `photo_entry(track, plan)` に集約（サンプル・読込・再計画・relink） |
+| S5 | 0 始まりと 1 始まりの混在 | 編集 UI の表示・入力・確認文を 1 始まりに統一（内部 index は parse 時に変換）。テスト `an_edge_split_that_would_leave_an_empty_half_is_refused` を 1 始まりに更新 |
+| S6 | 実装と矛盾するコメント | `load_photos_from_path` の fallback 記述、`# Errors`、`photo_shift` のフォールバック説明を実装に合わせた |
+| S7 | 再計画失敗時に `photo_shift.selected` が残る | 一覧を残す方針に変わったため、失敗時も選択は一覧と整合する。relink 失敗時（一覧を捨てる経路）は `selected` も clear |
+| S8 | UI スレッドで全 JPEG を再読 | 値の変更ごとではなく「確定（drag release / focus loss）」で再計画。カメラ解決は基準カメラが変わったときだけフォルダを読み、同一カメラの選択変更では基準写真 1 枚だけ読む。確定時の全 JPEG 再読は残る（core の planner がパスを取るため） |
+| S9 | CLI 等価性コメントの過大主張 | `kmz_export.rs` の doc を「CLI の簡略版（1 パス・dotfile 除外・gap 300 固定・tz 補正なし）」に書き直した |
+| S10 | 語彙の不一致と rustdoc の言語 | `photo_shift.rs` の rustdoc を英語に統一。`ScopeKind` と core の `PhotoShiftScope` の併存は、core の enum が同名のまま GUI 側の変換を消す変更がテストに波及するため Stage 3 候補 |
+| S11 | エラー文言に「次」がない | `parse_max_edge`、編集の分割／削除エラーに例と次の一手を追加。core エラーは `Error::hint()` を後ろに付ける `edit_error` を通す |
+
+### Could の扱い
+
+- C1（ドラッグ中の再計画）は可読性 S8 として対応。C2（シフト合計 overflow の到達不能分岐）は残す（UI の範囲 ±999 では到達しないが、外から shift を設定する将来の経路で使う）。C3 / C4 / C5 / C6 は見送り（仕様判断または範囲外）。
+- 可読性 Could の `fail` 改名、`max_edge_field` などの改名、キャプション共通化、`pub` 最小化は Stage 3 候補。
+
+### 却下した指摘
+
+なし。Must 6 件（仕様 3 + 可読性 3）はいずれも実装で再現でき、事実と一致した。Should の見送りは上表の理由による。
+
+### 検証
+
+- `M241_VENDOR_IMAGE=… TMPDIR=/var/tmp ./tools/check.sh` **6/6**（fmt / clippy / test / docs / design / safety、43 秒）。実機ポートは開いていない。
+- `cargo test -p m241-gui`: lib **121** + design_gate **6** + design_invariants **6** + render **36** = **169 passed / 0 failed**（Stage 1 時点 162 から +7）。
+- `--screenshot /tmp/m241-gui-wiring2` で **8 枚**（4 画面 × 1280×800 / 1024×640）を再出力し目視。1280×800 の Log で、写真ブロックの `見本`、`見本の写真 2 枚（未読込）`、`基準カメラ: HOLUX M-241（未検証）`、`合計 900 秒: 範囲内 2 枚 / 範囲外 0 枚`、KMZ 行の `未検証`、速度チャートが footer に切られないこと（チャート下端 632px / footer 罫線 647px）を確認。1024×640 の Log で KMZ 行が 1 行に収まり、`未検証` が欠けないことを確認。Connect / Firmware / Settings は変化なし。
+- Must 1（再計画失敗）は固定状態のスクショに無いため、一時テストで失敗フレームを PNG 化して目視（一覧・コントロール・拒否文が同一画面に出て、rail 幅が広がらず map が縮まないことを確認）。一時テストは削除済み。
+- 未検証: Google Earth / `unzip`、実写真、実カメラでの byCamera 一致、実機。
+
+### Stage 3 検証
+
+未検証（別エージェントが記入する）。
