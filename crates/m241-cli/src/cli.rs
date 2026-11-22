@@ -31,6 +31,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
 use m241_core::ExportFormat;
+use m241_core::log::geotag::{CameraModel, PhotoShiftScope, PhotoTimeShift};
 use m241_core::protocol::brom::BASE_ADDR_FIRMWARE;
 
 use crate::cal::{self, OffsetSpec};
@@ -355,6 +356,31 @@ pub enum LogCommand {
     Kmz(LogKmzOptions),
 }
 
+/// Which photos a `log geotag` clock shift moves: `07-eztour-spec.ja.md` §6.1-7's
+/// three scopes, spelled the way `--scope` accepts them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum ShiftScopeArg {
+    /// Every photo (the default).
+    #[default]
+    All,
+    /// Only the photos named with `--photo`.
+    Selected,
+    /// Only photos whose Exif `Make` and `Model` both equal the camera flags.
+    ByCamera,
+}
+
+impl ShiftScopeArg {
+    /// The value `--scope` takes, for output.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Selected => "selected",
+            Self::ByCamera => "by-camera",
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct LogGeotagOptions {
     /// The raw dump `m241 log download` wrote.
@@ -391,6 +417,68 @@ pub struct LogGeotagOptions {
     )]
     pub tz_offset_minutes: i32,
 
+    /// Shift the clock of the photos in `--scope` by whole days.
+    ///
+    /// The four `--shift-*` values are summed, so `--shift-seconds 90` is the
+    /// one-flag (bulk) form. `--tz-offset-minutes` moves only the track the
+    /// photos are matched against, so it is independent and may be given too.
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        default_value_t = 0,
+        value_name = "DAYS"
+    )]
+    pub shift_days: i64,
+
+    /// Shift the clock of the photos in `--scope` by whole hours.
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        default_value_t = 0,
+        value_name = "HOURS"
+    )]
+    pub shift_hours: i64,
+
+    /// Shift the clock of the photos in `--scope` by whole minutes.
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        default_value_t = 0,
+        value_name = "MINUTES"
+    )]
+    pub shift_minutes: i64,
+
+    /// Shift the clock of the photos in `--scope` by seconds.
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        default_value_t = 0,
+        value_name = "SECONDS"
+    )]
+    pub shift_seconds: i64,
+
+    /// Which photos the shift moves.
+    #[arg(long, value_enum, default_value = "all", value_name = "SCOPE")]
+    pub scope: ShiftScopeArg,
+
+    /// A photo to move under `--scope selected`; repeatable.
+    ///
+    /// The value is compared exactly as given, so a path spelled differently
+    /// from the one in `<PHOTOS>` selects nothing.
+    #[arg(long, value_name = "PATH", required_if_eq("scope", "selected"))]
+    pub photo: Vec<PathBuf>,
+
+    /// Exif `Make` a photo must carry under `--scope by-camera`.
+    ///
+    /// Both camera flags are required by that scope, because the match is the
+    /// exact pair of tags rather than a substring.
+    #[arg(long, value_name = "MAKE", required_if_eq("scope", "by-camera"))]
+    pub camera_make: Option<String>,
+
+    /// Exif `Model` a photo must carry under `--scope by-camera`.
+    #[arg(long, value_name = "MODEL", required_if_eq("scope", "by-camera"))]
+    pub camera_model: Option<String>,
+
     /// Print the plan and modify no photos.
     #[arg(long)]
     pub dry_run: bool,
@@ -398,6 +486,39 @@ pub struct LogGeotagOptions {
     /// Print one JSON object instead of labelled lines.
     #[arg(long)]
     pub json: bool,
+}
+
+impl LogGeotagOptions {
+    /// The clock movement the four `--shift-*` flags add up to.
+    ///
+    /// The single-value form is `--shift-seconds` alone. `--tz-offset-minutes`
+    /// is deliberately not part of this sum: it moves the matching track, not a
+    /// photo's clock, so the two adjustments are independent.
+    #[must_use]
+    pub fn shift(&self) -> PhotoTimeShift {
+        PhotoTimeShift {
+            days: self.shift_days,
+            hours: self.shift_hours,
+            minutes: self.shift_minutes,
+            seconds: self.shift_seconds,
+        }
+    }
+
+    /// The photos `--scope` selects, from the flags that scope reads.
+    ///
+    /// The handler reports and ignores `--photo` or the camera flags under
+    /// another scope rather than inventing a second operation.
+    #[must_use]
+    pub fn shift_scope(&self) -> PhotoShiftScope {
+        match self.scope {
+            ShiftScopeArg::All => PhotoShiftScope::AllPhotos,
+            ShiftScopeArg::Selected => PhotoShiftScope::SelectedPhotos(self.photo.clone()),
+            ShiftScopeArg::ByCamera => PhotoShiftScope::ByCamera(CameraModel {
+                make: self.camera_make.clone(),
+                model: self.camera_model.clone(),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -824,6 +945,11 @@ mod tests {
         );
         assert_eq!(geotag.utc_offset_days, OffsetSpec::Auto);
         assert_eq!(geotag.tz_offset_minutes, 0);
+        assert_eq!(geotag.shift().total_seconds(), Some(0));
+        assert_eq!(geotag.scope, ShiftScopeArg::All);
+        assert!(geotag.photo.is_empty());
+        assert_eq!(geotag.camera_make, None);
+        assert_eq!(geotag.camera_model, None);
         assert!(!geotag.dry_run);
         assert!(!geotag.json);
 
@@ -869,6 +995,157 @@ mod tests {
         assert_eq!(proxy.bind, None);
         assert!(!proxy.allow_non_loopback);
         assert_eq!(proxy.max_lines, None);
+    }
+
+    #[test]
+    fn geotag_shift_flags_add_up_and_accept_negative_values() {
+        let cli = Cli::try_parse_from([
+            "m241",
+            "log",
+            "geotag",
+            "track.bin",
+            "a.jpg",
+            "--shift-days",
+            "1",
+            "--shift-hours",
+            "-2",
+            "--shift-minutes",
+            "-3",
+            "--shift-seconds",
+            "30",
+            // Not a photo-clock shift, so it may be given with the four above.
+            "--tz-offset-minutes",
+            "540",
+        ])
+        .expect("the documented shift command line");
+        let Command::Log {
+            command: LogCommand::Geotag(geotag),
+        } = cli.command
+        else {
+            panic!("expected log geotag");
+        };
+        assert_eq!(geotag.shift_days, 1);
+        assert_eq!(geotag.shift_hours, -2);
+        assert_eq!(geotag.shift_minutes, -3);
+        assert_eq!(geotag.shift_seconds, 30);
+        assert_eq!(
+            geotag.shift().total_seconds(),
+            Some(86_400 - 7_200 - 180 + 30)
+        );
+
+        // `--shift-seconds` alone is the bulk spelling: negative values are
+        // accepted, which needs `allow_hyphen_values` to be read as values.
+        let cli = Cli::try_parse_from([
+            "m241",
+            "log",
+            "geotag",
+            "track.bin",
+            "a.jpg",
+            "--shift-seconds",
+            "-90",
+        ])
+        .expect("a negative bulk shift parses");
+        let Command::Log {
+            command: LogCommand::Geotag(geotag),
+        } = cli.command
+        else {
+            panic!("expected log geotag");
+        };
+        assert_eq!(geotag.shift().total_seconds(), Some(-90));
+    }
+
+    #[test]
+    fn geotag_selected_scope_needs_at_least_one_photo_flag() {
+        let err = Cli::try_parse_from([
+            "m241",
+            "log",
+            "geotag",
+            "track.bin",
+            "a.jpg",
+            "--scope",
+            "selected",
+        ])
+        .expect_err("--scope selected without --photo must be a usage error");
+        assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
+
+        let cli = Cli::try_parse_from([
+            "m241",
+            "log",
+            "geotag",
+            "track.bin",
+            "a.jpg",
+            "--scope",
+            "selected",
+            "--photo",
+            "a.jpg",
+            "--photo",
+            "b.jpg",
+        ])
+        .expect("one --photo per selected photo");
+        let Command::Log {
+            command: LogCommand::Geotag(geotag),
+        } = cli.command
+        else {
+            panic!("expected log geotag");
+        };
+        assert_eq!(geotag.scope, ShiftScopeArg::Selected);
+        assert_eq!(
+            geotag.photo,
+            vec![PathBuf::from("a.jpg"), PathBuf::from("b.jpg")]
+        );
+        assert_eq!(
+            geotag.shift_scope(),
+            PhotoShiftScope::SelectedPhotos(vec![PathBuf::from("a.jpg"), PathBuf::from("b.jpg"),])
+        );
+    }
+
+    #[test]
+    fn geotag_by_camera_scope_needs_both_camera_tags() {
+        for missing in [None, Some("--camera-make"), Some("--camera-model")] {
+            let mut args = vec![
+                "m241",
+                "log",
+                "geotag",
+                "track.bin",
+                "a.jpg",
+                "--scope",
+                "by-camera",
+            ];
+            match missing {
+                None => {}
+                Some(flag) => args.extend([flag, "HOLUX"]),
+            }
+            let err = Cli::try_parse_from(&args).expect_err("by-camera needs both tags");
+            assert_eq!(crate::exit::exit_code_for_parse_error(&err), 2);
+        }
+
+        let cli = Cli::try_parse_from([
+            "m241",
+            "log",
+            "geotag",
+            "track.bin",
+            "a.jpg",
+            "--scope",
+            "by-camera",
+            "--camera-make",
+            "HOLUX",
+            "--camera-model",
+            "M-241",
+        ])
+        .expect("a camera named completely");
+        let Command::Log {
+            command: LogCommand::Geotag(geotag),
+        } = cli.command
+        else {
+            panic!("expected log geotag");
+        };
+        assert_eq!(
+            geotag.shift_scope(),
+            PhotoShiftScope::ByCamera(CameraModel {
+                make: Some(String::from("HOLUX")),
+                model: Some(String::from("M-241")),
+            })
+        );
     }
 
     #[test]

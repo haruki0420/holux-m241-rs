@@ -352,8 +352,62 @@ time and writes GPS EXIF tags.
 
 Flags: `--max-gap <SECONDS>` (default `300`), `--utc-offset-days <DAYS|auto>`
 (default `auto`), `--tz-offset-minutes <MINUTES>` (default `0`, for cameras
-whose `DateTimeOriginal` is in local time), `--dry-run` (plan without modifying
-any photo), `--json`.
+whose `DateTimeOriginal` is in local time), the four `--shift-*` flags and
+`--scope` described below, `--dry-run` (plan without modifying any photo),
+`--json`.
+
+### Shifting photo clocks
+
+`--shift-days <DAYS>`, `--shift-hours <HOURS>`, `--shift-minutes <MINUTES>` and
+`--shift-seconds <SECONDS>` (each signed, default `0`) move the capture clock of
+the photos in `--scope` and match them against the track again. A day is 24
+hours (86,400 seconds), not a calendar day. The four values are summed, so there
+is no separate single-value shift flag: `--shift-seconds 90` is the one-flag
+form, and `--shift-days 1 --shift-hours -2` is the same 79,200 seconds. A shift
+that the four values cannot express as one number of seconds is a runtime error
+(exit code 1) before any photo is read. The shift is written into
+`DateTimeOriginal` in the same rewrite that writes the position, so a later run
+matches the photo without being told about the shift again. `--dry-run` reports
+the shifted capture time and writes nothing; `--json` carries the summed value
+as `shift_seconds` and the scope as `shift_scope` beside the per-photo plans.
+
+`--tz-offset-minutes` is **not** a photo-clock shift: it moves only the track a
+photo is matched against and is never written into a photo. The two adjustments
+are independent and may be given together, so there is no mutual-exclusion rule
+to document; `--shift-seconds` already accepts any single value on its own.
+
+### Which photos a shift moves
+
+`--scope <all|selected|by-camera>` (default `all`) decides whose clock the
+`--shift-*` values move. A photo outside the scope is **not dropped**: it is
+planned at its unshifted time and still receives its position, because the scope
+decides only whose clock moves. A zero shift with the default scope is exactly
+the behaviour of a run without any `--shift-*` flag.
+
+- `--scope selected` requires one or more `--photo <PATH>` (repeatable). The
+  path is compared exactly with the path the command planned, so it must be
+  spelled the same way as in `<PHOTOS>` (a directory argument contributes its
+  children as `<DIR>/<NAME>`), and a path that matches nothing selects nothing.
+- `--scope by-camera` requires both `--camera-make <MAKE>` and
+  `--camera-model <MODEL>`, because the match is the exact pair of Exif IFD0
+  tags: `Make` and `Model` are compared with trailing NUL and space padding
+  removed and with no case folding, and a name that is not valid UTF-8 is
+  treated as unknown, so that photo is never selected. The rule is unconfirmed
+  against ezTour and real camera files; see
+  [`06-open-questions.md`](../dev/06-open-questions.md).
+- `--photo` and the camera flags are read only by their own scope. Passing one
+  under another scope is reported on stderr and ignored, rather than being
+  turned into a second operation.
+
+Example: a camera whose clock was an hour fast, correcting two selected photos:
+
+```bash
+m241 log geotag track.bin photos/ --scope selected \
+  --photo photos/a.jpg --photo photos/b.jpg --shift-hours -1 --dry-run
+```
+
+Drop `--dry-run` to write the tags. `--shift-hours -1` moves both the match and
+the written `DateTimeOriginal`, so the next run needs no shift for those photos.
 
 ## `m241 log kmz`
 
