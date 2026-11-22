@@ -1937,7 +1937,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "m241-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "m241-core",
@@ -1950,7 +1950,7 @@ dependencies = [
 
 [[package]]
 name = "m241-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "image",
  "serialport",
@@ -1959,14 +1959,14 @@ dependencies = [
 
 [[package]]
 name = "m241-flash"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "m241-core",
 ]
 
 [[package]]
 name = "m241-gui"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "eframe",
  "egui",

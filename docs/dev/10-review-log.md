@@ -1006,3 +1006,82 @@ head は `6945728`。この節は Stage 2 の対応記録で、Stage 3 は別エ
 ### Stage 3 検証
 
 未検証（別エージェントが記入する）。
+
+---
+
+## 2026-11-22 / 1.0.0 リリース整備（PR #26、Stage 1 → Stage 2）
+
+対象: `feat-release-prep`（base `origin/main` = `b0456df`）。Stage 1 は仕様検収（Must 1 / Should 10 /
+Could 9）と可読性（Must 4 / Should 17 / Could 13）の 2 本で、レビューした head は `65f7d60`。
+この節は Stage 2 の対応記録で、Stage 3 は別エージェントが記入する。`crates/**/*.rs` は変更していない。
+
+### 対応表（Must）
+
+| 指摘 | 対応 |
+|---|---|
+| 仕様 M1: README の「NMEA の日付補正が実機で動いている」に `05-verification.md` の根拠が無い | README の状態節を「実機で動いているのは読み取り系・`fw patch`・`fw flash`」に限定し、`nmea repair` はオフライン処理で実装済み、`nmea proxy` は**実機未検証**と書き分けた。未検証一覧にも `nmea proxy` を追加 |
+| 可読性 M1: `02-fix-the-date.md` / `03-recovery.md` への導線が無い | 「使い方」末尾に 2 本への導線を追加し、ドキュメント表（利用者向け）に 2 行追加 |
+| 可読性 M2: リリース資産名が README と `01-install.md` で不一致 | `01-install.md` の取得節を Release の実アセット名の表に置き換え、`SHA256SUMS.txt` との照合手順も追加 |
+| 可読性 M3: 未作成の Release を既存として記述 | README・`01-install.md`・`12-progress-summary.md`・CHANGELOG に「まだ一度も実行していない／`v1.0.0` タグも Release も未作成」と明記 |
+| 可読性 M4: 個体データの 14 / 4 / 1 バイトの食い違い | README と CHANGELOG に「個体データは 14 バイト（`0x5C`–`0x5F` の 4、`0xF8`–`0xFD` の 6、`0x63458`–`0x6345B` の 4）。起動時にファームが書き戻すのは `0x5C`–`0x5F` の 4 バイトで、実測の読み戻しの差は `0x5C` の 1 バイトだけ」と検算できる形で統一 |
+
+### 対応表（仕様 Should）
+
+| 指摘 | 対応 |
+|---|---|
+| S1: 実機確認は `b8d91ee` 時点で、以後の flash / CLI 変更は未実行 | README 状態節と CHANGELOG 冒頭に明記 |
+| S2: 「767 件」は現 head と不一致 | 実測 **810 件**（m241-core 297 / m241-flash 149 / m241-cli 232 / m241-gui 132、2026-11-22）に更新 |
+| S3: Release workflow 未実行を既存として記述 | 未実行を明記（`workflow_dispatch` の dry-run は見送り。理由は下記） |
+| S4: `v*` は RC・誤タグも拾い、版一致の検査が無い | trigger を `v[0-9]+.[0-9]+.[0-9]+` に絞り、build job にタグと `Cargo.toml` の版一致検査 step を追加（不一致は fail） |
+| S5: 05 §2 に未検証 3 項目が無い | `05-verification.md` §2 に `device doctor` 実 probe / 実カメラ geotag / `nmea proxy` の 3 行を追加し、README の参照先を §2 に変更 |
+| S6: Release に `LICENSE` が無い・署名 / provenance が無い | release job で `LICENSE` を dist に足し、チェックサムと Release アセットに含めた。署名・attestation は見送り（下記） |
+| S7: Linux の glibc / libudev 前提が無い | README と `01-install.md` に「Ubuntu 24.04（glibc 2.39）ビルド、`libudev.so.1` 前提、musl 静的ではない」と明記 |
+| S8: macOS Gatekeeper / Windows SmartScreen の注意が無い | README と `01-install.md` に未署名バイナリの注意と回避手順を追加 |
+| S9: `01-install.md` のアセット名が不一致 | 実アセット名の表・SHA-256 照合・リネーム可を追記（可読性 M2 と同じ変更） |
+| S10: 05 §2 の macOS 行 `same` が曖昧 | `⚠️ never measured: …` に明確化 |
+
+### 対応表（可読性 Should）
+
+| 指摘 | 対応 |
+|---|---|
+| S1: 出典とコマンド列挙が無い | 状態節にコマンド名と `05-verification.md` §1.5 / §1a を併記 |
+| S2: 手法の節に検証状況が混入 | `fw flash` の実機状況を 05 §1.5 への 1 行リンクに置換 |
+| S3: 開発者向け情報の混入・表の混在 | `.gitignore` の説明を削除し、ドキュメント表を「利用者向け」「開発者向け」の 2 表に分割 |
+| S4: `strict 書き込み` が未定義 | 「通常の書き込み（自機バックアップとの差分だけを許す経路）」と初出で定義 |
+| S5: Keep a Changelog 形式が中途半端 | `## [Unreleased]` とリンク定義（`[Unreleased]` / `[1.0.0]`）を追加。`実機で確認したこと` / `既知の制限・未検証` / `注意` を `##` に上げ、変更カテゴリでないと明記。`0.1.0` は非公開開発版と明記 |
+| S6: 見出しの日付と項目の日付が不一致 | 見出しを `2026-11-21〜22` に変更 |
+| S7: Added に実機未検証の inline 表記が無い | GUI・`--allow-vendor`・実カメラ geotag に「実機未検証」「読み戻しは一致しない」を追記 |
+| S8: 内部研究メモの混入 | DA プロトコルの細部を `06-open-questions.md` への参照に置換し、プロトコル命令の説明先を `01-da-protocol.md` に明記。利用者が知るべき制限（タイミング・自動再試行）は残した |
+| S9: テスト件数の根拠が現在時点でない | 810 件・実測日・コマンド・内訳に更新（仕様 S2 と同じ） |
+| S10: `M241_VENDOR_IMAGE` が未説明 | 何のパスか、設定時にどのテストが走るか、未設定・CI では skip されることを 1 行で説明 |
+| S11: 太字の断定と同セルの記述が矛盾 | 該当セルを短い状態行に置き換え、限定（自機バックアップ・パッチ済み）を本文に明記 |
+| S12: 表のセルが長すぎる | `12-progress-summary.md` の該当 4 セルを短縮し、詳細を表直後の「補足」箇条書きへ移動 |
+| S13: job 名が成果物名でない | `build (${{ matrix.os }})` → `build (${{ matrix.platform }})` |
+| S14: Linux 依存インストールの重複 | 見送り（下記） |
+| S15: テスト済みコミットだけを配布することが読み取れない | release workflow の build job に `cargo test --workspace --locked` を追加し、`cargo build --release --locked` に変更 |
+| S16: タグと版の一致が「期待」だけ | 検査 step を追加（仕様 S4）し、`Cargo.toml` の version 行に 1 行コメント |
+| S17: 日本語 README から英語文書へ送っている | リンク先に「（英語）」を付記 |
+
+### 却下・見送り
+
+- **仕様 S3 の `workflow_dispatch` + `--draft` dry-run**: 「未実行」の明記で誤読は解消した。
+  `gh release create` は draft でも Release を作るため、初回前に workflow を走らせる検証経路は
+  本番と同じ副作用を持つ。タグを打たずに検証する手段は別設計（ローカルでの action 実行等）で扱う。
+- **仕様 S6 の署名・provenance**（`actions/attest-build-provenance` / cosign）: OIDC と新規 action
+  の導入、検証手順の文書化が必要でリリース整備の範囲を超える。README に「署名されていない・
+  SHA-256 は転送破損しか検出しない」と明記した。
+- **可読性 S14 の composite action 化**: `ci.yml` の 3 ジョブと `release.yml` の apt 行を 1 つの
+  action に寄せる変更で、PR #26 のスコープ（リリース整備）を超える。`release.yml` には
+  「`ci.yml` と同じ」という根拠コメントが残る。
+
+### ゲート・実測
+
+- `M241_VENDOR_IMAGE=... ./tools/check.sh` → 6/6（fmt / clippy / test / docs / design / safety）。
+  実機ポートは開いていない。
+- `cargo test --workspace --offline -- --list` → 810 件（内訳は仕様 S2 の行）。
+- タグ push・Release 作成・マージ・`review-gate` はしていない（Stage 3 の担当）。
+- workflow は YAML パースと `git diff --check` まで。実行はしていない。
+
+### Stage 3 検証
+
+未検証（別エージェントが記入する）。
