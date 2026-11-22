@@ -441,26 +441,47 @@ approximation from a mistake.
 - Empty log: 「まだログがありません」, the path with the ログを開く primary
   action, and a disabled ログを吸い出す marked 未検証.
 - The map draws OpenStreetMap tiles under the track and credits them on the
-  canvas; the attribution sits bottom-left because the zoom note owns the
-  bottom-right. The schematic grid is still drawn first and is what the offline
-  state shows, so a failed fetch leaves a readable canvas rather than a blank.
+  canvas whenever at least one OSM tile reached it. A sample, offline or
+  still-loading frame draws no OSM pixels and carries no credit, because the
+  credit is a statement about where the pixels came from. The attribution sits
+  bottom-left; the zoom note owns the bottom-right and is lifted above the
+  credit when a narrow canvas would make them collide. The schematic grid is
+  still drawn first and is what the offline state shows, so a failed fetch
+  leaves a readable canvas rather than a blank.
 - The track and the tiles are projected through one `MapView` (Web Mercator).
   The previous track projection was equirectangular with a `cos(latitude)`
   correction; close, but a road drawn a few pixels off the tile is exactly the
   defect the map was added to remove, so the track moved to the tiles'
   projection rather than the tiles being bent to the track.
-- The map's zoom is 1–19 (OSM's range), with fractional zoom between levels:
-  `+`/`−` moves continuously and the tiles are scaled by the fraction, instead
-  of jumping by a factor of two at every press. Follow mode's 12-zoom floor and
-  the fit-all/zoom/follow interactions are unchanged.
+- The map's zoom is 1–19 (OSM's range), with fractional zoom: fit can land
+  between levels and the tiles are then scaled by the fraction. `+`/`−` move in
+  whole steps from the zoom actually drawn — fit publishes its zoom to the
+  buttons, so a press straight after 全点表示 never lowers the map. Follow
+  mode's 12-zoom floor and the fit-all/zoom/follow interactions are unchanged.
 - Tiles live in the OS cache directory (`m241-gui/tiles`, 30-day TTL, 200 MB
   cap, oldest first) and the Settings rows report the measured size and the real
   path. At most four fetches are in flight and only the visible canvas plus one
-  ring is asked for; nothing is prefetched. `--screenshot` and the headless
-  render tests never fetch: the sample frame says
-  「見本：地図タイルは表示しません」, and a context with no viewport is treated as
-  offline by construction. Real-network tile display has not been verified on a
-  running window (see README's unverified list).
+  ring is asked for; nothing is prefetched. A tile that failed is retried after
+  the same 60-second window as the offline latch, so one timeout does not leave
+  a grey square for the whole session.
+- `--screenshot` and the headless render tests never fetch: the sample frame says
+  「見本：地図タイルは表示しません」, and the window gate is
+  `native_pixels_per_point`, not `inner_rect`. Wayland cannot report a window
+  position, so an `inner_rect` gate disabled the map on every Wayland session
+  while the caption said "loading"; a headless context has no native
+  pixels-per-point and is reported as 「ヘッドレス」. Fetching from a running
+  Wayland window was verified (Hyprland / winit's Wayland backend, 8 tiles
+  written to the cache), and X11/Xwayland was (16 tiles); the visual appearance
+  on Wayland was not, because this environment's screen capture never answered
+  (see README's unverified list).
+- The GUI has exactly one network consumer: background tiles. It used to be a
+  project rule that the GUI must not link a network client at all, because a
+  fetch cannot be exercised headlessly. The user asked for a real map, so that
+  rule was lifted for this module. What replaces it is the `TileFetcher` seam
+  (tests inject a fake), the window gate and the `sample` flag; what does not is
+  a mechanical check — `tools/check_safety.py` still knows nothing about the
+  network. A second network consumer would need the same seam and an update to
+  this bullet and the note in `crates/m241-gui/Cargo.toml`.
 - The screenshots show the firmware write step with the sample image applied in
   memory and the confirmation armed — it is never written to disk, and the
   panel and screen still carry 「見本」. That is why the amber button appears in

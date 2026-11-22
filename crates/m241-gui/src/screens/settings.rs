@@ -364,9 +364,13 @@ fn dynamic_row(ui: &mut Ui, label: &str, value: &str, note: &str) {
 }
 
 /// The 地図タイル row's explanation, which states the live value in words.
+///
+/// The "on" note names the recipient: turning the map on sends the tile
+/// coordinates of the area on screen to OpenStreetMap, and a setting that only
+/// says "uses the internet" does not tell a person what leaves the machine.
 fn tiles_note(enabled: bool) -> String {
     if enabled {
-        String::from("オン（OpenStreetMap のタイルを背景に表示します）")
+        String::from("オン（表示中の範囲を OpenStreetMap に送り、背景に表示します）")
     } else {
         String::from("オフ（模式キャンバスのみ。オフラインでもこの画面は使えます）")
     }
@@ -444,13 +448,48 @@ mod tests {
         }
     }
 
+    /// The text primitives of one frame, nested shape vectors included.
+    fn flatten_texts<'a>(shapes: &'a [egui::Shape], out: &mut Vec<&'a str>) {
+        for shape in shapes {
+            match shape {
+                egui::Shape::Vec(children) => flatten_texts(children, out),
+                egui::Shape::Text(text) => out.push(text.galley.job.text.as_str()),
+                _ => {}
+            }
+        }
+    }
+
     #[test]
-    fn the_rows_are_the_ones_the_design_names() {
-        // DESIGN.md §5 lists the cache's size and location, units, theme, language
-        // and reduced motion. The tile switch and the clear action are this
-        // change's additions; the cache values are measured rather than written
-        // here, so the labels below are the ones the page draws in order.
-        let labels: Vec<&str> = [
+    fn the_rendered_rows_are_the_ones_the_design_names_in_order() {
+        // The previous version compared a hand-written label array with itself:
+        // swapping or deleting a row in `ui()` left it green. This draws the
+        // real page and checks the labels appear in the rendered frame, in
+        // DESIGN.md §5's order.
+        let context = egui::Context::default();
+        crate::theme::install(&context);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let mut settings = AppSettings::default();
+        let mut texts: Vec<String> = Vec::new();
+        // Two passes: immediate-mode layout settles on the first.
+        for _ in 0..2 {
+            let output = context.run_ui(input.clone(), |ui| super::ui(ui, &mut settings));
+            let shapes: Vec<egui::Shape> = output
+                .shapes
+                .iter()
+                .map(|clipped| clipped.shape.clone())
+                .collect();
+            let mut flat = Vec::new();
+            flatten_texts(&shapes, &mut flat);
+            texts = flat.into_iter().map(str::to_owned).collect();
+            output.drop_without_applying_deltas();
+        }
+        let expected = [
             ROW_CACHE_LABEL,
             ROW_CACHE_LOCATION_LABEL,
             ROW_TILES_LABEL,
@@ -459,20 +498,21 @@ mod tests {
             ROW_LANG.label,
             ROW_MOTION_LABEL,
             ROW_CLEAR_LABEL,
-        ]
-        .to_vec();
+        ];
+        // A greedy subsequence: every expected label must be drawn, and the
+        // order it is drawn in must be the expected one.
+        let mut found: Vec<&str> = Vec::new();
+        let mut position = 0;
+        for text in &texts {
+            if position < expected.len() && text == expected[position] {
+                found.push(expected[position]);
+                position += 1;
+            }
+        }
         assert_eq!(
-            labels,
-            [
-                "地図キャッシュ",
-                "地図キャッシュの場所",
-                "地図タイルを使う（要インターネット）",
-                "単位",
-                "テーマ",
-                "言語",
-                "動きの低減",
-                "地図キャッシュを消去"
-            ]
+            found,
+            expected.to_vec(),
+            "the settings page did not render DESIGN.md §5's rows in order; frame texts: {texts:?}"
         );
     }
 
@@ -542,10 +582,16 @@ mod tests {
     #[test]
     fn map_tiles_default_on_and_the_note_states_the_live_value() {
         // A default of off would leave the new map feature invisible to anyone
-        // who never opens Settings; the note must state which way it is.
+        // who never opens Settings; the note must state which way it is, and the
+        // "on" note must name where the displayed area is sent.
         assert!(AppSettings::default().map_tiles);
         assert!(tiles_note(true).starts_with("オン"));
         assert!(tiles_note(false).starts_with("オフ"));
+        assert!(
+            tiles_note(true).contains("OpenStreetMap に送"),
+            "the on note does not say what leaves the machine: {}",
+            tiles_note(true)
+        );
         for note in [tiles_note(true), tiles_note(false)] {
             assert!(!note.contains(".md") && !note.contains('§'));
         }

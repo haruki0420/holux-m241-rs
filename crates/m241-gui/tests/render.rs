@@ -466,10 +466,12 @@ fn an_empty_log_says_there_is_no_log_yet() {
 }
 
 #[test]
-fn the_log_map_credits_openstreetmap_on_every_frame() {
-    // The OSM licence requires the attribution wherever the tiles are shown. It
-    // is drawn whether or not a tile arrived, so a frame with the offline fallback
-    // still credits the source the map is drawn from.
+fn a_sample_map_does_not_credit_tiles_it_does_not_show() {
+    // The OSM licence requires the attribution where OSM content is shown. A
+    // sample frame draws no tile, so crediting OSM there would be a false
+    // statement about where the pixels came from. The two tests this replaces
+    // asserted the credit and "shows no tiles" on the same frame, which made the
+    // contradiction itself the passing contract.
     let ctx = context();
     let mut app = App::default();
     app.select(Screen::Log);
@@ -477,12 +479,24 @@ fn the_log_map_credits_openstreetmap_on_every_frame() {
     let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
     let mut flat = Vec::new();
     flatten_shapes(&shapes, &mut flat);
+    let texts: Vec<&str> = flat
+        .iter()
+        .filter_map(|shape| match shape {
+            egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+            _ => None,
+        })
+        .collect();
     assert!(
-        flat.iter().any(|shape| matches!(
-            shape,
-            egui::Shape::Text(text) if text.galley.job.text.contains("© OpenStreetMap contributors")
-        )),
-        "the map drew no OpenStreetMap attribution"
+        !texts
+            .iter()
+            .any(|text| text.contains("© OpenStreetMap contributors")),
+        "a sample frame credited OSM tiles it did not draw: {texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("見本：地図タイルは表示しません")),
+        "the sample map did not say it shows no tiles: {texts:?}"
     );
 }
 
@@ -508,10 +522,12 @@ fn a_sample_map_says_it_shows_no_tiles() {
 }
 
 #[test]
-fn a_headless_render_never_asks_for_tiles() {
-    // The screenshot renderer and every test use a headless context. A tile
-    // request from one would be a network call nobody asked for, and `--screenshot`
-    // must stay offline. The map falls back to the schematic canvas and says so.
+fn a_headless_render_says_why_it_shows_no_tiles() {
+    // The screenshot renderer and every test use a headless context. The map
+    // must name that reason rather than sit on "loading" forever, and it must
+    // not credit tiles it cannot draw. The fetch count itself is asserted in
+    // `App`'s unit test, where a fake fetcher is injected: this frame-level test
+    // alone cannot tell a fetch from no fetch.
     let ctx = context();
     let mut app = App::default();
     app.select(Screen::Log);
@@ -530,16 +546,14 @@ fn a_headless_render_never_asks_for_tiles() {
     assert!(
         texts
             .iter()
-            .any(|text| text.contains("© OpenStreetMap contributors")),
-        "the headless map lost its attribution: {texts:?}"
+            .any(|text| text.contains("地図タイルは表示しません（ヘッドレス）")),
+        "the headless map did not explain its state: {texts:?}"
     );
     assert!(
-        texts
+        !texts
             .iter()
-            .any(|text| text.contains("地図タイルを読み込み中")
-                || text.contains("地図タイルを取得できません")
-                || text.contains("見本")),
-        "the headless map did not explain its state: {texts:?}"
+            .any(|text| text.contains("© OpenStreetMap contributors")),
+        "the headless map credited tiles it did not draw: {texts:?}"
     );
 }
 

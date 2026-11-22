@@ -209,4 +209,113 @@ mod tests {
         let _log = app.log_mut();
         let _firmware = app.firmware_mut();
     }
+
+    /// A fake tile fetcher that counts calls and never opens a socket.
+    #[derive(Debug, Default)]
+    struct CountingTiles {
+        calls: std::sync::Mutex<usize>,
+    }
+
+    impl CountingTiles {
+        fn calls(&self) -> usize {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+        }
+    }
+
+    impl crate::screens::log::tiles::TileFetcher for CountingTiles {
+        fn fetch(
+            &self,
+            _tile: crate::screens::log::tiles::TileId,
+        ) -> Result<Vec<u8>, crate::screens::log::tiles::TileError> {
+            if let Ok(mut calls) = self.calls.lock() {
+                *calls += 1;
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    /// Every text primitive in a frame, nested `Shape::Vec`s included.
+    fn flatten_texts(shapes: &[egui::Shape], out: &mut Vec<String>) {
+        for shape in shapes {
+            match shape {
+                egui::Shape::Vec(children) => flatten_texts(children, out),
+                egui::Shape::Text(text) => out.push(text.galley.job.text.clone()),
+                _ => {}
+            }
+        }
+    }
+
+    /// A track with positions, so the map panel draws and would fetch.
+    fn positioned_track() -> m241_core::Track {
+        let points = (0..4_u32)
+            .map(|step| m241_core::TrackPoint {
+                utc: Some(1_763_000_000 + step),
+                latitude: Some(35.681_236 + f64::from(step) * 0.001),
+                longitude: Some(139.767_125),
+                height_m: Some(40.0),
+                ..m241_core::TrackPoint::default()
+            })
+            .collect();
+        m241_core::Track {
+            points,
+            damaged_blocks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_headless_app_draw_never_starts_a_tile_fetch() {
+        // The render tests and `--screenshot` draw the real shell headlessly.
+        // Checking only the caption (what the first version did) left a hole: a
+        // broken window gate could have opened a socket and kept the test green.
+        // This counts the calls the tile layer actually makes.
+        let context = egui::Context::default();
+        crate::theme::install(&context);
+        let fetcher = std::sync::Arc::new(CountingTiles::default());
+        let mut app = App::default();
+        app.select(Screen::Log);
+        app.log_mut().set_tile_fetcher_for_test(fetcher.clone());
+        app.log_mut()
+            .set_track(positioned_track(), m241_core::log::ParseReport::default());
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let mut texts = Vec::new();
+        for _ in 0..3 {
+            let output = context.run_ui(input.clone(), |ui| app.draw(ui));
+            let shapes: Vec<egui::Shape> = output
+                .shapes
+                .iter()
+                .map(|clipped| clipped.shape.clone())
+                .collect();
+            texts.clear();
+            flatten_texts(&shapes, &mut texts);
+            output.drop_without_applying_deltas();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(
+            fetcher.calls(),
+            0,
+            "a headless App::draw started a tile fetch"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("地図タイルは表示しません（ヘッドレス）")),
+            "the headless map did not explain why it shows no tiles: {texts:?}"
+        );
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains("© OpenStreetMap contributors")),
+            "a headless frame credited OSM tiles it did not draw: {texts:?}"
+        );
+    }
 }

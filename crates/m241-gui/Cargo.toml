@@ -33,10 +33,30 @@ egui_system_font_provider = "0.37"
 # Background map tiles (DESIGN.md §5, §10). One blocking HTTP client with no async
 # runtime of its own; `rustls` rather than the OS TLS stack keeps the build
 # self-contained on the three supported platforms.
+#
+# NETWORK GATE — this dependency replaces a rule, and the rule is recorded here
+# because nothing checks it mechanically. Until PR #39 the GUI deliberately did
+# not link a network client: a fetch cannot be exercised headlessly, so there was
+# no way to prove an offline path stayed offline. The user asked for a real map,
+# which needs tiles, so the rule was lifted for this one module — not because the
+# concern was wrong.
+#
+# What is guaranteed now: every fetch goes through `tiles::TileFetcher`, so the
+# tests inject a fake and never open a socket; `tiles::has_window` gates fetching
+# on `native_pixels_per_point` (a headless `RawInput` has none, and Wayland has
+# one even though it has no `inner_rect`), and `MapOptions.sample` keeps
+# `--screenshot` offline. `app::tests` counts fetcher calls to prove that a
+# headless draw starts none.
+#
+# What is NOT guaranteed: this is not a mechanical gate like the read/write split
+# in `tools/check_safety.py`. A later change that adds a second network consumer
+# elsewhere in this crate would not fail any check. Tiles are the GUI's only
+# network consumer; anything else has to carry the same seam and update this note
+# and DESIGN.md §10.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 # Decoding the PNG (and, if a server ever answers with one, JPEG) that a tile
-# server returns. Only the decoders are built: encoding a tile is not a thing
-# this crate does.
+# server returns. The encoders are not used: encoding a tile is not a thing this
+# crate does. (The screenshot's PNG writer above is a separate dependency.)
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # The OS cache directory (`XDG_CACHE_HOME` on Linux, Known Folders on Windows,
 # `Library/Caches` on macOS) under which the tile cache lives.

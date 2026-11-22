@@ -1527,3 +1527,68 @@ Could 9）と可読性（Must 4 / Should 17 / Could 13）の 2 本で、レビ�
 - 変異テスト: 17 種の変異を入れて **17 種すべて検出**、**誤検出 7 種なし**。指摘との対応は本節の表のとおりで、Stage 3 は修正者の説明を読まずに差分とテストだけを読んだ。
 - 残る未検証: 実機での GUI 書き込み・GUI 2 回読み（シミュレータのみ）。GUI 経由の書き込み経路は依然として実機未検証である。
 - 本節の後に main（`5b2ffce`、PR #36）を追従マージしたため、**マージ後の head は新しい SHA であり、Stage 3 の再検証と `review-gate` の付け直しが必要**。`43af066` の gate はマージ前 head に対する判定である。
+
+## 2026-11-23 / PR #39 OSM タイル地図 Stage 2 修正（`feat-map-tiles`）
+
+- 対象: Stage 1 head `20a9f42`（base `origin/main` = `e934157`）への 2 レビュー、仕様検収 `#issuecomment-7084469149`（Must 1 / Should S1–S6）と可読性 `#issuecomment-7084367266`（Must M1–M7、Should S1–S8）。
+- Stage 2 修正（別エージェント）: 変更は `crates/m241-gui`（`tiles.rs` / `log.rs` / `settings.rs` / `Cargo.toml`）、`DESIGN.md`、`PRODUCT.md`、`DISCLAIMER.md`、`README.md`、本ファイルのみ。`m241-core` / `m241-cli` / `m241-flash` と connect / firmware 画面は未変更。実機ポートは開いていない。
+- 修正 head: `20a9f42` → `<SHA はコミット後に追記>`。
+
+### Must への対応
+
+| 指摘 | 対応 |
+|---|---|
+| 仕様 M1 Wayland でタイル取得なし | 取得ゲートを `inner_rect.is_some()` から `native_pixels_per_point.is_some()`（`tiles::has_window`）に変更。Wayland は `inner_rect` を返さないため旧判定では実ウィンドウでも fetch しなかった。headless は `Background::Headless` として理由を表示。X11 / Wayland / headless の 3 経路をテストで固定し、`tiles.rs` 冒頭 doc と `DESIGN.md` §10 の「no viewport = headless」記述を実態に合わせた |
+| 可読性 M1 消えた安全ゲートの記録 | `crates/m241-gui/Cargo.toml` に NETWORK GATE 節を追加: 旧規則が「headless で検証できないので GUI にネットワーク依存を入れない」だったこと、解除理由がユーザーの地図要求であること、現在の保証（`TileFetcher` の fake / `has_window` / `sample`）と**保証でないもの**（`check_safety.py` のような機械ゲートは無い）を明記。`DESIGN.md` §10 にも同内容。`AGENTS.md` は変更範囲外のため触っていない |
+| 可読性 M2(a) fetch しないことを未検証 | `app::tests::a_headless_app_draw_never_starts_a_tile_fetch` が fake fetcher の呼び出し **0** を検証。`render.rs` の旧テストは名前に反してテキストだけ見ていたので「ヘッドレス表示の契約」に改名し、fetch 回数は App テストが持つ |
+| 可読性 M2(b) sample で矛盾する合格条件 | sample フレームは OSM クレジットを出さない契約に変更（`a_sample_map_does_not_credit_tiles_it_does_not_show`）。「見本：地図タイルは表示しません」とクレジットの同居を合格条件から外した |
+| 可読性 M2(c) settings の描画順未検証 | `ui()` を実際に描画してラベルの出現順を検証する `the_rendered_rows_are_the_ones_the_design_names_in_order` に置換（旧テストは手書き配列同士の比較だった） |
+| 可読性 M3 未検証を検証済みと読ませる記述 | `draw_attribution` / `draw_note` が矩形を返すようにし、狭いキャンバス＋長い注記で両者が重ならないことを `the_zoom_note_stays_clear_of_the_credit` で固定。「first screenshot showed exactly that overlap」のコメントをテストの記述に修正 |
+| 可読性 M4 クレジット無条件描画 | `draw_map` が描画した OSM タイル枚数 `MapDrawn.tiles` を返し、`tiles > 0` のときだけクレジットを描く（sample / offline / loading / headless は出さない）。`log.rs` と render テストで固定 |
+| 可読性 M5 `pub` 過多 | `pub mod tiles` → `pub(crate) mod tiles`。`tiles.rs` の `pub` は 0 個（外部 API を廃止し、30 個強を `pub(crate)` / private に）。テスト専用 API は `#[cfg(test)]`（`with_fetcher_for_test`, `set_cache`, `texture_count`） |
+| 可読性 M6 デコード上限が事後検査 | `image::ImageReader` に `Limits`（2048 角・64 MiB）を **decode 前**に設定。2049px の PNG がデコード前に拒否されるテストを追加 |
+| 可読性 M7 `TooLarge` が到達不能 | `BodyExceedsLimit` を `TileError::TooLarge` にマップ（`map_body_error`）。上限超過 body がキャッシュに書かれないこと、`map_body_error` の分岐、をテストで固定。あわせて `x-blocked` と非 image Content-Type はエラーにし、ブロック画像を 30 日キャッシュしない |
+| Must 8（回帰） | X11 実ウィンドウでの取得と、headless の fetch 0 / キャッシュ書込み 0 を維持（下記「検証」） |
+
+### Should への対応
+
+| 指摘 | 対応 |
+|---|---|
+| 仕様 S1 部分失敗の再試行なし | **修正**。`failed` を `HashMap<TileId, Instant>` にし、60 秒経過後に再試行（`a_failed_tile_is_retried_only_after_the_retry_window`）。部分失敗の注記は追加せず、再試行で解消する方針 |
+| 仕様 S2 失敗理由が「オフライン」に丸め | **見送り**。理由: 状態 enum に理由を載せると `Background` の表示契約と UI 文言を同時に作り直す必要があり、本 Must 修正の範囲外。`TooLarge`/`Status`/`Decode` はログにも出していない |
+| 仕様 S3 HTTP キャッシュヘッダ無視 | **一部修正**。`x-blocked` のブロック画像はキャッシュしない。`max-age`/ETag の保存と条件付き GET は**見送り**（sidecar メタデータと 304 経路が必要。30 日 TTL はポリシー最低 7 日を満たす）。理由はこの行に記録 |
+| 仕様 S4 fit 直後の ± が表示 zoom と不一致 | **修正**。`sync_fit_zoom` が描画した `MapView::fit` の zoom を `map_zoom` に反映してから ± する（`a_fit_view_publishes_its_zoom_to_the_zoom_buttons`） |
+| 仕様 S5 送信説明・永続化 | **一部修正**。Settings の ON 注記に「表示中の範囲を OpenStreetMap に送り」を追加。トグルの永続化は**見送り**（`AppSettings` はセッション限定という既存契約の変更になる） |
+| 仕様 S6 `DISCLAIMER` / `PRODUCT` の事実誤認 | **修正**。`walkers` → `ureq`、ネットワーク機能の記述（タイルは既定 ON、表示範囲が OSM に渡る）、README の帰属条件を更新。ルート `Cargo.toml` の `walkers` コメントは**変更範囲外**のため未修正（同じ誤記は PRODUCT / README から消えた） |
+| 可読性 S1 投影・中心・zoom の重複 | **一部修正**。`MIN_ZOOM`/`MAX_ZOOM` を `tiles::MIN_TILE_ZOOM`/`MAX_TILE_ZOOM` から導出。`plotted_points` の再計算と `compute_fit_zoom` の一本化は**見送り**（`MapView::center` の追加と全点 2 回走査の解消は follow-up） |
+| 可読性 S2 ライフサイクル・reset 不在 | **修正**。`set_track` / `adopt_edited_track` で `MapTiles::reset()`、`request` で queue を `wanted` に filter、`pump` は pending でない結果を捨てる（`a_new_track_forgets_the_previous_areas_tiles`）。worker panic の `in_flight` 再同期と spawn 失敗理由の記録は**見送り** |
+| 可読性 S3 stale cache が「最新」に見える | **見送り**。`Background::Stale` の追加は状態 enum と文言の変更で、S2 の理由表示と同じ follow-up |
+| 可読性 S4 キャッシュ書込失敗が無言 | **見送り**。失敗を画面に出す状態経路の追加が必要。本 Stage 2 では Must を優先した |
+| 可読性 S5 UI スレッドのディスク I/O | **見送り**。Settings の 1 操作であり、worker 化には job 配線が必要（follow-up） |
+| 可読性 S6 エラーから次の行動が分からない | **一部修正**。`Background::Headless` を追加して「読み込み中」の永久表示を廃止。`Offline` の文言に接続確認・設定への導線を足すのは**見送り**（S2 と同じ文言変更） |
+| 可読性 S7 `tiles.rs` の責務分割 | **見送り**。`pub(crate)` 化で外部 API の問題は解消。キャッシュ部と取得部を別モジュールへ割るのは follow-up |
+| 可読性 S8 Settings の行描画 4 方式 | **見送り**。描画順テストで画面との一致は固定した。`RowSpec` への統一は follow-up |
+| 可読性 Could（`human_bytes` の単位、`TileId::url` 重複、`get_or_init` の Err 不能、`has_viewport` 名） | 一部修正: 未使用の `TileId::url` を削除、`HttpTiles` の `OnceLock<Result<..>>` を `OnceLock<Agent>` に、`has_viewport` → `has_window`。`human_bytes` の KB/MB 表記は**見送り**（表示仕様の変更） |
+
+### 追加テスト
+
+- Must 1: `screens::log::tiles::tests::an_x11_window_fetches_tiles` / `a_wayland_window_has_no_inner_rect_and_still_fetches_tiles` / `a_headless_context_never_requests_a_tile`
+- Must 2(a): `app::tests::a_headless_app_draw_never_starts_a_tile_fetch`（fake fetcher 呼び出し 0）
+- Must 2(b): `render.rs::a_sample_map_does_not_credit_tiles_it_does_not_show` / `a_headless_render_says_why_it_shows_no_tiles`
+- Must 2(c): `screens::settings::tests::the_rendered_rows_are_the_ones_the_design_names_in_order`
+- Must 3: `screens::log::tiles::tests::the_zoom_note_stays_clear_of_the_credit`
+- Must 4: `screens::log::tests::the_attribution_is_drawn_only_when_a_tile_is_on_screen`
+- Must 6/7: `a_body_limit_error_maps_to_too_large_not_offline` / `an_oversized_tile_is_too_large_and_is_not_cached` / `a_png_larger_than_a_tile_is_refused_by_the_decoder_limits`
+- Should: `a_failed_tile_is_retried_only_after_the_retry_window`、`a_new_track_forgets_the_previous_areas_tiles`、`a_fit_view_publishes_its_zoom_to_the_zoom_buttons`
+
+### 検証
+
+- `M241_VENDOR_IMAGE=<vendor V1.13> TMPDIR=/var/tmp ./tools/check.sh`: **6/6**（48 秒。初回は docs ゲートが本節の `cache.rs` / `fetch.rs` 参照を未実在パスとして検出したため、モジュール名の表記を修正して再実行）。
+- `cargo test -p m241-gui`: lib 175 / design_gate 6 / design_invariants 6 / render 38。**実ネットワークを使うテストはない**（タイル取得はすべて `TileFetcher` の fake）。
+- `--screenshot`（空の `XDG_CACHE_HOME`）: 15 枚生成、**タイルキャッシュ書込み 0**（fontconfig のみ）。ログ画面の見本フレームはクレジットなしで「見本：地図タイルは表示しません」、設定画面は新しい ON 注記を表示。1280×800 と 1024×640 を目視した。
+- 実ウィンドウ: Wayland（Hyprland、winit の Wayland バックエンド）で **8 枚**、X11（`WAYLAND_DISPLAY` を外して Xwayland を強制）で **16 枚**のタイルがキャッシュに書かれた。headless は 0 枚。ライブ画像の取得は compositor の screencopy（grim / wf-recorder）が応答せず断念し、見た目は `--screenshot` の画像で確認した。変更前の X11 実ウィンドウ画像（`/tmp/m241-tiles-live.png`）でタイルと軌跡の整合を確認済み。
+- 未検証: Wayland の実画面での見た目（取得は確認）、`.bin` 読込からの地図表示（ライブ確認は合成トラック）、HTTP キャッシュヘッダ尊重（見送り）。実機ポートは開いていない。
+
+### Stage 3
+
+- 未実施（本節は Stage 2 の記録。`review-gate` は付けていない。Stage 3 は別エージェントが新しい head SHA で行う）。

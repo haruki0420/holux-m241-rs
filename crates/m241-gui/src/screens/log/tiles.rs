@@ -9,8 +9,24 @@
 //!   tile set and the cache paths are tested without a socket;
 //! * the fetcher is behind [`TileFetcher`], so the drawing path can be driven
 //!   with a fake that returns synthetic PNG bytes;
-//! * `--screenshot` never fetches (the screen passes `sample: true`), so a
-//!   screenshot cannot pretend to have measured the network.
+//! * a fetch needs a real window, detected by `native_pixels_per_point` rather
+//!   than by `inner_rect`: Wayland has no inner rect (winit cannot report one),
+//!   so the old test disabled the map on every Wayland session. `--screenshot`
+//!   also passes `sample: true`, so a screenshot cannot pretend to have measured
+//!   the network, and a headless render reports why it shows no tiles.
+//!
+//! # Network policy, and the gate this change replaced
+//!
+//! Before this change the project rule was that `m241-gui` must not link a
+//! network client at all, because a network fetch cannot be exercised headlessly
+//! and there was therefore no way to prove an offline path stayed offline. That
+//! rule was lifted by the user's request for a real map (PR #39), not because the
+//! concern was wrong: `Cargo.toml` records why, and what now stands in its place.
+//! In short, the guarantees are a fakeable fetcher seam, the window gate above,
+//! and the `sample` flag; the non-guarantee is that none of this is a mechanical
+//! gate like `tools/check_safety.py` — a later change that adds another network
+//! call would not fail a check. Tiles are the GUI's only network consumer, and
+//! any second one has to carry the same seam and the same note.
 //!
 //! # The projection, and why the track moved with it
 //!
@@ -44,30 +60,38 @@ use crate::theme::{self, size, space};
 
 /// Side of one tile, in world pixels; the whole slippy-map convention rests on
 /// this number.
-pub const TILE_SIZE: f64 = 256.0;
+const TILE_SIZE: f64 = 256.0;
 
 /// Latitude at which Web Mercator is truncated (the usual slippy-map bound).
-pub const MERCATOR_LIMIT: f64 = 85.051_128_78;
+const MERCATOR_LIMIT: f64 = 85.051_128_78;
 
 /// Lowest zoom the map accepts.
-pub const MIN_TILE_ZOOM: u8 = 1;
+pub(crate) const MIN_TILE_ZOOM: u8 = 1;
 
 /// Highest zoom the map accepts (OSM serves 19).
-pub const MAX_TILE_ZOOM: u8 = 19;
+pub(crate) const MAX_TILE_ZOOM: u8 = 19;
 
 /// Requests allowed in flight at once. OSM's policy asks clients not to hammer
 /// the tile servers; four is the number this module promises.
-pub const MAX_CONCURRENT: usize = 4;
+const MAX_CONCURRENT: usize = 4;
 
 /// Largest tile body accepted. A PNG tile is tens of kilobytes; anything near
 /// this bound is a server that is not answering with a tile.
-pub const MAX_TILE_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_TILE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Longest tile edge accepted before decoding. A tile is 256 px; this allows a
+/// server to answer with an @2x tile and still refuses a decompression bomb.
+const MAX_TILE_EDGE: u32 = 2_048;
+
+/// Bytes the decoder may allocate for one tile. Four 2048² RGBA frames fit, so
+/// the limit admits every tile the edge limit admits and refuses the rest.
+const MAX_DECODE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// How long a cached tile may be served without asking the server again.
-pub const CACHE_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const CACHE_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// Upper bound on the cache on disk.
-pub const CACHE_MAX_BYTES: u64 = 200 * 1024 * 1024;
+const CACHE_MAX_BYTES: u64 = 200 * 1024 * 1024;
 
 /// Bytes written between cache-prune sweeps.
 const PRUNE_STEP_BYTES: u64 = 64 * 1024 * 1024;
@@ -82,18 +106,19 @@ const MAX_TEXTURES: usize = 256;
 /// Consecutive failures that switch the map to its offline state.
 const OFFLINE_FAILURES: usize = 3;
 
-/// How long the offline state lasts before one tile is tried again.
+/// How long the offline state lasts before the visible tiles are tried again,
+/// and how long a single failed tile is skipped before it is retried.
 const OFFLINE_RETRY: Duration = Duration::from_secs(60);
 
 /// The attribution OSM's licence requires, verbatim.
-pub const ATTRIBUTION: &str = "© OpenStreetMap contributors";
+const ATTRIBUTION: &str = "© OpenStreetMap contributors";
 
 /// Where the attribution's licence lives, shown beside the credit.
-pub const ATTRIBUTION_URL: &str = "openstreetmap.org/copyright";
+const ATTRIBUTION_URL: &str = "openstreetmap.org/copyright";
 
 /// The User-Agent the OSM tile usage policy requires: the tool and a way to
 /// reach its maintainers.
-pub const USER_AGENT: &str = concat!(
+const USER_AGENT: &str = concat!(
     "m241-gui/",
     env!("CARGO_PKG_VERSION"),
     " (+https://github.com/haruki0420/holux-m241-rs)"
@@ -101,26 +126,19 @@ pub const USER_AGENT: &str = concat!(
 
 /// One tile addressed the way a slippy map addresses it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TileId {
+pub(crate) struct TileId {
     /// Zoom level this tile belongs to (`1..=19`).
-    pub zoom: u8,
+    zoom: u8,
     /// Column, counted west to east.
-    pub x: u32,
+    x: u32,
     /// Row, counted north to south.
-    pub y: u32,
+    y: u32,
 }
 
 impl TileId {
     /// The tile `x`, `y` at `zoom`.
-    #[must_use]
-    pub const fn new(zoom: u8, x: u32, y: u32) -> Self {
+    const fn new(zoom: u8, x: u32, y: u32) -> Self {
         Self { zoom, x, y }
-    }
-
-    /// The URL the tile is fetched from.
-    #[must_use]
-    pub fn url(self) -> String {
-        tile_url(self)
     }
 }
 
@@ -128,8 +146,7 @@ impl TileId {
 ///
 /// The template is OSM's documented one, and it is a pure function so a test can
 /// check the string without a socket.
-#[must_use]
-pub fn tile_url(tile: TileId) -> String {
+fn tile_url(tile: TileId) -> String {
     format!(
         "https://tile.openstreetmap.org/{}/{}/{}.png",
         tile.zoom, tile.x, tile.y
@@ -137,8 +154,7 @@ pub fn tile_url(tile: TileId) -> String {
 }
 
 /// World pixels per tile side at `zoom`.
-#[must_use]
-pub fn zoom_scale(zoom: f64) -> f64 {
+fn zoom_scale(zoom: f64) -> f64 {
     TILE_SIZE * 2.0_f64.powf(zoom)
 }
 
@@ -165,8 +181,7 @@ fn longitude_fraction(longitude: f64) -> f64 {
 /// The result is in tiles, not pixels and not degrees: tile `(x, y)` covers
 /// `[x, x + 1) × [y, y + 1)`. The OSM wiki's `lon2tile`/`lat2tile` are the
 /// integer form of this function.
-#[must_use]
-pub fn lonlat_to_tile_f64(latitude: f64, longitude: f64, zoom: u8) -> (f64, f64) {
+fn lonlat_to_tile_f64(latitude: f64, longitude: f64, zoom: u8) -> (f64, f64) {
     let count = 2.0_f64.powi(i32::from(zoom));
     (
         longitude_fraction(longitude) * count,
@@ -175,15 +190,18 @@ pub fn lonlat_to_tile_f64(latitude: f64, longitude: f64, zoom: u8) -> (f64, f64)
 }
 
 /// A fractional tile coordinate back to latitude/longitude.
-#[must_use]
-pub fn tile_to_lonlat(x: f64, y: f64, zoom: u8) -> (f64, f64) {
+///
+/// Round-trip evidence only: the map never converts tiles back, so this is
+/// compiled for the projection test rather than for the product.
+#[cfg(test)]
+fn tile_to_lonlat(x: f64, y: f64, zoom: u8) -> (f64, f64) {
     let count = 2.0_f64.powi(i32::from(zoom));
     (latitude_from_fraction(y / count), x / count * 360.0 - 180.0)
 }
 
 /// The world-pixel origin of a tile at its own zoom.
-#[must_use]
-pub fn tile_pixel_origin(tile: TileId) -> (f64, f64) {
+#[cfg(test)]
+fn tile_pixel_origin(tile: TileId) -> (f64, f64) {
     (f64::from(tile.x) * TILE_SIZE, f64::from(tile.y) * TILE_SIZE)
 }
 
@@ -200,24 +218,25 @@ fn world_pixel(latitude: f64, longitude: f64, zoom: f64) -> (f64, f64) {
 ///
 /// This is the one projection the track and the tiles share. A fractional zoom
 /// is deliberate: [`Self::tile_zoom`] rounds to the level a tile server has, and
-/// the tiles are drawn scaled by [`Self::tile_scale`] so a `+`/`−` press moves
-/// the map continuously instead of jumping by a factor of two.
+/// the tiles are drawn scaled by [`Self::tile_scale`]. Fit derives its zoom from
+/// the canvas size and the Mercator bbox, so it can land between levels; the
+/// `+`/`−` buttons otherwise move in whole steps from the zoom actually drawn.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct MapView {
+pub(crate) struct MapView {
     /// Latitude at the canvas centre, in degrees.
-    pub center_latitude: f64,
+    center_latitude: f64,
     /// Longitude at the canvas centre, in degrees.
-    pub center_longitude: f64,
-    /// Fractional slippy-map zoom (`1.0..=19.0`).
-    pub zoom: f64,
+    center_longitude: f64,
+    /// Fractional slippy-map zoom (`1.0..=19.0`). Read by the Log screen, which
+    /// prints the zoom the map was actually drawn at.
+    pub(crate) zoom: f64,
     /// The canvas the view is projected into.
-    pub rect: Rect,
+    rect: Rect,
 }
 
 impl MapView {
     /// A view centred on a coordinate.
-    #[must_use]
-    pub fn new(center_latitude: f64, center_longitude: f64, zoom: f64, rect: Rect) -> Self {
+    pub(crate) fn new(center_latitude: f64, center_longitude: f64, zoom: f64, rect: Rect) -> Self {
         Self {
             center_latitude,
             center_longitude,
@@ -232,7 +251,7 @@ impl MapView {
     /// single point (or a degenerate box) lands at [`MAX_TILE_ZOOM`] and at the
     /// canvas centre, rather than dividing by zero.
     #[must_use]
-    pub fn fit(rect: Rect, padding: f32, points: &[(f64, f64)]) -> Self {
+    pub(crate) fn fit(rect: Rect, padding: f32, points: &[(f64, f64)]) -> Self {
         let Some(&(first_latitude, first_longitude)) = points.first() else {
             return Self::new(0.0, 0.0, f64::from(MIN_TILE_ZOOM), rect);
         };
@@ -269,8 +288,7 @@ impl MapView {
     }
 
     /// The integer zoom the tiles are requested at.
-    #[must_use]
-    pub fn tile_zoom(self) -> u8 {
+    fn tile_zoom(self) -> u8 {
         let rounded = self.zoom.round();
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let zoom = rounded as i64;
@@ -279,14 +297,12 @@ impl MapView {
     }
 
     /// How much a tile at [`Self::tile_zoom`] is scaled to reach this view.
-    #[must_use]
-    pub fn tile_scale(self) -> f64 {
+    fn tile_scale(self) -> f64 {
         2.0_f64.powf(self.zoom - f64::from(self.tile_zoom()))
     }
 
     /// Project a coordinate into the canvas.
-    #[must_use]
-    pub fn project(self, latitude: f64, longitude: f64) -> Pos2 {
+    pub(crate) fn project(self, latitude: f64, longitude: f64) -> Pos2 {
         let (x, y) = world_pixel(latitude, longitude, self.zoom);
         let (center_x, center_y) =
             world_pixel(self.center_latitude, self.center_longitude, self.zoom);
@@ -294,8 +310,7 @@ impl MapView {
     }
 
     /// Where one tile lands on the canvas.
-    #[must_use]
-    pub fn tile_rect(self, tile: TileId) -> Rect {
+    fn tile_rect(self, tile: TileId) -> Rect {
         let scale = 2.0_f64.powf(self.zoom - f64::from(tile.zoom));
         let tile_pixels = TILE_SIZE * scale;
         let (center_x, center_y) =
@@ -314,8 +329,7 @@ impl MapView {
     /// nothing further is requested, so the map never prefetches an area nobody
     /// is looking at. Rows and columns are clamped to the world, which is what
     /// makes zoom 1 and the poles finite instead of wrapping or panicking.
-    #[must_use]
-    pub fn visible_tiles(self) -> Vec<TileId> {
+    fn visible_tiles(self) -> Vec<TileId> {
         if !self.rect.is_positive() {
             return Vec::new();
         }
@@ -361,9 +375,9 @@ impl MapView {
 
 /// Where the tile cache lives on this OS.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CachePaths {
+pub(crate) struct CachePaths {
     /// The `m241-gui/tiles` directory.
-    pub root: PathBuf,
+    pub(crate) root: PathBuf,
 }
 
 impl CachePaths {
@@ -372,20 +386,17 @@ impl CachePaths {
     /// `XDG_CACHE_HOME` (or `~/.cache`) on Linux, Known Folders on Windows and
     /// `Library/Caches` on macOS are all resolved by `dirs`, so no path in this
     /// module names a home directory.
-    #[must_use]
-    pub fn locate() -> Option<Self> {
+    pub(crate) fn locate() -> Option<Self> {
         dirs::cache_dir().map(|base| Self::from_root(base.join("m241-gui").join("tiles")))
     }
 
     /// The cache under an explicit root, for tests.
-    #[must_use]
-    pub fn from_root(root: PathBuf) -> Self {
+    fn from_root(root: PathBuf) -> Self {
         Self { root }
     }
 
     /// `{root}/{z}/{x}/{y}.png` for one tile.
-    #[must_use]
-    pub fn tile_path(&self, tile: TileId) -> PathBuf {
+    fn tile_path(&self, tile: TileId) -> PathBuf {
         self.root
             .join(tile.zoom.to_string())
             .join(tile.x.to_string())
@@ -397,25 +408,23 @@ impl CachePaths {
 ///
 /// A modification time in the future (a clock that moved backwards) counts as
 /// fresh: treating it as stale would delete a tile that was just written.
-#[must_use]
-pub fn is_fresh(modified: SystemTime, now: SystemTime) -> bool {
+fn is_fresh(modified: SystemTime, now: SystemTime) -> bool {
     now.duration_since(modified)
         .map_or(true, |age| age <= CACHE_TTL)
 }
 
 /// What the cache holds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CacheUsage {
+pub(crate) struct CacheUsage {
     /// Number of cached tile files.
-    pub files: usize,
+    files: usize,
     /// Their total size.
-    pub bytes: u64,
+    bytes: u64,
 }
 
 impl CacheUsage {
     /// The figure the Settings row shows.
-    #[must_use]
-    pub fn label(self) -> String {
+    pub(crate) fn label(self) -> String {
         if self.files == 0 {
             return String::from("0 B（未使用）");
         }
@@ -428,8 +437,7 @@ impl CacheUsage {
 }
 
 /// `512 B` / `12.3 KB` / `4.5 MB`, for a cache figure.
-#[must_use]
-pub fn human_bytes(bytes: u64) -> String {
+fn human_bytes(bytes: u64) -> String {
     let value = bytes as f64;
     const KIB: f64 = 1024.0;
     const MIB: f64 = KIB * 1024.0;
@@ -473,8 +481,7 @@ fn cache_entries(root: &Path) -> Vec<CacheEntry> {
 }
 
 /// What a cache root holds.
-#[must_use]
-pub fn cache_usage_at(root: &Path) -> CacheUsage {
+fn cache_usage_at(root: &Path) -> CacheUsage {
     let entries = cache_entries(root);
     CacheUsage {
         files: entries.len(),
@@ -489,8 +496,7 @@ static LAST_USAGE: Mutex<Option<(Instant, CacheUsage)>> = Mutex::new(None);
 ///
 /// The Settings screen asks once a frame; walking a 200 MB tree every frame
 /// would make the settings page the slowest thing in the product.
-#[must_use]
-pub fn cache_usage() -> Option<CacheUsage> {
+pub(crate) fn cache_usage() -> Option<CacheUsage> {
     let cache = CachePaths::locate()?;
     if let Ok(guard) = LAST_USAGE.lock()
         && let Some((at, usage)) = guard.as_ref()
@@ -517,7 +523,7 @@ fn invalidate_usage_cache() {
 /// # Errors
 ///
 /// The I/O failure, with the path and the reason.
-pub fn clear_cache() -> Result<(), String> {
+pub(crate) fn clear_cache() -> Result<(), String> {
     let Some(cache) = CachePaths::locate() else {
         return Err(String::from("この環境ではキャッシュの場所を決められません"));
     };
@@ -539,8 +545,7 @@ pub fn clear_cache() -> Result<(), String> {
 ///
 /// Pure so the policy can be tested without a filesystem and without waiting 30
 /// days for a file to age.
-#[must_use]
-pub fn prune_plan(mut entries: Vec<CacheEntry>, limit: u64) -> Vec<PathBuf> {
+fn prune_plan(mut entries: Vec<CacheEntry>, limit: u64) -> Vec<PathBuf> {
     let total: u64 = entries.iter().map(|(_path, size, _at)| *size).sum();
     if total <= limit {
         return Vec::new();
@@ -579,7 +584,7 @@ fn prune_cache(root: &Path, limit: u64) -> u64 {
 /// A trait rather than a function so the drawing path can be tested with a fake:
 /// the tests must not depend on a socket, and a screenshot must not quietly
 /// produce evidence of a network that was never there.
-pub trait TileFetcher: Send + Sync + std::fmt::Debug {
+pub(crate) trait TileFetcher: Send + Sync + std::fmt::Debug {
     /// Fetch one tile as encoded bytes (PNG, or JPEG if a server answers so).
     ///
     /// # Errors
@@ -590,7 +595,7 @@ pub trait TileFetcher: Send + Sync + std::fmt::Debug {
 
 /// Why a tile could not be fetched or decoded.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TileError {
+pub(crate) enum TileError {
     /// The server could not be reached, or the transfer failed.
     Offline(String),
     /// The server answered with a non-success status.
@@ -614,9 +619,9 @@ impl std::fmt::Display for TileError {
 
 /// The real fetcher: `ureq` over TLS, with the policy's User-Agent.
 #[derive(Default)]
-pub struct HttpTiles {
+struct HttpTiles {
     /// Built on the first fetch, so creating a screen costs no TLS setup.
-    agent: OnceLock<Result<ureq::Agent, String>>,
+    agent: OnceLock<ureq::Agent>,
 }
 
 impl std::fmt::Debug for HttpTiles {
@@ -626,59 +631,90 @@ impl std::fmt::Debug for HttpTiles {
 }
 
 impl HttpTiles {
-    fn agent(&self) -> Result<&ureq::Agent, TileError> {
-        let built = self.agent.get_or_init(|| {
-            Ok(ureq::Agent::config_builder()
+    fn agent(&self) -> &ureq::Agent {
+        self.agent.get_or_init(|| {
+            ureq::Agent::config_builder()
                 .timeout_global(Some(Duration::from_secs(15)))
                 .user_agent(USER_AGENT)
                 .build()
-                .new_agent())
-        });
-        built
-            .as_ref()
-            .map_err(|reason| TileError::Offline(reason.clone()))
+                .new_agent()
+        })
+    }
+}
+
+/// Turn a body-read failure into the tile error the map reports.
+///
+/// `BodyExceedsLimit` used to fall into `Offline`, so an oversized answer was
+/// reported as a network outage and [`TileError::TooLarge`] was unreachable.
+fn map_body_error(error: ureq::Error) -> TileError {
+    match error {
+        ureq::Error::BodyExceedsLimit(limit) => TileError::TooLarge(limit),
+        other => TileError::Offline(other.to_string()),
     }
 }
 
 impl TileFetcher for HttpTiles {
     fn fetch(&self, tile: TileId) -> Result<Vec<u8>, TileError> {
-        let agent = self.agent()?;
-        let mut response = agent
-            .get(&tile_url(tile))
-            .call()
-            .map_err(|error| match error {
-                ureq::Error::StatusCode(code) => TileError::Status(code),
-                other => TileError::Offline(other.to_string()),
-            })?;
-        let body = response
+        let mut response =
+            self.agent()
+                .get(&tile_url(tile))
+                .call()
+                .map_err(|error| match error {
+                    ureq::Error::StatusCode(code) => TileError::Status(code),
+                    other => TileError::Offline(other.to_string()),
+                })?;
+        // OSM answers 200 with an image that says the request was blocked. The
+        // body is a valid PNG of the wrong thing, so the status and the decoder
+        // cannot tell it from a tile; the header is the tell. It is not cached,
+        // because a block notice painted on the map for 30 days is worse than
+        // the missing tile it replaced.
+        let headers = response.headers();
+        if headers.get("x-blocked").is_some() {
+            return Err(TileError::Offline(String::from(
+                "the tile server answered with its block image",
+            )));
+        }
+        if let Some(content_type) = headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            && !content_type.starts_with("image/")
+        {
+            return Err(TileError::Decode(format!("server answered {content_type}")));
+        }
+        response
             .body_mut()
             .with_config()
             .limit(MAX_TILE_BYTES)
             .read_to_vec()
-            .map_err(|error| TileError::Offline(error.to_string()))?;
-        let size = u64::try_from(body.len()).unwrap_or(MAX_TILE_BYTES);
-        if size > MAX_TILE_BYTES {
-            return Err(TileError::TooLarge(size));
-        }
-        Ok(body)
+            .map_err(map_body_error)
     }
 }
 
 /// Decode tile bytes into a texture-ready image.
 ///
-/// The size is bounded because the image ends up in a GPU texture: a server that
-/// answers with a 10000×10000 PNG must not be able to allocate that here.
+/// The limits are installed on the decoder *before* it allocates. Checking the
+/// decoded image's dimensions (as this function used to) was too late: a server
+/// could hand over a 10000×10000 PNG and the decoder would allocate hundreds of
+/// megabytes before the check ran. `ImageReader::decode` enforces the strict
+/// edge limits and reserves the output against `max_alloc` first.
 fn decode_tile(bytes: &[u8]) -> Result<ColorImage, TileError> {
-    const MAX_EDGE: u32 = 2048;
-    let decoded =
-        image::load_from_memory(bytes).map_err(|error| TileError::Decode(error.to_string()))?;
-    if decoded.width() > MAX_EDGE || decoded.height() > MAX_EDGE {
-        return Err(TileError::Decode(format!(
-            "{}×{} is larger than a tile",
-            decoded.width(),
-            decoded.height()
-        )));
-    }
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| TileError::Decode(error.to_string()))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_TILE_EDGE);
+    limits.max_image_height = Some(MAX_TILE_EDGE);
+    limits.max_alloc = Some(MAX_DECODE_BYTES);
+    reader.limits(limits);
+    let decoded = reader.decode().map_err(|error| match error {
+        // The limit is measured in bytes the decoder may allocate, but the cause
+        // is a tile whose decoded size is too large for this map; report the
+        // decoded ceiling rather than a number the caller cannot act on.
+        image::ImageError::Limits(_) => {
+            TileError::TooLarge(u64::from(MAX_TILE_EDGE) * u64::from(MAX_TILE_EDGE) * 4)
+        }
+        other => TileError::Decode(other.to_string()),
+    })?;
     let rgba = decoded.to_rgba8();
     Ok(ColorImage::from_rgba_unmultiplied(
         [rgba.width() as usize, rgba.height() as usize],
@@ -757,7 +793,7 @@ struct TileDone {
 
 /// What the map layer is showing, and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Background {
+pub(crate) enum Background {
     /// At least one tile is on screen.
     Tiles,
     /// Tiles are wanted and the first results have not arrived yet.
@@ -768,44 +804,47 @@ pub enum Background {
     Disabled,
     /// The screen is sample data; no tile is fetched or shown.
     Sample,
+    /// There is no window to fetch into (a headless render or `--screenshot`).
+    Headless,
 }
 
 impl Background {
     /// Whether this state should keep requesting tiles.
-    #[must_use]
-    pub fn may_fetch(self) -> bool {
+    fn may_fetch(self) -> bool {
         matches!(self, Self::Tiles | Self::Loading)
     }
 
     /// The caption the map shows for this state, if it needs one.
-    #[must_use]
-    pub fn note(self) -> Option<&'static str> {
+    pub(crate) fn note(self) -> Option<&'static str> {
         match self {
             Self::Tiles => None,
             Self::Loading => Some("地図タイルを読み込み中"),
             Self::Offline => Some("地図タイルを取得できません（オフライン）"),
             Self::Disabled => Some("地図タイルはオフです（設定で切り替え）"),
             Self::Sample => Some("見本：地図タイルは表示しません"),
+            Self::Headless => Some("地図タイルは表示しません（ヘッドレス）"),
         }
     }
 }
 
 /// What the Log screen allows the map layer to do this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MapOptions {
+pub(crate) struct MapOptions {
     /// The Settings screen's 「地図タイルを使う（要インターネット）」.
-    pub enabled: bool,
+    pub(crate) enabled: bool,
     /// The screen is showing sample data (a screenshot must not fetch).
-    pub sample: bool,
+    pub(crate) sample: bool,
 }
 
 /// The tile service and the textures it has loaded.
-pub struct MapTiles {
+pub(crate) struct MapTiles {
     fetcher: Arc<dyn TileFetcher>,
     cache: Option<CachePaths>,
     textures: HashMap<TileId, TextureHandle>,
     pending: HashSet<TileId>,
-    failed: HashSet<TileId>,
+    /// Failed tiles with the time they failed, so a partial failure retries
+    /// after [`OFFLINE_RETRY`] instead of staying grey for the session.
+    failed: HashMap<TileId, Instant>,
     queue: VecDeque<TileId>,
     in_flight: usize,
     failures: usize,
@@ -835,16 +874,15 @@ impl Default for MapTiles {
 }
 
 impl MapTiles {
-    /// A tile service over an explicit fetcher (tests use a fake).
-    #[must_use]
-    pub fn with_fetcher(fetcher: Arc<dyn TileFetcher>) -> Self {
+    /// A tile service over an explicit fetcher.
+    fn with_fetcher(fetcher: Arc<dyn TileFetcher>) -> Self {
         let (sender, receiver) = mpsc::channel();
         Self {
             fetcher,
             cache: CachePaths::locate(),
             textures: HashMap::new(),
             pending: HashSet::new(),
-            failed: HashSet::new(),
+            failed: HashMap::new(),
             queue: VecDeque::new(),
             in_flight: 0,
             failures: 0,
@@ -856,16 +894,46 @@ impl MapTiles {
         }
     }
 
-    /// The cache root, when the OS offers one (an explicit root otherwise).
-    #[must_use]
-    pub fn cache(&self) -> Option<&CachePaths> {
-        self.cache.as_ref()
+    /// A tile service over a fake fetcher with no cache.
+    ///
+    /// Only the tests outside this module need this seam (the render and App
+    /// tests); the tests inside it can reach `with_fetcher` directly. It is
+    /// `cfg(test)` so the shipped binary keeps a single constructor.
+    #[cfg(test)]
+    pub(crate) fn with_fetcher_for_test(fetcher: Arc<dyn TileFetcher>) -> Self {
+        let mut tiles = Self::with_fetcher(fetcher);
+        tiles.cache = None;
+        tiles
     }
 
     /// Replace the cache root (tests point this at a scratch directory).
-    pub fn set_cache(&mut self, cache: Option<CachePaths>) {
+    #[cfg(test)]
+    fn set_cache(&mut self, cache: Option<CachePaths>) {
         self.cache = cache;
         self.pruned = false;
+    }
+
+    /// Forget every tile and every request.
+    ///
+    /// Called when the shown track is replaced: the previous area's textures and
+    /// its in-flight requests belong to a log that is no longer on screen, and a
+    /// map that keeps them would draw the old trip's roads under the new one.
+    /// Workers already running finish and their results are ignored by [`Self::pump`]
+    /// (their tile is no longer pending).
+    pub(crate) fn reset(&mut self) {
+        self.textures.clear();
+        self.pending.clear();
+        self.failed.clear();
+        self.queue.clear();
+        self.failures = 0;
+        self.offline_until = None;
+        self.pruned = false;
+    }
+
+    /// How many textures are held. Test-only: the render tests wait for it.
+    #[cfg(test)]
+    pub(crate) fn texture_count(&self) -> usize {
+        self.textures.len()
     }
 
     /// The state the map is in, clearing an expired offline latch first.
@@ -902,7 +970,11 @@ impl MapTiles {
     fn pump(&mut self, context: &egui::Context) {
         while let Ok(done) = self.receiver.try_recv() {
             self.in_flight = self.in_flight.saturating_sub(1);
-            let _removed = self.pending.remove(&done.tile);
+            // A result for a tile that is no longer pending belongs to a reset or
+            // to a view that has moved on; drawing it would repaint the old area.
+            if !self.pending.remove(&done.tile) {
+                continue;
+            }
             match done.image {
                 Ok(image) => {
                     let name = format!("osm/{}/{}/{}", done.tile.zoom, done.tile.x, done.tile.y);
@@ -911,7 +983,7 @@ impl MapTiles {
                     self.failures = 0;
                 }
                 Err(_error) => {
-                    let _inserted = self.failed.insert(done.tile);
+                    let _inserted = self.failed.insert(done.tile, Instant::now());
                     self.failures = self.failures.saturating_add(1);
                     if self.failures >= OFFLINE_FAILURES {
                         self.offline_until = Some(Instant::now() + OFFLINE_RETRY);
@@ -940,10 +1012,30 @@ impl MapTiles {
                     });
             }
         }
+        // A failure is not permanent. Retrying it after the same window the
+        // offline latch uses turns a single timeout or a z19 gap into a tile
+        // that appears a minute later, instead of an empty square for the whole
+        // session (the old `failed` set was only cleared when the whole map went
+        // offline).
+        self.failed.retain(|_tile, at| at.elapsed() < OFFLINE_RETRY);
+        // A fast pan leaves tiles in the queue that the canvas no longer touches.
+        // Drop them (and their pending mark) rather than fetching an area nobody
+        // is looking at, which is what the module doc promises.
+        let wanted_set: HashSet<TileId> = wanted.iter().copied().collect();
+        let stale: Vec<TileId> = self
+            .queue
+            .iter()
+            .copied()
+            .filter(|tile| !wanted_set.contains(tile))
+            .collect();
+        for tile in stale {
+            let _removed = self.pending.remove(&tile);
+        }
+        self.queue.retain(|tile| wanted_set.contains(tile));
         for tile in wanted {
             if self.textures.contains_key(tile)
                 || self.pending.contains(tile)
-                || self.failed.contains(tile)
+                || self.failed.contains_key(tile)
             {
                 continue;
             }
@@ -958,7 +1050,7 @@ impl MapTiles {
                 Ok(()) => self.in_flight += 1,
                 Err(_) => {
                     let _removed = self.pending.remove(&tile);
-                    let _inserted = self.failed.insert(tile);
+                    let _inserted = self.failed.insert(tile, Instant::now());
                 }
             }
         }
@@ -992,36 +1084,59 @@ impl MapTiles {
     }
 }
 
-/// Whether this context belongs to a window somebody is looking at.
+/// Whether this context belongs to a real window someone could be looking at.
 ///
-/// `eframe` fills `inner_rect` before the first frame; a headless `RawInput` (the
-/// screenshot renderer and every render test) leaves it `None`. The distinction
-/// is what keeps the promise that a headless render never touches the network —
-/// by construction, rather than by every caller remembering to disable tiles.
-fn has_viewport(context: &egui::Context) -> bool {
-    context.input(|input| input.viewport().inner_rect.is_some())
+/// The test is `native_pixels_per_point`, not `inner_rect`. `inner_rect` is
+/// `None` on Wayland (winit cannot report a window position there), so gating on
+/// it silently disabled the map on every Wayland session while the caption kept
+/// saying "loading". `eframe` fills `native_pixels_per_point` on both X11 and
+/// Wayland, and a headless `RawInput` (the screenshot renderer and every render
+/// test) leaves it `None`, which is the distinction the offline promise needs.
+fn has_window(context: &egui::Context) -> bool {
+    context.input(|input| input.viewport().native_pixels_per_point.is_some())
+}
+
+/// What one map frame drew: the state the zoom note describes and how many OSM
+/// tiles reached the canvas.
+///
+/// The count exists so the attribution is drawn only on a frame that actually
+/// shows OSM data. Crediting a sample or empty frame is a false statement about
+/// where the pixels came from.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MapDrawn {
+    /// The state the caller should describe in its zoom note.
+    pub(crate) background: Background,
+    /// OSM tiles painted this frame.
+    pub(crate) tiles: usize,
 }
 
 /// Draw the map's base layer: tiles when they are available, nothing when the
 /// schematic grid underneath is the fallback.
 ///
 /// The grid is drawn by the caller before this, so the offline canvas is never
-/// empty. Returns the state the caller should describe in its zoom note.
-pub fn draw_map(
+/// empty.
+pub(crate) fn draw_map(
     ui: &Ui,
     painter: &Painter,
     view: MapView,
     state: &mut MapTiles,
     options: MapOptions,
-) -> Background {
+) -> MapDrawn {
     state.pump(ui.ctx());
     let visible = view.visible_tiles();
     let mut background = state.background(options);
-    if background.may_fetch() && has_viewport(ui.ctx()) {
-        state.request(&visible, ui.ctx());
-        state.pump(ui.ctx());
-        background = state.background(options);
+    if background.may_fetch() {
+        if has_window(ui.ctx()) {
+            state.request(&visible, ui.ctx());
+            state.pump(ui.ctx());
+            background = state.background(options);
+        } else {
+            // Nothing can arrive without a window, so "loading" would be a
+            // caption that never changes. Name the real reason instead.
+            background = Background::Headless;
+        }
     }
+    let mut tiles = 0;
     for tile in &visible {
         if let Some(texture) = state.textures.get(tile) {
             painter.image(
@@ -1030,23 +1145,23 @@ pub fn draw_map(
                 Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                 Color32::WHITE,
             );
+            tiles += 1;
         }
     }
-    background
+    MapDrawn { background, tiles }
 }
 
-/// The attribution OSM requires, drawn over the map on every frame.
+/// The attribution OSM requires, drawn whenever OSM pixels are on the canvas.
 ///
 /// The plate is not decoration: OSM tiles are bright, and `theme::MUTE` on a
 /// white field would fail the contrast the rest of the product holds itself to.
-pub fn draw_attribution(painter: &Painter, rect: Rect) {
+/// Returns the plate so the caller can keep the zoom note clear of it.
+pub(crate) fn draw_attribution(painter: &Painter, rect: Rect) -> Rect {
     let text = format!("{ATTRIBUTION} · {ATTRIBUTION_URL}");
     let galley =
         painter.layout_no_wrap(text, egui::FontId::proportional(size::CAPTION), theme::INK);
     let text_size = Vec2::new(galley.rect.width(), galley.rect.height());
-    // Bottom-left: the zoom note owns the bottom-right corner, and two captions
-    // in one corner would cover each other (the first screenshot showed exactly
-    // that overlap).
+    // Bottom-left: the zoom note owns the bottom-right corner.
     let origin = Pos2::new(
         rect.left() + space::S,
         rect.bottom() - space::S - text_size.y,
@@ -1054,6 +1169,38 @@ pub fn draw_attribution(painter: &Painter, rect: Rect) {
     let plate = Rect::from_min_size(origin, text_size).expand(space::XS);
     painter.rect_filled(plate, theme::RADIUS, theme::RAIL.gamma_multiply(0.9));
     painter.galley(origin, galley, theme::INK);
+    plate
+}
+
+/// The zoom/state caption, bottom-right, lifted clear of the attribution.
+///
+/// Both captions are one line tall and anchored to opposite bottom corners. At a
+/// wide canvas they cannot meet; at a narrow one a long state note (`追従 zoom
+/// 13（…）`) reaches past the credit. Rather than eliding either, the note moves
+/// up by the credit's height when the two rects would overlap. Returns the note
+/// rect so a test can hold that promise without reading pixels.
+pub(crate) fn draw_note(
+    painter: &Painter,
+    rect: Rect,
+    text: &str,
+    attribution: Option<Rect>,
+) -> Rect {
+    let galley = painter.layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::proportional(size::CAPTION),
+        theme::MUTE,
+    );
+    let size = Vec2::new(galley.rect.width(), galley.rect.height());
+    let right_bottom = rect.right_bottom() + Vec2::new(-space::S, -space::S);
+    let mut origin = right_bottom - size;
+    if let Some(attribution) = attribution {
+        let provisional = Rect::from_min_size(origin, size);
+        if provisional.intersects(attribution.expand(space::XS)) {
+            origin.y = attribution.top() - space::XS - size.y;
+        }
+    }
+    painter.galley(origin, galley, theme::MUTE);
+    Rect::from_min_size(origin, size)
 }
 
 #[cfg(test)]
@@ -1087,15 +1234,18 @@ mod tests {
 
     /// A 2×2 PNG, so decoding has something real to decode.
     fn synthetic_png() -> Vec<u8> {
+        png_bytes(2, 2)
+    }
+
+    /// A valid PNG of the requested size, for the decoder's limit tests.
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = Vec::new();
         {
-            let mut encoder = png::Encoder::new(&mut bytes, 2, 2);
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
             encoder.set_color(png::ColorType::Rgba);
             encoder.set_depth(png::BitDepth::Eight);
             let mut writer = encoder.write_header().expect("PNG header");
-            let pixels = [
-                255_u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
-            ];
+            let pixels = vec![0_u8; usize::try_from(width * height * 4).expect("pixel count")];
             writer.write_image_data(&pixels).expect("PNG data");
         }
         bytes
@@ -1119,6 +1269,13 @@ mod tests {
             Self {
                 calls: Mutex::new(0),
                 result: Err(TileError::Offline(String::from("no network in tests"))),
+            }
+        }
+
+        fn too_large() -> Self {
+            Self {
+                calls: Mutex::new(0),
+                result: Err(TileError::TooLarge(MAX_TILE_BYTES + 1)),
             }
         }
 
@@ -1279,30 +1436,44 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_headless_context_never_requests_a_tile() {
-        // `--screenshot` and every render test use a context with no viewport.
-        // Drawing there must not start a fetch, or a headless artifact would
-        // depend on the network it is supposed to run without.
-        let fetcher = Arc::new(FakeFetcher::ok());
-        let mut tiles = MapTiles::with_fetcher(fetcher.clone());
-        tiles.set_cache(None);
-        let context = egui::Context::default();
-        let input = egui::RawInput {
+    /// A raw input that looks like a real window to the map gate.
+    ///
+    /// `inner_rect` is what Wayland cannot report; `native_pixels_per_point` is
+    /// what eframe fills on every real window. Passing `None` for `inner_rect`
+    /// therefore reproduces Wayland, and `Some(..)` reproduces X11.
+    fn window_input(inner_rect: Option<Rect>) -> egui::RawInput {
+        let mut input = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0))),
             ..egui::RawInput::default()
         };
-        let mut background = Background::Loading;
+        input.viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                native_pixels_per_point: Some(1.0),
+                inner_rect,
+                ..egui::ViewportInfo::default()
+            },
+        );
+        input
+    }
+
+    /// Run one map frame and return what it drew.
+    fn draw_one_frame(tiles: &mut MapTiles, input: egui::RawInput) -> MapDrawn {
+        let context = egui::Context::default();
+        let mut drawn = MapDrawn {
+            background: Background::Loading,
+            tiles: 0,
+        };
         let output = context.run_ui(input, |ui| {
             let (rect, _response) =
                 ui.allocate_exact_size(Vec2::new(400.0, 200.0), egui::Sense::hover());
             let painter = ui.painter();
             let view = MapView::new(TOKYO.0, TOKYO.1, 13.0, rect);
-            background = draw_map(
+            drawn = draw_map(
                 ui,
                 painter,
                 view,
-                &mut tiles,
+                tiles,
                 MapOptions {
                     enabled: true,
                     sample: false,
@@ -1310,8 +1481,73 @@ mod tests {
             );
         });
         output.drop_without_applying_deltas();
-        assert_eq!(background, Background::Loading);
-        std::thread::sleep(Duration::from_millis(20));
+        drawn
+    }
+
+    #[test]
+    fn an_x11_window_fetches_tiles() {
+        // X11 reports both an inner rect and a scale factor. This is the path the
+        // live screenshot was taken on; it must keep fetching after the Wayland
+        // gate changed.
+        let fetcher = Arc::new(FakeFetcher::ok());
+        let mut tiles = MapTiles::with_fetcher(fetcher.clone());
+        tiles.set_cache(None);
+        let input = window_input(Some(Rect::from_min_size(
+            Pos2::ZERO,
+            Vec2::new(1280.0, 800.0),
+        )));
+        let drawn = draw_one_frame(&mut tiles, input);
+        assert_eq!(drawn.tiles, 0, "no tile could be drawn on the first frame");
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(fetcher.calls() > 0, "an X11 window started no tile fetch");
+    }
+
+    #[test]
+    fn a_wayland_window_has_no_inner_rect_and_still_fetches_tiles() {
+        // winit reports `NotSupported` for the inner position on Wayland, so
+        // egui-winit fills `inner_rect: None`. Gating the fetch on `inner_rect`
+        // therefore disabled the map on every Wayland session; the gate must be
+        // `native_pixels_per_point`, which is Some on Wayland too.
+        let input = window_input(None);
+        assert!(
+            input.viewport().inner_rect.is_none(),
+            "the Wayland fixture must have no inner rect"
+        );
+        assert!(
+            input.viewport().native_pixels_per_point.is_some(),
+            "the Wayland fixture must still name a scale factor"
+        );
+        let fetcher = Arc::new(FakeFetcher::ok());
+        let mut tiles = MapTiles::with_fetcher(fetcher.clone());
+        tiles.set_cache(None);
+        let _drawn = draw_one_frame(&mut tiles, input);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            fetcher.calls() > 0,
+            "a Wayland window started no tile fetch"
+        );
+    }
+
+    #[test]
+    fn a_headless_context_never_requests_a_tile() {
+        // `--screenshot` and every render test use a headless `RawInput`: no
+        // window, no scale factor. Drawing there must not start a fetch, or a
+        // headless artifact would depend on the network it is supposed to run
+        // without. The state says why nothing is shown instead of "loading".
+        let fetcher = Arc::new(FakeFetcher::ok());
+        let mut tiles = MapTiles::with_fetcher(fetcher.clone());
+        tiles.set_cache(None);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0))),
+            ..egui::RawInput::default()
+        };
+        let drawn = draw_one_frame(&mut tiles, input);
+        assert_eq!(drawn.background, Background::Headless);
+        assert_eq!(
+            Background::Headless.note(),
+            Some("地図タイルは表示しません（ヘッドレス）")
+        );
+        std::thread::sleep(Duration::from_millis(80));
         assert_eq!(
             fetcher.calls(),
             0,
@@ -1582,5 +1818,137 @@ mod tests {
         };
         assert!(usage.label().contains("12.0 KB"));
         assert!(usage.label().contains("200.0 MB"));
+    }
+
+    #[test]
+    fn a_body_limit_error_maps_to_too_large_not_offline() {
+        // `ureq` reports the configured body limit as `BodyExceedsLimit`. The
+        // old code mapped every read error to `Offline`, which was both wrong
+        // and made `TileError::TooLarge` unreachable: the check after the read
+        // could never fire.
+        assert_eq!(
+            map_body_error(ureq::Error::BodyExceedsLimit(MAX_TILE_BYTES + 1)),
+            TileError::TooLarge(MAX_TILE_BYTES + 1)
+        );
+        assert!(matches!(
+            map_body_error(ureq::Error::HostNotFound),
+            TileError::Offline(_)
+        ));
+    }
+
+    #[test]
+    fn an_oversized_tile_is_too_large_and_is_not_cached() {
+        // The oversized-body path must be distinguishable from an outage, and a
+        // rejected body must not reach the disk: caching it would serve the same
+        // failure for a month without asking the server again.
+        let scratch = Scratch::new("too-large");
+        let cache = CachePaths::from_root(scratch.path());
+        let tile = TileId::new(13, 3, 3);
+        let fetcher = FakeFetcher::too_large();
+        let (image, written) = load_tile(&fetcher, Some(&cache), tile, SystemTime::now());
+        assert!(
+            matches!(image, Err(TileError::TooLarge(_))),
+            "an oversized tile was not reported as TooLarge: {image:?}"
+        );
+        assert_eq!(written, 0, "an oversized tile was written to the cache");
+        assert!(
+            !cache.tile_path(tile).exists(),
+            "an oversized tile left a cache file"
+        );
+    }
+
+    #[test]
+    fn a_png_larger_than_a_tile_is_refused_by_the_decoder_limits() {
+        // The limits are installed on `ImageReader` before `decode`, so the
+        // decoder refuses the width instead of allocating the bitmap first. The
+        // old code decoded the whole image and then compared its dimensions.
+        let wide = png_bytes(MAX_TILE_EDGE + 1, 1);
+        assert!(
+            matches!(decode_tile(&wide), Err(TileError::TooLarge(_))),
+            "a PNG wider than a tile was decoded anyway"
+        );
+        // The ordinary tile still decodes.
+        assert!(decode_tile(&synthetic_png()).is_ok());
+    }
+
+    #[test]
+    fn the_zoom_note_stays_clear_of_the_credit() {
+        // The note owns the bottom-right and the attribution the bottom-left.
+        // At a narrow canvas a long state note reaches past the credit; the note
+        // then moves above it. This is the overlap the old comment claimed a
+        // screenshot had shown, but nothing held it.
+        let context = egui::Context::default();
+        let map_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(360.0, 240.0));
+        // Fonts only exist after one `run_ui`; a painter created before it
+        // cannot lay out text.
+        let input = egui::RawInput {
+            screen_rect: Some(map_rect),
+            ..egui::RawInput::default()
+        };
+        let output = context.run_ui(input, |ui| {
+            let _ = ui.allocate_exact_size(Vec2::new(1.0, 1.0), egui::Sense::hover());
+        });
+        output.drop_without_applying_deltas();
+        let painter = egui::Painter::new(context, egui::LayerId::background(), map_rect);
+        let attribution = draw_attribution(&painter, map_rect);
+        let long_note = "追従 zoom 13（地図タイルを取得できません（オフライン））";
+        let note = draw_note(&painter, map_rect, long_note, Some(attribution));
+        assert!(
+            !note.intersects(attribution),
+            "the zoom note {note:?} overlaps the credit {attribution:?}"
+        );
+        assert!(
+            attribution.top() - note.bottom() >= space::XS - 0.5,
+            "the lifted note does not clear the credit: note {note:?}, credit {attribution:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_tile_is_retried_only_after_the_retry_window() {
+        // A single failed visible tile used to stay failed for the whole session
+        // (only the global offline latch cleared it). It now retries after the
+        // same window as the offline latch, without waiting for a full outage.
+        let fetcher = Arc::new(FakeFetcher::ok());
+        let mut tiles = MapTiles::with_fetcher(fetcher.clone());
+        tiles.set_cache(None);
+        let context = egui::Context::default();
+        let view = MapView::new(
+            TOKYO.0,
+            TOKYO.1,
+            13.0,
+            Rect::from_min_size(Pos2::ZERO, Vec2::new(200.0, 120.0)),
+        );
+        let wanted = view.visible_tiles();
+        let tile = wanted[0];
+        // A fresh failure is honoured: it is not requested again immediately.
+        let _fresh = tiles.failed.insert(tile, Instant::now());
+        tiles.request(&wanted, &context);
+        for _ in 0..30 {
+            tiles.pump(&context);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            !tiles.textures.contains_key(&tile),
+            "a fresh failure was retried immediately"
+        );
+
+        // Once the window has passed, the next request tries the tile again.
+        let _expired = tiles.failed.insert(
+            tile,
+            Instant::now() - OFFLINE_RETRY - Duration::from_secs(1),
+        );
+        for _ in 0..200 {
+            tiles.request(&wanted, &context);
+            tiles.pump(&context);
+            if tiles.textures.contains_key(&tile) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            tiles.textures.contains_key(&tile),
+            "an expired failure was never retried"
+        );
+        assert!(fetcher.calls() > 0, "the retry never reached the fetcher");
     }
 }

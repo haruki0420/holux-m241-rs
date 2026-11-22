@@ -31,10 +31,11 @@ mod geotag_gate;
 mod editing;
 mod kmz_export;
 mod photo_shift;
-// Background map tiles (DESIGN.md §5, §10). Public because the Settings screen
-// reports the cache path, its usage and its clear action from the module that
-// owns them, rather than duplicating any of it.
-pub mod tiles;
+// Background map tiles (DESIGN.md §5, §10). Crate-visible rather than public:
+// the Settings screen needs the cache path, its usage and its clear action, and
+// nothing outside this crate needs the tile machinery. Making the module public
+// turned 34 helpers into a crate-external API that no consumer used.
+pub(crate) mod tiles;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -74,12 +75,12 @@ const MAX_LOG_BYTES: usize = 16 * 1024 * 1024;
 const FOLLOW_MIN_ZOOM: f32 = 12.0;
 
 /// Lowest zoom the user can ask for while not following.
-const MIN_ZOOM: f32 = 1.0;
+const MIN_ZOOM: f32 = tiles::MIN_TILE_ZOOM as f32;
 
 /// Highest zoom the map allows. OSM serves tiles to 19 and the projection is
 /// defined there; the track is drawn over the same view, so the limit is the
 /// tiles' rather than a separate one.
-const MAX_ZOOM: f32 = 19.0;
+const MAX_ZOOM: f32 = tiles::MAX_TILE_ZOOM as f32;
 
 /// Playback step while motion is allowed (DESIGN.md §3: 150 ms is the authored
 /// transition; a track that steps four points a second reads as playback).
@@ -232,6 +233,9 @@ impl LogScreen {
         self.fit_mode = true;
         self.follow = false;
         self.map_zoom = self.compute_fit_zoom();
+        // A different log means a different part of the world: the previous
+        // textures, pending requests and failures belong to the old one.
+        self.tiles.reset();
         self.hidden_days.clear();
         self.close_geotag_confirmation();
         self.outcome = None;
@@ -246,6 +250,20 @@ impl LogScreen {
     pub fn show_sample(&mut self) {
         self.sample = true;
         self.set_track(sample_track(), ParseReport::default());
+    }
+
+    /// Install a fake tile fetcher with no cache (tests only).
+    ///
+    /// The render and App tests draw the real screen; without this seam the
+    /// "headless never fetches" test could only inspect the caption, which is
+    /// exactly the hole the Stage 1 review found: a broken window gate could
+    /// have opened a real socket and left the test green.
+    #[cfg(test)]
+    pub(crate) fn set_tile_fetcher_for_test(
+        &mut self,
+        fetcher: std::sync::Arc<dyn tiles::TileFetcher>,
+    ) {
+        self.tiles = tiles::MapTiles::with_fetcher_for_test(fetcher);
     }
 
     /// Fill the photo block with two sample entries, for the screenshot renderer.
@@ -1306,6 +1324,9 @@ impl LogScreen {
         self.last_step_at = None;
         self.fit_mode = true;
         self.map_zoom = self.compute_fit_zoom();
+        // Split / merge / delete can move the track out of the area whose tiles
+        // are held, so the map layer is rebuilt from the new bounds.
+        self.tiles.reset();
         self.hidden_days.clear();
         self.close_geotag_confirmation();
         self.relink_photos();
@@ -1321,9 +1342,10 @@ impl LogScreen {
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, theme::RADIUS, theme::RAIL);
 
-            let view = self.map_view(rect);
+            let view = self.sync_fit_zoom(rect);
             let plotted: Vec<(usize, egui::Pos2)> = self.plotted_points(rect);
             let mut background = None;
+            let mut attribution = None;
             if plotted.is_empty() {
                 painter.text(
                     rect.center(),
@@ -1338,7 +1360,7 @@ impl LogScreen {
                 // The grid stays underneath the tiles: it is the offline canvas,
                 // and it also fills a tile that has not arrived yet.
                 draw_grid(&painter, rect);
-                background = Some(tiles::draw_map(
+                let drawn = tiles::draw_map(
                     ui,
                     &painter,
                     view,
@@ -1347,7 +1369,13 @@ impl LogScreen {
                         enabled: settings.map_tiles,
                         sample,
                     },
-                ));
+                );
+                background = Some(drawn.background);
+                // OSM requires the credit where its tiles are shown; a sample,
+                // offline or still-loading frame shows none, so it carries none.
+                if drawn.tiles > 0 {
+                    attribution = Some(tiles::draw_attribution(&painter, rect));
+                }
                 let line: Vec<egui::Pos2> = plotted.iter().map(|(_index, pos)| *pos).collect();
                 if line.len() > 1 {
                     // The spec's track numbers (07-eztour §5 「幅 5・不透明度 0.7」)
@@ -1437,23 +1465,17 @@ impl LogScreen {
                 }
             }
 
-            tiles::draw_attribution(&painter, rect);
             // One caption, bottom-right: the zoom, and the map's state when the
             // tiles are not on screen (offline, sample, loading). The
-            // attribution owns the bottom-left corner so the two cannot collide.
+            // attribution owns the bottom-left corner; `draw_note` lifts this
+            // caption above it when a narrow canvas would make them collide.
             let follow_label = if self.follow { "追従 " } else { "" };
             let status_note = background.and_then(|background| background.note());
             let mode_note = match status_note {
                 Some(extra) => format!("{follow_label}zoom {:.0}（{extra}）", view.zoom),
                 None => format!("{follow_label}zoom {:.0}", view.zoom),
             };
-            painter.text(
-                rect.right_bottom() + Vec2::new(-space::S, -space::S),
-                Align2::RIGHT_BOTTOM,
-                mode_note,
-                FontId::proportional(size::CAPTION),
-                theme::MUTE,
-            );
+            let _note_rect = tiles::draw_note(&painter, rect, &mode_note, attribution);
 
             // Clicking the map selects the nearest plotted point: the map is a
             // picker, not a picture, and a track you cannot ask about is a diagram.
@@ -2135,6 +2157,22 @@ impl LogScreen {
     fn fail<T>(&mut self, message: String) -> Result<T, String> {
         self.outcome = Some((Status::Err, message.clone()));
         Err(message)
+    }
+
+    /// The view for this frame, publishing the fitted zoom to the `+`/`−` buttons.
+    ///
+    /// Fit is computed from the canvas size and the Mercator bbox; the buttons
+    /// work from `map_zoom`, which [`Self::compute_fit_zoom`] estimates from the
+    /// degree span. On an east-west track the two differ by about one and a half
+    /// levels, so `+` straight after 全点表示 could shrink the map. Publishing
+    /// the zoom that was actually drawn keeps a press monotonic, and the label
+    /// already shows `view.zoom`.
+    fn sync_fit_zoom(&mut self, rect: Rect) -> MapView {
+        let view = self.map_view(rect);
+        if self.fit_mode {
+            self.map_zoom = view.zoom as f32;
+        }
+        view
     }
 
     /// The view the map and the track are both drawn through.
@@ -4012,5 +4050,182 @@ mod tests {
             sample_track().points.len(),
             "a refused split changed the track"
         );
+    }
+
+    /// A fake tile fetcher for the full-screen tests: a 1×1 PNG.
+    #[derive(Debug, Default)]
+    struct CountingTiles;
+
+    impl tiles::TileFetcher for CountingTiles {
+        fn fetch(&self, _tile: tiles::TileId) -> Result<Vec<u8>, tiles::TileError> {
+            Ok(tiny_png())
+        }
+    }
+
+    /// A 1×1 opaque PNG.
+    fn tiny_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("PNG header");
+            writer
+                .write_image_data(&[255_u8, 0, 0, 255])
+                .expect("PNG data");
+        }
+        bytes
+    }
+
+    /// A raw input that looks like an X11 window to the map gate.
+    fn windowed_input() -> egui::RawInput {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(1280.0, 800.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        input.viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                native_pixels_per_point: Some(1.0),
+                inner_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1280.0, 800.0),
+                )),
+                ..egui::ViewportInfo::default()
+            },
+        );
+        input
+    }
+
+    /// Draw one full screen frame and return every text primitive it produced.
+    fn frame_texts(
+        context: &egui::Context,
+        input: &egui::RawInput,
+        screen: &mut LogScreen,
+    ) -> Vec<String> {
+        let output = context.run_ui(input.clone(), |ui| screen.ui(ui));
+        let shapes: Vec<egui::Shape> = output
+            .shapes
+            .iter()
+            .map(|clipped| clipped.shape.clone())
+            .collect();
+        let mut flat = Vec::new();
+        flatten(&shapes, &mut flat);
+        let texts = flat
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+        texts
+    }
+
+    #[test]
+    fn the_attribution_is_drawn_only_when_a_tile_is_on_screen() {
+        // The credit names where the pixels came from. A sample or loading
+        // frame has no OSM pixels, so it must not carry the credit; the two
+        // tests this replaces asserted the credit and "no tiles" on the same
+        // frame, which made the contradiction a passing contract.
+        let context = egui::Context::default();
+        crate::theme::install(&context);
+        let input = windowed_input();
+        let mut screen = LogScreen::default();
+        screen.set_tile_fetcher_for_test(std::sync::Arc::new(CountingTiles));
+        screen.set_track(sample_track(), ParseReport::default());
+        for _ in 0..200 {
+            let _texts = frame_texts(&context, &input, &mut screen);
+            if screen.tiles.texture_count() > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            screen.tiles.texture_count() > 0,
+            "the fake fetch produced no texture"
+        );
+        let texts = frame_texts(&context, &input, &mut screen);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("© OpenStreetMap contributors")),
+            "a frame with OSM tiles carried no attribution: {texts:?}"
+        );
+
+        // The same screen switched to the sample: no OSM pixels, no credit.
+        screen.sample = true;
+        screen.tiles.reset();
+        let texts = frame_texts(&context, &input, &mut screen);
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains("© OpenStreetMap contributors")),
+            "a sample frame credited OSM tiles it did not draw: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("見本：地図タイルは表示しません")),
+            "the sample frame did not say it shows no tiles: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_new_track_forgets_the_previous_areas_tiles() {
+        // The stage 1 review found `set_track` leaving the old textures, pending
+        // requests and failures in place: after loading another log the map kept
+        // drawing the previous area under the new track.
+        let context = egui::Context::default();
+        crate::theme::install(&context);
+        let input = windowed_input();
+        let mut screen = LogScreen::default();
+        screen.set_tile_fetcher_for_test(std::sync::Arc::new(CountingTiles));
+        screen.set_track(sample_track(), ParseReport::default());
+        for _ in 0..200 {
+            let _texts = frame_texts(&context, &input, &mut screen);
+            if screen.tiles.texture_count() > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            screen.tiles.texture_count() > 0,
+            "the fake fetch produced no texture"
+        );
+        screen.set_track(sample_track(), ParseReport::default());
+        assert_eq!(
+            screen.tiles.texture_count(),
+            0,
+            "the previous track's tiles survived set_track"
+        );
+    }
+
+    #[test]
+    fn a_fit_view_publishes_its_zoom_to_the_zoom_buttons() {
+        // Fit is computed by `MapView::fit` (canvas + Mercator); `+`/`−` work
+        // from `map_zoom`. Without publishing the fitted zoom, `+` right after
+        // 全点表示 could lower the displayed zoom.
+        let mut screen = sample();
+        let rect = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(770.0, 320.0));
+        let view = screen.sync_fit_zoom(rect);
+        assert!(screen.fit_mode, "a fresh track must start in fit mode");
+        assert!(
+            (screen.map_zoom - view.zoom as f32).abs() < 1e-6,
+            "the buttons' zoom {} differs from the drawn zoom {}",
+            screen.map_zoom,
+            view.zoom
+        );
+        let before = screen.map_zoom;
+        screen.set_zoom(screen.map_zoom + 1.0);
+        assert!(
+            screen.map_zoom > before,
+            "`+` after 全点表示 lowered the zoom: {before} -> {}",
+            screen.map_zoom
+        );
+        assert!(!screen.fit_mode, "a zoom press must leave fit mode");
     }
 }
