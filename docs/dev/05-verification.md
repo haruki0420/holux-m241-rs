@@ -170,10 +170,15 @@ m241: error: framing error: 0xD5 packet 1588 answered 0x01, expected 0x69. packe
 
 Device: the same retail M-241 (`B-core_1.20`, build `0043`, model `01017-00F`,
 flash `00C2:22BA`). Host: Linux, `/dev/m241` (udev symlink to `/dev/ttyUSB0`).
-Binary: the branch head `b8d91ee` — the client that sends the final `0xD5`
-packet at the DA's receive length (§1.4). Every write below was approved per
-execution by an independent reviewer (`AGENTS.md` §2.5) and the unit matched the
-backup before any erase (`verify_device`).
+Binary: `fix/flash-d3-resync` at `b8d91ee` — the client that sends the final
+`0xD5` packet at the DA's receive length (§1.4); that branch is PR #19, merged
+into `main` as `877881c`, and this page records the runs, not the merge. Every
+write below was approved per execution by an independent reviewer
+(`AGENTS.md` §2.5). The two strict writes compared the unit with the backup
+before the DA was loaded (`verify_device`); the **recovery write did not** —
+`--recover` skips that comparison by design, because a partly written unit
+cannot match its backup, and its log says so (`recovery mode: … the whole-unit
+comparison is skipped; checking only the M-241 vector and family markers`).
 
 | Step | Command | Result | Status |
 |---|---|---|---|
@@ -185,6 +190,11 @@ backup before any erase (`verify_device`).
 | patch | `m241 fw patch` on a fresh V1.13 dump | 3 bytes changed (`0x402F6`, `0x402F7`, `0x59C2C`), epoch `935280000`, marker V1.14 | ✅ |
 | patched write | `m241 fw flash --yes` (patched image, backup = the fresh dump) | 1589 packets, `verified: 406620 bytes read back and identical` | ✅ |
 | boot of V1.14 | not run: the unit was left in the BootROM by the read-back | — | ⚠️ |
+
+The raw command output quoted on this page was captured in the session that ran
+the commands and is not committed here: the captures are device transcripts and
+the repository does not take them (`AGENTS.md` §6). The quoted lines are
+verbatim; each is the line the client printed.
 
 * **The write path completed on a unit for the first time.** Both successful
   runs reached the final packet, were acknowledged, restarted the chip with
@@ -225,10 +235,17 @@ firmware-managed offsets — a design decision that has not been made.
 
 #### V1.12 is refused before a port is opened
 
-Measured, not assumed: with the 406,620-byte backup, `fw flash` refuses the
-V1.12 release (`the backup is 406620 bytes; profile V1.12 is 406312 bytes`), and
-`--allow-vendor` refuses it because the gate accepts only the pinned V1.13
-digest.
+Measured, not assumed — two dry runs, so no port was opened:
+
+```text
+$ m241 fw flash <V1.12 image> --backup <406,620-byte dump> --dry-run
+m241: error: refused: the backup is 406620 bytes; profile V1.12 is 406312 bytes
+
+$ m241 fw flash <V1.12 image> --backup <406,620-byte dump> --allow-vendor --dry-run
+m241: error: refused: the vendor gate is pinned to V1.13 (406620 bytes, SHA-256 32fe5269…); profile V1.12 is not that release. V1.12 and other vendor builds are not supported
+```
+
+Both exit 5.
 
 ## 1a. The Linux log-erase hardware session (2026-11-21)
 
