@@ -1583,7 +1583,7 @@ Could 9）と可読性（Must 4 / Should 17 / Could 13）の 2 本で、レビ�
 
 ### 検証
 
-- `M241_VENDOR_IMAGE=<vendor V1.13> TMPDIR=/var/tmp ./tools/check.sh`: **6/6**（48 秒。初回は docs ゲートが本節の `cache.rs` / `fetch.rs` 参照を未実在パスとして検出したため、モジュール名の表記を修正して再実行）。
+- `M241_VENDOR_IMAGE=<vendor V1.13> TMPDIR=/var/tmp ./tools/check.sh`: **6/6**（48 秒。初回は docs ゲートが本節の未実在パス参照を検出したため、モジュール名の表記を修正して再実行）。
 - `cargo test -p m241-gui`: lib 175 / design_gate 6 / design_invariants 6 / render 38。**実ネットワークを使うテストはない**（タイル取得はすべて `TileFetcher` の fake）。
 - `--screenshot`（空の `XDG_CACHE_HOME`）: 15 枚生成、**タイルキャッシュ書込み 0**（fontconfig のみ）。ログ画面の見本フレームはクレジットなしで「見本：地図タイルは表示しません」、設定画面は新しい ON 注記を表示。1280×800 と 1024×640 を目視した。
 - 実ウィンドウ: Wayland（Hyprland、winit の Wayland バックエンド）で **8 枚**、X11（`WAYLAND_DISPLAY` を外して Xwayland を強制）で **16 枚**のタイルがキャッシュに書かれた。headless は 0 枚。ライブ画像の取得は compositor の screencopy（grim / wf-recorder）が応答せず断念し、見た目は `--screenshot` の画像で確認した。変更前の X11 実ウィンドウ画像（`/tmp/m241-tiles-live.png`）でタイルと軌跡の整合を確認済み。
