@@ -1416,7 +1416,7 @@ impl LogScreen {
                     let Some(point) = self.track.points.get(index).copied() else {
                         continue;
                     };
-                    if self.point_row(ui, index, &point, settings) {
+                    if self.point_row(ui, index, &point, settings).clicked() {
                         clicked_index = Some(index);
                     }
                 }
@@ -1432,7 +1432,7 @@ impl LogScreen {
         index: usize,
         point: &TrackPoint,
         settings: &AppSettings,
-    ) -> bool {
+    ) -> egui::Response {
         let selected = self.selected == Some(index);
         let (rect, response) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), metric::ROW), Sense::click());
@@ -1471,7 +1471,7 @@ impl LogScreen {
         // Rows are focusable (Sense::click); without this the keyboard's position
         // in a 10,000-row list was invisible (design review, Must 1).
         common::focus_ring(ui, &response);
-        response.clicked()
+        response
     }
 
     /// The export row: a format, a destination, one button that says what it does.
@@ -1967,6 +1967,74 @@ mod tests {
         screen
     }
 
+    /// Flatten nested shape trees into leaf shapes.
+    fn flatten<'a>(shapes: &'a [egui::Shape], out: &mut Vec<&'a egui::Shape>) {
+        for shape in shapes {
+            match shape {
+                egui::Shape::Vec(children) => flatten(children, out),
+                other => out.push(other),
+            }
+        }
+    }
+
+    #[test]
+    fn a_point_row_draws_the_focus_ring() {
+        // The design review's Must 1 covers the point list as well as the buttons:
+        // a 10,000-row list whose focused row looks like every other row is not
+        // keyboard-operable. The row paints the shared 2pt ink ring from its
+        // `Response`; this focuses the real row and measures the frame.
+        let screen = sample();
+        let point = screen
+            .track()
+            .points
+            .first()
+            .copied()
+            .expect("the sample track has points");
+        let settings = AppSettings::default();
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(640.0, 400.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let mut id = None;
+        let mut found = false;
+        for pass in 0..3 {
+            let output = ctx.run_ui(input.clone(), |ui| {
+                let response = screen.point_row(ui, 0, &point, &settings);
+                if pass == 0 {
+                    id = Some(response.id);
+                }
+            });
+            let shapes: Vec<egui::Shape> = output
+                .shapes
+                .iter()
+                .map(|clipped| clipped.shape.clone())
+                .collect();
+            output.drop_without_applying_deltas();
+            if pass > 0 {
+                let mut flat = Vec::new();
+                flatten(&shapes, &mut flat);
+                found = flat.iter().any(|shape| {
+                    matches!(
+                        shape,
+                        egui::Shape::Rect(rect)
+                            if (rect.stroke.width - metric::FOCUS_RING).abs() < f32::EPSILON
+                                && rect.stroke.color == theme::INK
+                    )
+                });
+            }
+            if pass == 0
+                && let Some(id) = id
+            {
+                ctx.memory_mut(|memory| memory.request_focus(id));
+            }
+        }
+        assert!(found, "the focused point row drew no focus ring");
+    }
+
     #[test]
     fn a_new_screen_has_an_empty_log_and_a_gpx_default() {
         let screen = LogScreen::default();
@@ -2240,7 +2308,7 @@ mod tests {
         for (format, needle) in [
             (ExportFormat::Gpx, "<gpx"),
             (ExportFormat::Kml, "<kml"),
-            (ExportFormat::Csv, "index,utc,lat,lon"),
+            (ExportFormat::Csv, "INDEX,TRACK NUMBER,UTC DATE"),
         ] {
             screen.set_export_format(format);
             let out_path = PathBuf::from(&screen.destination);

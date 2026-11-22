@@ -31,17 +31,19 @@
 
 ---
 
-## 2. 現在の到達点（PR #20 時点）
+## 2. 現在の到達点（1.0.0 リリース時点）
 
 ### 数字とゲート
 
 | 項目 | 値 |
 |---|---|
+| バージョン | **1.0.0**（`Cargo.toml` の `[workspace.package]` 1 か所で 4 クレートを統一。初回公開リリース） |
 | クレート構成 | 4 クレート（`m241-core` 読取専用 / `m241-flash` 書込専用 / `m241-cli` / `m241-gui`） |
-| テスト | **767 件全緑**（`cargo test --workspace`、PR #20 修正時点の実測） |
-| ゲート | **6/6 PASS**（`./tools/check.sh`: fmt / clippy / test / docs / design / safety） |
-| CI | Linux / Windows / macOS |
-| **実機検証** | 読み取り・`log erase`（[`05-verification.md`](05-verification.md) §1a）に加え、2026-11-22 の書き込みセッション（同 §1.5）で `fw dump` / `fw probe-da` / `fw flash --recover` / `fw patch` / strict 書き込みが実機で通り、**2 回の書き込み（recovery と strict）が全長読み戻し一致**。`fw flash --allow-vendor` は書込み自体は完了したが、起動したファームが個体データ 4 バイトを復元するため読み戻しが `0x5C` で不一致（設計課題）。パッチ済み V1.14 の起動も確認済み（既定日付が `22-08-99`＝パッチ済みエポック）。残りは**測位ありでの日付確認**と GUI の実機検証 |
+| テスト | **810 件全緑**（2026-11-22 に `cargo test --workspace --offline -- --list` で実測。内訳は m241-core 297 / m241-flash 149 / m241-cli 232 / m241-gui 132） |
+| ゲート | **6/6 PASS**（`./tools/check.sh`: fmt / clippy / test / docs / design / safety。2026-11-22 に `M241_VENDOR_IMAGE` を設定して実行）。`M241_VENDOR_IMAGE` はベンダーの V1.13 ファームウェアイメージのパスで、設定するとその隣の `DA_v3.8.4.bin` を使う実 DA 受理テストが走る（未設定・CI では skip） |
+| CI | Linux / Windows / macOS（`ci.yml`） |
+| 配布 | `.github/workflows/release.yml`: `v1.0.0` のような安定版タグで 3 OS の `cargo build --release` を行い、`m241` / `m241-gui` / `LICENSE` / `SHA256SUMS.txt` を GitHub Release に添付。**まだ一度も実行していない**（`v*` タグ・Release とも未作成） |
+| **実機検証** | 読み取りと `log erase`（[05-verification.md](05-verification.md) §1a）に加え、2026-11-22 の書き込みセッション（同 §1.5）で `fw dump` / `fw probe-da` / `fw patch` / `fw flash --recover` / 通常の書き込みが実機で通り、**2 回の書き込みが全長読み戻し一致**。`fw flash --allow-vendor` は書き込みが完走したが読み戻しは不一致（設計課題）。残りは**測位ありでの日付確認**と GUI の実機検証。詳細は §3.3 |
 
 ### 完成・`main` 統合済み（三段構成で検証済み、[`10-review-log.md`](10-review-log.md) 記録済み）
 
@@ -65,25 +67,38 @@
 
 | 項目 | 状態 | ブロッカー / 注意点 |
 |---|---|---|
-| **DA 書き込み実装**（`crates/m241-flash/src/da.rs`） | 実装済み。開始アドレスは確定済み（PR #13） | DA 側の開始アドレスは 2026-11-21 の `fw probe-da` で `0` に確定（`docs/dev/05-verification.md` §1.2）。`UNRESOLVED_STARTS` は空、`check_layout` は確定値 `0` を通す。通常の受理規則は自機バックアップとの差分のみ（同一または `PATCH_OFFSETS` のみ）。`--allow-vendor` は固定 V1.13 SHA-256 の公式イメージだけを受理する別ゲートで、個体データ 14 バイトを上書きする（実機未検証）。`write_range` は private、読み戻し・消去失敗 `0xA5`・ゼロ詰め・`0xD9` 無応答はテスト済み。**実機の書き込み・消去・再起動・`0xD9` 後の再入・ベンダーイメージ書き込みは未検証** |
-| **CLI 配線** | 完了（スタブなし） | `fw flash` は開始アドレス確定後、`verify_device` → DA RAM ロード → `0xD3`/`0xD5` → `0xD9` → NMEA probe + `$PMTK180*3B` で BootROM 再入 → 読み戻し照合まで配線済み。`--allow-vendor` は固定 SHA の V1.13 イメージを書き、dry-run で個体データ上書きを警告する。再入失敗は「読み戻し未実施」として報告し、不一致とは区別する。`0xD3` 失敗時は `0xD9` で再起動し、`0xD5` 前だけ 1 回再試行する。`fw da-restart` は DA のまま残った端末に単独の `0xD9` を送る。`log erase` は PR #12 で実装済み（実機記録は [`05-verification.md`](05-verification.md) §1a）。`device doctor` / `log geotag` / `nmea proxy` はマージ済み。**`fw flash` の実機の書き込み・消去・再起動・`0xD9` 後の再入・ベンダーイメージ書き込みは未検証** |
+| **DA 書き込み実装**（`crates/m241-flash/src/da.rs`） | 実装済み。開始アドレスは確定済み（PR #13） | 実機では書込み・消去・再起動・`0xD9` 後の再入・全長読み戻しまで通過（[05-verification.md](05-verification.md) §1.5）。ベンダーイメージの読み戻しだけが設計課題。詳細は下の補足 |
+| **CLI 配線** | 完了（スタブなし） | `fw flash` は `verify_device` → DA RAM ロード → `0xD3`/`0xD5` → `0xD9` → NMEA probe + `$PMTK180*3B` で BootROM 再入 → 読み戻し照合まで配線済み。`0xD3` 失敗時は `0xD9` で再起動し `0xD5` 前だけ 1 回再試行。`log erase` は PR #12 で実装済み（実機記録は §1a）。`device doctor` / `log geotag` / `nmea proxy` はマージ済みだが実機未検証。詳細は下の補足 |
+
+補足:
+
+- DA 側の開始アドレスは 2026-11-21 の `fw probe-da` で `0` に確定した（[05-verification.md](05-verification.md) §1.2）。`UNRESOLVED_STARTS` は空で、`check_layout` は確定値 `0` を通す。
+- `--da` は長さ（14,896 バイト）・先頭 4 バイト・全文 SHA-256（`DA_IMAGE_SHA256`、`AGENTS.md` §2.5 のベンダー値）の 3 つを照合する（follow-up W2a を実装済み）。期待ダイジェストは `DaDigest` トークンで、通常ビルドの構築子は `DaDigest::vendor()` のみ（テスト用 `for_test_da` は `simulator` feature 配下）。
+- 通常の受理規則は自機バックアップとの差分のみ（同一または `PATCH_OFFSETS` のみ）。`--allow-vendor` は固定 V1.13 SHA-256 の公式イメージだけを受理する別ゲートで、個体データ 14 バイトを上書きする。実機では 2026-11-22 に書き込みが完走し V1.13 で起動したが、起動したファームが個体データ 4 バイトを復元するため読み戻しは `0x5C` で不一致（同 §1.5）。
+- `write_range` は private。読み戻し・消去失敗 `0xA5`・ゼロ詰め・`0xD9` 無応答はテスト済み（dry-run の個体データ上書き警告、再入失敗を「読み戻し未実施」として不一致と区別する報告もテスト済み）。`fw da-restart` は DA のまま残った端末に単独の `0xD9` を送る。
 
 ### 3.2 ezTour 代替機能の再実装（[`07-eztour-spec.ja.md`](07-eztour-spec.ja.md) §8）
 
 | 優先度 | 機能 | 現状と不足 |
 |---|---|---|
-| **P0** | **KMZ 書き出し** | マージ済み（PR #5 / #20 / #21）。写真同梱（`photo/`）＋ zip 化（Store）＋ 色/幅＋ `<Point>`／`<TimeStamp>`、**長辺縮小（`kmzMaxPhotoEdgeSize`）** を実装。`KmzPhoto::max_edge_pixels` が `Some(limit)` で長辺が `limit` を超える写真だけ JPEG を復号し、アスペクト比を保って長辺 = `limit` に縮小（Lanczos3）、JPEG 品質 85 で再符号化する。上限以内と `None` の写真は**元のバイト列のまま**。縮小した写真は **EXIF を保持しない**（`image` の JPEG エンコーダは APP1 を書かない）。上限超過で復号できないバイト列は `Error::State`（写真名と理由つき）。依存は `image` の `jpeg` feature のみ。CLI 経路は PR #20 で接続済み（`log kmz --max-photo-edge` / `--utc-offset-days` / `--tz-offset-minutes` / `--max-gap`）。`icon/` サムネイルは PR #21 の `export_kmz_with_icons` で追加: `icon/<同じ名前>` を別上限（`KmzIconOptions::max_edge_pixels`）で同じ縮小経路から生成し、`export_kmz` は `icon/` を書かない（回帰テストあり）。**未確定**: サムネイルの寸法（仕様に記載なし）、`icon/` の命名規則、KML からの参照方法、ezTour が実際に `icon/` へ置いていたか。**残る未実装**: `kmzMaxPhotoEdgeSize`・`icon/` 寸法を GUI から渡す経路。実写真での縮小結果・EXIF Orientation 付き写真の向き、Google Earth / `unzip` での開封は**未検証** |
+| **P0** | **KMZ 書き出し** | マージ済み（PR #5 / #20 / #21）。写真同梱（`photo/`）＋ zip 化＋色/幅＋ `<Point>`／`<TimeStamp>`＋長辺縮小（`kmzMaxPhotoEdgeSize`）＋ `icon/` サムネイルを実装。CLI 経路は `log kmz --max-photo-edge` 等で接続済み。**未検証**: 実写真での縮小結果、EXIF Orientation 付き写真の向き、Google Earth / `unzip` での開封。詳細は下の補足 |
 | **P0** | **GUI の実データ接続・地図体験** | マージ済み（PR #4）。実ポート probe・実ログ読込・全点 fit・追従（zoom ≥ 12）・再生・写真同期・POI・始点終点を実装。**未検証**: 実ポート probe、追従の実描画、GUI 経由の実 JPEG 書き込み。スライダーのキーボード / accesskit 操作は未対応（見送り理由を記録済み） |
 | **P1** | **写真ジオタグ拡充** | `exif.rs` / `geotag.rs` に実装済み: `GPSVersionID`・`_original` バックアップ・距離グループ化（推移的／順序非依存）・時刻シフト後の再マッチング（`plan_with_shift` で再計画、`apply` が `DateTimeOriginal` を書き換え、次回はシフト無しで一致）。PR #21 で日/時/分/秒の個別シフト（`PhotoTimeShift`、各値は符号付き・合計は checked 演算）と適用範囲（`PhotoShiftScope`: 既定 `AllPhotos` / `SelectedPhotos` / `ByCamera`）を `plan_with_time_shift` として追加し、`plan_with_shift` はその `AllPhotos` 版への委譲にした（既存動作の回帰テストあり）。`byCamera` は Exif IFD0 の `Make`/`Model` を `CameraModel::from_jpeg` で読む。CLI は `log geotag`（dry-run / `--tz-offset-minutes` / シフト / バックアップ）、GUI は写真同期と書き込み確認まで実装済み。**未確定**: 「同じカメラ」の判定規則（対象タグ・大文字小文字・表記揺れの正規化。現状は末尾の NUL/空白だけを除いた完全一致で、UTF-8 として読めない名前は不明扱い）、`selPhotos` の一致規則（現状はパスの完全一致）、日 = 24 時間（カレンダー日ではない）の解釈。詳細は [`06-open-questions.md`](06-open-questions.md) §6。新しい scoped API は CLI/GUI 未配線（別担当）。未実装: 非 JPEG（動画）の「紐づけのみ」。実カメラ JPEG への書き込みと、実カメラの IFD0 配置（合成 JPEG でしか読めていない）は**未検証** |
 | **P1** | **トラック編集** | 分割（Split）・結合（Merge）・点削除・Undo/Redo は `edit.rs` に実装済み（PR #5）。CLI 経路は PR #20 で追加（`log edit --split-at` / `--merge` / `--delete`）。GUI の操作体系（範囲選択）は未着手 |
-| **P2** | **互換・移行機能** | GPX 1.0/1.1 読込（`<wpt>` は読まない）・NMEA 読込→トラック化・座標形式切替（度分秒 / 10 進度 / UTM）は実装済み（PR #5）。CSV 列の ezTour 互換確認・プロジェクト保存が未着手。NMEA 読込は落ちた行数を返さない（doc に明記） |
+| **P2** | **互換・移行機能** | GPX 1.0/1.1 読込（`<wpt>` は読まない）・NMEA 読込→トラック化・座標形式切替（度分秒 / 10 進度 / UTM）は実装済み（PR #5）。`feat-p2-compat` で (1) NMEA 読込が `NmeaImport`（`imported` / `dropped` / `ignored`）を返し、`m241 log read --nmea` が「読み込んだ行数／落ちた行数」を stderr に表示、(2) CSV の列・順を ezTour の 12 列（INDEX / TRACK NUMBER / UTC DATE / UTC TIME / LOCAL DATE / LOCAL TIME / LATITUDE / N/S / LONGITUDE / E/W / ALTITUDE / SPEED）に一致、(3) `m241 log project save\|load` で log・写真フォルダ・時刻補正・出力設定を 1 つの JSON に保存し、`log read` / `log kmz` 相当の出力を行う、まで実装。**未確定**: CSV の `LOCAL DATE` / `LOCAL TIME` は、ezTour が表示用タイムゾーンのどれを基準にしていたか仕様に無いため**空で出力**（UTC や PC のゾーンを推測して書かない）。`INDEX` の基点（0 始まり）・`TRACK NUMBER` の値（1）・日時/緯度経度/高度/速度の書式・N/S・E/W の綴りも仕様に無く、こちらで固定した値（テストで固定）。プロジェクト JSON は `.itm` の互換ではなく本プロジェクトの最小形式（[`docs/reference/02-cli.md`](../reference/02-cli.md) に明記） |
+
+補足（KMZ）:
+
+- 長辺縮小は `KmzPhoto::max_edge_pixels` が `Some(limit)` のときだけ JPEG を復号し、アスペクト比を保って Lanczos3 で縮小、JPEG 品質 85 で再符号化する。上限以内と `None` の写真は元のバイト列のまま。縮小した写真は EXIF を保持しない（`image` の JPEG エンコーダは APP1 を書かない）。上限超過で復号できないバイト列は `Error::State`（写真名と理由つき）。
+- `icon/` は `export_kmz_with_icons` が別上限（`KmzIconOptions::max_edge_pixels`）で同じ縮小経路から生成し、`export_kmz` は `icon/` を書かない（回帰テストあり）。CLI フラグは `--max-photo-edge` / `--utc-offset-days` / `--tz-offset-minutes` / `--max-gap`。
+- **未確定**: サムネイルの寸法（仕様に記載なし）、`icon/` の命名規則、KML からの参照方法、ezTour が実際に `icon/` へ置いていたか。**残る未実装**: `kmzMaxPhotoEdgeSize`・`icon/` 寸法を GUI から渡す経路。依存は `image` の `jpeg` feature のみ。
 
 ### 3.3 実機検証の到達点
 
 読み取りと書き込みの主要経路は実機で通った。結果は [`05-verification.md`](05-verification.md) §1.5 に記録：
 
 - `fw dump`（2 回一致）、`fw probe-da`（DA 側ベース `0`）、`fw patch`（3 バイト）
-- `fw flash --recover` と strict 書き込み（パッチ済み V1.14）: 1589 パケット完走、406,620 バイト読み戻し一致
+- `fw flash --recover` と通常の書き込み（自機バックアップとの差分のみを許す経路、パッチ済み V1.14）: 1589 パケット完走、406,620 バイト読み戻し一致
 - `fw flash --allow-vendor`（ベンダー V1.13）: 書込みは完了したが、起動したファームが個体データ 4 バイトを復元するため読み戻しが `0x5C` で不一致（設計課題）
 - V1.12 の書き込み拒否を実測
 
@@ -105,7 +120,7 @@
 
 ```bash
 ./tools/check.sh              # 6 ゲート（fmt / clippy / test / docs / design / safety）
-cargo test --workspace        # 全テスト（現在 767 件）
+cargo test --workspace        # 全テスト（現在 810 件）
 cargo build --release
 cargo run -q -p m241-gui -- --screenshot
 ```

@@ -954,6 +954,140 @@ Stage 2 の差分は本節と同じコミットで、範囲は `crates/m241-core
 
 ---
 
+## 2026-11-22 / W2a DA 全文 SHA-256（PR #24、Stage 1 → Stage 2）
+
+対象: `feat-da-digest`（base `origin/main` = `40efd53`）。Stage 1 は仕様検収
+（Must 0 / Should 3 / Could 4）と可読性（Must 2 / Should 4）の 2 本で、レビューした
+head は `6945728`。この節は Stage 2 の対応記録で、Stage 3 は別エージェントが記入する。
+
+### 対応表（Must）
+
+| 指摘 | 対応 |
+|---|---|
+| 可読性 M1: `check_da_image_against` / `DaLoader::load_against` が生 `&str` を受け取り、rustdoc が pin の差し替えを正当化している。機械ゲートも無い | `DaDigest` トークンに変更。フィールドは private で、通常ビルドの構築子は `DaDigest::vendor()`（= `DA_IMAGE_SHA256`）だけ。テスト用 `DaDigest::for_test_da` は `#[cfg(any(test, feature = "simulator"))]` の下（`FakeDa` と同じ feature 慣習）。CLI の本番 5 箇所は `da_digest()` が返す `DaDigest::vendor()` だけを渡せる。`tools/check_safety.py` に検査 8「`DaDigest::for_test_da` の直前が `#[cfg(any(test, feature = "simulator"))]`」を追加し、`docs/dev/11-safety-review.md` の ✓ 表に追記。`crates/m241-flash/tests/safety_gate.rs` に `a_da_digest_constructor_outside_its_cfg_gate_is_reported` を追加（cfg を外す変異で落ちる） |
+| 可読性 M2: `the_vendor_da_hashes_to_the_pinned_digest_and_loads` が env 無しで無言 skip し、`docs/dev/11-safety-review.md` が 🧪 として引用している | テスト名を `the_vendor_da_matches_the_pinned_digest_and_loads_when_the_vendor_da_is_available` に変更。skip 時に `eprintln!` で理由を出す。`docs/dev/11-safety-review.md` の該当行を「条件付き（CI では未実行）」に変更し、pin 値そのものは CI で走る `the_loader_constants_are_pinned_to_the_documents_and_the_read_crate` がリテラル固定することを明記 |
+
+### 対応表（Should / Could）
+
+| 指摘 | 対応 |
+|---|---|
+| 仕様 S1 / 可読性 S1: pin 値の CI 回帰が無い | `the_loader_constants_are_pinned_to_the_documents_and_the_read_crate` に `DA_IMAGE_SHA256` のリテラル比較と `DaDigest::vendor().sha256()` の比較を追加（CI で常に走る） |
+| 仕様 S2: public な逃げ道（M1 と同じ） | `DaDigest` トークン化で解消（上記） |
+| 仕様 S3: ベンダーファイル無し環境で skip する検証の記録 | `M241_VENDOR_IMAGE` を設定して `./tools/check.sh` を実行し 6/6 を確認（下記「ゲート」）。CI では条件付きテストが skip することを `docs/dev/11-safety-review.md` に明記 |
+| 仕様 C1: `fw flash` 側に「正しい先頭・誤 digest」テストが無い | `flash_refuses_a_same_size_da_with_the_right_head_but_a_different_digest` を追加 |
+| 仕様 C2 / 可読性 S1: `digest::matches` を再利用していない・拒否文が常に「pinned vendor digest」と言い切る | 比較を `m241_core::firmware::digest::matches` に変更。拒否文は期待値が pin 値のときだけ「the pinned DA_v3.8.4.bin digest」、それ以外は「the expected digest」と表示し、次の行動（ベンダーパッケージの `DA_v3.8.4.bin` を使う）を書く |
+| 仕様 C4: `--da` フラグ説明に digest が無い | `docs/reference/02-cli.md` の `fw probe-da` フラグ行に追記 |
+| 可読性 S2: docs が実際は呼ばない `check_da_image` を名指し | `AGENTS.md` §2.5、`docs/reference/02-cli.md`、`docs/dev/11-safety-review.md` を、CLI が `check_da_image_against` / `load_against` に `da_digest()` を渡し、`check_da_image` / `load` は同じ pin 済みチェックである、という記述に更新 |
+| 可読性 S3: fingerprint / digest / hash / SHA-256 の語の揺れ | 概念語を `digest` に統一（`DaDigest`、`da_digest()`、テスト名を `..._wrong_digest` / `..._different_digest` / `..._matches_the_pinned_digest_...` に改名） |
+| 可読性 S4: `cfg(not(test))` の本番分岐がテストで実行されない | `da_digest()` の doc に「この分岐は `cargo test` ではコンパイルされない（テストは `#[cfg(test)]` 側を通る）」と明記し、フィクスチャで通るテスト名に条件（`with_the_test_fixture_da`）を付けた |
+| 可読性 C1: モジュール doc の 4+1 チェックが数えにくい | 「ジャンプ前の 4 チェック + その後 DA 自身が返す 20 バイト report が 5 番目」と明記 |
+| 可読性 C2 / C4: fixture doc の主語が移動後になっていない・2 つの fixture の差が不明 | `da_fixture_bytes` の doc を「書き込む合成 DA」に直し、`m241-flash` の `da_image()` との差（`DA_REPORT_OFFSET` の fake report のみ）を明記 |
+| 可読性 C3: `pub(super)` の理由が無い | `da_fixture_bytes` の doc に「親の `da_digest` が同じバイトをハッシュするため」と明記 |
+| 可読性 C5: `run_against` の doc が実装詳細に読める | `load` の check を切り出したものであり、`DaDigest` トークンにより逃げ道ではない、という主語に書き直した |
+
+### 却下・見送り
+
+- 仕様 C3（`fw probe-da` も DA の SHA-256 を表示する）: `fw probe-da` の標準出力・
+  `--json` 契約と `docs/reference/02-cli.md` の出力節を変える別変更になる。§2.5 の承認
+  成果物はもともと承認者が `--da` のパスから独立に SHA-256 を再計算する運用で、
+  W2a（安全ゲートの強化）の範囲外。別 follow-up 候補として残す。
+- 可読性 C6（`assert_eq!(opcodes(), &[] as &[u8])` を `is_empty()` に）: 新規テストは
+  `is_empty()` にしたが、既存行（旧テスト）はファイル内の既存パターンを揃えるため
+  そのまま。全置換は本 PR の目的（安全ゲート）と無関係な差分を増やす。
+
+### ゲート
+
+`M241_VENDOR_IMAGE=".../M-241 Firmware V1.13 update package/01017-01C ... V1.13_GR-241_HLX.bin" ./tools/check.sh`
+→ 6/6（fmt / clippy / test / docs / design / safety）。実機ポートは開いていない。
+この設定では `M241_VENDOR_IMAGE` の隣の `DA_v3.8.4.bin` が使われ、条件付きの
+実 DA 受理テストも実行される（CI ではベンダーファイルが無いため skip。skip は
+`eprintln!` で出力され、pin 値のリテラル回帰は CI でも走る）。
+
+### Stage 3 検証
+
+未検証（別エージェントが記入する）。
+
+---
+
+## 2026-11-22 / 1.0.0 リリース整備（PR #26、Stage 1 → Stage 2）
+
+対象: `feat-release-prep`（base `origin/main` = `b0456df`）。Stage 1 は仕様検収（Must 1 / Should 10 /
+Could 9）と可読性（Must 4 / Should 17 / Could 13）の 2 本で、レビューした head は `65f7d60`。
+この節は Stage 2 の対応記録で、Stage 3 は別エージェントが記入する。`crates/**/*.rs` は変更していない。
+
+### 対応表（Must）
+
+| 指摘 | 対応 |
+|---|---|
+| 仕様 M1: README の「NMEA の日付補正が実機で動いている」に `05-verification.md` の根拠が無い | README の状態節を「実機で動いているのは読み取り系・`fw patch`・`fw flash`」に限定し、`nmea repair` はオフライン処理で実装済み、`nmea proxy` は**実機未検証**と書き分けた。未検証一覧にも `nmea proxy` を追加 |
+| 可読性 M1: `02-fix-the-date.md` / `03-recovery.md` への導線が無い | 「使い方」末尾に 2 本への導線を追加し、ドキュメント表（利用者向け）に 2 行追加 |
+| 可読性 M2: リリース資産名が README と `01-install.md` で不一致 | `01-install.md` の取得節を Release の実アセット名の表に置き換え、`SHA256SUMS.txt` との照合手順も追加 |
+| 可読性 M3: 未作成の Release を既存として記述 | README・`01-install.md`・`12-progress-summary.md`・CHANGELOG に「まだ一度も実行していない／`v1.0.0` タグも Release も未作成」と明記 |
+| 可読性 M4: 個体データの 14 / 4 / 1 バイトの食い違い | README と CHANGELOG に「個体データは 14 バイト（`0x5C`–`0x5F` の 4、`0xF8`–`0xFD` の 6、`0x63458`–`0x6345B` の 4）。起動時にファームが書き戻すのは `0x5C`–`0x5F` の 4 バイトで、実測の読み戻しの差は `0x5C` の 1 バイトだけ」と検算できる形で統一 |
+
+### 対応表（仕様 Should）
+
+| 指摘 | 対応 |
+|---|---|
+| S1: 実機確認は `b8d91ee` 時点で、以後の flash / CLI 変更は未実行 | README 状態節と CHANGELOG 冒頭に明記 |
+| S2: 「767 件」は現 head と不一致 | 実測 **810 件**（m241-core 297 / m241-flash 149 / m241-cli 232 / m241-gui 132、2026-11-22）に更新 |
+| S3: Release workflow 未実行を既存として記述 | 未実行を明記（`workflow_dispatch` の dry-run は見送り。理由は下記） |
+| S4: `v*` は RC・誤タグも拾い、版一致の検査が無い | trigger を `v[0-9]+.[0-9]+.[0-9]+` に絞り、build job にタグと `Cargo.toml` の版一致検査 step を追加（不一致は fail） |
+| S5: 05 §2 に未検証 3 項目が無い | `05-verification.md` §2 に `device doctor` 実 probe / 実カメラ geotag / `nmea proxy` の 3 行を追加し、README の参照先を §2 に変更 |
+| S6: Release に `LICENSE` が無い・署名 / provenance が無い | release job で `LICENSE` を dist に足し、チェックサムと Release アセットに含めた。署名・attestation は見送り（下記） |
+| S7: Linux の glibc / libudev 前提が無い | README と `01-install.md` に「Ubuntu 24.04（glibc 2.39）ビルド、`libudev.so.1` 前提、musl 静的ではない」と明記 |
+| S8: macOS Gatekeeper / Windows SmartScreen の注意が無い | README と `01-install.md` に未署名バイナリの注意と回避手順を追加 |
+| S9: `01-install.md` のアセット名が不一致 | 実アセット名の表・SHA-256 照合・リネーム可を追記（可読性 M2 と同じ変更） |
+| S10: 05 §2 の macOS 行 `same` が曖昧 | `⚠️ never measured: …` に明確化 |
+
+### 対応表（可読性 Should）
+
+| 指摘 | 対応 |
+|---|---|
+| S1: 出典とコマンド列挙が無い | 状態節にコマンド名と `05-verification.md` §1.5 / §1a を併記 |
+| S2: 手法の節に検証状況が混入 | `fw flash` の実機状況を 05 §1.5 への 1 行リンクに置換 |
+| S3: 開発者向け情報の混入・表の混在 | `.gitignore` の説明を削除し、ドキュメント表を「利用者向け」「開発者向け」の 2 表に分割 |
+| S4: `strict 書き込み` が未定義 | 「通常の書き込み（自機バックアップとの差分だけを許す経路）」と初出で定義 |
+| S5: Keep a Changelog 形式が中途半端 | `## [Unreleased]` とリンク定義（`[Unreleased]` / `[1.0.0]`）を追加。`実機で確認したこと` / `既知の制限・未検証` / `注意` を `##` に上げ、変更カテゴリでないと明記。`0.1.0` は非公開開発版と明記 |
+| S6: 見出しの日付と項目の日付が不一致 | 見出しを `2026-11-21〜22` に変更 |
+| S7: Added に実機未検証の inline 表記が無い | GUI・`--allow-vendor`・実カメラ geotag に「実機未検証」「読み戻しは一致しない」を追記 |
+| S8: 内部研究メモの混入 | DA プロトコルの細部を `06-open-questions.md` への参照に置換し、プロトコル命令の説明先を `01-da-protocol.md` に明記。利用者が知るべき制限（タイミング・自動再試行）は残した |
+| S9: テスト件数の根拠が現在時点でない | 810 件・実測日・コマンド・内訳に更新（仕様 S2 と同じ） |
+| S10: `M241_VENDOR_IMAGE` が未説明 | 何のパスか、設定時にどのテストが走るか、未設定・CI では skip されることを 1 行で説明 |
+| S11: 太字の断定と同セルの記述が矛盾 | 該当セルを短い状態行に置き換え、限定（自機バックアップ・パッチ済み）を本文に明記 |
+| S12: 表のセルが長すぎる | `12-progress-summary.md` の該当 4 セルを短縮し、詳細を表直後の「補足」箇条書きへ移動 |
+| S13: job 名が成果物名でない | `build (${{ matrix.os }})` → `build (${{ matrix.platform }})` |
+| S14: Linux 依存インストールの重複 | 見送り（下記） |
+| S15: テスト済みコミットだけを配布することが読み取れない | release workflow の build job に `cargo test --workspace --locked` を追加し、`cargo build --release --locked` に変更 |
+| S16: タグと版の一致が「期待」だけ | 検査 step を追加（仕様 S4）し、`Cargo.toml` の version 行に 1 行コメント |
+| S17: 日本語 README から英語文書へ送っている | リンク先に「（英語）」を付記 |
+
+### 却下・見送り
+
+- **仕様 S3 の `workflow_dispatch` + `--draft` dry-run**: 「未実行」の明記で誤読は解消した。
+  `gh release create` は draft でも Release を作るため、初回前に workflow を走らせる検証経路は
+  本番と同じ副作用を持つ。タグを打たずに検証する手段は別設計（ローカルでの action 実行等）で扱う。
+- **仕様 S6 の署名・provenance**（`actions/attest-build-provenance` / cosign）: OIDC と新規 action
+  の導入、検証手順の文書化が必要でリリース整備の範囲を超える。README に「署名されていない・
+  SHA-256 は転送破損しか検出しない」と明記した。
+- **可読性 S14 の composite action 化**: `ci.yml` の 3 ジョブと `release.yml` の apt 行を 1 つの
+  action に寄せる変更で、PR #26 のスコープ（リリース整備）を超える。`release.yml` には
+  「`ci.yml` と同じ」という根拠コメントが残る。
+
+### ゲート・実測
+
+- `M241_VENDOR_IMAGE=... ./tools/check.sh` → 6/6（fmt / clippy / test / docs / design / safety）。
+  実機ポートは開いていない。
+- `cargo test --workspace --offline -- --list` → 810 件（内訳は仕様 S2 の行）。
+- タグ push・Release 作成・マージ・`review-gate` はしていない（Stage 3 の担当）。
+- workflow は YAML パースと `git diff --check` まで。実行はしていない。
+
+### Stage 3 検証
+
+未検証（別エージェントが記入する）。
+
+---
+
 ## 2026-11-22 / PR #27 `feat-gui-design` の Stage 2 修正
 
 対象: `crates/m241-gui` と `DESIGN.md` §10。ブランチ `feat-gui-design`、修正前 head
@@ -971,7 +1105,7 @@ Stage 2 の差分は本節と同じコミットで、範囲は `crates/m241-core
 | 可読性 M1 | `promote_system_face(ctx, "a"/"0", …)` の意味不明な文字列 | `PROPORTIONAL_CLUSTER` / `MONOSPACE_CLUSTER` 定数にし、各 family をその文字で代表させる理由を doc に書いた | コンパイルと既存のフォント描画テスト（`screenshot.rs`） |
 | 可読性 M2 | 「All figures come from `m241-core`」と `0x402F4` 直書きの矛盾 | `patch_offset_value()` が `patch::EFFECTIVE_EPOCH_OFFSET` から組み、バイト数は V1.13 固定である理由をコメント。テストが core の epoch 定数から差分バイト数を再計算して 3 と照合 | `the_colophon_builds_the_patch_offset_from_the_core_constant` |
 | 可読性 M3 | 列挙失敗でも「ポートが見つかりません／ケーブル確認」で同画面の `port_status` と矛盾 | `port_guidance()` を empty と failed で分岐。failed は理由（`ポートを列挙できません: {reason}`）とドライバ/権限の次の手を出す | `an_empty_port_list_asks_for_the_cable_and_the_power`、`a_failed_enumeration_reports_the_reason_instead_of_no_port_found`、`a_readable_port_list_needs_no_guidance` |
-| デザイン Must 1 | 主要ボタン・点一覧でキーボードフォーカスが見えない（明示 `.stroke()` が egui の focus 輪を上書き） | `common::focus_ring` を追加し、primary/secondary/choice/tool/write ボタンと点一覧行が `Response` から 2pt `ink` の inset 矩形を描く。テストはウィジェットに focus を与え、フレームの 2pt INK 矩形を測る | `every_custom_button_draws_the_focus_ring`、`the_write_button_draws_the_focus_ring`、`the_focus_ring_is_two_points_of_ink`。加えて一時ヘルパで Tab を押したフレームを PNG 化し、レール「接続」と「書き込む」に輪が出ることを目視（ヘルパは確認後に削除） |
+| デザイン Must 1 | 主要ボタン・点一覧でキーボードフォーカスが見えない（明示 `.stroke()` が egui の focus 輪を上書き） | `common::focus_ring` を追加し、primary/secondary/choice/tool/write ボタンと点一覧行が `Response` から 2pt `ink` の inset 矩形を描く。テストはウィジェットに focus を与え、フレームの 2pt INK 矩形を測る | `every_custom_button_draws_the_focus_ring`、`the_write_button_draws_the_focus_ring`、`a_point_row_draws_the_focus_ring`、`the_focus_ring_is_two_points_of_ink`。加えて一時ヘルパで Tab を押したフレームを PNG 化し、レール「接続」と「書き込む」に輪が出ることを目視（ヘルパは確認後に削除） |
 
 ### 仕様検収 Should の対応
 
@@ -1024,10 +1158,91 @@ Stage 2 の差分は本節と同じコミットで、範囲は `crates/m241-core
 
 ### 検証
 
-- `M241_VENDOR_IMAGE=… ./tools/check.sh` **6/6**（fmt / clippy / test / docs / design / safety、42 秒）。
-- `cargo test -p m241-gui`: lib **103** + design_gate **6** + design_invariants **6** + render **36** = **151 passed / 0 failed**。
+- `M241_VENDOR_IMAGE=… TMPDIR=/var/tmp ./tools/check.sh` **6/6**（fmt / clippy / test / docs / design / safety、41 秒）。
+- `cargo test -p m241-gui`: lib **104** + design_gate **6** + design_invariants **6** + render **36** = **152 passed / 0 failed**。
+- Stage 3 の Minor 対応: §10 の「next-step 行は `→` を残す」と「`→` は無い」の矛盾を、実装（矢印なし）に合わせて前者を削除。点一覧行の focus 輪専用テスト `a_point_row_draws_the_focus_ring` を追加（`point_row` は `Response` を返し、テストが実際に focus を与えて 2pt ink 矩形を測る）。
 - `--screenshot /tmp/m241-gui-after2` で **8 枚**（4 画面 × 1280×800 / 1024×640）を再出力し目視。変更点: 設定のキャッシュ場所行、接続の矢印削除、ファームのフッター内前提 3 行、ログの tool ボタン統一、コピーの括弧化。待機状態（Must 1）は 8 枚に含まれないため、一時テストで待機フレームを PNG 化し、バーが全幅で満ちていることを目視（テストは削除済み）。フォーカスも一時ヘルパで Tab 押下後のフレームを PNG 化し、レール「接続」と「書き込む」に 2pt ink の輪が出ることを目視（ヘルパは削除済み）。
 - スクリーンショットで確認した既知の残り: 1280×800 の設定はキャッシュ場所行の追加で巻末の「修正する位置」が、1024×640 では「動きの低減」と巻末が本文スクロールの下にある（フッターは固定）。行を増やした帰結で、本文スクロールで到達する。
+
+---
+
+## 2026-11-22 / PR #28 `feat-p2-compat` の Stage 2 修正
+
+- 対象: `feat-p2-compat`（base `origin/main` = `b0456df`、Stage 1 レビュー head `7474798`）。修正コードの head は `959ab2a`、本節はその次の commit。
+- Stage 1: [仕様検収](https://github.com/haruki0420/holux-m241-rs/pull/28#issuecomment-7080543382) と[可読性](https://github.com/haruki0420/holux-m241-rs/pull/28#issuecomment-7080553810)。実装者はどちらのレビューにも参加していない。
+- 実機は使っていない（3 項目ともオフライン機能）。実機未検証の挙動を検証済みにはしていない。
+- `m241-flash` / `m241-gui` は未変更（今回 CSV ヘッダを変えないため GUI の例外 1 行も不要）。
+
+### 仕様検収 Must への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| Must 1 | save は入力をそのまま、load は project 親基準で join するため往復が壊れる | `save` が相対パスを project 親基準へ正規化して保存（絶対パスは絶対のまま）。`load` は同じ基準で join。`02-cli.md` も「保存される文字列は常に project 基準」に修正 | `a_project_in_a_subdirectory_round_trips_relative_paths`, `a_relative_path_is_stored_against_the_project_directory` |
+
+### 可読性 Must への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| M1 | NMEA 全却下でも exit 0 で空 GPX | 非空キャプチャで 1 点も取れなければエラー（`Error::State`、ファイル名と件数、出力なし）。部分的な dropped は `console.warn`。空ファイルは従来どおり 0 点で成功。`02-cli.md` に明記 | `read_nmea_refuses_a_capture_that_yields_no_point`, `read_nmea_refuses_a_file_that_is_not_a_capture`, `read_nmea_converts_a_capture_and_reports_dropped_lines`（warning を追加検証） |
+| M2 | `--nmea` の件数が JSON に無い | `--format json` のオブジェクトに `"nmea": {"imported", "dropped", "ignored"}` を追加（`offset_days` と同じ規約: 事実がある時だけ） | `read_nmea_json_carries_the_line_counts`, `read_json_without_a_shift_carries_no_offset_field`（dump に `nmea` が無いことも固定） |
+| M3 | project の相対パスが save/load で非対称 | Must 1 と同じ（パス基準を 1 つにした） | 同上 |
+| M4 | project が入力種別を記録しない | `"input": "dump" \| "nmea"` を保存し、`project save --nmea` を追加。`load` はその種別で `log read` する。kmz は dump 必須（`--nmea` と排他、kmz project で nmea はエラー） | `a_project_records_the_input_kind_and_load_reads_it_back`, `a_kmz_project_cannot_read_an_nmea_capture`, `log_project_save_and_load_parse_their_documented_arguments` |
+| M5 | project のエラーがパスも version も出さない | すべての refusal が project パスを名指し、version 不一致は「見つけた version と対応 version」を表示。欠落/型違いフィールドは推測せず拒否。serialize エラーの文言も write 失敗と読ませない形に修正 | `a_project_error_names_the_file_and_the_version_it_found`, `every_required_field_is_refused_when_missing_and_the_file_is_named`, `a_project_that_is_not_one_is_refused_not_guessed`, `an_unknown_export_format_in_a_project_is_refused`, `a_kmz_project_without_a_photo_folder_is_refused_on_load` |
+
+`Error::State` のままにした理由: project 専用 variant を足すには
+`crates/m241-core/src/error.rs` の変更が要り、この PR の変更範囲外。代わりに
+メッセージがファイル・version・次の行動を含むようにした（`fileio` の
+「失敗は必ずファイルを名指す」規約に合わせる）。
+
+### 仕様検収 Should への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| Should 2 | load 挙動のテストが無い | 一覧のほぼ全てをテスト化: 未知 export_format / 読込時 kmz+写真なし / 非ゼロ offset の適用と stderr 告知 / 相対パスの project 基準解決 / save がログを開かない / 既存 project の置換 / photos null / kmz の export_format | `saving_a_project_does_not_open_the_log`, `saving_a_project_replaces_an_existing_file`, `a_project_load_applies_the_stored_day_correction_and_announces_it`, `a_kmz_project_records_the_kmz_export_format_and_photo_folder`, 上記 Must 1 / M4 / M5 の各テスト |
+| Should 3 | dropped/ignored の境界が doc と違う | 種別を checksum より先に読む実装に変更。`$GPGSA` 等は checksum 不正でも `ignored`、`$GPRMC`/`$GPGGA` だけが `dropped`。doc の記述はそのまま正しくなった | `another_sentence_kind_with_a_broken_checksum_is_ignored_not_dropped` |
+| Should 4 | `02-cli.md` の `§1.5` は存在しない | `§1, §8 item 12` に修正 | docs ゲート（節アンカーは `check_docs.py` の対象外なので目視） |
+| Should 5 | doc の JSON 例 `"log": "capture.nmea"` が load 不能 | 入力種別を実装したので例を `"input": "nmea"` として実際に読める形に更新 | `a_project_records_the_input_kind_and_load_reads_it_back` |
+| Should 6 | `utc_offset_days` 欠落を黙って 0 に | 必須フィールドとして拒否（欠落・文字列・範囲外）。doc も「nothing is guessed」と整合 | `every_required_field_is_refused_when_missing_and_the_file_is_named` |
+
+### 可読性 Should の対応（任意対応分）
+
+- S3: `import_nmea` の `# Errors` 節を復活（失敗しない理由を明記）。
+- S4: `utc_date_and_time` を追加し、`to_csv` の文字列手術を削除。`utc_iso` も同じ変換を通す。テスト `the_csv_date_and_time_agree_with_the_iso_rendering`。
+- S5: `TRACK_NUMBER` 定数と、`INDEX` の基点・消えた列（`rcr` / `fix` / `waypoint`）の理由を `to_csv` doc に明記。
+- S6: テストの CSV ヘッダ重複を `CSV_COLUMNS` 参照に縮小（project / logcmd）。`cli.rs` の parse テストは実在する入力名に修正。
+- S7: 実 ezTour 出力との突き合わせは未検証と doc に明記（「互換」と断定しない）。
+- S8: モジュール doc に 8 キー一覧と「`.itm` と相互運用しない」を追記。
+- S9: `load` から文書検証を `ProjectDocument::read` に分離、`read` から NMEA の報告を `report_nmea_import` に分離。
+- S10: project が log / output と同一パスなら `Error::Safety` で拒否。テスト `saving_a_project_over_the_files_it_names_is_refused`。
+- C2 / C3 / C6 / C7 / C8 も併せて修正（`LogProjectLoadOptions.project` の doc、Project サブコマンドの説明、project 定数の可視性、`csv_optional` の doc、`log/mod.rs` の import 行）。
+
+### 見送った指摘と理由
+
+- 可読性 S1（`dropped` を rejected / no_fix に分割）: `02-cli.md` が 3 区分を仕様として定めており、区分の追加はこの修正ラウンドの範囲を超える仕様変更。代わりに「dropped は破損と no-fix の両方を含む」ことを型 doc と全却下エラー文に明記した。
+- 可読性 S2（`NmeaImport` を `NmeaReport` + タプル戻り値へ改名）: 公開 API と既存テスト多数を書き換える変更で、指摘の本質（名前の揃え）に対してリスクが大きい。Stage 3 の判断材料として残す。
+- 可読性 S8 の kmz 成功経路テスト: 写真フォルダと実 JPEG の用意が要り、今回の Must 修正とは独立。拒否経路と `export_format` の保存はテスト済み。
+- 仕様検収 Could 9（未確定事項を `06-open-questions.md` へ登録）: 内容は `12-progress-summary.md` に既にあり、今回はコード修正に集中した。別タスクで台帳へ移す。
+
+### 却下した指摘
+
+なし。Must 6 件（仕様 1 + 可読性 5）はいずれも実装で再現でき、事実と一致した。
+
+### 変異で確認したこと
+
+いずれも変異を入れて対応テストが落ちることを確認し、そのあと元に戻した
+（`git diff` が変異前と同じ内容に戻ったことを確認済み）。
+
+- `stored_path` が入力をそのまま返す（修正前の挙動）に戻すと
+  `a_project_in_a_subdirectory_round_trips_relative_paths` が `"track.bin"` と
+  `"../track.bin"` の不一致で落ちる。
+- `report_nmea_import` の全却下ガードを無効にすると
+  `read_nmea_refuses_a_capture_that_yields_no_point` と
+  `read_nmea_refuses_a_file_that_is_not_a_capture` が落ちる。
+
+### ゲート
+
+`./tools/check.sh` 6/6（`M241_VENDOR_IMAGE` を設定した状態。実機ポートは開いていない）。
+修正コード head `959ab2a` で実行。
 
 ### Stage 3 検証
 

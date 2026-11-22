@@ -24,17 +24,20 @@ use crate::types::{ExportFormat, Track, TrackPoint};
 /// Name embedded in a GPX or KML document.
 pub const DOCUMENT_NAME: &str = "M-241 log";
 
-/// CSV header, in the order the columns are written.
-pub const CSV_COLUMNS: [&str; 9] = [
-    "index",
-    "utc",
-    "lat",
-    "lon",
-    "altitude_m",
-    "speed_kmh",
-    "rcr",
-    "fix",
-    "waypoint",
+/// CSV header in ezTour's column order (`docs/dev/07-eztour-spec.ja.md` §2).
+pub const CSV_COLUMNS: [&str; 12] = [
+    "INDEX",
+    "TRACK NUMBER",
+    "UTC DATE",
+    "UTC TIME",
+    "LOCAL DATE",
+    "LOCAL TIME",
+    "LATITUDE",
+    "N/S",
+    "LONGITUDE",
+    "E/W",
+    "ALTITUDE",
+    "SPEED",
 ];
 
 /// Render `track` in `format`.
@@ -146,40 +149,73 @@ pub fn to_kml(track: &Track) -> String {
     out
 }
 
+/// `TRACK NUMBER` for every CSV row.
+///
+/// ezTour numbers tracks; a [`Track`] is exactly one track, so the column is a
+/// constant rather than a per-point value.
+const TRACK_NUMBER: &str = "1";
+
 /// Render `track` as CSV with the [`CSV_COLUMNS`] header.
+///
+/// The columns and order follow the ezTour layout recorded in
+/// `docs/dev/07-eztour-spec.ja.md` §2; that specification is the source, and a
+/// byte-for-byte comparison with an ezTour export is 未検証.
+///
+/// `INDEX` is the zero-based index of the point in the track. `LOCAL DATE` and
+/// `LOCAL TIME` stay empty because the time-zone basis ezTour used is
+/// unrecorded. The dump's `rcr` / `fix` / `waypoint` fields have no column in
+/// ezTour's layout: `rcr` and `waypoint` are in the JSON export, and `fix` is
+/// the presence of a coordinate ([`TrackPoint::has_position`]).
 #[must_use]
 pub fn to_csv(track: &Track) -> String {
     let mut out = String::new();
     out.push_str(&CSV_COLUMNS.join(","));
     out.push('\n');
     for (index, point) in track.points.iter().enumerate() {
+        let (utc_date, utc_time) = point
+            .utc
+            .map_or_else(|| (String::new(), String::new()), utc_date_and_time);
+        let (latitude, north_south) = csv_coordinate(point.latitude, 'N', 'S');
+        let (longitude, east_west) = csv_coordinate(point.longitude, 'E', 'W');
         let fields = [
             index.to_string(),
-            point.utc.map(utc_iso).unwrap_or_default(),
-            point
-                .latitude
-                .map(|v| format!("{v:.8}"))
-                .unwrap_or_default(),
-            point
-                .longitude
-                .map(|v| format!("{v:.8}"))
-                .unwrap_or_default(),
-            point
-                .height_m
-                .map(|v| format!("{v:.2}"))
-                .unwrap_or_default(),
-            point
-                .speed_kmh
-                .map(|v| format!("{v:.3}"))
-                .unwrap_or_default(),
-            point.rcr.map(|v| format!("0x{v:04X}")).unwrap_or_default(),
-            if point.has_position() { "1" } else { "0" }.to_owned(),
-            if point.is_waypoint() { "1" } else { "0" }.to_owned(),
+            String::from(TRACK_NUMBER),
+            utc_date,
+            utc_time,
+            String::new(),
+            String::new(),
+            latitude,
+            north_south,
+            longitude,
+            east_west,
+            csv_optional(point.height_m, 2),
+            csv_optional(point.speed_kmh, 3),
         ];
         out.push_str(&fields.join(","));
         out.push('\n');
     }
     out
+}
+
+/// `(unsigned decimal degrees, hemisphere letter)`: the sign is its own column.
+fn csv_coordinate(value: Option<f64>, positive: char, negative: char) -> (String, String) {
+    let Some(value) = value.filter(|value| value.is_finite()) else {
+        return (String::new(), String::new());
+    };
+    let letter = if value.is_sign_negative() {
+        negative
+    } else {
+        positive
+    };
+    (format!("{:.8}", value.abs()), letter.to_string())
+}
+
+/// An optional numeric column: empty when absent.
+///
+/// `digits` is the per-column precision (`ALTITUDE` 2, `SPEED` 3) rather than a
+/// constant because the two columns carry different units.
+fn csv_optional(value: Option<f32>, digits: usize) -> String {
+    value.map_or_else(String::new, |value| format!("{value:.digits$}"))
 }
 
 /// Render `track` as reconstructed `$GPRMC` sentences.
@@ -328,6 +364,27 @@ pub(crate) fn escape_xml(text: &str) -> String {
     out
 }
 
+/// `(YYYY-MM-DD, HH:MM:SS)` for a Unix timestamp, in UTC.
+///
+/// The two halves the CSV columns need. [`utc_iso`] renders the same instant
+/// with a `T` and a trailing `Z`, and both go through this conversion, so the
+/// date surgery in the CSV writer cannot drift from the ISO form.
+#[must_use]
+pub fn utc_date_and_time(seconds: u32) -> (String, String) {
+    let days = i64::from(seconds / 86_400);
+    let time = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    (
+        format!("{year:04}-{month:02}-{day:02}"),
+        format!(
+            "{:02}:{:02}:{:02}",
+            time / 3_600,
+            (time % 3_600) / 60,
+            time % 60
+        ),
+    )
+}
+
 /// `1970-01-01T00:00:00Z` for a Unix timestamp.
 ///
 /// The crate has no date library (and does not want one for five format
@@ -337,15 +394,8 @@ pub(crate) fn escape_xml(text: &str) -> String {
 /// arithmetic cannot overflow.
 #[must_use]
 pub fn utc_iso(seconds: u32) -> String {
-    let days = i64::from(seconds / 86_400);
-    let time = seconds % 86_400;
-    let (year, month, day) = civil_from_days(days);
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        time / 3_600,
-        (time % 3_600) / 60,
-        time % 60
-    )
+    let (date, time) = utc_date_and_time(seconds);
+    format!("{date}T{time}Z")
 }
 
 /// `(day, month, year)` a Unix timestamp falls on, in UTC.
@@ -441,6 +491,26 @@ mod tests {
 
     #[test]
     fn a_csv_row_has_the_documented_columns() {
+        // The header is the contract: a spreadsheet written against ezTour
+        // looks these columns up by name and position.
+        assert_eq!(
+            CSV_COLUMNS,
+            [
+                "INDEX",
+                "TRACK NUMBER",
+                "UTC DATE",
+                "UTC TIME",
+                "LOCAL DATE",
+                "LOCAL TIME",
+                "LATITUDE",
+                "N/S",
+                "LONGITUDE",
+                "E/W",
+                "ALTITUDE",
+                "SPEED",
+            ],
+            "the CSV column list and order are ezTour's"
+        );
         let csv = to_csv(&one_point_track());
         let header = csv.lines().next().expect("a header line");
         assert_eq!(header, CSV_COLUMNS.join(","));
@@ -448,9 +518,53 @@ mod tests {
         let fields: Vec<&str> = row.split(',').collect();
         assert_eq!(fields.len(), CSV_COLUMNS.len());
         assert_eq!(fields[0], "0");
-        assert_eq!(fields[1], "2023-11-14T22:13:20Z");
-        assert_eq!(fields[7], "1", "the point has a position");
-        assert_eq!(fields[8], "0", "it is not a waypoint");
+        assert_eq!(fields[1], "1");
+        assert_eq!(fields[2], "2023-11-14");
+        assert_eq!(fields[3], "22:13:20");
+        assert_eq!(
+            (fields[4], fields[5]),
+            ("", ""),
+            "a local time with no zone basis is left empty, not guessed"
+        );
+        assert_eq!(fields[6], "35.68123600");
+        assert_eq!(fields[7], "N");
+        assert_eq!(fields[8], "139.76712500");
+        assert_eq!(fields[9], "E");
+        assert_eq!(fields[10], "80.00");
+        assert_eq!(fields[11], "42.500");
+    }
+
+    #[test]
+    fn a_csv_coordinate_carries_its_sign_as_a_hemisphere_column() {
+        // The number is unsigned because N/S and E/W say the sign; `-35.5`
+        // would otherwise appear as a negative latitude with an S beside it.
+        let track = Track {
+            points: vec![TrackPoint {
+                utc: None,
+                latitude: Some(-35.5),
+                longitude: Some(-70.25),
+                ..TrackPoint::default()
+            }],
+            damaged_blocks: Vec::new(),
+        };
+        let csv = to_csv(&track);
+        let row = csv.lines().nth(1).expect("one row");
+        let fields: Vec<&str> = row.split(',').collect();
+        assert_eq!(fields[6], "35.50000000");
+        assert_eq!(fields[7], "S");
+        assert_eq!(fields[8], "70.25000000");
+        assert_eq!(fields[9], "W");
+        assert_eq!(
+            (fields[4], fields[5]),
+            ("", ""),
+            "a local time with no zone basis is left empty"
+        );
+        assert_eq!(
+            (fields[2], fields[3]),
+            ("", ""),
+            "no time is an empty UTC pair"
+        );
+        assert_eq!((fields[10], fields[11]), ("", ""), "no height or speed");
     }
 
     #[test]
@@ -562,6 +676,15 @@ mod tests {
         assert_eq!(utc_iso(315_964_800), "1980-01-06T00:00:00Z");
         assert_eq!(utc_iso(935_280_000), "1999-08-22T00:00:00Z");
         assert_eq!(utc_iso(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn the_csv_date_and_time_agree_with_the_iso_rendering() {
+        let seconds = 1_700_000_000;
+        let (date, time) = utc_date_and_time(seconds);
+        assert_eq!(date, "2023-11-14");
+        assert_eq!(time, "22:13:20");
+        assert_eq!(format!("{date}T{time}Z"), utc_iso(seconds));
     }
 
     #[test]

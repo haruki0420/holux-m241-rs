@@ -279,8 +279,11 @@ nothing on this page makes the final head verified.
 | The OLED after flashing | never observed; the display was not photographed |
 | The binary log's timestamps after flashing | inferred from the shared NMEA conversion path; no post-flash log was downloaded |
 | The NMEA date from a live GPS fix after patching | 2026-11-22 (§1.5) showed the patched default date `22-08-99` (epoch `935280000`) with no fix; no fix was available indoors, so a GPS-derived date after patching has not been observed |
+| `m241 device doctor` against a unit | the command and its tests exist, but no hardware session in §1 ran the port probe, the drop scan or the DA extraction on a unit |
+| `m241 log geotag` on a real camera JPEG | only synthetic JPEGs are written by the tests; no file from a real camera has been geotagged, and a real camera's IFD0 layout has not been read |
+| `m241 nmea proxy` on a live stream | `nmea repair` is an offline transform covered by unit tests; relaying a live NMEA stream over stdout or TCP has never been run against a unit |
 | Linux BootROM / firmware dump & flash with a real logger | ✅ measured 2026-11-22 (§1.5): `fw dump`, `fw probe-da`, three `fw flash` runs and their read-backs all ran on Linux over `/dev/ttyUSB0` |
-| macOS with a real logger | same |
+| macOS with a real logger | ⚠️ never measured: every hardware session in §1 and §1a was Linux over USB; no macOS host was used and the binary was never launched on a Mac |
 | Bluetooth SPP | all hardware work went over USB |
 | 4 MiB units and GR-245 variants | geometry maths is implemented and unit-tested; no device was available |
 | V1.11 and V1.12 on hardware | no V1.11 image to profile. The V1.12 release was measured as **refused before opening a port** on 2026-11-22 (§1.5), so it was never flashed by this client |

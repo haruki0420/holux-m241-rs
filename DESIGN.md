@@ -445,8 +445,8 @@ approximation from a mistake.
   a satellite count because `TrackPoint` carries none — the log record has no
   such field. The record count is printed without a thousands separator
   (`10399`), not as §5's `10,399`.
-- The Connect screen's next-step rows keep the figure's `→` marks; the rows are a
-  reading order, not links, and the arrow marks where the list continues.
+- The Connect screen's next-step rows carry no `→` (the figure in §5 draws one;
+  see below).
 - Settings' cache location is `—（未使用）`. No tile fetcher is linked, so there
   is no cache directory to name; the row states that rather than printing a path
   nothing writes to.
