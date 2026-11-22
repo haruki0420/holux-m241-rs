@@ -568,6 +568,19 @@ fn find_exif_app1(jpeg: &[u8]) -> Result<Option<App1Location>> {
     }
 }
 
+/// The TIFF block of the first Exif APP1 segment, or `None`.
+///
+/// [`find_exif_app1`] is the strict walk the writers need: it reports where the
+/// segment is and treats a malformed chain as an error. A read-only caller that
+/// only wants a tag reads the same chain but treats "cannot walk" as "no Exif",
+/// so this wrapper flattens both "no Exif APP1" and "malformed JPEG" to `None`.
+/// It exists so the segment walk has one implementation: a second copy is how
+/// the two reads drift apart on a segment type only one of them handles.
+pub(crate) fn exif_tiff_block(jpeg: &[u8]) -> Option<&[u8]> {
+    let location = find_exif_app1(jpeg).ok()??;
+    tiff_block(jpeg, location).ok()
+}
+
 // ---------------------------------------------------------------------------
 // TIFF / IFD reader
 // ---------------------------------------------------------------------------

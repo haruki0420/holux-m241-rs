@@ -35,7 +35,31 @@
 //! naming the photo and the decoder's reason: the bytes it holds are not a JPEG
 //! this build can read, and embedding them at full size would ignore the limit
 //! the caller asked for.
+//!
+//! # `icon/` thumbnails
+//!
+//! `07-eztour-spec.ja.md` §6.3 says a KMZ carries the photos under `photo/` and
+//! their thumbnails under `icon/` (or as reduced copies). It does not record how
+//! large a thumbnail is, whether the "Photo size in KMZ" limit
+//! (`kmzMaxPhotoEdgeSize`) bounds the `photo/` entry or the `icon/` one, what
+//! the thumbnails are named, or how the KML refers to them. Those points are
+//! **unconfirmed**, so this module does not guess at them:
+//!
+//! * [`export_kmz`] keeps the behaviour that predates the thumbnails and writes
+//!   no `icon/` entries;
+//! * [`export_kmz_with_icons`] writes one `icon/<name>` per photo, using the
+//!   same sanitised, de-duplicated name as the `photo/` entry, and takes the
+//!   thumbnail's long-edge limit from [`KmzIconOptions`] — a size the caller
+//!   chose is a decision, where a size invented here would be a guess;
+//! * a thumbnail is produced by the same reduction path as the photo entry:
+//!   over the limit it is decoded, scaled with the aspect ratio kept and
+//!   re-encoded as JPEG; at or under the limit, or when its frame header cannot
+//!   be read, its bytes are stored unchanged;
+//! * `doc.kml` is unchanged. It still shows the `photo/` copy in the balloon,
+//!   and no `<IconStyle>` is invented for a thumbnail the spec does not say is a
+//!   marker.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::io::Cursor;
@@ -112,6 +136,12 @@ pub struct KmzPhoto {
     /// A photo over the limit is decoded, scaled down to it and re-encoded;
     /// one at or under it keeps its exact bytes. See the module doc for what a
     /// re-encode costs.
+    ///
+    /// `Some(0)` is the pre-existing "no limit" value: a zero-pixel reduction is
+    /// meaningless, so the reduction filter treats it as "leave the bytes
+    /// alone". That is the opposite of [`KmzIconOptions::max_edge_pixels`], where
+    /// zero is refused because a caller asking for an `icon/` entry with a zero
+    /// limit has made a mistake, not asked for the original bytes.
     pub max_edge_pixels: Option<u32>,
     /// Raw JPEG bytes to store in the archive.
     pub jpeg_bytes: Vec<u8>,
@@ -140,11 +170,26 @@ impl KmzPhoto {
     }
 }
 
+/// How [`export_kmz_with_icons`] writes the `icon/` thumbnails.
+///
+/// `07-eztour-spec.ja.md` §6.3 names one size knob, `kmzMaxPhotoEdgeSize`, and
+/// does not say whether it bounds the `photo/` entry, the `icon/` entry or both,
+/// so the thumbnail size is a value the caller supplies rather than one this
+/// module invents. See the module doc's "`icon/` thumbnails" section for the
+/// remaining unconfirmed points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KmzIconOptions {
+    /// Largest long edge of an `icon/` thumbnail, in pixels. Must be at least
+    /// one; zero is refused because a thumbnail of no pixels is not a thumbnail.
+    pub max_edge_pixels: u32,
+}
+
 /// Bundle `track` and `photos` into an uncompressed (Store) KMZ archive.
 ///
 /// The resulting ZIP contains `doc.kml` (KML 2.0 with styled `<LineString>` and
 /// a `<Folder><name>Photos</name>` of photo `<Placemark>` entries) and each
-/// photo under `photo/<sanitised_name>`.
+/// photo under `photo/<sanitised_name>`. No `icon/` entry is written; use
+/// [`export_kmz_with_icons`] when thumbnails are wanted (see the module doc).
 ///
 /// A photo with no altitude is written with altitude `0`, because KML's
 /// `<coordinates>` has no "unknown" value and a two-value pair would clamp to
@@ -158,36 +203,149 @@ impl KmzPhoto {
 /// bytes cannot be decoded as a JPEG (see the module doc), and [`Error::Log`]
 /// if the archive exceeds ZIP32 limits.
 pub fn export_kmz(track: &Track, photos: &[KmzPhoto]) -> Result<Vec<u8>> {
+    export_kmz_inner(track, photos, None)
+}
+
+/// Bundle `track` and `photos` into an uncompressed (Store) KMZ archive with an
+/// `icon/` thumbnail beside each photo.
+///
+/// The archive is the one [`export_kmz`] writes plus one
+/// `icon/<sanitised_name>` entry per photo, named exactly like its `photo/`
+/// entry (so `photo/holiday.jpg` is paired with `icon/holiday.jpg`). The
+/// thumbnail's long edge is [`KmzIconOptions::max_edge_pixels`]; a photo already
+/// within that limit, or one whose frame header cannot be read, contributes its
+/// own bytes, so a KMZ of small photos does not grow beyond the duplicated
+/// bytes.
+///
+/// The `photo/` entry keeps the behaviour [`export_kmz`] documents, including
+/// [`KmzPhoto::max_edge_pixels`]; the two limits are independent.
+///
+/// # Errors
+///
+/// The same errors as [`export_kmz`], with one addition: a thumbnail over the
+/// icon limit that cannot be decoded is an [`Error::State`] naming the photo and
+/// the icon limit, because storing the full-size bytes would be a silent
+/// duplication of the `photo/` entry rather than a thumbnail. An icon limit of
+/// zero is also an [`Error::State`].
+pub fn export_kmz_with_icons(
+    track: &Track,
+    photos: &[KmzPhoto],
+    icons: &KmzIconOptions,
+) -> Result<Vec<u8>> {
+    if icons.max_edge_pixels == 0 {
+        return Err(Error::State(String::from(
+            "the icon/ thumbnail long edge must be at least one pixel",
+        )));
+    }
+    export_kmz_inner(track, photos, Some(icons.max_edge_pixels))
+}
+
+fn export_kmz_inner(
+    track: &Track,
+    photos: &[KmzPhoto],
+    icon_max_edge: Option<u32>,
+) -> Result<Vec<u8>> {
+    let resolved = resolve_photo_names(photos)?;
+    let kml = build_kml(track, &resolved);
+    let kml_utc = track.time_span().map(|(_, end)| end);
+
+    let photo_entries = photo_entry_bytes(&resolved)?;
+    let icon_entries = icon_thumbnail_bytes(&resolved, icon_max_edge)?;
+    zip_entries(&resolved, &photo_entries, &icon_entries, &kml, kml_utc)
+}
+
+/// The archive names for `photos`: validated, sanitised and de-duplicated once.
+///
+/// One pass decides the name, so the `photo/` and `icon/` entries cannot
+/// disagree about which sanitised, de-duplicated name a photo got.
+fn resolve_photo_names(photos: &[KmzPhoto]) -> Result<Vec<(String, &KmzPhoto)>> {
     let mut used_names = HashSet::with_capacity(photos.len());
     let mut resolved: Vec<(String, &KmzPhoto)> = Vec::with_capacity(photos.len());
-
     for photo in photos {
         validate_photo(photo)?;
         let sanitised = sanitize_photo_name(&photo.name);
         let unique = deduplicate_name(&sanitised, &mut used_names);
         resolved.push((unique, photo));
     }
+    Ok(resolved)
+}
 
-    let kml = build_kml(track, &resolved);
-    let kml_utc = track.time_span().map(|(_, end)| end);
-
-    // Reduced bytes live here, not beside the photo, so the entries can borrow
-    // either the caller's slice or this buffer for the life of the write.
-    let mut reduced: Vec<Option<Vec<u8>>> = Vec::with_capacity(resolved.len());
-    for (_, photo) in &resolved {
-        reduced.push(reduce_to_edge_limit(photo)?);
+/// The bytes each `photo/` entry stores, in `resolved` order.
+///
+/// Resolving the "no reduction needed" case to the caller's own bytes here
+/// removes the second meaning `Option<Vec<u8>>` used to carry: a `Cow` says
+/// which bytes are stored, not what a `None` is supposed to mean.
+fn photo_entry_bytes<'a>(resolved: &[(String, &'a KmzPhoto)]) -> Result<Vec<Cow<'a, [u8]>>> {
+    let mut entries = Vec::with_capacity(resolved.len());
+    for (_, photo) in resolved {
+        entries.push(match reduce_to_edge_limit(photo)? {
+            Some(reduced) => Cow::Owned(reduced),
+            None => Cow::Borrowed(photo.jpeg_bytes.as_slice()),
+        });
     }
+    Ok(entries)
+}
 
-    let mut entries: Vec<ZipInput<'_>> = Vec::with_capacity(1 + resolved.len());
+/// The bytes each `icon/` entry stores, in `resolved` order.
+///
+/// Empty when no thumbnail was asked for. A thumbnail is its own reduction, not
+/// a copy of the photo entry: the two limits are independent, so an archive may
+/// keep an original under `photo/` and a reduced copy under `icon/`.
+fn icon_thumbnail_bytes<'a>(
+    resolved: &[(String, &'a KmzPhoto)],
+    icon_max_edge: Option<u32>,
+) -> Result<Vec<Cow<'a, [u8]>>> {
+    let Some(max_edge) = icon_max_edge else {
+        return Ok(Vec::new());
+    };
+    let mut thumbnails = Vec::with_capacity(resolved.len());
+    for (_, photo) in resolved {
+        let label = format!("the icon/ thumbnail of photo {:?}", photo.name);
+        thumbnails.push(
+            match reduce_bytes_to_edge_limit(&label, &photo.jpeg_bytes, Some(max_edge))? {
+                Some(reduced) => Cow::Owned(reduced),
+                None => Cow::Borrowed(photo.jpeg_bytes.as_slice()),
+            },
+        );
+    }
+    Ok(thumbnails)
+}
+
+/// Assemble the archive: `doc.kml`, then every `photo/` entry, then every
+/// `icon/` entry.
+///
+/// The three slices are built from the same `resolved` list and the length
+/// checks below keep a later edit from pairing one photo's name with another
+/// photo's bytes — `zip` would otherwise truncate silently.
+fn zip_entries<'a>(
+    resolved: &[(String, &'a KmzPhoto)],
+    photos: &[Cow<'a, [u8]>],
+    icons: &[Cow<'a, [u8]>],
+    kml: &str,
+    kml_utc: Option<u32>,
+) -> Result<Vec<u8>> {
+    debug_assert_eq!(photos.len(), resolved.len());
+    debug_assert!(icons.is_empty() || icons.len() == resolved.len());
+    // `doc.kml`, plus one `photo/` entry and (when asked for) one `icon/` entry
+    // per photo: the capacity is exactly what the loops below push.
+    let entries_per_photo = 1 + usize::from(!icons.is_empty());
+    let mut entries: Vec<ZipInput<'_>> = Vec::with_capacity(1 + resolved.len() * entries_per_photo);
     entries.push(ZipInput {
         path: String::from("doc.kml"),
         data: kml.as_bytes(),
         utc: kml_utc,
     });
-    for ((name, photo), reduced_bytes) in resolved.iter().zip(&reduced) {
+    for ((name, photo), bytes) in resolved.iter().zip(photos) {
         entries.push(ZipInput {
             path: format!("photo/{name}"),
-            data: reduced_bytes.as_deref().unwrap_or(&photo.jpeg_bytes),
+            data: bytes.as_ref(),
+            utc: photo.zip_utc(),
+        });
+    }
+    for ((name, photo), bytes) in resolved.iter().zip(icons) {
+        entries.push(ZipInput {
+            path: format!("icon/{name}"),
+            data: bytes.as_ref(),
             utc: photo.zip_utc(),
         });
     }
@@ -223,10 +381,27 @@ fn validate_photo(photo: &KmzPhoto) -> Result<()> {
 /// `Ok(None)` means "store [`KmzPhoto::jpeg_bytes`] unchanged". The size is read
 /// from the frame header first, so a photo within the limit is never decoded.
 fn reduce_to_edge_limit(photo: &KmzPhoto) -> Result<Option<Vec<u8>>> {
-    let Some(max_edge) = photo.max_edge_pixels.filter(|limit| *limit > 0) else {
+    let label = format!("photo {:?}", photo.name);
+    reduce_bytes_to_edge_limit(&label, &photo.jpeg_bytes, photo.max_edge_pixels)
+}
+
+/// [`reduce_to_edge_limit`] over raw bytes, shared with the `icon/` thumbnails.
+///
+/// `label` names what is being reduced in an error message: `photo "a.jpg"` for
+/// a `photo/` entry, `the icon/ thumbnail of photo "a.jpg"` for an `icon/` one.
+/// An `icon/` thumbnail is the same reduction under another limit, so the two
+/// callers must not carry two copies of it.
+fn reduce_bytes_to_edge_limit(
+    label: &str,
+    bytes: &[u8],
+    max_edge: Option<u32>,
+) -> Result<Option<Vec<u8>>> {
+    // `Some(0)` means "no limit" here, the pre-existing behaviour of
+    // `KmzPhoto::max_edge_pixels`; `KmzIconOptions` refuses zero at its own
+    // entry point instead. Both readings are documented on the fields.
+    let Some(max_edge) = max_edge.filter(|limit| *limit > 0) else {
         return Ok(None);
     };
-    let bytes = photo.jpeg_bytes.as_slice();
     // A byte stream with no frame header cannot be measured; it is stored as it
     // is, as before the reduction existed. Every decodable JPEG carries a SOF.
     let Some((width, height)) = jpeg_dimensions(bytes) else {
@@ -240,10 +415,9 @@ fn reduce_to_edge_limit(photo: &KmzPhoto) -> Result<Option<Vec<u8>>> {
     let decoded =
         image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg).map_err(|err| {
             Error::State(format!(
-                "photo {:?} is {width} pixels wide and {height} high, and its long edge \
+                "{label} is {width} pixels wide and {height} high, and its long edge \
                  {long_edge} exceeds the {max_edge} pixel limit, but it could not be decoded \
-                 to be reduced: {err}",
-                photo.name
+                 to be reduced: {err}"
             ))
         })?;
 
@@ -265,12 +439,9 @@ fn reduce_to_edge_limit(photo: &KmzPhoto) -> Result<Option<Vec<u8>>> {
         Cursor::new(&mut out),
         RESIZE_JPEG_QUALITY,
     );
-    encoder.encode_image(&resized).map_err(|err| {
-        Error::State(format!(
-            "photo {:?} could not be re-encoded: {err}",
-            photo.name
-        ))
-    })?;
+    encoder
+        .encode_image(&resized)
+        .map_err(|err| Error::State(format!("{label} could not be re-encoded: {err}")))?;
     Ok(Some(out))
 }
 
@@ -1061,6 +1232,238 @@ mod tests {
         let reduced = entries.get(2).expect("the second photo entry").data.clone();
         assert_ne!(reduced, large_bytes);
         assert_eq!(decoded_dimensions(&reduced), (150, 75));
+    }
+
+    /// The archive entry names, in the order the writer emitted them.
+    fn entry_names(kmz: &[u8]) -> Vec<String> {
+        parse_zip_and_verify(kmz)
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect()
+    }
+
+    #[test]
+    fn asking_for_icons_writes_one_icon_entry_for_each_photo() {
+        // Spec §6.3: photos under `photo/`, thumbnails under `icon/`. The spec
+        // does not say how the KML refers to a thumbnail, so the balloon keeps
+        // pointing at `photo/` and no `<IconStyle>` is invented.
+        let mut small = photo("small.jpg");
+        small.jpeg_bytes = synthetic_jpeg(120, 60);
+        let mut large = photo("large.jpg");
+        large.jpeg_bytes = synthetic_jpeg(200, 100);
+
+        let kmz = export_kmz_with_icons(
+            &sample_track(),
+            &[small, large],
+            &KmzIconOptions {
+                max_edge_pixels: 64,
+            },
+        )
+        .expect("export kmz with icons");
+        let entries = parse_zip_and_verify(&kmz);
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "doc.kml",
+                "photo/small.jpg",
+                "photo/large.jpg",
+                "icon/small.jpg",
+                "icon/large.jpg",
+            ],
+            "the icons follow the photos and pair with them by name"
+        );
+
+        let kml = std::str::from_utf8(&entries[0].data).expect("UTF-8 KML");
+        assert!(kml.contains("<img src=\"photo/small.jpg\"/>"));
+        assert!(
+            !kml.contains("icon/"),
+            "the spec does not say the KML references icon/, so it must not: {kml}"
+        );
+    }
+
+    #[test]
+    fn export_kmz_still_writes_no_icon_entries() {
+        // Regression: adding the thumbnail path must not change the archive a
+        // caller of the pre-existing function gets.
+        let kmz = export_kmz(&sample_track(), &[photo("only.jpg")]).expect("export kmz");
+        assert_eq!(entry_names(&kmz), vec!["doc.kml", "photo/only.jpg"]);
+    }
+
+    #[test]
+    fn an_icon_thumbnail_is_reduced_to_the_icon_long_edge_not_the_photo_limit() {
+        // The two limits are independent: the photo entry is reduced to its own
+        // limit and the icon to the icon limit, from the same original bytes.
+        let original = synthetic_jpeg(200, 100);
+        let mut big = photo("big.jpg");
+        big.jpeg_bytes = original.clone();
+        big.max_edge_pixels = Some(100);
+
+        let kmz = export_kmz_with_icons(
+            &sample_track(),
+            &[big],
+            &KmzIconOptions {
+                max_edge_pixels: 50,
+            },
+        )
+        .expect("export kmz with icons");
+        let entries = parse_zip_and_verify(&kmz);
+        let photo_bytes = entries.get(1).expect("the photo entry").data.clone();
+        let icon_bytes = entries.get(2).expect("the icon entry").data.clone();
+        assert_eq!(jpeg_dimensions(&photo_bytes), Some((100, 50)));
+        assert_eq!(jpeg_dimensions(&icon_bytes), Some((50, 25)));
+        assert_eq!(decoded_dimensions(&icon_bytes), (50, 25));
+        assert_ne!(
+            icon_bytes, photo_bytes,
+            "the icon is its own reduction, not a copy of the photo entry"
+        );
+    }
+
+    #[test]
+    fn a_photo_within_the_icon_limit_keeps_its_bytes_in_both_directories() {
+        // The limit is a maximum, exactly as for the photo entry: re-encoding a
+        // photo already small enough would drop its EXIF for no gain.
+        let original = synthetic_jpeg(100, 50);
+        let mut fits = photo("fits.jpg");
+        fits.jpeg_bytes = original.clone();
+
+        let kmz = export_kmz_with_icons(
+            &sample_track(),
+            &[fits],
+            &KmzIconOptions {
+                max_edge_pixels: 100,
+            },
+        )
+        .expect("export kmz with icons");
+        let entries = parse_zip_and_verify(&kmz);
+        assert_eq!(
+            entries.get(1).map(|entry| entry.data.clone()),
+            Some(original.clone()),
+            "the photo entry keeps its bytes"
+        );
+        assert_eq!(
+            entries.get(2).map(|entry| entry.data.clone()),
+            Some(original),
+            "a photo exactly at the icon limit keeps its exact bytes"
+        );
+    }
+
+    #[test]
+    fn a_portrait_photo_icon_is_reduced_through_its_height() {
+        // 50x100 with a 40-pixel icon limit becomes 20x40: measuring only the
+        // width would leave the thumbnail over the limit.
+        let mut portrait = photo("portrait.jpg");
+        portrait.jpeg_bytes = synthetic_jpeg(50, 100);
+        let kmz = export_kmz_with_icons(
+            &sample_track(),
+            &[portrait],
+            &KmzIconOptions {
+                max_edge_pixels: 40,
+            },
+        )
+        .expect("export kmz with icons");
+        let entries = parse_zip_and_verify(&kmz);
+        let icon_bytes = entries.get(2).expect("the icon entry").data.clone();
+        assert_eq!(jpeg_dimensions(&icon_bytes), Some((20, 40)));
+        assert_eq!(decoded_dimensions(&icon_bytes), (20, 40));
+    }
+
+    #[test]
+    fn icon_entries_use_the_same_deduplicated_name_as_their_photo_entries() {
+        // Two photos with one name must stay paired: the sanitiser and the
+        // de-duplicator run once and both directories use the result.
+        let photos = [photo("same.jpg"), photo("same.jpg")];
+        let kmz = export_kmz_with_icons(
+            &sample_track(),
+            &photos,
+            &KmzIconOptions {
+                max_edge_pixels: 32,
+            },
+        )
+        .expect("export kmz with icons");
+        assert_eq!(
+            entry_names(&kmz),
+            vec![
+                "doc.kml",
+                "photo/same.jpg",
+                "photo/same_1.jpg",
+                "icon/same.jpg",
+                "icon/same_1.jpg",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_undecodable_icon_thumbnail_is_reported_rather_than_copied() {
+        // A SOF0 header that claims 4000x3000 but has no scan data. Storing the
+        // full-size bytes as the thumbnail would silently ignore the requested
+        // limit, so it is an error that names the photo and the icon limit.
+        let mut broken = photo("broken.jpg");
+        broken.jpeg_bytes = jpeg_with_size(4000, 3000);
+        let err = export_kmz_with_icons(
+            &sample_track(),
+            &[broken],
+            &KmzIconOptions {
+                max_edge_pixels: 256,
+            },
+        )
+        .expect_err("an undecodable thumbnail must fail");
+        let message = err.to_string();
+        assert!(
+            message.contains("broken.jpg") && message.contains("256"),
+            "the error must name the photo and the icon limit: {message}"
+        );
+        assert!(
+            message.contains("icon/") && message.contains("could not be decoded"),
+            "the error must say which copy failed and why: {message}"
+        );
+        assert!(matches!(err, Error::State(_)));
+    }
+
+    #[test]
+    fn a_photo_with_no_readable_frame_header_keeps_its_bytes_under_icon() {
+        // The module doc promises that a thumbnail whose frame header cannot be
+        // read is stored unchanged; `photo()`'s bytes are a truncated JPEG with
+        // no SOF at all, so both directories must keep the exact bytes.
+        let original = photo("unknown.jpg").jpeg_bytes;
+        assert!(
+            jpeg_dimensions(&original).is_none(),
+            "the fixture must have no frame header for this test to mean anything"
+        );
+        let kmz = export_kmz_with_icons(
+            &sample_track(),
+            &[photo("unknown.jpg")],
+            &KmzIconOptions {
+                max_edge_pixels: 32,
+            },
+        )
+        .expect("export kmz with icons");
+        let entries = parse_zip_and_verify(&kmz);
+        assert_eq!(
+            entries.get(1).map(|entry| entry.data.as_slice()),
+            Some(original.as_slice()),
+            "the photo entry keeps the unmeasurable bytes"
+        );
+        assert_eq!(
+            entries.get(2).map(|entry| entry.data.as_slice()),
+            Some(original.as_slice()),
+            "the icon entry keeps the unmeasurable bytes too"
+        );
+    }
+
+    #[test]
+    fn an_icon_limit_of_zero_pixels_is_refused() {
+        let err = export_kmz_with_icons(
+            &sample_track(),
+            &[photo("zero.jpg")],
+            &KmzIconOptions { max_edge_pixels: 0 },
+        )
+        .expect_err("zero pixels is not a thumbnail");
+        assert!(matches!(err, Error::State(_)));
+        assert!(
+            err.to_string().contains("at least one pixel"),
+            "the error must say what a usable limit is: {err}"
+        );
     }
 
     /// A colour-ramp JPEG with a two-pixel checker, smooth in both directions.

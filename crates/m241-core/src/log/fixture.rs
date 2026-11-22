@@ -49,10 +49,19 @@ impl Entry {
     pub(crate) fn ascii(tag: u16, text: &str) -> Self {
         let mut payload = text.as_bytes().to_vec();
         payload.push(0);
+        Self::ascii_bytes(tag, &payload)
+    }
+
+    /// An ASCII value from the exact bytes to store, including any terminator.
+    ///
+    /// [`Self::ascii`] cannot express a value that is not valid UTF-8, or one
+    /// whose padding is not a single trailing NUL; both are real cases for a
+    /// camera's `Make` / `Model`, so the tests need to build them.
+    pub(crate) fn ascii_bytes(tag: u16, payload: &[u8]) -> Self {
         Self {
             tag,
             field_type: TYPE_ASCII,
-            payload,
+            payload: payload.to_vec(),
         }
     }
 

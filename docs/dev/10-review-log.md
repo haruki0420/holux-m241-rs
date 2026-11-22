@@ -795,3 +795,78 @@ Stage 1 の 2 レビュアーは `./tools/check.sh` を実行していない（�
 `./tools/check.sh` 6/6（`M241_VENDOR_IMAGE` を設定した状態。実機ポートは開かず、
 `m241-core` / `m241-flash` / `m241-gui` / `Cargo.*` / `tools/` は未変更）。
 
+
+---
+
+## 2026-11-22 / PR #21 `feat-log-edit` の Stage 2 修正
+
+対象: Stage 1 head `660d9a4`（base `origin/main` = `3202c34`）。Stage 1 は仕様検収
+（[仕様レビュー](https://github.com/haruki0420/holux-m241-rs/pull/21#issuecomment-7078597563)）と
+可読性（[可読性レビュー](https://github.com/haruki0420/holux-m241-rs/pull/21#issuecomment-7078619948)）を
+別々のレビュアーが並行実施した。Stage 2 は別エージェントが担当し、Stage 3 で検証する。
+Stage 2 の差分は本節と同じコミットで、範囲は `crates/m241-core/src/log/` と `docs/` のみ
+（`m241-cli` は別 PR が担当するため触っていない）。
+
+### Stage 1 の Must への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| 可読性 M1 | モジュール doc の "PhotoTimeShift is the first / PhotoShiftScope the second" が直前の 3 スコープ列挙に係り、`PhotoTimeShift = allPhotos` / `PhotoShiftScope = selPhotos` と誤読させる | 2 入力を名詞で書き分けた。「シフトの大きさ（日/時/分/秒）」と「適用範囲（3 スコープ）」が別の入力であることを明示し、`byCamera` を含む 3 スコープが後者に属すると読める形にした | —（doc のみ） |
+| 可読性 M2 | `CameraModel` の doc は「末尾の NUL/空白だけ除去して byte 比較」だが、実装は `from_utf8_lossy` + `.trim()`。非 UTF-8 の異なる名前が同じ `String` になり、先頭空白も落ちる | **実装を安全側に寄せた**。`str::from_utf8` で厳密に読み、末尾の NUL/空白だけを除去して完全一致で比較する。非 UTF-8 のタグは `None`（不明扱い）とし、lossy 変換による誤同一視をしない。doc も同じ規則に書き換え、`06-open-questions.md` §6 に未確定として記録 | `camera_names_that_are_not_valid_utf8_are_unreadable_not_collapsed`, `leading_whitespace_is_part_of_the_camera_name`, `trailing_nul_and_space_padding_is_trimmed_from_camera_names` |
+| 可読性 M3 | 「a value longer than four bytes lives at an offset from the header, which is the layout cameras use」は実カメラ未検証なのに断定 | 「この walk が受け付ける配置」に弱め、実カメラでの確認は未検証と明記。モジュール doc の「Not verified on camera files」にも IFD0 配置を追加し、`12-progress-summary.md` と `06-open-questions.md` §6 に未検証として記録 | —（doc のみ） |
+
+### 仕様検収の Should への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| S1 | scoped shift の end-to-end テストが無い（選択写真だけが書き換わることを直接固定していない） | `SelectedPhotos` と `ByCamera` の両スコープで plan → apply し、選択写真の `DateTimeOriginal` がシフト後になり、非選択写真はバイト列も時刻も変わらないことを固定 | `a_scoped_shift_writes_the_clock_into_the_scoped_photos_only` |
+| S2 | icon 経路で「フレームヘッダ不明はバイト列そのまま」の分岐が未テスト | SOF を持たない合成 JPEG で `export_kmz_with_icons` を呼び、`photo/` と `icon/` の両方が元バイト列になることを固定 | `a_photo_with_no_readable_frame_header_keeps_its_bytes_under_icon` |
+| S3 | 新しい未確定点が `06-open-questions.md` に無い（`AGENTS.md` §7 の置き場は 06） | §6（byCamera / selPhotos の一致規則、日=24h、実カメラ IFD0 配置）と §7（`icon/` の寸法・命名・KML 参照、ezTour が実際に置いていたか）を追記 | —（docs） |
+| S4 | 新 API が `log` 直下に再エクスポートされていない | `PhotoTimeShift` / `PhotoShiftScope` / `CameraModel` / `plan_with_time_shift` / `KmzIconOptions` / `export_kmz_with_icons` を `log/mod.rs` に追加（既存 re-export は変更なし） | —（コンパイルで担保） |
+| S5 | 既定 scope = `AllPhotos` のテストも未確定記録も無い | 既定をテストで固定（仕様が既定を規定しない実装判断である旨をテストのコメントに記載） | `the_default_scope_is_every_photo` |
+
+### 可読性レビューの Should への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| S1 | overflow テストが「写真を読む前に拒否」を名乗りながら、読める写真を渡すだけで順序を検証していない | 存在しないパスを渡し、`Error::Io` ではなく `Error::State` になることを固定。テスト名も `..._before_any_photo_is_read` に改名 | `a_shift_that_overflows_seconds_is_refused_before_any_photo_is_read` |
+| S2 | JPEG セグメント走査が 3 実装目。`0xD0..=JPEG_MARKER_SOI` は `exif.rs` の綴りと違い、SOI の値に暗黙依存 | 推奨どおり `exif` に `pub(crate) exif_tiff_block` を追加し、既存の `find_exif_app1` を再利用。geotag 側の走査を削除し、malformed を `None` に落とす差分だけ呼び出し側で吸収 | 既存の camera テスト一式（`the_camera_model_is_read_from_ifd0_make_and_model_in_both_byte_orders` ほか） |
+| S3 | `ifd0_ascii` が 40 行・4 抽象度で、`try_into().ok()?` の連鎖が TIFF の配置を隠す | `read_u16_at` / `read_u32_at` を追加し、文字列正規化を `camera_string` に分離。IFD エントリの配置をコメントで明示 | camera テスト一式 |
+| S4 | `export_kmz_inner` が 66 行・5 段 | `resolve_photo_names` / `photo_entry_bytes` / `icon_thumbnail_bytes` / `zip_entries` に分割 | kmz テスト一式 |
+| S5 | `thumbnails: Vec<Option<Vec<u8>>>` の暗黙不変条件と `zip` の silent truncation。`None` が「元バイト列」を意味する二重契約 | 格納するバイト列を `Cow<'_, [u8]>` に解決して持ち（`None` の意味を消した）、`zip_entries` の先頭で長さを `debug_assert_eq!` で検査 | kmz テスト一式（`asking_for_icons_writes_one_icon_entry_for_each_photo` ほか） |
+| S6 | `is_zero` はテスト以外に呼び出しが無く、`includes` は本体からのみ呼ばれるのに `pub` | `includes` を private に。`is_zero` は production 呼び出し元が無いため削除し、テストは `PhotoTimeShift::default()` との比較に変更 | `the_day_hour_minute_and_second_fields_add_up_to_one_total` |
+| S7 | ゼロ上限の意味が同じファイル内で逆（`KmzIconOptions` は 0 を拒否、`KmzPhoto` は 0 を「縮小しない」で通す） | 挙動は既存公開 API なので変えず、`KmzPhoto::max_edge_pixels` の doc と共通ヘルパのコメントに「`Some(0)` は制限なし、`KmzIconOptions` の 0 はエラー」を明記 | 既存 `a_photo_with_no_limit_keeps_its_bytes` / `an_icon_limit_of_zero_pixels_is_refused` |
+
+### Could
+
+- 対応: 仕様 C1（`is_zero` 削除）、仕様 C4（M2 と同じ。doc を実装に合わせた）、可読性 C1（エラー文を構造体 Debug の露出から「各値と小さくする案内」に変更）、可読性 C3（容量計算のコメント）、可読性 C5（default の重複主張を 1 つに）、可読性 C7（ezTour との等価性を断定しない参照を追加）。
+- 見送り:
+  - 可読性 C2（`Copy` な設定値の渡し方が値/参照で不揃い）: `KmzIconOptions` を参照で渡すのは `GeotagOptions` と同じ「設定型は参照」の慣習に合わせた判断。CLI 配線前の signature 変更は差分の利得が小さい。
+  - 可読性 C4（テストがエントリ順を固定）: レビュー自身が「害は小さい」としている実装固定テスト。集合比較への書き換えは別途。
+  - 可読性 C6（同じ説明をモジュール doc・関数 doc・`12` で 3 回）: 未確定情報の参照先を 06 に寄せたが、説明の重複自体は残した。
+
+### 却下した指摘
+
+なし（Stage 1 の指摘はすべて事実と一致した）。
+
+### 変異で確認したこと
+
+いずれも変異を入れて対応テストが落ちることを確認し、そのあと元に戻して
+`git status --porcelain` の対象ファイルが元の差分に戻ったことを確認した。
+
+- `camera_string` を `String::from_utf8_lossy(...).trim()` に戻すと
+  `camera_names_that_are_not_valid_utf8_are_unreadable_not_collapsed` と
+  `leading_whitespace_is_part_of_the_camera_name` が落ちる。
+- 末尾の NUL/空白の除去をやめると camera の 4 本
+  （invalid UTF-8 / leading whitespace / trailing padding / inline の short names）が落ちる。
+- `plan_with_time_shift` で shift の検査より先に写真を `read` すると
+  `a_shift_that_overflows_seconds_is_refused_before_any_photo_is_read` が
+  `Io` で落ちる（`State` を期待している）。
+
+### ゲート
+
+`./tools/check.sh` 6/6（`M241_VENDOR_IMAGE` を設定した状態。実機ポートは開いていない）。
+
+### Stage 3 検証
+
+未検証（別エージェントが記入する）。
