@@ -493,7 +493,15 @@ pub fn write_all(directory: &Path) -> Result<Vec<std::path::PathBuf>, String> {
 fn prepare(app: &mut App, screen: Screen) {
     match screen {
         Screen::Connect => app.connect_mut().show_sample(),
-        Screen::Log => app.log_mut().show_sample(),
+        Screen::Log => {
+            app.log_mut().show_sample();
+            // The photo block and the KMZ row are the wiring this artifact is
+            // reviewed for, so the Log frame is taken with sample photos loaded
+            // (no file touched) and the KMZ writer selected.
+            app.log_mut().show_sample_photos();
+            app.log_mut().set_kmz_export();
+            app.log_mut().set_kmz_max_edge("1600");
+        }
         Screen::Firmware => {
             // The write step is what the design review is for, so the screenshot
             // shows it with the patched sample image already in memory and the
