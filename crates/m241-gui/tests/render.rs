@@ -466,10 +466,10 @@ fn an_empty_log_says_there_is_no_log_yet() {
 }
 
 #[test]
-fn the_log_map_is_labelled_as_a_track_without_map_tiles() {
-    // §3 makes the map the one light surface, and §10 records that no tile
-    // fetcher is linked. The note is how a reader knows the dark canvas is not a
-    // broken map.
+fn the_log_map_credits_openstreetmap_on_every_frame() {
+    // The OSM licence requires the attribution wherever the tiles are shown. It
+    // is drawn whether or not a tile arrived, so a frame with the offline fallback
+    // still credits the source the map is drawn from.
     let ctx = context();
     let mut app = App::default();
     app.select(Screen::Log);
@@ -480,9 +480,66 @@ fn the_log_map_is_labelled_as_a_track_without_map_tiles() {
     assert!(
         flat.iter().any(|shape| matches!(
             shape,
-            egui::Shape::Text(text) if text.galley.job.text.contains("地図タイルなし")
+            egui::Shape::Text(text) if text.galley.job.text.contains("© OpenStreetMap contributors")
         )),
-        "the map did not say it has no tiles"
+        "the map drew no OpenStreetMap attribution"
+    );
+}
+
+#[test]
+fn a_sample_map_says_it_shows_no_tiles() {
+    // §3 makes the map the one light surface; §10 records that the screenshot is
+    // produced offline. The note is how a reader knows the dark canvas is the
+    // sample frame rather than a broken tile fetch.
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Log);
+    app.log_mut().show_sample();
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    let mut flat = Vec::new();
+    flatten_shapes(&shapes, &mut flat);
+    assert!(
+        flat.iter().any(|shape| matches!(
+            shape,
+            egui::Shape::Text(text) if text.galley.job.text.contains("見本：地図タイルは表示しません")
+        )),
+        "the sample map did not say it shows no tiles"
+    );
+}
+
+#[test]
+fn a_headless_render_never_asks_for_tiles() {
+    // The screenshot renderer and every test use a headless context. A tile
+    // request from one would be a network call nobody asked for, and `--screenshot`
+    // must stay offline. The map falls back to the schematic canvas and says so.
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Log);
+    app.log_mut()
+        .set_track(mixed_track(), ParseReport::default());
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    let mut flat = Vec::new();
+    flatten_shapes(&shapes, &mut flat);
+    let texts: Vec<&str> = flat
+        .iter()
+        .filter_map(|shape| match shape {
+            egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("© OpenStreetMap contributors")),
+        "the headless map lost its attribution: {texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("地図タイルを読み込み中")
+                || text.contains("地図タイルを取得できません")
+                || text.contains("見本")),
+        "the headless map did not explain its state: {texts:?}"
     );
 }
 

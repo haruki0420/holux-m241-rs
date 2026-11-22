@@ -30,10 +30,17 @@ png = "0.18"
 # screenshots are rendered without `eframe` (no window), and without this the
 # Japanese labels rasterise as empty boxes — an image that misrepresents the UI.
 egui_system_font_provider = "0.37"
-
-# walkers (map tiles) is deliberately not a dependency yet: it fetches tiles over
-# the network at runtime and cannot be exercised headlessly. The Log screen draws
-# the track itself on a scaled canvas; a slippy map is a later, separate change.
+# Background map tiles (DESIGN.md §5, §10). One blocking HTTP client with no async
+# runtime of its own; `rustls` rather than the OS TLS stack keeps the build
+# self-contained on the three supported platforms.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# Decoding the PNG (and, if a server ever answers with one, JPEG) that a tile
+# server returns. Only the decoders are built: encoding a tile is not a thing
+# this crate does.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# The OS cache directory (`XDG_CACHE_HOME` on Linux, Known Folders on Windows,
+# `Library/Caches` on macOS) under which the tile cache lives.
+dirs = "7"
 
 [lints]
 workspace = true

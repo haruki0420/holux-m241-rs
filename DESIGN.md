@@ -219,6 +219,12 @@ inside the wizard.
 The left column is a **rail block**, not a second tab rail — same 8px staircase
 rhythm, but subordinate: headers in `caption`, rows 28px, no fill.
 
+The map is the product's one light face: OpenStreetMap tiles under the track,
+with the licence's `© OpenStreetMap contributors` credit on the canvas. When the
+tiles cannot be fetched — offline, or the setting switched off — the same canvas
+falls back to the schematic grid and says so in `mute`; the track, its records
+and every control keep working, because none of them needs the network.
+
 ### ファーム — Firmware
 
 ```
@@ -264,8 +270,9 @@ disabled until the field contains `WRITE`.
 
 ### 設定 — Settings
 
-Plain rows, no rail block: map cache size and location, units, theme
-(light theme is not built; the row states that), language, reduced motion.
+Plain rows, no rail block: map cache size and location, the map-tiles switch,
+units, theme (light theme is not built; the row states that), language, reduced
+motion, and the clear-cache action.
 
 ## 6. States the build must ship
 
@@ -276,6 +283,7 @@ Plain rows, no rail block: map cache size and location, units, theme
 | Device state undefined | Firmware step 3 failure | `danger` border on the panel, the recovery command as copyable text |
 | Waiting for the user | Firmware step 2 | Progress held at 100%, the instruction given as an imperative |
 | Empty log | Log | "まだログがありません" plus the download action |
+| Offline map | Log | Schematic grid plus 「地図タイルを取得できません（オフライン）」 in `mute`; the track still draws |
 | Unverified feature | Anywhere | The word 未検証 beside it, `mute`, never `danger` |
 | Loading | Any | Skeleton rows in the table, never a centred spinner |
 | Keyboard | All | Every control focusable, focus ring is a 2px `ink` outline inset 1px |
@@ -432,8 +440,27 @@ approximation from a mistake.
   `path/to/log.bin` sample.
 - Empty log: 「まだログがありません」, the path with the ログを開く primary
   action, and a disabled ログを吸い出す marked 未検証.
-- The map says 「地図タイルなし・軌跡のみ」. No tile fetcher is linked, so the
-  canvas draws the track itself rather than claiming a map it does not have.
+- The map draws OpenStreetMap tiles under the track and credits them on the
+  canvas; the attribution sits bottom-left because the zoom note owns the
+  bottom-right. The schematic grid is still drawn first and is what the offline
+  state shows, so a failed fetch leaves a readable canvas rather than a blank.
+- The track and the tiles are projected through one `MapView` (Web Mercator).
+  The previous track projection was equirectangular with a `cos(latitude)`
+  correction; close, but a road drawn a few pixels off the tile is exactly the
+  defect the map was added to remove, so the track moved to the tiles'
+  projection rather than the tiles being bent to the track.
+- The map's zoom is 1–19 (OSM's range), with fractional zoom between levels:
+  `+`/`−` moves continuously and the tiles are scaled by the fraction, instead
+  of jumping by a factor of two at every press. Follow mode's 12-zoom floor and
+  the fit-all/zoom/follow interactions are unchanged.
+- Tiles live in the OS cache directory (`m241-gui/tiles`, 30-day TTL, 200 MB
+  cap, oldest first) and the Settings rows report the measured size and the real
+  path. At most four fetches are in flight and only the visible canvas plus one
+  ring is asked for; nothing is prefetched. `--screenshot` and the headless
+  render tests never fetch: the sample frame says
+  「見本：地図タイルは表示しません」, and a context with no viewport is treated as
+  offline by construction. Real-network tile display has not been verified on a
+  running window (see README's unverified list).
 - The screenshots show the firmware write step with the sample image applied in
   memory and the confirmation armed — it is never written to disk, and the
   panel and screen still carry 「見本」. That is why the amber button appears in
@@ -458,9 +485,10 @@ approximation from a mistake.
   (`10399`), not as §5's `10,399`.
 - The Connect screen's next-step rows carry no `→` (the figure in §5 draws one;
   see below).
-- Settings' cache location is `—（未使用）`. No tile fetcher is linked, so there
-  is no cache directory to name; the row states that rather than printing a path
-  nothing writes to.
+- Settings' cache location is the path the fetcher actually writes to, resolved
+  through the OS cache directory, and the size row is measured from it. The
+  clear action deletes only that directory; it is not amber, because deleting a
+  local cache is not a destructive device action.
 - The port ComboBox and hover tooltips carry no drop shadow, and the rail's tab
   transition is 150 ms ease-out (quadratic); reduced motion drops it to 0. These
   are the design's own values, recorded because §3's motion and elevation rules

@@ -31,6 +31,10 @@ mod geotag_gate;
 mod editing;
 mod kmz_export;
 mod photo_shift;
+// Background map tiles (DESIGN.md §5, §10). Public because the Settings screen
+// reports the cache path, its usage and its clear action from the module that
+// owns them, rather than duplicating any of it.
+pub mod tiles;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -48,6 +52,7 @@ use crate::theme::{self, metric, size, space};
 use self::editing::TrackEditState;
 use self::geotag_gate::GeotagConfirmation;
 use self::photo_shift::{PhotoShiftSettings, ScopeKind};
+use self::tiles::{MapOptions, MapView};
 
 /// Rows the point list shows before it scrolls.
 ///
@@ -71,9 +76,10 @@ const FOLLOW_MIN_ZOOM: f32 = 12.0;
 /// Lowest zoom the user can ask for while not following.
 const MIN_ZOOM: f32 = 1.0;
 
-/// Highest zoom the projection allows; above this the whole loop fits in a few
-/// pixels and the shape stops being readable.
-const MAX_ZOOM: f32 = 18.0;
+/// Highest zoom the map allows. OSM serves tiles to 19 and the projection is
+/// defined there; the track is drawn over the same view, so the limit is the
+/// tiles' rather than a separate one.
+const MAX_ZOOM: f32 = 19.0;
 
 /// Playback step while motion is allowed (DESIGN.md §3: 150 ms is the authored
 /// transition; a track that steps four points a second reads as playback).
@@ -145,8 +151,10 @@ pub struct LogScreen {
     follow: bool,
     /// When true, the map projects the whole track bounds to fit the canvas.
     fit_mode: bool,
-    /// Logical slippy-map zoom level (`1.0..=18.0`), clamped >= 12 while following.
+    /// Logical slippy-map zoom level (`1.0..=19.0`), clamped >= 12 while following.
     map_zoom: f32,
+    /// Background tiles, their textures and the fetch workers.
+    tiles: tiles::MapTiles,
     /// Path input for loading photos (directory or single JPEG).
     photo_path: String,
     /// Read-only photo plans loaded via `geotag::plan`.
@@ -186,6 +194,7 @@ impl Default for LogScreen {
             follow: false,
             fit_mode: true,
             map_zoom: FOLLOW_MIN_ZOOM,
+            tiles: tiles::MapTiles::default(),
             photo_path: String::new(),
             photo_entries: Vec::new(),
             selected_photo: None,
@@ -901,13 +910,13 @@ impl LogScreen {
                     );
                     ui.add_space(space::L);
                     ui.vertical(|ui| {
-                        self.map_panel(ui);
+                        self.map_panel(ui, settings);
                         self.speed_panel(ui, settings);
                         self.selected_panel(ui, settings);
                     });
                 });
             } else {
-                self.map_panel(ui);
+                self.map_panel(ui, settings);
                 ui.add_space(space::M);
                 ui.horizontal_top(|ui| {
                     ui.vertical(|ui| self.summary_block(ui, settings));
@@ -1302,8 +1311,8 @@ impl LogScreen {
         self.relink_photos();
     }
 
-    /// 地図: the track painted from latitude and longitude, with playback and follow controls.
-    fn map_panel(&mut self, ui: &mut Ui) {
+    /// 地図: the track painted over the background tiles, with playback and follow controls.
+    fn map_panel(&mut self, ui: &mut Ui, settings: &AppSettings) {
         let sample = self.sample;
         common::sample_panel(ui, "地図", sample, |ui| {
             let height = metric::PLOT;
@@ -1312,7 +1321,9 @@ impl LogScreen {
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, theme::RADIUS, theme::RAIL);
 
+            let view = self.map_view(rect);
             let plotted: Vec<(usize, egui::Pos2)> = self.plotted_points(rect);
+            let mut background = None;
             if plotted.is_empty() {
                 painter.text(
                     rect.center(),
@@ -1324,7 +1335,19 @@ impl LogScreen {
             } else {
                 let first_index = plotted.first().map(|(index, _pos)| *index);
                 let last_index = plotted.last().map(|(index, _pos)| *index);
+                // The grid stays underneath the tiles: it is the offline canvas,
+                // and it also fills a tile that has not arrived yet.
                 draw_grid(&painter, rect);
+                background = Some(tiles::draw_map(
+                    ui,
+                    &painter,
+                    view,
+                    &mut self.tiles,
+                    MapOptions {
+                        enabled: settings.map_tiles,
+                        sample,
+                    },
+                ));
                 let line: Vec<egui::Pos2> = plotted.iter().map(|(_index, pos)| *pos).collect();
                 if line.len() > 1 {
                     // The spec's track numbers (07-eztour §5 「幅 5・不透明度 0.7」)
@@ -1414,10 +1437,15 @@ impl LogScreen {
                 }
             }
 
-            let mode_note = if self.follow {
-                format!("追従 zoom {:.0}（地図タイルなし・軌跡のみ）", self.map_zoom)
-            } else {
-                format!("zoom {:.0}（地図タイルなし・軌跡のみ）", self.map_zoom)
+            tiles::draw_attribution(&painter, rect);
+            // One caption, bottom-right: the zoom, and the map's state when the
+            // tiles are not on screen (offline, sample, loading). The
+            // attribution owns the bottom-left corner so the two cannot collide.
+            let follow_label = if self.follow { "追従 " } else { "" };
+            let status_note = background.and_then(|background| background.note());
+            let mode_note = match status_note {
+                Some(extra) => format!("{follow_label}zoom {:.0}（{extra}）", view.zoom),
+                None => format!("{follow_label}zoom {:.0}", view.zoom),
             };
             painter.text(
                 rect.right_bottom() + Vec2::new(-space::S, -space::S),
@@ -2109,84 +2137,66 @@ impl LogScreen {
         Err(message)
     }
 
+    /// The view the map and the track are both drawn through.
+    ///
+    /// `fit_mode` fits the whole track; otherwise the canvas is centred on the
+    /// selected point (or on the track's middle when nothing is selected) at
+    /// `map_zoom`. Both branches use the Mercator projection the tiles are laid
+    /// out in: a track drawn through a different projection drifts off the
+    /// roads the tiles show, which is the defect the map exists to remove.
+    fn map_view(&self, rect: Rect) -> MapView {
+        let points: Vec<(f64, f64)> = self
+            .track
+            .points
+            .iter()
+            .filter_map(|point| Some((point.latitude?, point.longitude?)))
+            .collect();
+        if points.is_empty() || self.fit_mode {
+            return MapView::fit(rect, space::M, &points);
+        }
+        let (center_latitude, center_longitude) = self
+            .selected
+            .and_then(|index| self.track.points.get(index))
+            .and_then(|point| Some((point.latitude?, point.longitude?)))
+            .unwrap_or_else(|| {
+                let Some(&(first_latitude, first_longitude)) = points.first() else {
+                    return (0.0, 0.0);
+                };
+                let (mut min_latitude, mut max_latitude) = (first_latitude, first_latitude);
+                let (mut min_longitude, mut max_longitude) = (first_longitude, first_longitude);
+                for &(latitude, longitude) in &points {
+                    min_latitude = min_latitude.min(latitude);
+                    max_latitude = max_latitude.max(latitude);
+                    min_longitude = min_longitude.min(longitude);
+                    max_longitude = max_longitude.max(longitude);
+                }
+                (
+                    (min_latitude + max_latitude) / 2.0,
+                    (min_longitude + max_longitude) / 2.0,
+                )
+            });
+        MapView::new(
+            center_latitude,
+            center_longitude,
+            f64::from(self.map_zoom),
+            rect,
+        )
+    }
+
     /// Every point with a position, as (index, pixel).
     ///
     /// Kept as indices rather than as a filtered copy so a click on the map can
     /// select the *original* row in the table.
     fn plotted_points(&self, rect: Rect) -> Vec<(usize, egui::Pos2)> {
-        let fixes: Vec<(usize, f64, f64)> = self
-            .track
+        let view = self.map_view(rect);
+        self.track
             .points
             .iter()
             .enumerate()
-            .filter_map(|(index, point)| match (point.latitude, point.longitude) {
-                (Some(latitude), Some(longitude)) => Some((index, latitude, longitude)),
-                _ => None,
-            })
-            .collect();
-        let Some(&(_, first_latitude, first_longitude)) = fixes.first() else {
-            return Vec::new();
-        };
-
-        if !self.fit_mode {
-            let (center_lat, center_lon) = self
-                .selected
-                .and_then(|idx| self.track.points.get(idx))
-                .and_then(|p| Some((p.latitude?, p.longitude?)))
-                .unwrap_or_else(|| {
-                    let (mut min_lat, mut max_lat) = (first_latitude, first_latitude);
-                    let (mut min_lon, mut max_lon) = (first_longitude, first_longitude);
-                    for (_, lat, lon) in &fixes {
-                        min_lat = min_lat.min(*lat);
-                        max_lat = max_lat.max(*lat);
-                        min_lon = min_lon.min(*lon);
-                        max_lon = max_lon.max(*lon);
-                    }
-                    ((min_lat + max_lat) / 2.0, (min_lon + max_lon) / 2.0)
-                });
-            let deg_per_px = 360.0 / (256.0 * 2.0_f64.powf(f64::from(self.map_zoom)));
-            let lon_scale = center_lat.to_radians().cos().abs().max(0.1);
-            let center = rect.center();
-            return fixes
-                .iter()
-                .map(|(index, lat, lon)| {
-                    let dx = ((*lon - center_lon) * lon_scale / deg_per_px) as f32;
-                    let dy = ((center_lat - *lat) / deg_per_px) as f32;
-                    (*index, egui::pos2(center.x + dx, center.y + dy))
-                })
-                .collect();
-        }
-
-        let (mut min_latitude, mut max_latitude) = (first_latitude, first_latitude);
-        let (mut min_longitude, mut max_longitude) = (first_longitude, first_longitude);
-        for (_, latitude, longitude) in &fixes {
-            min_latitude = min_latitude.min(*latitude);
-            max_latitude = max_latitude.max(*latitude);
-            min_longitude = min_longitude.min(*longitude);
-            max_longitude = max_longitude.max(*longitude);
-        }
-
-        let padding = space::M;
-        let width = (rect.width() - padding * 2.0).max(1.0);
-        let height = (rect.height() - padding * 2.0).max(1.0);
-        let latitude_span = (max_latitude - min_latitude).max(f64::EPSILON);
-        let longitude_span = (max_longitude - min_longitude).max(f64::EPSILON);
-        // One scale for both axes, so the drawn shape is the shape of the trip
-        // rather than a stretched one that fits the rectangle.
-        let scale = (width as f64 / longitude_span).min(height as f64 / latitude_span);
-        let drawn_width = longitude_span * scale;
-        let drawn_height = latitude_span * scale;
-        let left = rect.left() + padding + ((width as f64 - drawn_width) / 2.0) as f32;
-        let top = rect.top() + padding + ((height as f64 - drawn_height) / 2.0) as f32;
-
-        fixes
-            .iter()
-            .map(|(index, latitude, longitude)| {
-                let x = left + ((longitude - min_longitude) * scale) as f32;
-                // Latitude grows northwards and y grows downwards, so the
-                // subtraction is what puts north at the top.
-                let y = top + ((max_latitude - latitude) * scale) as f32;
-                (*index, egui::pos2(x, y))
+            .filter_map(|(index, point)| {
+                let latitude = point.latitude?;
+                let longitude = point.longitude?;
+                Some((index, view.project(latitude, longitude)))
             })
             .collect()
     }
@@ -3538,7 +3548,7 @@ mod tests {
         let metric_settings = AppSettings::default();
         let imperial_settings = AppSettings {
             units: crate::screens::settings::UnitSystem::Imperial,
-            reduced_motion: false,
+            ..AppSettings::default()
         };
         assert!(
             screen
