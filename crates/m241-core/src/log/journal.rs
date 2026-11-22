@@ -1,24 +1,43 @@
-//! The settings/state journal that shares a log block with the track records.
+//! The settings journal that shares a log block with the track records.
 //!
 //! A block is not a pure array of track records: the unit also writes a journal
 //! of configuration and state changes into the same 64 KiB area, between record
 //! runs. Two shapes have been observed:
 //!
-//! * a **16-byte entry**, `AA`×7 | type (1 byte) | value (`u32` LE) | `BB`×4.
-//!   Types 3, 4 and 7 have been seen. Their meanings are **not** established:
-//!   the values look like the header's period / threshold / policy words, but
-//!   that is inference from the values, not firmware. Type 2 has been suggested
-//!   to overwrite the record mask; ⚠️ unconfirmed, and not acted on here.
-//! * a **20-byte device name**, `HOLUXGR241LOGGER    `, which separates clusters.
+//! * a **16-byte entry**, `AA`×7 | type (1 byte) | value (`u32` LE) | `BB`×4;
+//! * a **20-byte name**, `HOLUXGR241LOGGER    `, which separates clusters.
 //!
-//! Reading journal bytes as records is what used to produce checksum-failing
-//! points; skipping them keeps the read aligned with the records either side.
+//! A cluster is one name plus the entries that follow it; the walk treats an
+//! entry and a name as one "journal item" each, because both are skipped the
+//! same way.
+//!
+//! Entry types observed in the 2026-11-21 dump (248 items: 34 names and 214
+//! entries): type 3 ×68, type 4 ×68, type 7 ×75, type 6 ×2, type 2 ×1. The two
+//! 2026-11-22 journal-only dumps carry types 3, 4 and 7 only. Meanings are
+//! inference from the values, not firmware: 50 looks like the header's period
+//! (5.0 s), `0x0104` / `0x0106` like its policy words, and the type-6 values are
+//! exactly those policy words.
+//!
+//! Type 2 is the one type with an observation behind the mask theory: it appears
+//! once, in block 0 of the 2026-11-21 dump at file offset `0x220`, with value
+//! `0x8800_003D` — the same mask the 20-byte records that follow it use, and the
+//! one blocks 1–3 carry in their headers. So a type-2 entry *can* carry a record
+//! mask. It is still not applied: the record length is already decided from
+//! checksum evidence (see [`crate::log::parse`]), and acting on one unconfirmed
+//! value is the kind of guess this module exists to prevent.
+//!
+//! Reading journal bytes as records is what used to invent points. The earlier
+//! parser exported every record whatever its checksum: on the 2026-11-21 dump
+//! 11,088 points, 4,481 of them checksum-failing (3,244 from the stale 16-byte
+//! mask on block 0 alone), and the two 2026-11-22 journal-only dumps became 135
+//! and 137 points built from configuration bytes. Skipping the journal keeps the
+//! read aligned with the records on either side.
 
-/// Bytes of one settings/state journal entry.
-pub const ENTRY_SIZE: usize = 16;
+/// Bytes of one settings journal entry.
+const ENTRY_SIZE: usize = 16;
 
 /// Bytes of the device-name string that separates journal clusters.
-pub const NAME_SIZE: usize = 20;
+const NAME_SIZE: usize = 20;
 
 /// The device-name string, exactly as the observed dumps carry it. The four
 /// trailing spaces are part of the field.
@@ -33,10 +52,13 @@ const TAIL: &[u8] = &[0xBB; 4];
 /// Bytes of one item at the start of `bytes`, when the bytes are a journal
 /// item.
 ///
-/// Recognition is by exact shape only. An item with a different marker, or a
-/// name whose padding differs, returns `None`; the record reader then fails its
-/// per-record checksum and drops the bytes, which is the fail-closed behaviour.
-/// A wildcard match here would be how the original bug comes back.
+/// Recognition checks only what is known exactly: the seven-byte head, the
+/// four-byte tail, and the whole name string. The type and value bytes are not
+/// checked because their meanings are unconfirmed — so a track record that
+/// happened to carry this template would be skipped as configuration. That is
+/// the cost of the strict match, and it is the safe direction: a wildcard match
+/// would let configuration be read as records again, which is the bug this
+/// module exists to prevent.
 #[must_use]
 pub fn item_len(bytes: &[u8]) -> Option<usize> {
     if bytes.get(..NAME_SIZE) == Some(NAME) {

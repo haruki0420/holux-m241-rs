@@ -628,7 +628,7 @@ pub fn synthetic_dump(points: usize) -> Vec<u8> {
     block
 }
 
-/// A one-block dump that holds only the settings/state journal: the shape a
+/// A one-block dump that holds only the settings journal: the shape a
 /// configured unit writes before it records a point.
 ///
 /// It is what the 2026-11-22 dumps contained. The journal is not a track
@@ -636,9 +636,13 @@ pub fn synthetic_dump(points: usize) -> Vec<u8> {
 /// rather than as an empty log.
 #[must_use]
 pub fn synthetic_journal_only_dump() -> Vec<u8> {
-    use m241_core::log::block::{BLOCK_HEADER_SIZE, BLOCK_SIZE, POLICY_LOG_DISABLED};
+    use m241_core::log::block::{
+        BLOCK_HEADER_SIZE, BLOCK_SIZE, COUNT_NOT_FULL, POLICY_LOG_DISABLED,
+    };
 
     const NAME: &[u8] = b"HOLUXGR241LOGGER    ";
+    /// The measured 20-byte mask from the 2026-11-21 headers: bit 27 is set in
+    /// the real word and selects no field, so it changes no layout.
     const MASK: u32 = 0x8800_003D;
 
     /// One 16-byte journal entry: seven `0xAA`, a type, a `u32` value, four
@@ -653,7 +657,7 @@ pub fn synthetic_journal_only_dump() -> Vec<u8> {
     }
 
     let mut block = vec![0xFFu8; BLOCK_SIZE];
-    block[0..2].copy_from_slice(&u16::MAX.to_le_bytes());
+    block[0..2].copy_from_slice(&COUNT_NOT_FULL.to_le_bytes());
     block[2..6].copy_from_slice(&MASK.to_le_bytes());
     block[6..8].copy_from_slice(&POLICY_LOG_DISABLED.to_le_bytes());
     block[8..12].copy_from_slice(&50u32.to_le_bytes());
@@ -675,6 +679,8 @@ pub fn synthetic_journal_only_dump() -> Vec<u8> {
             body.extend_from_slice(&entry(kind, value));
         }
     }
+    // A journal-only dump is only as long as its used bytes. The rest of the
+    // block is not present, so the parser sees the real end rather than padding.
     block.truncate(BLOCK_HEADER_SIZE + body.len());
     block[BLOCK_HEADER_SIZE..].copy_from_slice(&body);
     block

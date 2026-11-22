@@ -2,18 +2,41 @@
 //!
 //! A real dump is not a clean file. It has blocks that were never written (all
 //! `0xFF`), blocks that were half-erased, a final record cut short by a power-off,
-//! and a **settings journal interleaved between the track records**. The reader
-//! returns every point it can defend and says — per block, and in totals — what
-//! it had to skip.
+//! a settings journal interleaved between the track records, and headers whose
+//! mask no longer matches the data because the configuration changed after the
+//! block was written. The reader returns every point it can defend and says — per
+//! block, and in totals — what it had to skip.
 //!
 //! This is deliberately forgiving in the same way `fsck` is forgiving: one
 //! damaged block is a track worth keeping. [`ParseReport`] carries the damage so
 //! the caller can warn instead of hiding it.
 //!
-//! Two rules keep the forgiveness from turning into invention: a record whose
-//! checksum does not match is **not** exported as a point, and the record length
-//! comes from checksum evidence rather than the header mask alone (a stale mask
-//! has been measured). A block that holds only the journal yields no points.
+//! # What the forgiveness does not do
+//!
+//! Two earlier rules were removed because measurement showed they invented data:
+//!
+//! * **A failed checksum no longer keeps the point.** The previous parser
+//!   exported every record and only counted the failure. On the 2026-11-21 dump
+//!   that was 11,088 exported points, 4,481 of them checksum-failing (3,244 from
+//!   the stale 16-byte mask on block 0 alone); the two 2026-11-22 dumps, which
+//!   hold only the settings journal, became 135 and 137 points whose coordinates
+//!   came from configuration bytes. The cost is real but small: the checksum is
+//!   one XOR byte, so a genuinely damaged record is now lost instead of exported
+//!   with a guessed position.
+//! * **The header mask is no longer the only authority on the record length.**
+//!   The measured 2026-11-21 block 0 declares 16-byte records while all 3,244 of
+//!   its records are 20 bytes and only the 20-byte grid checksums, so the length
+//!   is decided from checksum evidence. That override has an invariant: **the
+//!   boundary comes from the data, the field meanings come from the mask**, and a
+//!   field the detected length has no room for is not decoded (block 0's 3,244
+//!   points therefore carry no speed). A block where the two disagree is counted
+//!   in [`ParseReport::layout_mismatched_blocks`], never accepted silently.
+//!
+//! The gates are not absolute. A record grid is believed after an unbroken run of
+//! matching checksums (see the `*_LEADING_RECORDS` constants); random bytes pass
+//! one XOR check in 256, so a run makes a fabricated grid unlikely but not
+//! impossible, and the constants carry the arithmetic instead of claiming
+//! otherwise. Anything no gate accepts is counted in `unparsed_bytes`.
 
 use crate::error::{Error, Result};
 use crate::log::block::{
@@ -25,38 +48,89 @@ use crate::types::{LogSummary, Track};
 
 /// The fixed record lengths tried when the header mask may be stale.
 ///
-/// A mask that declares another fixed length is tried too, so this only has to
-/// cover the mismatch that has actually been seen.
-const DETECTED_RECORD_LENGTHS: [usize; 2] = [16, 20];
+/// The mask's own length is always tried first; this only has to cover the two
+/// layouts a V1.13 unit writes (UTC + lat + lon + height, and the same plus a
+/// float speed).
+const CANDIDATE_RECORD_LENGTHS: [usize; 2] = [16, 20];
 
 /// Records the length-detection scan samples before it decides.
+///
+/// Sampling bounds the cost of a long record run; the decision itself rests on an
+/// unbroken leading run (below), so 256 is a cap on work, not a probability.
 const DETECTION_SAMPLE_RECORDS: usize = 256;
 
+/// Unbroken matching records required to believe the mask's own length.
+///
+/// Two in a row: a random offset passes one XOR check in 256, so two is about one
+/// in 65,536 per start, and there is one start per block. One match is enough when
+/// the run ends at a journal item or padding — that boundary is evidence random
+/// bytes do not produce.
+///
+/// A short block that begins with a damaged record has no leading run at all, so
+/// the walk start also accepts a grid where most of the samples match. That
+/// fallback is about one block in 22,000 on random bytes, and it is deliberately
+/// **not** used at a resync offset, where the same shape is just two lucky
+/// checksums.
+const DECLARED_LEADING_RECORDS: usize = 2;
+
+/// Unbroken matching records required to use a length the mask did not declare.
+///
+/// Higher than the declared threshold because overriding the device's own mask
+/// is the stronger claim; the measured stale mask has a run of 3,244, so this
+/// costs nothing on real data.
+const DETECTED_LEADING_RECORDS: usize = 3;
+
+/// Unbroken matching records required to resume anywhere inside a block.
+///
+/// [`resync_offset`] asks at every byte of up to [`RESYNC_SCAN_BYTES`], for up to
+/// three candidate lengths: `0x1000 × 3 × 256⁻⁴ ≈ 3 × 10⁻⁶` per block, i.e. fewer
+/// than one fabricated grid in 300,000 blocks. The cost is the other side of the
+/// same coin: garbage followed by a run shorter than four records loses those
+/// records as `unparsed_bytes` (a run that ends at a journal item or padding is
+/// still accepted, because that boundary is itself evidence).
+const RESYNC_LEADING_RECORDS: usize = 4;
+
 /// Bytes a resync scan looks through for the next journal item or record grid.
+///
+/// A bound, not a guarantee: past it the rest of the block — including any real
+/// records still in it — is reported as `unparsed_bytes`. An unbounded scan would
+/// trade that known loss for an unknown amount of guessing.
 const RESYNC_SCAN_BYTES: usize = 0x1000;
 
-/// What the parser had to skip, in the same units as [`LogSummary`].
+/// What the parser observed and what it had to skip.
+///
+/// Counts are in blocks, records, journal items (16-byte entries plus 20-byte
+/// name separators) or bytes, as each field says. The one exception is
+/// [`used_bytes`](Self::used_bytes), which counts record bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ParseReport {
     /// Blocks fully or partly read.
     pub blocks: usize,
     /// Blocks whose header was all `0xFF`: never written.
     pub empty_blocks: usize,
-    /// Blocks with at least one record whose checksum failed.
+    /// Blocks with at least one record whose checksum failed or that could not
+    /// be decoded.
     pub damaged_blocks: usize,
     /// Records that decoded and are in the track.
     pub records: usize,
     /// Records whose checksum did not match. They are **not** in the track.
     pub bad_checksums: usize,
+    /// Records that decoded but carried neither a time nor a position, so they
+    /// were dropped rather than exported as empty rows. They are **not** in the
+    /// track.
+    pub empty_records: usize,
     /// Records skipped because the bytes ran out, typically the final write.
     pub truncated_records: usize,
-    /// Settings-journal items skipped because they are not track records.
+    /// Settings-journal items (16-byte entries and 20-byte name separators)
+    /// skipped because they are not track records.
     pub journal_items: usize,
     /// Blocks whose header mask disagreed with the record length in the data.
-    pub layout_mismatches: usize,
+    pub layout_mismatched_blocks: usize,
     /// Bytes no record grid or journal item could explain; they were skipped.
     pub unparsed_bytes: usize,
-    /// Bytes consumed by the last block, for a "how full is it" figure.
+    /// Bytes occupied by records the walk stepped over, including records that
+    /// failed their checksum. Journal items, padding and skipped bytes are not
+    /// counted, so this is not a "how full is the block" figure.
     pub used_bytes: usize,
 }
 
@@ -71,11 +145,20 @@ impl ParseReport {
 
     /// Whether the dump held only the settings journal, with no track records.
     ///
-    /// This is a configured or erased unit that has not recorded a point yet,
-    /// not a dump that contains nothing at all.
+    /// True when there is at least one journal item and every other byte is
+    /// accounted for: no track record (exported or empty), no damaged or
+    /// truncated record, no unreadable byte. That is a configured unit that has
+    /// not recorded a point yet — not an erased unit (which has no journal items)
+    /// and not a damaged dump (which fails this test and is warned about as
+    /// damage instead).
     #[must_use]
     pub fn is_journal_only(&self) -> bool {
-        self.records == 0 && self.journal_items > 0
+        self.records == 0
+            && self.empty_records == 0
+            && self.bad_checksums == 0
+            && self.truncated_records == 0
+            && self.unparsed_bytes == 0
+            && self.journal_items > 0
     }
 }
 
@@ -84,8 +167,10 @@ impl ParseReport {
 /// Each block carries its own header, so a dump written across a configuration
 /// change parses correctly. Within a block the walk skips the settings journal,
 /// checks every record's checksum before it becomes a point, and — where the
-/// header mask and the data disagree about the record length — trusts the data
-/// and reports the disagreement.
+/// header mask and the data disagree about the record length — takes the boundary
+/// from the data and the field meanings from the mask, then reports the
+/// disagreement. The module doc records why the older forgiving rules were
+/// removed and what that costs.
 ///
 /// # Errors
 ///
@@ -136,6 +221,11 @@ pub fn parse_dump(data: &[u8]) -> Result<(Track, ParseReport)> {
         // `None` means the mask selects the variable satellite block; that length
         // is a property of each record, not of the block.
         let declared_length = block::fixed_record_length(mask).filter(|length| *length > 0);
+        // Decided once per block, not re-detected after a journal cluster: a
+        // block is written under one configuration, and the only evidence that a
+        // journal entry can change the mask is the unconfirmed type 2. Re-detecting
+        // there would act on that guess; a real change shows up in the next
+        // block's header.
         let mut detected_length: Option<usize> = None;
         let mut pos = header.data_offset();
         let mut in_block = 0usize;
@@ -172,24 +262,36 @@ pub fn parse_dump(data: &[u8]) -> Result<(Track, ParseReport)> {
                 match detected_length {
                     Some(length) => length,
                     None => {
-                        let Some(length) = detect_record_length(data, pos, end, mask_length) else {
-                            // Nothing here is a record. Resume at the next
-                            // journal item, padding, or record grid rather than
-                            // inventing a point from these bytes.
-                            let Some(next) = resync_offset(data, pos, end, mask_length) else {
-                                report.unparsed_bytes += end - pos;
-                                break;
-                            };
-                            report.unparsed_bytes += next - pos;
-                            pos = next;
-                            continue;
+                        let length = match detect_record_length(data, pos, end, mask_length, 0) {
+                            Some(length) => length,
+                            // A block whose first record is damaged has no
+                            // leading run at the walk's start, but the grid one
+                            // record later can be intact. Believing the mask
+                            // then costs one damaged record instead of the
+                            // block; the check is a full detection one record
+                            // later, not a bare checksum, so a garbage start
+                            // still goes to the resync path.
+                            None if one_record_later_is_a_grid(data, pos, end, mask_length) => {
+                                mask_length
+                            }
+                            None => {
+                                // Nothing here is a record. Resume at the next
+                                // journal item, padding, or record grid rather
+                                // than inventing a point from these bytes.
+                                let Some(next) = resync_offset(data, pos, end, mask_length) else {
+                                    report.unparsed_bytes += end - pos;
+                                    break;
+                                };
+                                report.unparsed_bytes += next - pos;
+                                pos = next;
+                                continue;
+                            }
                         };
                         if length != mask_length {
-                            // The mask's field selection is still the only
-                            // evidence of what each field is, so the record is
-                            // decoded with it; only the boundary comes from the
-                            // data.
-                            report.layout_mismatches += 1;
+                            // Boundary from the data, field meanings from the
+                            // mask (see the module doc's invariant): the block
+                            // is reported, not silently reinterpreted.
+                            report.layout_mismatched_blocks += 1;
                         }
                         detected_length = Some(length);
                         length
@@ -218,19 +320,36 @@ pub fn parse_dump(data: &[u8]) -> Result<(Track, ParseReport)> {
                 pos += length;
                 continue;
             }
-            match record::decode(bytes, mask) {
+            // A length that came from the data rather than the mask may leave
+            // fields in the mask without bytes; decode only the ones that fit
+            // instead of losing the whole record.
+            let decoded = match declared_length {
+                Some(declared) if declared != length => {
+                    record::decode_with_length(bytes, mask, length)
+                }
+                _ => record::decode(bytes, mask),
+            };
+            match decoded {
                 Ok(point) => {
                     // A record with neither a time nor a position carries no
                     // information, so it is dropped rather than exported as an
-                    // empty row.
+                    // empty row. Counted, so `is_journal_only` cannot claim
+                    // "only the journal" for a block whose records all came out
+                    // empty.
                     if point.utc.is_some() || point.latitude.is_some() {
                         track.points.push(point);
                         report.records += 1;
+                    } else {
+                        report.empty_records += 1;
                     }
                 }
                 Err(_) => {
-                    report.truncated_records += 1;
-                    break;
+                    // A checksum-valid record whose fields do not fit means the
+                    // mask and the bytes disagree beyond what the length
+                    // override can reconcile. Counted as damage and stepped
+                    // over: "cut short" would name a cause this is not.
+                    report.bad_checksums += 1;
+                    block_damaged = true;
                 }
             }
             in_block += 1;
@@ -252,7 +371,7 @@ pub fn parse_dump(data: &[u8]) -> Result<(Track, ParseReport)> {
 
 /// Checksum evidence for one candidate record length.
 #[derive(Debug, Clone, Copy, Default)]
-struct Evidence {
+struct LengthEvidence {
     /// Records on the candidate grid whose trailer matched.
     valid: usize,
     /// Records on the candidate grid that were sampled.
@@ -260,14 +379,23 @@ struct Evidence {
     /// Records that matched at the start of the grid, before the first failure.
     ///
     /// This is the strong figure: a record run interrupted by a journal cluster
-    /// has few valid records out of many sampled, but a long unbroken leading run
-    /// cannot be random bytes.
+    /// has few valid records out of many sampled, but a leading run that does not
+    /// break is what random bytes almost never produce.
     leading: usize,
+    /// The leading run ended at a boundary the format defines — a journal item,
+    /// `0xFF` padding, or the end of the block — rather than at a failed
+    /// checksum.
+    ///
+    /// One matching checksum is worth 1/256 on random bytes; a matching checksum
+    /// followed by one of these markers is worth far more, which is what lets a
+    /// one-record run at the start of a block be believed without believing every
+    /// lucky checksum in a garbage stretch.
+    ends_at_boundary: bool,
 }
 
 /// How much checksum evidence supports `length` as the record length.
-fn length_evidence(data: &[u8], pos: usize, end: usize, length: usize) -> Evidence {
-    let mut evidence = Evidence::default();
+fn length_evidence(data: &[u8], pos: usize, end: usize, length: usize) -> LengthEvidence {
+    let mut evidence = LengthEvidence::default();
     let mut at = pos;
     let mut leading = true;
     while at < end && evidence.tried < DETECTION_SAMPLE_RECORDS {
@@ -275,6 +403,9 @@ fn length_evidence(data: &[u8], pos: usize, end: usize, length: usize) -> Eviden
             break;
         };
         if is_padding(rest) {
+            // Padding after an unbroken run is a boundary too; only raise the
+            // flag, never clear one set at an earlier failure.
+            evidence.ends_at_boundary |= leading;
             break;
         }
         let Some(candidate) = rest.get(..length) else {
@@ -287,40 +418,61 @@ fn length_evidence(data: &[u8], pos: usize, end: usize, length: usize) -> Eviden
                 evidence.leading += 1;
             }
         } else {
+            if leading {
+                evidence.ends_at_boundary = journal::item_len(rest).is_some();
+            }
             leading = false;
         }
         at = at.saturating_add(length);
     }
+    // Running out of block without a failure is also a boundary.
+    evidence.ends_at_boundary |= leading && at >= end;
     evidence
 }
 
-/// Decide the record length for a block whose header mask declares
-/// `mask_length`.
+/// Decide the record length at `pos`.
 ///
-/// The mask is the device's own declaration, but a stale one has been measured:
-/// a block that says 16-byte records while every record is 20 bytes and only the
+/// The mask is the device's own declaration, but a stale one has been measured: a
+/// block that says 16-byte records while every record is 20 bytes and only the
 /// 20-byte grid checksums. The mask's candidate is preferred when the evidence is
-/// equal; an alternative length has to be corroborated more strongly, and neither
-/// is accepted on evidence that random bytes could produce.
-fn detect_record_length(data: &[u8], pos: usize, end: usize, mask_length: usize) -> Option<usize> {
+/// equal; an alternative length has to be corroborated more strongly.
+///
+/// `minimum_leading` is raised by [`resync_offset`], which asks at every byte of a
+/// garbage stretch and therefore needs stronger proof than the walk at a known
+/// position does.
+fn detect_record_length(
+    data: &[u8],
+    pos: usize,
+    end: usize,
+    mask_length: usize,
+    minimum_leading: usize,
+) -> Option<usize> {
     let mut candidates = vec![mask_length];
-    for length in DETECTED_RECORD_LENGTHS {
+    for length in CANDIDATE_RECORD_LENGTHS {
         if !candidates.contains(&length) {
             candidates.push(length);
         }
     }
-    let mut best: Option<(usize, Evidence)> = None;
+    let mut best: Option<(usize, LengthEvidence)> = None;
     for length in candidates {
-        let evidence = length_evidence(data, pos, end, length);
-        let trusted = if length == mask_length {
-            // The declared layout is believed on a short unbroken run, or when
-            // most of the sampled grid matches (a few damaged records at the
-            // start are normal).
-            evidence.leading >= 2 || (evidence.valid >= 1 && evidence.valid * 2 >= evidence.tried)
+        let evidence: LengthEvidence = length_evidence(data, pos, end, length);
+        let trusted = if evidence.leading >= 1 && evidence.ends_at_boundary {
+            // One matching record followed by a journal item, padding or the end
+            // of the block: that marker is evidence the random-bytes argument
+            // does not cover.
+            true
+        } else if length == mask_length {
+            // The declared layout is believed on an unbroken run, or when most of
+            // the sampled grid matches (a few damaged records at the start are
+            // normal). A resync raises the run it needs.
+            evidence.leading >= DECLARED_LEADING_RECORDS.max(minimum_leading)
+                || (minimum_leading == 0
+                    && evidence.valid >= DECLARED_LEADING_RECORDS
+                    && evidence.valid * 2 >= evidence.tried)
         } else {
             // A layout the header did not declare needs an unbroken run before
             // the parser overrides the device's own mask.
-            evidence.leading >= 2
+            evidence.leading >= DETECTED_LEADING_RECORDS.max(minimum_leading)
         };
         if !trusted {
             continue;
@@ -332,17 +484,31 @@ fn detect_record_length(data: &[u8], pos: usize, end: usize, mask_length: usize)
     best.map(|(length, _)| length)
 }
 
+/// Whether the bytes one declared record after `pos` are a record grid.
+///
+/// Used only when [`detect_record_length`] rejects the bytes at `pos` itself: a
+/// single damaged record at the start of a run leaves no leading evidence, but an
+/// intact grid immediately after it is enough to keep the run's alignment.
+fn one_record_later_is_a_grid(data: &[u8], pos: usize, end: usize, mask_length: usize) -> bool {
+    let shifted = pos.saturating_add(mask_length);
+    shifted < end && detect_record_length(data, shifted, end, mask_length, 0) == Some(mask_length)
+}
+
 /// Find the next offset that can be parsed: a journal item, the `0xFF` padding,
-/// or a record grid that [`detect_record_length`] accepts.
+/// or a record grid [`detect_record_length`] accepts with at least
+/// [`RESYNC_LEADING_RECORDS`] matching records.
 ///
 /// Used when the bytes at `pos` are neither a journal item nor a record grid, so
 /// the walk can resume instead of inventing a point. The scan is bounded; past
 /// `RESYNC_SCAN_BYTES` the rest of the block is reported as unparsed.
 fn resync_offset(data: &[u8], pos: usize, end: usize, mask_length: usize) -> Option<usize> {
     let stop = end.min(pos.saturating_add(RESYNC_SCAN_BYTES));
-    let mut candidates = vec![mask_length, 16, 20];
-    candidates.sort_unstable();
-    candidates.dedup();
+    let mut candidates = vec![mask_length];
+    for length in CANDIDATE_RECORD_LENGTHS {
+        if !candidates.contains(&length) {
+            candidates.push(length);
+        }
+    }
     for at in (pos.saturating_add(1))..stop {
         let Some(rest) = data.get(at..end) else {
             break;
@@ -356,7 +522,9 @@ fn resync_offset(data: &[u8], pos: usize, end: usize, mask_length: usize) -> Opt
             rest.get(..*length)
                 .is_some_and(|record| block::checksum_matches_length(record, *length))
         });
-        if starts_a_record && detect_record_length(data, at, end, mask_length).is_some() {
+        if starts_a_record
+            && detect_record_length(data, at, end, mask_length, RESYNC_LEADING_RECORDS).is_some()
+        {
             return Some(at);
         }
     }
@@ -415,8 +583,12 @@ mod tests {
         block
     }
 
-    /// The measured 20-byte mask: UTC + lat + lon + height + float speed.
-    const MASK20: u32 = 0x8000_003D;
+    /// The measured 20-byte header mask from the 2026-11-21 blocks 1–3.
+    ///
+    /// Bit 27 (0x0800_0000) is set in the real header and selects no field in
+    /// [`block::FIELD_SIZES`] (which covers bits 0–19), so it changes no layout;
+    /// keeping it makes the fixture the mask the device actually wrote.
+    const MASK20: u32 = 0x8800_003D;
 
     /// The repository's example coordinate. All three records share it on
     /// purpose: the log stores coordinates as `f32`, so a sub-metre difference
@@ -427,7 +599,7 @@ mod tests {
     /// The device-name string the settings journal interleaves with its entries.
     const JOURNAL_NAME: &[u8; 20] = b"HOLUXGR241LOGGER    ";
 
-    /// One 16-byte settings/state journal entry, in the shape a dump carries.
+    /// One 16-byte settings journal entry, in the shape a dump carries.
     fn journal_entry(kind: u8, value: u32) -> [u8; 16] {
         let mut entry = [0xAAu8; 16];
         entry[7] = kind;
@@ -518,7 +690,7 @@ mod tests {
         // The second block uses a 20-byte mask: same fields plus speed.
         let mut second = vec![0xFFu8; BLOCK_SIZE];
         second[0..2].copy_from_slice(&1u16.to_le_bytes());
-        second[2..6].copy_from_slice(&0x8000_003Du32.to_le_bytes());
+        second[2..6].copy_from_slice(&MASK20.to_le_bytes());
         let mut body = Vec::new();
         body.extend_from_slice(&1_700_000_010u32.to_le_bytes());
         body.extend_from_slice(&LAT.to_le_bytes());
@@ -637,7 +809,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hundred_twenty_byte_records_keep_every_point_and_no_damage() {
+    fn a_hundred_records_of_twenty_bytes_keep_every_point_and_no_damage() {
         let mut body = Vec::new();
         for index in 0..100u32 {
             push_record20(&mut body, 1_700_000_000 + index);
@@ -648,7 +820,7 @@ mod tests {
         assert_eq!(report.bad_checksums, 0);
         assert_eq!(report.damaged_blocks, 0);
         assert_eq!(report.journal_items, 0);
-        assert_eq!(report.layout_mismatches, 0);
+        assert_eq!(report.layout_mismatched_blocks, 0);
         assert!(!report.is_journal_only());
         assert!(track.damaged_blocks.is_empty());
         assert_eq!(track.points[99].utc, Some(1_700_000_099));
@@ -672,7 +844,7 @@ mod tests {
         assert_eq!(report.bad_checksums, 0);
         assert_eq!(report.damaged_blocks, 0);
         assert_eq!(report.journal_items, 2 + 3 * 7);
-        assert_eq!(report.layout_mismatches, 0);
+        assert_eq!(report.layout_mismatched_blocks, 0);
         assert!(report.is_journal_only());
         assert!(track.damaged_blocks.is_empty());
     }
@@ -695,7 +867,7 @@ mod tests {
         assert_eq!(report.bad_checksums, 0);
         assert_eq!(report.damaged_blocks, 0);
         assert_eq!(report.journal_items, 3 * 7);
-        assert_eq!(report.layout_mismatches, 0);
+        assert_eq!(report.layout_mismatched_blocks, 0);
         // The points after each cluster keep their place and their time.
         assert_eq!(track.points[10].utc, Some(1_700_000_010));
         assert_eq!(track.points[30].utc, Some(1_700_000_030));
@@ -704,14 +876,15 @@ mod tests {
     #[test]
     fn a_stale_sixteen_byte_mask_still_reads_twenty_byte_records() {
         // The 2026-11-21 block 0 shape: the header says 16-byte records, but the
-        // data is a journal lead followed by 20-byte records. The record length
-        // must come from the data, and the disagreement must be reported rather
-        // than silently guessed at.
+        // data is a journal lead followed by 20-byte records. Type 2 carrying the
+        // record mask is the measured entry that suggests a mask write; the
+        // parser ignores its value and decides the length from checksums. The
+        // disagreement must be reported rather than silently guessed at.
         let mut body = Vec::new();
         for (kind, value) in [
             (3u8, 50u32),
             (4, 1000),
-            (2, 0x8000_003D),
+            (2, 0x8800_003D),
             (6, 0x0104),
             (3, 50),
             (4, 0),
@@ -729,7 +902,7 @@ mod tests {
         assert_eq!(report.damaged_blocks, 0);
         assert_eq!(report.journal_items, 8);
         assert_eq!(
-            report.layout_mismatches, 1,
+            report.layout_mismatched_blocks, 1,
             "the stale mask must be reported, not silently trusted"
         );
         assert_eq!(track.points[0].utc, Some(1_700_000_000));
@@ -763,6 +936,145 @@ mod tests {
         assert_eq!(track.points.len(), 4);
         assert_eq!(report.bad_checksums, 0);
         assert_eq!(report.unparsed_bytes, 7);
+    }
+
+    #[test]
+    fn a_stale_twenty_byte_mask_still_reads_sixteen_byte_records() {
+        // The mirror of the measured block 0 shape: the header still asks for
+        // speed, but the data is 16-byte records and only the 16-byte grid
+        // checksums. The boundary comes from the data and the fields that fit are
+        // decoded, so the block is not lost and is not called a short write.
+        let mut body = Vec::new();
+        for (utc, lat, lon, height) in sample() {
+            push_record(&mut body, utc, lat, lon, &height);
+        }
+        let (track, report) = parse_body(MASK20, 3, &body);
+        assert_eq!(
+            track.points.len(),
+            3,
+            "a shorter detected length must not lose the block"
+        );
+        assert_eq!(report.records, 3);
+        assert_eq!(report.bad_checksums, 0);
+        assert_eq!(report.damaged_blocks, 0);
+        assert_eq!(
+            report.truncated_records, 0,
+            "a layout mismatch is not a short write"
+        );
+        assert_eq!(report.layout_mismatched_blocks, 1);
+        assert_eq!(track.points[0].utc, Some(1_700_000_000));
+        assert_eq!(
+            track.points[0].speed_kmh, None,
+            "the mask asks for speed but a 16-byte record has no room for it"
+        );
+    }
+
+    #[test]
+    fn one_record_before_a_journal_cluster_is_not_lost() {
+        // A block can begin with a single record and then a cluster: the journal
+        // is written when the configuration changes, not on a record grid. The
+        // single checksum match is believed because the run ends at a journal
+        // item; requiring two matches would drop the record.
+        let mut body = Vec::new();
+        push_record20(&mut body, 1_700_000_000);
+        push_journal_cluster(&mut body);
+        for index in 1..4u32 {
+            push_record20(&mut body, 1_700_000_000 + index);
+        }
+        let (track, report) = parse_body(MASK20, COUNT_NOT_FULL, &body);
+        assert_eq!(track.points.len(), 4);
+        assert_eq!(track.points[0].utc, Some(1_700_000_000));
+        assert_eq!(report.journal_items, 7);
+        assert_eq!(report.unparsed_bytes, 0);
+    }
+
+    #[test]
+    fn resync_needs_an_unbroken_run_not_two_lucky_checksums() {
+        // Garbage, two good records, then garbage again: the pair is not enough
+        // evidence to resume on, so the bytes stay reported instead of becoming
+        // points (and the following garbage never becomes a grid).
+        let mut body = pseudo_random_bytes(7, 9);
+        for index in 0..2u32 {
+            push_record20(&mut body, 1_700_000_000 + index);
+        }
+        body.extend_from_slice(&pseudo_random_bytes(11, 7));
+        let (track, report) = parse_body(MASK20, COUNT_NOT_FULL, &body);
+        assert!(
+            track.is_empty(),
+            "two checksum matches are not a record grid: {track:?}"
+        );
+        assert_eq!(report.unparsed_bytes, 9 + 2 * 20 + 7);
+    }
+
+    #[test]
+    fn a_journal_with_unreadable_bytes_is_not_journal_only() {
+        // "Only the journal" has to account for every byte. Seven unreadable
+        // bytes after the cluster mean the dump is not just configuration.
+        let mut body = Vec::new();
+        push_journal_cluster(&mut body);
+        body.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
+        let (_track, report) = parse_body(MASK20, COUNT_NOT_FULL, &body);
+        assert_eq!(report.journal_items, 7);
+        assert_eq!(report.unparsed_bytes, 7);
+        assert!(
+            !report.is_journal_only(),
+            "unreadable bytes mean the dump is not only the journal"
+        );
+    }
+
+    #[test]
+    fn a_record_without_a_time_or_a_position_is_counted_as_empty() {
+        // A UTC-only mask whose timestamp is zero means "no time"; the record has
+        // no position either, so it is dropped rather than exported as a blank
+        // row — and it has to be counted, or `is_journal_only` could call the
+        // dump configuration-only.
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes());
+        let checksum = xor_checksum(&body);
+        body.push(checksum);
+        let (track, report) = parse_body(0x0000_0001, 1, &body);
+        assert!(track.is_empty());
+        assert_eq!(report.records, 0);
+        assert_eq!(report.empty_records, 1);
+        assert!(!report.is_journal_only());
+    }
+
+    /// Deterministic pseudo-random bytes: a 64-bit LCG, so the fixture is the
+    /// same on every run and on every platform.
+    fn pseudo_random_bytes(seed: u64, len: usize) -> Vec<u8> {
+        let mut state = seed;
+        (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (state >> 33) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn random_bytes_do_not_become_track_points() {
+        // The trailer is one XOR byte, so random bytes pass it about once in 256.
+        // That makes a fabricated grid improbable rather than impossible; the
+        // `*_LEADING_RECORDS` constants record the arithmetic. This fixes the
+        // measured result: 50 full blocks of random body yield no point and no
+        // resync.
+        for seed in 0..50u64 {
+            let dump = build_custom_block(
+                MASK20,
+                COUNT_NOT_FULL,
+                &pseudo_random_bytes(seed, BLOCK_SIZE - BLOCK_HEADER_SIZE),
+            );
+            let (track, report) = parse_dump(&dump).expect("a header of the right shape");
+            assert!(
+                track.is_empty(),
+                "seed {seed} produced {} points from random bytes",
+                track.points.len()
+            );
+            assert_eq!(report.records, 0, "seed {seed}");
+            assert_eq!(report.bad_checksums, 0, "seed {seed}");
+        }
     }
 
     #[test]

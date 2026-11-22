@@ -283,6 +283,35 @@ in a `finally`-equivalent, so a failure does not leave the device not recording.
 Flags: `--port <PORT|auto>` (default `auto`), `-o/--output <FILE>`, `--force`
 (overwrite an existing output file), `--json`.
 
+## `m241 log info`
+
+Parses a dump and reports what it holds without converting it. One labelled line
+per fact: `file`, `size`, `records`, `fixes`, `blocks`, `damaged blocks`,
+`bad checksums`, `truncated records`, `start`, `end`; and when they are non-zero,
+`journal items`, `empty records`, `layout mismatches` and `unparsed bytes`. A dump
+that holds only the settings journal prints
+`track            : no track points (settings journal only)` and is not an error.
+
+`--json` prints one object: `file`, `size`, `summary` (the same shape as
+`log read --format json`'s summary) and `parse`:
+
+| Field | Unit | Meaning |
+|---|---|---|
+| `blocks`, `empty_blocks`, `damaged_blocks` | blocks | blocks walked; never-written; holding a failed record |
+| `records` | records | in the track |
+| `bad_checksums` | records | failed their per-record checksum; **not** in the track |
+| `empty_records` | records | decoded but had neither a time nor a position; **not** in the track |
+| `truncated_records` | records | the bytes ran out before the record did |
+| `journal_items` | items | settings-journal entries (16-byte) and name separators (20-byte) skipped |
+| `layout_mismatched_blocks` | blocks | header mask disagreed with the record length in the data; the detected length was used |
+| `unparsed_bytes` | bytes | no record grid or journal item explained them; skipped |
+| `journal_only` | flag | derived: at least one journal item, no track record, no damage, no unparsed byte |
+| `used_bytes` | bytes | record bytes walked; journal, padding and skipped bytes are not counted |
+
+Exit code 1 when the file is not an M-241 dump (including a firmware image or a
+random binary whose first block has no known policy word); 0 otherwise, even with
+damage or with no points at all.
+
 ## `m241 log read`
 
 Converts a dumped log to CSV, GPX, KML, NMEA or JSON (`--format`, default
@@ -336,6 +365,14 @@ comparison with an actual ezTour export has not been done (未検証); the
 specification is the source. This replaces the provisional nine-column layout
 (`index,utc,lat,lon,…`) of earlier builds: `rcr` and `waypoint` remain in
 `--format json`, and `fix` is the presence of a coordinate.
+
+The parser's observations go to stderr as warnings: skipped records that failed
+their checksum, unreadable bytes, a header mask that disagreed with the data, and
+a dump that holds only the settings journal. None of them fails the command; the
+export is what the parser could defend. A journal-only dump (a configured unit
+that has not recorded a point yet) is a warning and an **empty** track with exit
+code 0, the same as an empty dump — unlike an NMEA capture that yields no point,
+which is an error because a non-empty capture losing every sentence is a failure.
 
 ## `m241 log project save`
 
