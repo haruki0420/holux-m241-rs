@@ -31,16 +31,18 @@
 
 ---
 
-## 2. 現在の到達点（PR #20 時点）
+## 2. 現在の到達点（1.0.0 リリース時点）
 
 ### 数字とゲート
 
 | 項目 | 値 |
 |---|---|
+| バージョン | **1.0.0**（`Cargo.toml` の `[workspace.package]` 1 か所で 4 クレートを統一。初回公開リリース） |
 | クレート構成 | 4 クレート（`m241-core` 読取専用 / `m241-flash` 書込専用 / `m241-cli` / `m241-gui`） |
-| テスト | **767 件全緑**（`cargo test --workspace`、PR #20 修正時点の実測） |
-| ゲート | **6/6 PASS**（`./tools/check.sh`: fmt / clippy / test / docs / design / safety） |
-| CI | Linux / Windows / macOS |
+| テスト | **767 件全緑**（`cargo test --workspace`、PR #20 修正時点の実測。1.0.0 リリース準備時に同コマンドを再実行し PASS） |
+| ゲート | **6/6 PASS**（`./tools/check.sh`: fmt / clippy / test / docs / design / safety。1.0.0 リリース準備時に `M241_VENDOR_IMAGE` を設定して再実行） |
+| CI | Linux / Windows / macOS（`ci.yml`） |
+| 配布 | `.github/workflows/release.yml`: `v*` タグで 3 OS の `cargo build --release` を行い、`m241` / `m241-gui` と `SHA256SUMS.txt` を GitHub Release に添付 |
 | **実機検証** | 読み取り・`log erase`（[`05-verification.md`](05-verification.md) §1a）に加え、2026-11-22 の書き込みセッション（同 §1.5）で `fw dump` / `fw probe-da` / `fw flash --recover` / `fw patch` / strict 書き込みが実機で通り、**2 回の書き込み（recovery と strict）が全長読み戻し一致**。`fw flash --allow-vendor` は書込み自体は完了したが、起動したファームが個体データ 4 バイトを復元するため読み戻しが `0x5C` で不一致（設計課題）。パッチ済み V1.14 の起動も確認済み（既定日付が `22-08-99`＝パッチ済みエポック）。残りは**測位ありでの日付確認**と GUI の実機検証 |
 
 ### 完成・`main` 統合済み（三段構成で検証済み、[`10-review-log.md`](10-review-log.md) 記録済み）
@@ -65,8 +67,8 @@
 
 | 項目 | 状態 | ブロッカー / 注意点 |
 |---|---|---|
-| **DA 書き込み実装**（`crates/m241-flash/src/da.rs`） | 実装済み。開始アドレスは確定済み（PR #13） | DA 側の開始アドレスは 2026-11-21 の `fw probe-da` で `0` に確定（`docs/dev/05-verification.md` §1.2）。`UNRESOLVED_STARTS` は空、`check_layout` は確定値 `0` を通す。`--da` は長さ（14,896 バイト）・先頭 4 バイト・全文 SHA-256（`DA_IMAGE_SHA256`、`AGENTS.md` §2.5 のベンダー値）の 3 つを照合する（follow-up W2a を実装済み）。期待ダイジェストは `DaDigest` トークンで、通常ビルドの構築子は `DaDigest::vendor()` のみ（テスト用 `for_test_da` は `simulator` feature 配下）。通常の受理規則は自機バックアップとの差分のみ（同一または `PATCH_OFFSETS` のみ）。`--allow-vendor` は固定 V1.13 SHA-256 の公式イメージだけを受理する別ゲートで、個体データ 14 バイトを上書きする（実機未検証）。`write_range` は private、読み戻し・消去失敗 `0xA5`・ゼロ詰め・`0xD9` 無応答はテスト済み。**実機の書き込み・消去・再起動・`0xD9` 後の再入・ベンダーイメージ書き込みは未検証** |
-| **CLI 配線** | 完了（スタブなし） | `fw flash` は開始アドレス確定後、`verify_device` → DA RAM ロード → `0xD3`/`0xD5` → `0xD9` → NMEA probe + `$PMTK180*3B` で BootROM 再入 → 読み戻し照合まで配線済み。`--allow-vendor` は固定 SHA の V1.13 イメージを書き、dry-run で個体データ上書きを警告する。再入失敗は「読み戻し未実施」として報告し、不一致とは区別する。`0xD3` 失敗時は `0xD9` で再起動し、`0xD5` 前だけ 1 回再試行する。`fw da-restart` は DA のまま残った端末に単独の `0xD9` を送る。`log erase` は PR #12 で実装済み（実機記録は [`05-verification.md`](05-verification.md) §1a）。`device doctor` / `log geotag` / `nmea proxy` はマージ済み。**`fw flash` の実機の書き込み・消去・再起動・`0xD9` 後の再入・ベンダーイメージ書き込みは未検証** |
+| **DA 書き込み実装**（`crates/m241-flash/src/da.rs`） | 実装済み。開始アドレスは確定済み（PR #13） | DA 側の開始アドレスは 2026-11-21 の `fw probe-da` で `0` に確定（`docs/dev/05-verification.md` §1.2）。`UNRESOLVED_STARTS` は空、`check_layout` は確定値 `0` を通す。`--da` は長さ（14,896 バイト）・先頭 4 バイト・全文 SHA-256（`DA_IMAGE_SHA256`、`AGENTS.md` §2.5 のベンダー値）の 3 つを照合する（follow-up W2a を実装済み）。期待ダイジェストは `DaDigest` トークンで、通常ビルドの構築子は `DaDigest::vendor()` のみ（テスト用 `for_test_da` は `simulator` feature 配下）。通常の受理規則は自機バックアップとの差分のみ（同一または `PATCH_OFFSETS` のみ）。`--allow-vendor` は固定 V1.13 SHA-256 の公式イメージだけを受理する別ゲートで、個体データ 14 バイトを上書きする（実機では 2026-11-22 に書込みが完走し V1.13 で起動。読み戻しはファームが個体データ 4 バイトを復元するため `0x5C` で不一致、[`05-verification.md`](05-verification.md) §1.5）。`write_range` は private、読み戻し・消去失敗 `0xA5`・ゼロ詰め・`0xD9` 無応答はテスト済み。**実機: 書込み・消去・再起動・`0xD9` 後の再入・全長読み戻しは 2026-11-22 に通った（同 §1.5）。ベンダーイメージの読み戻しだけが設計課題として残る** |
+| **CLI 配線** | 完了（スタブなし） | `fw flash` は開始アドレス確定後、`verify_device` → DA RAM ロード → `0xD3`/`0xD5` → `0xD9` → NMEA probe + `$PMTK180*3B` で BootROM 再入 → 読み戻し照合まで配線済み。`--allow-vendor` は固定 SHA の V1.13 イメージを書き、dry-run で個体データ上書きを警告する。再入失敗は「読み戻し未実施」として報告し、不一致とは区別する。`0xD3` 失敗時は `0xD9` で再起動し、`0xD5` 前だけ 1 回再試行する。`fw da-restart` は DA のまま残った端末に単独の `0xD9` を送る。`log erase` は PR #12 で実装済み（実機記録は [`05-verification.md`](05-verification.md) §1a）。`device doctor` / `log geotag` / `nmea proxy` はマージ済み。**`fw flash` は 2026-11-22 に実機で recovery / strict の 2 回が全長読み戻し一致まで通った（[`05-verification.md`](05-verification.md) §1.5）。ベンダーイメージの読み戻しだけが設計課題（同 §1.5）** |
 
 ### 3.2 ezTour 代替機能の再実装（[`07-eztour-spec.ja.md`](07-eztour-spec.ja.md) §8）
 

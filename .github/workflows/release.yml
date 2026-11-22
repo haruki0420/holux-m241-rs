@@ -1,0 +1,117 @@
+name: Release
+
+# A `v*` tag is the only trigger: the tag is the release version, and the
+# workspace version in `Cargo.toml` is expected to match it (the tag is not used
+# to rewrite the version). Building here stays separate from `ci.yml` so a tag
+# can be moved only by re-pushing it, not by a branch push.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            cli: target/release/m241
+            gui: target/release/m241-gui
+          - os: windows-latest
+            platform: windows-x86_64
+            cli: target/release/m241.exe
+            gui: target/release/m241-gui.exe
+          - os: macos-latest
+            platform: macos-aarch64
+            cli: target/release/m241
+            gui: target/release/m241-gui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The same packages `ci.yml` uses: `serialport` links libudev on Linux,
+      # and egui links the X11 / Wayland / GL stack.
+      - name: Install the Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libudev-dev \
+            libxkbcommon-dev libwayland-dev libx11-dev libxi-dev \
+            libgl1-mesa-dev libegl1-mesa-dev pkg-config
+      - name: Build
+        run: cargo build --release
+      # Rename per platform so the assets from the three matrix jobs do not
+      # collide on the release, and keep the Windows `.exe` suffix.
+      - name: Collect the release assets (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp "${{ matrix.cli }}" "dist/m241-${{ matrix.platform }}"
+          cp "${{ matrix.gui }}" "dist/m241-gui-${{ matrix.platform }}"
+      - name: Collect the release assets (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "${{ matrix.cli }}" "dist/m241-${{ matrix.platform }}.exe"
+          Copy-Item "${{ matrix.gui }}" "dist/m241-gui-${{ matrix.platform }}.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m241-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: publish the GitHub Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The only job that writes: `gh release create` / `upload` uses
+    # `GITHUB_TOKEN`, scoped to the release on this repository.
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Write the SHA-256 checksums
+        run: |
+          cd dist
+          # Artifact downloads can drop the executable bit; restore it so the
+          # assets are runnable after download. The checksum covers bytes only.
+          chmod +x m241-* 2>/dev/null || true
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create or update the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # A re-pushed tag reuses the existing release; replace the assets.
+            gh release upload "$tag" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$tag" \
+              --generate-notes \
+              --verify-tag \
+              --latest
+          fi
