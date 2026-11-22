@@ -7,6 +7,7 @@
 
 use egui::{RichText, Ui};
 use m241_core::firmware::PROFILE_V1_13;
+use m241_core::firmware::patch::EFFECTIVE_EPOCH_OFFSET;
 
 use crate::screens::common;
 use crate::theme::{self, size, space};
@@ -120,6 +121,16 @@ const ROW_CACHE: Row = Row {
     note: "地図タイルをまだ読んでいないため、キャッシュは空です",
 };
 
+/// Where the map cache lives. DESIGN.md §5 names both the size and the location.
+///
+/// No tile fetcher is linked, so there is no cache directory to name yet. The row
+/// says that instead of printing a path nothing writes to (DESIGN.md §10).
+const ROW_CACHE_LOCATION: Row = Row {
+    label: "地図キャッシュの場所",
+    value: "—（未使用）",
+    note: "地図タイルを読まないため、キャッシュは作りません",
+};
+
 const ROW_UNITS: Row = Row {
     label: "単位",
     value: "km/h・m",
@@ -138,16 +149,26 @@ const ROW_LANG: Row = Row {
     note: "日本語以外の表示は未検証",
 };
 
-/// The 視差低減 row's label. Its value is the live setting, so the row is drawn
+/// The 動きの低減 row's label. Its value is the live setting, so the row is drawn
 /// from the buttons rather than from a constant that could disagree with them.
-const ROW_MOTION_LABEL: &str = "視差低減";
+///
+/// 「動きの低減」, not 「視差低減」: the setting is reduced motion (turn movement
+/// down), and 「視差」 means parallax — a user who wants less motion would not find
+/// it under that name (design review, Should 6).
+const ROW_MOTION_LABEL: &str = "動きの低減";
 
 /// The rows DESIGN.md §5 names, in its order (checked in tests).
 ///
-/// 視差低減 is absent from this list on purpose: unlike the fixed rows it has no
+/// 動きの低減 is absent from this list on purpose: unlike the fixed rows it has no
 /// static value, because its value is whatever the buttons currently show.
 #[cfg(test)]
-const FIXED_ROWS: [Row; 4] = [ROW_CACHE, ROW_UNITS, ROW_THEME, ROW_LANG];
+const FIXED_ROWS: [Row; 5] = [
+    ROW_CACHE,
+    ROW_CACHE_LOCATION,
+    ROW_UNITS,
+    ROW_THEME,
+    ROW_LANG,
+];
 
 /// Draw the screen body. The rail is drawn by the shell, not here.
 pub fn ui(ui: &mut Ui, settings: &mut AppSettings) {
@@ -178,7 +199,7 @@ pub fn ui(ui: &mut Ui, settings: &mut AppSettings) {
         common::heading(
             ui,
             "設定",
-            "単位と視差低減はアプリ内で切り替えられます（終了後は既定値に戻ります）。",
+            "単位と動きの低減はアプリ内で切り替えられます（終了後は既定値に戻ります）。",
         );
         ui.add_space(space::L);
 
@@ -193,6 +214,7 @@ pub fn ui(ui: &mut Ui, settings: &mut AppSettings) {
             ],
         );
         fixed_row(ui, ROW_CACHE);
+        fixed_row(ui, ROW_CACHE_LOCATION);
         option_row(
             ui,
             ROW_UNITS.label,
@@ -211,10 +233,10 @@ pub fn ui(ui: &mut Ui, settings: &mut AppSettings) {
         fixed_row(ui, ROW_THEME);
         fixed_row(ui, ROW_LANG);
         let motion_note = if settings.reduced_motion {
-            "オン（0 ms — タブ切替の移動アニメーションを無効化中）".to_owned()
+            "オン（0 ms。タブ切替の移動アニメーションを無効化中）".to_owned()
         } else {
             format!(
-                "オフ（{} ms — 選択タブが 4px 飛び出します）",
+                "オフ（{} ms。選択タブが 4px 飛び出します）",
                 (AppSettings::DEFAULT_RAIL_TRANSITION_SECS * 1000.0).round() as u32
             )
         };
@@ -234,8 +256,11 @@ pub fn ui(ui: &mut Ui, settings: &mut AppSettings) {
         );
 
         // The colophon of a reference manual: the facts a person needs when the
-        // box and the release note are long gone. All figures come from
-        // `m241-core`, so a changed profile changes this page.
+        // box and the release note are long gone. The figures are read from
+        // `m241-core` — the profile's name and the measured patch offset — so a
+        // changed profile changes this page. The byte count is the V1.13 patch's
+        // own figure (two epoch bytes plus the marker digit); Settings never opens
+        // an image, so it cannot count a `PatchPlan` here.
         //
         // The session-scope sentence lives in the heading and the footer, so it
         // is not repeated here as a status line: that line cost the last row of
@@ -249,18 +274,36 @@ pub fn ui(ui: &mut Ui, settings: &mut AppSettings) {
         ui.add_space(space::S);
         common::hairline(ui);
         for (label, value) in [
-            ("対応ファーム", PROFILE_V1_13.name),
-            ("修正する位置", "0x402F4（3 バイトが変わります）"),
+            ("対応ファーム", String::from(PROFILE_V1_13.name)),
+            ("修正する位置", patch_offset_value()),
         ] {
-            common::figure_row_compact(ui, label, value);
+            common::figure_row_compact(ui, label, &value);
         }
     });
+}
+
+/// The bytes a V1.13 patch rewrites: two in the epoch constant and one in the
+/// version marker.
+///
+/// Not derived from a loaded image because this screen never opens one. The test
+/// below checks the two epoch bytes against `m241-core`'s constants, so a change
+/// there fails here rather than leaving a stale count on the page.
+const V1_13_CHANGED_BYTES: usize = 3;
+
+/// The 修正する位置 row's value.
+///
+/// Built from [`EFFECTIVE_EPOCH_OFFSET`] rather than written as `0x402F4`: the
+/// colophon promises figures that come from `m241-core`, and a literal would keep
+/// pointing at the old address if the measured offset ever moved.
+#[must_use]
+fn patch_offset_value() -> String {
+    format!("0x{EFFECTIVE_EPOCH_OFFSET:05X}（{V1_13_CHANGED_BYTES} バイトが変わります）")
 }
 
 /// A fixed settings row: the value on the right, the explanation underneath,
 /// one hairline under the pair (DESIGN.md §3, row height 32).
 fn fixed_row(ui: &mut Ui, row: Row) {
-    let _row = common::figure_row_open(ui, row.label, row.value);
+    common::figure_row_open(ui, row.label, row.value);
     note_label(ui, row.note);
     common::hairline(ui);
     ui.add_space(space::XS);
@@ -292,6 +335,7 @@ fn note_label(ui: &mut Ui, text: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use m241_core::firmware::image::{GPS_EPOCH_UNIX, GPS_EPOCH_UNIX_WNRO};
 
     #[test]
     fn every_row_names_its_value_and_why_it_cannot_change() {
@@ -311,9 +355,10 @@ mod tests {
 
     #[test]
     fn the_rows_are_the_ones_the_design_names() {
-        // DESIGN.md §5 lists exactly five settings; a sixth added here is a design
-        // change rather than a detail. The four fixed rows plus the live 視差低減
-        // row, which has no static value to assert.
+        // DESIGN.md §5 lists the cache's size and location, units, theme, language
+        // and reduced motion. The location row is a token: the Stage 1 review found
+        // the published build listed the size only, and this test used to pin the
+        // five rows without it, so the omission could not fail.
         let labels: Vec<&str> = FIXED_ROWS
             .iter()
             .map(|row| row.label)
@@ -321,7 +366,41 @@ mod tests {
             .collect();
         assert_eq!(
             labels,
-            ["地図キャッシュ", "単位", "テーマ", "言語", "視差低減"]
+            [
+                "地図キャッシュ",
+                "地図キャッシュの場所",
+                "単位",
+                "テーマ",
+                "言語",
+                "動きの低減"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_colophon_builds_the_patch_offset_from_the_core_constant() {
+        // The row was a literal while its comment said every figure came from
+        // `m241-core`, so a changed offset would have left the page pointing at
+        // the old address. Two epoch bytes change and the marker digit changes.
+        let differing = GPS_EPOCH_UNIX
+            .to_le_bytes()
+            .iter()
+            .zip(GPS_EPOCH_UNIX_WNRO.to_le_bytes())
+            .filter(|pair| *pair.0 != pair.1)
+            .count();
+        assert_eq!(
+            differing + 1,
+            V1_13_CHANGED_BYTES,
+            "the V1.13 patch changes {differing} epoch bytes plus the marker digit"
+        );
+        let value = patch_offset_value();
+        assert!(
+            value.contains(&format!("0x{EFFECTIVE_EPOCH_OFFSET:05X}")),
+            "the row does not name the core offset: {value}"
+        );
+        assert!(
+            value.contains(&format!("{V1_13_CHANGED_BYTES} バイト")),
+            "the row does not state the byte count: {value}"
         );
     }
 

@@ -259,31 +259,41 @@ impl ConnectScreen {
                 );
             });
 
-            // Guidance and the driver diagnostics appear together, and only when
-            // the list is empty or unreadable: with a port present the question
-            // "why is my logger not listed" is not the one being asked, and the
-            // 1280×800 page needs that height for the next-step list.
-            let needs_help = matches!(&self.ports, Listing::Read(ports) if ports.is_empty())
-                || matches!(&self.ports, Listing::Failed(_));
-            if needs_help {
+            // Guidance appears only when there is nothing to pick. An empty list
+            // and a failed enumeration are different failures and get different
+            // sentences: an empty list is the cable or the power, while a failed
+            // enumeration is the OS (driver, permission) and re-plugging the
+            // cable cannot fix it. Sharing one sentence made the panel contradict
+            // the footer, which states the reason.
+            if let Some((message, hint)) = self.port_guidance() {
                 ui.add_space(space::S);
-                ui.label(
-                    RichText::new(
-                        "シリアルポートが見つかりません。USB ケーブルの接続と端末の電源を確認し、「再読込」を押してください。",
-                    )
-                    .size(size::UI)
-                    .color(theme::MUTE),
-                );
+                ui.label(RichText::new(message).size(size::UI).color(theme::MUTE));
                 ui.add_space(space::S);
-                ui.label(
-                    RichText::new(
-                        "診断: CP210x / PL2303 / FTDI / CH340 のいずれかとして見えていれば接続できます",
-                    )
-                    .size(size::CAPTION)
-                    .color(theme::MUTE),
-                );
+                ui.label(RichText::new(hint).size(size::CAPTION).color(theme::MUTE));
             }
         });
+    }
+
+    /// What to say under the port selector when there is nothing to pick.
+    ///
+    /// Returns one line about the failure and one diagnostic line. The failed case
+    /// repeats the reason the footer's status line shows, because the two lines sit
+    /// on the same screen and "no port found" beside "could not list ports: …"
+    /// reads as two contradictory problems.
+    fn port_guidance(&self) -> Option<(String, &'static str)> {
+        match &self.ports {
+            Listing::Read(ports) if ports.is_empty() => Some((
+                String::from(
+                    "シリアルポートが見つかりません。USB ケーブルの接続と端末の電源を確認し、「再読込」を押してください。",
+                ),
+                "診断: CP210x / PL2303 / FTDI / CH340 のいずれかとして見えていれば接続できます",
+            )),
+            Listing::Failed(reason) => Some((
+                format!("ポートを列挙できません: {reason}"),
+                "診断: ドライバの導入状況と、ポートへのアクセス権を確認してください。ケーブルの抜き差しでは直りません。",
+            )),
+            _ => None,
+        }
     }
 
     /// The pinned action row: the probe state on the left, the two port actions
@@ -299,7 +309,13 @@ impl ConnectScreen {
                 {
                     self.start_probe(port);
                 }
-                if common::secondary_button(ui, "再読込", !probing).clicked() {
+                // Reloading during a probe would re-enumerate the list under a
+                // running probe: the probe keeps its own port, but the selection
+                // and the list can disagree until it finishes. The wait is a
+                // fraction of a second, so the button is disabled rather than
+                // allowed to race the list it is not part of.
+                let can_refresh = !probing;
+                if common::secondary_button(ui, "再読込", can_refresh).clicked() {
                     self.refresh();
                 }
             });
@@ -383,7 +399,7 @@ impl ConnectScreen {
                     common::status_line(
                         ui,
                         Status::Info,
-                        "未接続 — 端末の情報はまだ読んでいません",
+                        "未接続（端末の情報はまだ読んでいません）",
                     );
                     ui.add_space(space::S);
                     for (index, line) in [
@@ -439,10 +455,10 @@ impl ConnectScreen {
                     common::status_line(ui, Status::Info, "ログ使用量を確認中…");
                 }
                 ProbeState::Failed(_) => {
-                    common::status_line(ui, Status::Info, "未取得 — 接続確認に失敗しました");
+                    common::status_line(ui, Status::Info, "未取得（接続確認に失敗しました）");
                 }
                 ProbeState::Idle => {
-                    common::status_line(ui, Status::Info, "未取得 — ログはまだ読んでいません");
+                    common::status_line(ui, Status::Info, "未取得（ログはまだ読んでいません）");
                     ui.add_space(space::S);
                     ui.label(
                         RichText::new(
@@ -487,7 +503,7 @@ impl ConnectScreen {
             if unverified {
                 // DESIGN.md §6: an unverified feature wears the word, in mute,
                 // never amber. Amber is for danger, not for doubt.
-                let _marker = painter.text(
+                painter.text(
                     label_rect.right_center() + Vec2::new(space::S, 0.0),
                     Align2::LEFT_CENTER,
                     "未検証",
@@ -495,15 +511,13 @@ impl ConnectScreen {
                     theme::MUTE,
                 );
             }
-            let arrow = painter.text(
+            // No `→` after the note. DESIGN.md §5's mock drew an arrow as a
+            // direction mark, but on screen it reads as "this row goes somewhere"
+            // while the row is not clickable or focusable (design review,
+            // Should 3). The note stays at the right edge; §10 records the
+            // departure from the figure.
+            painter.text(
                 rect.right_center(),
-                Align2::RIGHT_CENTER,
-                "→",
-                FontId::proportional(size::UI),
-                theme::MUTE,
-            );
-            let _note = painter.text(
-                egui::pos2(arrow.left() - space::S, rect.center().y),
                 Align2::RIGHT_CENTER,
                 note,
                 FontId::proportional(size::CAPTION),
@@ -640,6 +654,50 @@ mod tests {
             reason.contains("permission denied"),
             "the failure was reworded instead of reported: {reason}"
         );
+    }
+
+    #[test]
+    fn an_empty_port_list_asks_for_the_cable_and_the_power() {
+        // An empty list is the "nothing is plugged in" failure: the next step is
+        // physical. It must not be confused with a broken enumeration.
+        let mut screen = screen();
+        screen.ports = Listing::Read(Vec::new());
+        let (message, hint) = screen
+            .port_guidance()
+            .expect("an empty list needs guidance");
+        assert!(message.contains("見つかりません"), "got {message}");
+        assert!(message.contains("ケーブル"), "got {message}");
+        assert!(!message.contains("列挙できません"), "got {message}");
+        assert!(hint.contains("CP210x"), "got {hint}");
+    }
+
+    #[test]
+    fn a_failed_enumeration_reports_the_reason_instead_of_no_port_found() {
+        // The Stage 1 review found both failures sharing one sentence, so the
+        // panel said "no port found, check the cable" while the footer said "could
+        // not list ports: permission denied". The reason is the whole message.
+        let mut screen = screen();
+        screen.ports = Listing::Failed(String::from("permission denied"));
+        let (message, hint) = screen
+            .port_guidance()
+            .expect("a failed enumeration needs guidance");
+        assert!(message.contains("列挙できません"), "got {message}");
+        assert!(
+            message.contains("permission denied"),
+            "the reason was dropped: {message}"
+        );
+        assert!(
+            !message.contains("見つかりません"),
+            "a failed enumeration is not an empty list: {message}"
+        );
+        assert!(hint.contains("ドライバ"), "got {hint}");
+    }
+
+    #[test]
+    fn a_readable_port_list_needs_no_guidance() {
+        let mut screen = screen();
+        screen.ports = Listing::Read(vec![String::from("/dev/ttyUSB0")]);
+        assert!(screen.port_guidance().is_none());
     }
 
     #[test]

@@ -845,7 +845,7 @@ impl LogScreen {
             let _download = common::secondary_button(ui, "ログを吸い出す", false);
             ui.label(
                 RichText::new(
-                    "未検証 — 端末からの直接吸い出しは CLI の `m241 log dump` を利用してください",
+                    "未検証（端末からの直接吸い出しは CLI の `m241 log dump` を利用してください）",
                 )
                 .size(size::CAPTION)
                 .color(theme::MUTE),
@@ -868,9 +868,9 @@ impl LogScreen {
 
     /// The 集計 figures: distance, duration, average speed.
     ///
-    /// Three rows, the ones DESIGN.md §5's rail block names. 点数 and 位置 used to
-    /// be repeated here; the point table below is the place a count belongs, and
-    /// the rail block has to stay subordinate to it.
+    /// Three rows, the ones DESIGN.md §5's rail block names. The record count
+    /// lives on the Connect screen's log panel; repeating it here made this
+    /// subordinate block compete with the point list beside it.
     fn summary_block(&self, ui: &mut Ui, settings: &AppSettings) {
         common::block_title(ui, "集計", self.sample);
         common::hairline(ui);
@@ -891,8 +891,13 @@ impl LogScreen {
         }
     }
 
-    /// The left rail block: days, photos, totals. Subordinate to the tab rail: the
-    /// same staircase rhythm, no fill (DESIGN.md §5).
+    /// The left rail block: days, photos, totals. Subordinate to the tab rail:
+    /// caption headings, 28pt rows, no fill (DESIGN.md §5).
+    ///
+    /// Its three blocks share one left edge because that is how §5's figure draws
+    /// them; the 8px staircase is the tab rail's signature and repeating it here
+    /// would give the screen a second one. DESIGN.md §10 records that the section's
+    /// prose and its figure disagree on this point, and which one the build follows.
     fn rail_block(&mut self, ui: &mut Ui, settings: &AppSettings) {
         common::block_title(ui, "トラック", self.sample);
         common::hairline(ui);
@@ -942,13 +947,7 @@ impl LogScreen {
             );
         });
         ui.add_space(space::XS);
-        if ui
-            .add(
-                egui::Button::new(RichText::new("写真を読込").size(size::UI))
-                    .corner_radius(theme::RADIUS),
-            )
-            .clicked()
-        {
+        if common::secondary_button(ui, "写真を読込", true).clicked() {
             let target = PathBuf::from(self.photo_path.trim());
             let _res = self.load_photos_from_path(&target);
         }
@@ -974,7 +973,7 @@ impl LogScreen {
             .id_salt("m241-log-photos")
             .max_height(metric::ROW * 5.0)
             .auto_shrink([false, true])
-            .show_rows(ui, metric::TABLE_HEADER, entries_len, |ui, range| {
+            .show_rows(ui, metric::ROW_COMPACT, entries_len, |ui, range| {
                 for index in range {
                     let Some(entry) = self.photo_entries.get(index) else {
                         continue;
@@ -1168,71 +1167,32 @@ impl LogScreen {
             } else {
                 "再生"
             };
-            if ui
-                .add(
-                    egui::Button::new(RichText::new(play_label).size(size::UI))
-                        .corner_radius(theme::RADIUS),
-                )
-                .clicked()
-            {
+            // The toolbar is the `tool_button` class, not egui's default filled
+            // face: on this screen the default made the playback strip the
+            // brightest thing on the page, and a filled box beside 中止 (outline)
+            // read as a second primary action (design review, Should 4).
+            if common::tool_button(ui, play_label, self.playing, true).clicked() {
                 self.toggle_play();
             }
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("前の点").size(size::UI))
-                        .corner_radius(theme::RADIUS),
-                )
-                .clicked()
-            {
+            if common::tool_button(ui, "前の点", false, true).clicked() {
                 let _moved = self.step_prev();
             }
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("次の点").size(size::UI))
-                        .corner_radius(theme::RADIUS),
-                )
-                .clicked()
-            {
+            if common::tool_button(ui, "次の点", false, true).clicked() {
                 let _moved = self.step_next();
             }
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("全点表示").size(size::UI))
-                        .corner_radius(theme::RADIUS),
-                )
-                .clicked()
-            {
+            if common::tool_button(ui, "全点表示", false, true).clicked() {
                 self.fit_all();
             }
 
-            let mut follow = self.follow;
-            if ui
-                .add(egui::Button::selectable(
-                    follow,
-                    RichText::new("追従").size(size::UI),
-                ))
-                .clicked()
-            {
-                follow = !follow;
-                self.set_follow(follow);
+            let follow = self.follow;
+            if common::tool_button(ui, "追従", follow, true).clicked() {
+                self.set_follow(!follow);
             }
 
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("−").size(size::UI))
-                        .corner_radius(theme::RADIUS),
-                )
-                .clicked()
-            {
+            if common::tool_button(ui, "−", false, true).clicked() {
                 self.set_zoom(self.map_zoom - 1.0);
             }
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("＋").size(size::UI))
-                        .corner_radius(theme::RADIUS),
-                )
-                .clicked()
-            {
+            if common::tool_button(ui, "＋", false, true).clicked() {
                 self.set_zoom(self.map_zoom + 1.0);
             }
         });
@@ -1508,6 +1468,9 @@ impl LogScreen {
             rect.bottom(),
             Stroke::new(metric::HAIRLINE, theme::RULE),
         );
+        // Rows are focusable (Sense::click); without this the keyboard's position
+        // in a 10,000-row list was invisible (design review, Must 1).
+        common::focus_ring(ui, &response);
         response.clicked()
     }
 
@@ -1522,23 +1485,14 @@ impl LogScreen {
             for format in ExportFormat::ALL {
                 let label = format.extension().to_uppercase();
                 let selected = self.format == format;
-                if ui
-                    .add(egui::Button::selectable(
-                        selected,
-                        RichText::new(label).size(size::UI),
-                    ))
-                    .clicked()
-                {
+                if common::tool_button(ui, &label, selected, true).clicked() {
                     self.set_export_format(format);
                 }
             }
             // Named in the design, absent from the exporter: saying so is better
             // than a button that quietly writes something else (§7, no icons for
             // words — and no control that lies about what it produces).
-            let _ignored = ui.add_enabled(
-                false,
-                egui::Button::new(RichText::new("KMZ").size(size::UI)).corner_radius(theme::RADIUS),
-            );
+            common::tool_button(ui, "KMZ", false, false);
             ui.label(
                 RichText::new("未対応")
                     .size(size::CAPTION)
@@ -1553,6 +1507,18 @@ impl LogScreen {
             };
             if common::secondary_button(ui, &photo_button_label, matched > 0).clicked() {
                 self.open_geotag_confirmation();
+            }
+            if matched == 0 {
+                // Why the button beside it is disabled, next to the button. The
+                // photo block is scrolled away at this point, so a reason that
+                // lives only there is a reason the reader at the footer cannot
+                // see (DESIGN.md §6: a refusal says what the next step is, where
+                // the control is).
+                ui.label(
+                    RichText::new("写真を読み込むと位置を書き込めます")
+                        .size(size::CAPTION)
+                        .color(theme::MUTE),
+                );
             }
         });
 
@@ -1600,23 +1566,12 @@ impl LogScreen {
                 ),
             );
             ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("書き込む").size(size::UI))
-                            .corner_radius(theme::RADIUS),
-                    )
-                    .clicked()
+                if common::primary_button(ui, "書き込む", true).clicked()
                     && let Some(confirmation) = self.confirm_geotag_write()
                 {
                     let _res = self.apply_geotags(confirmation);
                 }
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("キャンセル").size(size::UI))
-                            .corner_radius(theme::RADIUS),
-                    )
-                    .clicked()
-                {
+                if common::secondary_button(ui, "キャンセル", true).clicked() {
                     self.close_geotag_confirmation();
                 }
             });

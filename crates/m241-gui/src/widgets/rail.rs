@@ -140,14 +140,17 @@ pub fn rail_with_transition(ui: &mut Ui, current: Screen, transition_secs: f32) 
     ui.vertical(|ui| {
         for screen in Screen::ALL {
             // The caller's duration is used here, once; `tab` only paints at the
-            // progress that animation reached.
+            // progress that animation reached. The curve is ease-out (§3): most of
+            // the 4pt move happens early and the tab settles instead of arriving
+            // at a constant speed, which is what a manual's tab would do.
             let animation_id = ui.scope_id().with(("m241-rail-active", screen.index()));
-            let progress = ui.ctx().animate_bool_with_time(
+            let progress = ui.ctx().animate_bool_with_time_and_easing(
                 animation_id,
                 screen == current,
                 // egui rejects a negative animation time; the caller passing a
                 // negative number of seconds means "none", not "go backwards".
                 transition_secs.max(0.0),
+                egui::emath::easing::quadratic_out,
             );
             if tab(ui, screen, progress).clicked() && screen != current {
                 selected = Some(screen);
@@ -214,12 +217,20 @@ mod tests {
     use super::*;
 
     /// Run eight rail passes, moving the selection from `from` to `to` after two
-    /// frames, and return the x where `label`'s tab was painted in the last pass.
+    /// frames, and return the x where `label`'s tab was painted in `read_pass`.
     ///
     /// Measured from the primitives, not from `tab_left_at`: the point of the
-    /// test is the duration the *caller* passed, so re-reading the pure function
-    /// would prove nothing about the wiring.
-    fn measure_labelled_tab(label: &str, seconds: f32, from: Screen, to: Option<Screen>) -> f32 {
+    /// test is the duration and the curve the *caller* passed, so re-reading the
+    /// pure function would prove nothing about the wiring. `read_pass` is an
+    /// argument because a position read late enough cannot tell easing curves
+    /// apart once the 4pt offset has been rounded.
+    fn measure_labelled_tab(
+        label: &str,
+        seconds: f32,
+        from: Screen,
+        to: Option<Screen>,
+        read_pass: usize,
+    ) -> f32 {
         let ctx = egui::Context::default();
         let mut time = 0.0_f64;
         let mut left = f32::NAN;
@@ -241,7 +252,7 @@ mod tests {
                 let current = if pass < 2 { from } else { to.unwrap_or(from) };
                 let _selected = rail_with_transition(ui, current, seconds);
             });
-            if pass == 7 {
+            if pass == read_pass {
                 for clipped in &output.shapes {
                     if let egui::Shape::Text(text) = &clipped.shape
                         && text.galley.job.text == label
@@ -260,18 +271,25 @@ mod tests {
     fn the_tab_slides_at_the_transition_time_the_caller_passed() {
         // DESIGN.md §3: 150 ms by default, and reduced motion drops the duration
         // to 0 without dropping the 4pt offset. Frames are driven at the real
-        // rate and 「ログ」 is measured where it was painted after the selection
-        // moved onto it. Seven frames is ~117 ms: less than 150 ms, so a tab
-        // animating for the passed duration must still be between the two ends;
-        // at 0 s it is home at once.
+        // rate and 「ログ」 is measured where it was painted four frames in
+        // (~67 ms, a third of 150 ms). Ease-out is already past halfway there, so
+        // the tab is still between the two ends; at 0 s it is home at once.
+        // (Seven frames was the old probe; ease-out is nearly home by then, so
+        // the curve would decide the result instead of the duration.)
         let moving = measure_labelled_tab(
             Screen::Log.label(),
             0.15,
             Screen::Connect,
             Some(Screen::Log),
+            4,
         );
-        let at_once =
-            measure_labelled_tab(Screen::Log.label(), 0.0, Screen::Connect, Some(Screen::Log));
+        let at_once = measure_labelled_tab(
+            Screen::Log.label(),
+            0.0,
+            Screen::Connect,
+            Some(Screen::Log),
+            4,
+        );
         // Text is drawn at the tab's left edge plus `space::L`.
         let home = tab_left(Screen::Log) - ACTIVE_STEP_OUT + space::L;
         let seated = tab_left(Screen::Log) + space::L;
@@ -281,8 +299,34 @@ mod tests {
         );
         assert!(
             (moving - home).abs() > 0.05 && (moving - seated).abs() > 0.05,
-            "a 0.15 s transition finished within seven frames: it painted at {moving}, \
+            "a 0.15 s transition finished within four frames: it painted at {moving}, \
              home is {home} and the staircase is {seated}"
+        );
+    }
+
+    #[test]
+    fn the_tab_eases_out_rather_than_moving_linearly() {
+        // §3: the transition is ease-out. A third of the way through, linear
+        // would have moved round(4 × 1/3) = 1pt; quadratic-out has moved
+        // round(4 × 0.56) = 2pt. Those integers are far enough apart to tell the
+        // curves apart, which a read later in the animation cannot.
+        let moving = measure_labelled_tab(
+            Screen::Log.label(),
+            0.15,
+            Screen::Connect,
+            Some(Screen::Log),
+            4,
+        );
+        let seated = tab_left(Screen::Log) + space::L;
+        let offset = seated - moving;
+        assert!(
+            offset > 1.5,
+            "at a third of the transition the tab had moved {offset}pt; a linear \
+             animation moves 1pt and an ease-out more than 2pt"
+        );
+        assert!(
+            offset < ACTIVE_STEP_OUT,
+            "the tab was already home at a third of the transition ({offset}pt)"
         );
     }
 

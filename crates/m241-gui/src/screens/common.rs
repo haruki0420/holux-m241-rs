@@ -1,5 +1,6 @@
-//! Furniture the three screens share: the status voice, the ruled panel, and the
-//! formatting of times and figures.
+//! Furniture the four screens share: the status voice, the ruled panel and
+//! table, the figure rows, the button hierarchy, and the formatting of times and
+//! figures.
 //!
 //! Why the status voice is a type rather than a habit: DESIGN.md §3 says a status
 //! colour is never the only signal. If every screen chose a colour at its own call
@@ -8,7 +9,7 @@
 //! chosen, and it returns the word with it, so a caller cannot take one without
 //! the other.
 
-use egui::{Color32, RichText, Sense, Stroke, Ui, Vec2};
+use egui::{Color32, RichText, Sense, Stroke, StrokeKind, Ui, Vec2};
 use m241_core::TrackPoint;
 
 use crate::theme::{self, metric, size, space};
@@ -244,7 +245,7 @@ pub fn figure_row(ui: &mut Ui, label: &str, value: &str) {
 /// DESIGN.md §5 makes the Log screen's left column a rail block rather than a
 /// second table: its rows are one step tighter than the content tables.
 pub fn figure_row_compact(ui: &mut Ui, label: &str, value: &str) {
-    let (rect, _response) = figure_row_sized(ui, label, value, metric::TABLE_HEADER);
+    let (rect, _response) = figure_row_sized(ui, label, value, metric::ROW_COMPACT);
     ui.painter().hline(
         rect.x_range(),
         rect.bottom(),
@@ -256,9 +257,11 @@ pub fn figure_row_compact(ui: &mut Ui, label: &str, value: &str) {
 ///
 /// For a row that carries an explanation underneath: the caller hangs the note
 /// below the pair and draws one rule under both, so the note belongs to the
-/// figure instead of sitting across a rule from it.
-pub fn figure_row_open(ui: &mut Ui, label: &str, value: &str) -> (egui::Rect, egui::Response) {
-    figure_row_sized(ui, label, value, metric::ROW)
+/// figure instead of sitting across a rule from it. Returns nothing: both call
+/// sites place the note in the layout, so a `Rect` nobody reads would be an
+/// invitation to guess at positions instead of using the layout.
+pub fn figure_row_open(ui: &mut Ui, label: &str, value: &str) {
+    let _ = figure_row_sized(ui, label, value, metric::ROW);
 }
 
 /// The label/value pair at a chosen row height.
@@ -353,6 +356,25 @@ pub fn table_row(ui: &mut Ui, cells: &[(&str, f32)]) {
     );
 }
 
+/// The design's focus ring: 2pt `ink`, inset by the hairline (DESIGN.md §6).
+///
+/// egui's `Button` draws its own focus outline only when it has no explicit
+/// `.stroke()` (button.rs replaces the frame style with the argument), and every
+/// button in this product sets a stroke to state its role. So the ring is drawn
+/// here, from the same `Response` the widget returned, and every custom control
+/// calls it. Without this a focused 接続して確認 / 中止 / 書き込む was pixel-
+/// identical to an unfocused one, which is the Must finding of the design review.
+pub fn focus_ring(ui: &Ui, response: &egui::Response) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.shrink(metric::HAIRLINE),
+            theme::RADIUS,
+            Stroke::new(metric::FOCUS_RING, theme::INK),
+            StrokeKind::Inside,
+        );
+    }
+}
+
 /// The primary action: a bone (`ink`) face with a `ground` word.
 ///
 /// This is the safe action the screen recommends. When it cannot be taken it
@@ -365,16 +387,37 @@ pub fn primary_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response
     } else {
         (theme::GROUND, theme::MUTE, theme::RULE)
     };
+    action_button(ui, label, enabled, fill, ink, border, 1.0)
+}
+
+/// A compact control: a `rule` outline with no fill, for a toolbar or a toggle.
+///
+/// A fourth class the §10 hierarchy did not name. The map's playback controls and
+/// the export-format chips are neither the screen's primary action nor its
+/// secondary one, and leaving them on egui's default filled face made the Log
+/// toolbar the brightest thing on the page (design review, Should 4). Selected is
+/// an `ink` outline — the same selection language as [`choice_button`] — and
+/// amber is never used.
+pub fn tool_button(ui: &mut Ui, label: &str, selected: bool, enabled: bool) -> egui::Response {
+    let (ink, border) = if selected {
+        (theme::INK, theme::INK)
+    } else {
+        (theme::MUTE, theme::RULE)
+    };
     ui.scope(|ui| {
+        // A disabled tool keeps its own contrast pair rather than egui's dimmed
+        // fill, the same rule the action buttons follow.
         ui.style_mut().visuals.disabled_alpha = 1.0;
-        ui.add_enabled(
+        let response = ui.add_enabled(
             enabled,
             egui::Button::new(RichText::new(label).size(size::UI).color(ink))
-                .fill(fill)
+                .fill(Color32::TRANSPARENT)
                 .stroke(Stroke::new(metric::HAIRLINE, border))
                 .corner_radius(theme::RADIUS)
-                .min_size(Vec2::new(metric::ACTION_WIDTH, metric::ROW)),
-        )
+                .min_size(Vec2::new(0.0, metric::ROW_COMPACT)),
+        );
+        focus_ring(ui, &response);
+        response
     })
     .inner
 }
@@ -383,19 +426,26 @@ pub fn primary_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response
 ///
 /// Selected is a bone outline, not a fill and not a status colour: selection in
 /// this product is never amber (DESIGN.md §3, §7).
+///
+/// This control has no disabled state on purpose: the settings choices are live
+/// whenever the screen shows them, so there is nothing to gate. The two action
+/// buttons do have one, which is why they share [`action_button`] and this does
+/// not.
 pub fn choice_button(ui: &mut Ui, label: &str, selected: bool) -> egui::Response {
     let (ink, border) = if selected {
         (theme::INK, theme::INK)
     } else {
         (theme::MUTE, theme::RULE)
     };
-    ui.add(
+    let response = ui.add(
         egui::Button::new(RichText::new(label).size(size::UI).color(ink))
             .fill(Color32::TRANSPARENT)
             .stroke(Stroke::new(metric::HAIRLINE, border))
             .corner_radius(theme::RADIUS)
             .min_size(Vec2::new(metric::ACTION_WIDTH * 0.75, metric::ROW)),
-    )
+    );
+    focus_ring(ui, &response);
+    response
 }
 
 /// A secondary action: an outline on the ground, no fill.
@@ -404,16 +454,44 @@ pub fn choice_button(ui: &mut Ui, label: &str, selected: bool) -> egui::Response
 /// quieter class than the one primary action a screen offers.
 pub fn secondary_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
     let ink = if enabled { theme::INK } else { theme::MUTE };
+    action_button(
+        ui,
+        label,
+        enabled,
+        Color32::TRANSPARENT,
+        ink,
+        theme::RULE,
+        0.7,
+    )
+}
+
+/// The body [`primary_button`] and [`secondary_button`] share.
+///
+/// The two roles differ only in fill, ink, border and width factor, so those are
+/// arguments; the disabled treatment (override `disabled_alpha`, keep the face's
+/// own contrast pair) is written once here instead of twice with a chance to
+/// drift.
+fn action_button(
+    ui: &mut Ui,
+    label: &str,
+    enabled: bool,
+    fill: Color32,
+    ink: Color32,
+    border: Color32,
+    width_factor: f32,
+) -> egui::Response {
     ui.scope(|ui| {
         ui.style_mut().visuals.disabled_alpha = 1.0;
-        ui.add_enabled(
+        let response = ui.add_enabled(
             enabled,
             egui::Button::new(RichText::new(label).size(size::UI).color(ink))
-                .fill(Color32::TRANSPARENT)
-                .stroke(Stroke::new(metric::HAIRLINE, theme::RULE))
+                .fill(fill)
+                .stroke(Stroke::new(metric::HAIRLINE, border))
                 .corner_radius(theme::RADIUS)
-                .min_size(Vec2::new(metric::ACTION_WIDTH * 0.7, metric::ROW)),
-        )
+                .min_size(Vec2::new(metric::ACTION_WIDTH * width_factor, metric::ROW)),
+        );
+        focus_ring(ui, &response);
+        response
     })
     .inner
 }
@@ -422,10 +500,12 @@ pub fn secondary_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Respon
 ///
 /// PRODUCT.md makes "say what the device is doing" a rule; sample data is the
 /// one case where the honest sentence is "no device is doing anything, this is a
-/// drawing of one". Every screen that can show sample data calls this first.
+/// drawing of one". The firmware screen prints this under its heading; panels
+/// and blocks that carry sample figures use [`sample_panel`] and [`block_title`],
+/// which put the same word in their caption instead of adding a band above them.
 pub fn sample_marker(ui: &mut Ui) {
     ui.label(
-        RichText::new("見本 — 実機から読んだ値ではありません")
+        RichText::new("見本（実機から読んだ値ではありません）")
             .size(size::CAPTION)
             .color(theme::MUTE),
     );
@@ -595,6 +675,88 @@ pub fn grouped(value: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Flatten nested `Shape::Vec` trees into a list of leaf shapes.
+    fn flatten<'a>(shapes: &'a [egui::Shape], out: &mut Vec<&'a egui::Shape>) {
+        for shape in shapes {
+            match shape {
+                egui::Shape::Vec(children) => flatten(children, out),
+                other => out.push(other),
+            }
+        }
+    }
+
+    /// Focus `draw`'s widget and report whether the 2pt ink ring reached the frame.
+    fn focus_ring_is_painted(mut draw: impl FnMut(&mut Ui) -> egui::Response) -> bool {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(640.0, 400.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let mut id = None;
+        for pass in 0..3 {
+            let output = ctx.run_ui(input.clone(), |ui| {
+                let response = draw(ui);
+                if pass == 0 {
+                    id = Some(response.id);
+                }
+            });
+            let shapes: Vec<egui::Shape> = output
+                .shapes
+                .iter()
+                .map(|clipped| clipped.shape.clone())
+                .collect();
+            output.drop_without_applying_deltas();
+            if pass > 0 {
+                let mut flat = Vec::new();
+                flatten(&shapes, &mut flat);
+                if flat.iter().any(|shape| {
+                    matches!(
+                        shape,
+                        egui::Shape::Rect(rect)
+                            if (rect.stroke.width - metric::FOCUS_RING).abs() < f32::EPSILON
+                                && rect.stroke.color == theme::INK
+                    )
+                }) {
+                    return true;
+                }
+            }
+            if pass == 0
+                && let Some(id) = id
+            {
+                ctx.memory_mut(|memory| memory.request_focus(id));
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn every_custom_button_draws_the_focus_ring() {
+        // The design review's Must: an explicit `.stroke()` makes egui's Button
+        // skip its own focus outline, so every custom control painted the same
+        // whether focused or not. The ring is drawn from the response; this drives
+        // each button class through the real widget, gives it focus, and looks for
+        // the 2pt ink rectangle in the frame.
+        assert!(
+            focus_ring_is_painted(|ui| primary_button(ui, "接続して確認", true)),
+            "the primary button has no focus ring"
+        );
+        assert!(
+            focus_ring_is_painted(|ui| secondary_button(ui, "中止", true)),
+            "the secondary button has no focus ring"
+        );
+        assert!(
+            focus_ring_is_painted(|ui| choice_button(ui, "オン", true)),
+            "the choice button has no focus ring"
+        );
+        assert!(
+            focus_ring_is_painted(|ui| tool_button(ui, "再生", false, true)),
+            "the tool button has no focus ring"
+        );
+    }
 
     #[test]
     fn every_status_colour_carries_a_word() {

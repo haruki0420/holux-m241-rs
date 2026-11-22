@@ -951,3 +951,84 @@ Stage 2 の差分は本節と同じコミットで、範囲は `crates/m241-core
 ### Stage 3 検証
 
 未検証（別エージェントが記入する）。
+
+---
+
+## 2026-11-22 / PR #27 `feat-gui-design` の Stage 2 修正
+
+対象: `crates/m241-gui` と `DESIGN.md` §10。ブランチ `feat-gui-design`、修正前 head
+`bcf829c`、base `origin/main` = `b0456df`。指摘は 3 レビュー:
+仕様検収（issuecomment 7080617175）、可読性（7080524634）、デザインレビュー
+（7080737431）。実機ポートは開いていない。`m241-core` / `m241-flash` /
+`m241-cli` は未変更（`git diff --name-only` で確認）。
+
+### Must の解消
+
+| レビュー | 指摘 | 解消 | 固定するテスト |
+|---|---|---|---|
+| 仕様 §6 | 操作待ちで進捗が 100% に保持されない（`firmware.rs:652-670`） | バーを全状態で描くよう `dump_progress` に一本化し、`WaitingForPowerCycle { total }` は `Some(1.0)` と `406,620 / 406,620 バイト（読み取り完了）` を描く。状態行と命令文はバーの下に残す | `the_waiting_state_holds_the_dump_progress_at_one_hundred_percent`（値）、`waiting_for_the_power_cycle_holds_the_progress_bar_at_one_hundred_percent`（描画されたバーの幅と命令文） |
+| 仕様 §5 | 設定に「地図キャッシュの場所」が無い（`settings.rs:117-121`） | 「地図キャッシュの場所 / —（未使用）」行を追加（タイル非同梱の事実）。`DESIGN.md` §10 に記録 | `the_rows_are_the_ones_the_design_names`（6 行）、`the_settings_screen_names_the_cache_location_and_the_patch_offset`（描画） |
+| 可読性 M1 | `promote_system_face(ctx, "a"/"0", …)` の意味不明な文字列 | `PROPORTIONAL_CLUSTER` / `MONOSPACE_CLUSTER` 定数にし、各 family をその文字で代表させる理由を doc に書いた | コンパイルと既存のフォント描画テスト（`screenshot.rs`） |
+| 可読性 M2 | 「All figures come from `m241-core`」と `0x402F4` 直書きの矛盾 | `patch_offset_value()` が `patch::EFFECTIVE_EPOCH_OFFSET` から組み、バイト数は V1.13 固定である理由をコメント。テストが core の epoch 定数から差分バイト数を再計算して 3 と照合 | `the_colophon_builds_the_patch_offset_from_the_core_constant` |
+| 可読性 M3 | 列挙失敗でも「ポートが見つかりません／ケーブル確認」で同画面の `port_status` と矛盾 | `port_guidance()` を empty と failed で分岐。failed は理由（`ポートを列挙できません: {reason}`）とドライバ/権限の次の手を出す | `an_empty_port_list_asks_for_the_cable_and_the_power`、`a_failed_enumeration_reports_the_reason_instead_of_no_port_found`、`a_readable_port_list_needs_no_guidance` |
+| デザイン Must 1 | 主要ボタン・点一覧でキーボードフォーカスが見えない（明示 `.stroke()` が egui の focus 輪を上書き） | `common::focus_ring` を追加し、primary/secondary/choice/tool/write ボタンと点一覧行が `Response` から 2pt `ink` の inset 矩形を描く。テストはウィジェットに focus を与え、フレームの 2pt INK 矩形を測る | `every_custom_button_draws_the_focus_ring`、`the_write_button_draws_the_focus_ring`、`the_focus_ring_is_two_points_of_ink`。加えて一時ヘルパで Tab を押したフレームを PNG 化し、レール「接続」と「書き込む」に輪が出ることを目視（ヘルパは確認後に削除） |
+
+### 仕様検収 Should の対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| S1 | ease-out が linear（`rail.rs:145`） | `animate_bool_with_time_and_easing(..., quadratic_out)` に変更。150 ms は据え置き、reduced motion は 0 のまま | `the_tab_eases_out_rather_than_moving_linearly`（遷移 1/3 時点の描画位置で linear の 1pt と区別）。既存の duration テストは 4 フレーム読みに更新 |
+| S2 | `popup_shadow` / `window_shadow` 未無効化 | `apply` で `Shadow::NONE` を両方に設定 | `the_page_has_no_shadow_elevation` |
+| S3 | ログ左カラムの 8px 階段が未実装 | 実装は §5 の図（3 ブロック同一左端）に従い、本文と図の不一致を `DESIGN.md` §10 に記録。`log.rs` のコメントも実装に合わせた | —（記録） |
+| S4 | 1280×800 で「選択した点」「点の一覧」が初期表示に出ない | §10 の「§9 が 1024 で認めている」という誤記を撤回し、両サイズとも本文スクロールで到達すると明記 | —（記録。レイアウトは変更せず） |
+| S5 | OSM タイル未実装と `PRODUCT.md:66` の記述が矛盾 | 本 PR の write scope 外（`PRODUCT.md`）のため未編集。§10 の「タイル取得なし」記録は維持し、対応は別 PR に分離 | — |
+| S6 | `§10` の記述不足 | 残る既定ボタン、点一覧の `PANEL` 選択、DA 未取得、書き込みスタブ、KMZ 未対応、衛星なし、桁区切りなし、body 行高、ローディング、虹色軌跡、矢印削除、コピー表記を追記 | — |
+| S7 | 描画変更を固定するテスト欠如 | パレット 16 進値・タイプ・余白・`RADIUS=2`・行高・影・フォーカス・空ログ文言・地図注記・設定コラムを追加。`write_all` の 8 枚出力テストは 8 回のフルサイズ描画（約 60 秒）を check.sh に足すため見送り、`--screenshot` の実行結果（8 枚）で確認 | 上記各テスト + `an_empty_log_says_there_is_no_log_yet`、`the_log_map_is_labelled_as_a_track_without_map_tiles` |
+
+### 可読性 Should の対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| S1 | `figure_row_compact` が `metric::TABLE_HEADER` を流用 | `metric::ROW_COMPACT: 28` を新設し、写真一覧の行高も同じ定数へ。`TABLE_HEADER` はヘッダ専用に | `the_row_heights_are_the_ones_the_design_names` |
+| S2 | `figure_row_open` の戻り値が未使用 | 戻り値を `()` にし、`_row` / `_da` の束縛を削除。doc も「note は呼び出し側がレイアウトで置く」に修正 | コンパイル |
+| S3 | `table_header` / `table_row` のセル配置と列分率の二重管理 | **見送り**。1 つの `Column` 定義へ寄せる変更は firmware/settings の表全体に及び、Stage 2 の範囲では退行リスクが大きい。ヘッダと本文は各画面の同じ関数内で隣接しており、次 PR の構造改善候補として残す | — |
+| S4 | `primary_button` / `secondary_button` の重複 | `action_button` に共通化し、幅係数と色だけを引数に。`choice_button` に disabled を持たない理由を doc 化 | 既存描画テスト + フォーカス輪テスト |
+| S5 | `connect::next_steps` の手書き罫線行 | 未使用束縛（`_marker` / `_note`）を削除。3 系統（next_steps / step_row / point_row）の共通化は **見送り**（データ形が異なり、`tool_button` 追加後の再設計が必要） | — |
+| S6 | `StepMarker::colour` のテストが無い | `an_unreached_step_marker_is_not_drawn_in_the_hairline_colour` を追加（MUTE 固定・RULE でないこと） | 同左 |
+| S7 | 無効ボタンの理由が画面から消えた | 「写真を読み込むと位置を書き込めます」を「写真に位置」ボタンの隣に戻した | レンダリングで目視（`log-1280x800.png`） |
+| S8 | `再読込` の probing 中無効化に理由が無い | `can_refresh` に名前を付け、列挙と probe の競合を避ける理由コメントを追加 | — |
+| S9 | `common.rs` doc の「three screens」 | 「four screens」と家具（status / panel / ruled table / figure rows / button hierarchy / formatting）に修正 | — |
+| Could C2/C3 | `text_styles` の数値直書き、写真行高の不揃い | `size::*` と `metric::ROW_COMPACT` から組むよう修正 | `the_type_scale_is_the_five_sizes_the_design_names` |
+
+### デザインレビュー Should の対応
+
+| # | 指摘 | 対応 |
+|---|---|---|
+| 2 | 1024×640 で書き込みの前提チェックと拒否メッセージが折り返し下 | `gate_rows` を固定フッター（書き込むの直上）へ移動し、`message` もフッターに表示。1024 の再描画で 3 つの前提が見えることを目視 |
+| 3 | 「次にすること」の `→` が偽アフォーダンス | 矢印を削除し、行き先は右端の注記の言葉で示す。§5 の図との差は §10 に記録 |
+| 4 | ボタン語彙が 4 分裂 | `common::tool_button`（rule outline・28pt・選択は ink outline）を追加し、地図操作と書き出しチップ、KMZ（disabled）を移行。step 1/2 の 参照/吸い出す/開く/保存/コピー は secondary/primary へ。§10 に第 4 クラスとして記録 |
+| 5 | 書体の理由が事実誤認（「ライセンスが無い」） | `DESIGN.md` §10 を「Barlow / Noto Sans JP は SIL OFL 1.1 で同梱可能。本ビルドはバイナリ非同梱の方針で OS フェイスを使う。同梱は将来作業」に修正。ネット取得はしない |
+| 6 | 「視差低減」は reduced motion の誤訳 | 「動きの低減」へ変更（ラベル・見出し・テスト期待値） |
+| 7 | 地図の軌跡が 10 色（`TRACK_PALETTE`）で虹 | コードは変更せず §10 に「線は data 1 色、記録ドットのみ ezTour §5 由来の 10 色。§3 に無い色なので単色化か §3 追記のどちらかを設計判断として残す」と記録 |
+| 8 | 「 — 」連結コピー | UI コピー 6 箇所を括弧・句点へ（`見本（…）` / `未検証（…）` / `未接続（…）` / `未取得（…）` / `オン（0 ms。…）` / `オフ（150 ms。…）`）。render テストの期待値も更新 |
+
+### デザインレビュー Could の扱い
+
+- 影の除去（Could 6）: 対応（仕様 S2 と同じ）。
+- キャレット・スクロールバーのテーマ（Could 6）: **見送り**。egui のスクロールバーは `style.visuals` の複数フィールドにまたがり、今回は craft-floor の影・フォーカスを優先。
+- ローディングのスケルトン行（Could 2）、タイトルバーの断定（Could 3）、ステッパーのラベル対称性（Could 1）、地図の明色面（Could 5）、レビュー画像の状態 variant（Could 7）: **見送り**。いずれも仕様変更・追加実装で、Stage 2 の指摘解消とは独立。§10 のローディング記録と 1280 折り返しの訂正に留めた。
+
+### 却下した指摘
+
+なし。3 レビューの Must はすべて事実と一致した。Should のうち実装を見送ったものは上表の理由のとおり（`PRODUCT.md` は write scope 外、表・罫線行の共通化は構造変更、虹色軌跡は設計判断待ち）。
+
+### 検証
+
+- `M241_VENDOR_IMAGE=… ./tools/check.sh` **6/6**（fmt / clippy / test / docs / design / safety、42 秒）。
+- `cargo test -p m241-gui`: lib **103** + design_gate **6** + design_invariants **6** + render **36** = **151 passed / 0 failed**。
+- `--screenshot /tmp/m241-gui-after2` で **8 枚**（4 画面 × 1280×800 / 1024×640）を再出力し目視。変更点: 設定のキャッシュ場所行、接続の矢印削除、ファームのフッター内前提 3 行、ログの tool ボタン統一、コピーの括弧化。待機状態（Must 1）は 8 枚に含まれないため、一時テストで待機フレームを PNG 化し、バーが全幅で満ちていることを目視（テストは削除済み）。フォーカスも一時ヘルパで Tab 押下後のフレームを PNG 化し、レール「接続」と「書き込む」に 2pt ink の輪が出ることを目視（ヘルパは削除済み）。
+- スクリーンショットで確認した既知の残り: 1280×800 の設定はキャッシュ場所行の追加で巻末の「修正する位置」が、1024×640 では「動きの低減」と巻末が本文スクロールの下にある（フッターは固定）。行を増やした帰結で、本文スクロールで到達する。
+
+### Stage 3 検証
+
+未検証（別エージェントが記入する）。
