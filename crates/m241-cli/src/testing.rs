@@ -712,6 +712,10 @@ pub mod fake_da {
         pub nmea_after: usize,
         /// Whether any reset line was asserted (`set_control_lines(true)`).
         pub control_lines_asserted: bool,
+        /// How many times a port was opened. A dry run must leave this at zero.
+        pub opens: usize,
+        /// Whether the serial line was ever read or written.
+        pub bytes_moved: usize,
     }
 
     impl Record {
@@ -1107,9 +1111,11 @@ pub mod fake_da {
                 buf[count] = byte;
                 count += 1;
             }
+            self.record.borrow_mut().bytes_moved += count;
             Ok(count)
         }
         fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+            self.record.borrow_mut().bytes_moved += buf.len();
             for byte in buf {
                 self.consume(*byte);
             }
@@ -1177,6 +1183,7 @@ pub mod fake_da {
         }
 
         fn open(&self, _name: &str, baud: u32) -> Result<Opened> {
+            self.chip.record().borrow_mut().opens += 1;
             let mut transport = FakeDaTransport::new(&self.chip);
             transport.set_baud(baud)?;
             Ok(Opened::new(Box::new(transport)))
@@ -1215,6 +1222,111 @@ pub mod fake_da {
                 chip.record().borrow().pmtk180,
                 "the stale fragment hid the sentence"
             );
+        }
+    }
+}
+
+/// The write crate's own fake DA behind the CLI's [`Links`] seam.
+///
+/// `fw flash` drives the whole write sequence (`verify_device`, the DA load,
+/// `0xD3` / `0xD5`, `0xD9`, the read-back), so its end-to-end test uses the same
+/// model the protocol tests do rather than a second description of the wire.
+/// The feature is enabled in this crate's dev-dependencies only; the shipped
+/// binary does not link the model.
+pub mod da_write {
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use m241_core::Result;
+    use m241_core::protocol::port::Transport;
+    use m241_flash::simulator::FakeDa;
+
+    use crate::link::{Cable, Links, Opened, PortEntry};
+
+    use super::FAKE_PORT;
+
+    /// The transport one `open` hands out; clones share the chip.
+    #[derive(Debug)]
+    struct SharedFakeDa(Rc<RefCell<FakeDa>>);
+
+    impl Transport for SharedFakeDa {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+            self.0.borrow_mut().read(buf)
+        }
+
+        fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+            self.0.borrow_mut().write_all(buf)
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            self.0.borrow_mut().flush()
+        }
+
+        fn clear_input(&mut self) -> Result<()> {
+            self.0.borrow_mut().clear_input()
+        }
+
+        /// Set the baud without changing the modelled mode.
+        ///
+        /// Re-entry after `0xD9` is not signalled here: the CLI's
+        /// `reenter_bootrom` probes the firmware's NMEA stream and sends
+        /// `$PMTK180*3B`, which [`m241_flash::FakeDa`] models itself. A shim
+        /// that switched to the BootROM on `set_baud` would hide a missing
+        /// re-entry, so there is none.
+        fn set_baud(&mut self, baud: u32) -> Result<()> {
+            self.0.borrow_mut().set_baud(baud)
+        }
+
+        fn set_control_lines(&mut self, asserted: bool) -> Result<()> {
+            self.0.borrow_mut().set_control_lines(asserted)
+        }
+    }
+
+    /// A [`Links`] with one plausible port backed by a shared [`FakeDa`].
+    #[derive(Debug, Clone)]
+    pub struct DaWritePorts {
+        chip: Rc<RefCell<FakeDa>>,
+        opens: Rc<Cell<usize>>,
+    }
+
+    impl DaWritePorts {
+        /// One plausible port backed by `device`.
+        #[must_use]
+        pub fn new(device: FakeDa) -> Self {
+            Self {
+                chip: Rc::new(RefCell::new(device)),
+                opens: Rc::new(Cell::new(0)),
+            }
+        }
+
+        /// The chip, for assertions after the command returns.
+        #[must_use]
+        pub fn chip(&self) -> Rc<RefCell<FakeDa>> {
+            Rc::clone(&self.chip)
+        }
+
+        /// How many times the handler opened the port.
+        #[must_use]
+        pub fn opens(&self) -> usize {
+            self.opens.get()
+        }
+    }
+
+    impl Links for DaWritePorts {
+        fn ports(&self) -> Result<Vec<PortEntry>> {
+            Ok(vec![PortEntry {
+                name: String::from(FAKE_PORT),
+                cable: Some(Cable::Cp210x),
+                likely: true,
+                description: Some(String::from("simulated M-241")),
+            }])
+        }
+
+        fn open(&self, _name: &str, baud: u32) -> Result<Opened> {
+            self.opens.set(self.opens.get() + 1);
+            let mut transport = SharedFakeDa(Rc::clone(&self.chip));
+            transport.set_baud(baud)?;
+            Ok(Opened::new(Box::new(transport)))
         }
     }
 }

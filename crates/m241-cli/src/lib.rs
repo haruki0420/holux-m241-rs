@@ -13,19 +13,23 @@
 //!   fileio   reading and writing the files a command works on
 //!   cal      civil dates, so the offset flags need no date library
 //!   device   ports, info, doctor
-//!   fw       dump and patch (flash is a stub, see below)
+//!   fw       dump, patch and flash
 //!   logcmd   download, info, read, erase, geotag
 //!   nmea     repair and proxy
 //! ```
 //!
-//! One verb is deliberately not wired: `fw flash`, which changes the firmware
-//! image on the device. It parses, so the help is complete, and it fails with a
-//! message naming itself and pointing at `m241 --help`. `log erase` is wired
-//! because `m241-flash`'s [`BackupProof`](m241_flash::erase::BackupProof) can
-//! only be built by handing over the dump that was taken first. That check is
-//! deliberately weak — it compares lengths, not contents — but it makes "erase
-//! without a copy" a line of code a reviewer sees rather than an argument
-//! nobody reads.
+//! `fw flash` and `log erase` are the two destructive verbs wired here, and both
+//! are thin front ends to `m241-flash`: the erase, the program and the restart
+//! live in that crate, and the handler only decides the order of the refusals and
+//! what to print. `log erase` is wired because `m241-flash`'s
+//! [`BackupProof`](m241_flash::erase::BackupProof) can only be built by handing
+//! over the dump that was taken first. That check is deliberately weak — it
+//! compares lengths, not contents — but it makes "erase without a copy" a line of
+//! code a reviewer sees rather than an argument nobody reads.
+//!
+//! 🧪 The firmware write has not run against a unit. It is exercised end to end
+//! against `m241-flash`'s fake DA; `docs/dev/05-verification.md` records what
+//! hardware sessions exist.
 //!
 //! Machine output goes to stdout; progress and warnings go to stderr. Exit codes
 //! are documented in `docs/reference/02-cli.md` and map one-to-one onto
@@ -272,7 +276,7 @@ pub(crate) fn run_with(
         Command::Fw { command } => match command {
             FwCommand::Dump(options) => fw::dump(&options, session)?,
             FwCommand::Patch(options) => fw::patch(&options, session)?,
-            FwCommand::Flash => return Err(not_implemented("fw flash").into()),
+            FwCommand::Flash(options) => fw::flash(&options, session)?,
             FwCommand::ProbeDa(options) => fw::probe_da(&options, session)?,
         },
         Command::Log { command } => match command {
@@ -288,18 +292,6 @@ pub(crate) fn run_with(
         },
     }
     Ok(())
-}
-
-/// The error for a command this build parses but cannot carry out yet.
-///
-/// The message names the command the user actually typed and says where to find
-/// one that works. "not implemented yet" on its own leaves them with no next
-/// step, and naming internal work items tells them nothing they can act on.
-fn not_implemented(command: &str) -> m241_core::Error {
-    m241_core::Error::State(format!(
-        "`m241 {command}` is not implemented in this build; \
-         see `m241 --help` for the commands that work"
-    ))
 }
 
 /// Install the tracing subscriber, writing to stderr.
@@ -318,70 +310,10 @@ pub fn init_tracing(verbose: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{AutoConfirm, FakePorts, RecordingConsole};
     use super::*;
     use m241_core::protocol::pmtk::{
         DEFAULT_ENTRY_QUIET_BUDGET, DEFAULT_ENTRY_SETTLE, DEFAULT_ENTRY_WATCH,
     };
-
-    /// Parse a command line, so the stub list is built the way a user builds it.
-    fn parsed(args: &[&str]) -> Command {
-        use clap::Parser as _;
-
-        let mut argv = vec!["m241"];
-        argv.extend_from_slice(args);
-        Cli::try_parse_from(argv)
-            .expect("the grammar accepts this command line")
-            .command
-    }
-
-    /// Every command this build still stubs, with the name its message must
-    /// carry.
-    ///
-    /// One entry leaves this list with each commit that wires a handler, so the
-    /// list is this build's own record of how far the wiring got. The command
-    /// lines are the ones `docs/reference/02-cli.md` documents.
-    fn unimplemented_commands() -> Vec<(Command, &'static str)> {
-        vec![(parsed(&["fw", "flash"]), "fw flash")]
-    }
-
-    #[test]
-    fn an_unimplemented_command_names_itself_and_a_next_step() {
-        let links = FakePorts::empty();
-        let console = RecordingConsole::default();
-        let session = Session::new(&links, &console, &AutoConfirm);
-        for (command, name) in unimplemented_commands() {
-            let err = run_with(session, command).expect_err("a stub command must fail");
-            let text = err.to_string();
-            assert!(
-                text.contains(&format!("`m241 {name}`")),
-                "{name}: message does not name the command: {text}"
-            );
-            assert!(
-                text.contains("not implemented in this build"),
-                "{name}: does not say what is missing: {text}"
-            );
-            assert!(
-                text.contains("`m241 --help`"),
-                "{name}: no next step for the user: {text}"
-            );
-            assert!(
-                !text.contains("vendor") && !text.contains("未実装"),
-                "{name}: internal work item, or not in the language of the rest of the CLI: {text}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_stub_list_records_how_far_the_wiring_got() {
-        // Pins the set: a command that gains an implementation must leave this
-        // list, so a half-wired command cannot stay "stubbed but advertised".
-        let names: Vec<&str> = unimplemented_commands()
-            .iter()
-            .map(|(_command, name)| *name)
-            .collect();
-        assert_eq!(names, vec!["fw flash"]);
-    }
 
     #[test]
     fn the_real_timings_are_the_measured_ones() {

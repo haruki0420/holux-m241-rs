@@ -101,23 +101,35 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
 3. **書き込み後に読み戻して照合しているか。** 👁
    書いたバイト列をそのまま信じない。BootROM 経由で同じ範囲を読み、イメージと
    比較する。比較は `m241-core` の読み取り API で行う（書き込みクレートが読み取り
-   側を再実装しない）。*現状:* `PendingWrite::verify_written` が `0xD9` を送ってから
-   `m241_core` の `MtkBootRom` で読み戻し、先頭の不一致オフセットを報告する。
-   読み出しそのものは再実装していない（比較だけがこのクレートにある）。🧪
+   側を再実装しない）。*現状:* `PendingWrite::verify_written` が `0xD9` を送り、
+   呼び出し側の再入ステップ（CLI は NMEA probe → `$PMTK180*3B` → 115200）が
+   transport を返したあと、`m241_core` の `MtkBootRom` で読み戻して先頭の不一致
+   オフセットを報告する。再入が失敗した場合は「読み戻し未実施」として返し、
+   不一致（実行したが違う）と区別する。読み出しそのものは再実装していない
+   （比較だけがこのクレートにある）。🧪
    読み出しアドレスは `BASE_ADDR_FIRMWARE + da_start` で、フェイクが記録した
    最終読み出しアドレスとの一致をテストで固定している。DA ビューと BootROM
    ビューの写像は 2026-11-21 に先頭 64 バイトで確認された（DA `0` と BootROM
    `0x00200000` が同じイメージの先頭を返す。`docs/dev/05-verification.md`
-   §1.2）。テストが固定するのは「クライアントが base を足す」ことであり、
-   書き込み後の全範囲読み戻しは実機で未検証である。
+   §1.2）。テストが固定するのは「クライアントが base を足す」ことと
+   「`0xD9` 後に NMEA → `$PMTK180` で再入する」こと、そして「読み出しが
+   `DUMP_CHUNK` ごとの複数 `0xA2` に分かれる」ことである。406,620 バイトを
+   1 フレームで読むと 115,200 8N1 で約 35 秒かかり、`MtkBootRom` の 5 秒
+   deadline を超える。`the_device_check_reads_the_span_in_chunked_bootrom_frames`
+   と `the_read_back_reads_the_span_in_chunked_bootrom_frames` がフレーム数と
+   各 count の上限を fake の記録で固定する。実機の全範囲読み戻しは未検証である。
 4. **失敗時に装置を既知の状態に戻せるか。** 👁
    途中で失敗したとき、どこまで書けたかを報告し、リセット（`0xD9`）後に
    BootROM へ再入する手順が案内されること。`0xD9` は応答を返さないので、
    待ってはいけない（同 §8.4）。*現状:* `0xD5` 送信後の失敗はすべて
    `PartialWrite::recovery` の文面を伴う。書けたバイト数、`0xD9` の送信有無、
    `--assume-brom` での再入、自分のバックアップの書き戻しを名指しする。🧪
-   クライアントが `0xD9` の後に読まないことは
-   `the_restart_does_not_read_a_reply` が、書き込み経路が `0xD9` を送らないことは
+   部分書き込み後の書き戻しは `fw flash --recover --yes` が唯一の経路で、
+   イメージがバックアップと完全一致するときだけ許可され、`verify_device` の
+   代わりにベクタ / family のマーカー検査だけを行う。通常経路の
+   `verify_device` は必須のままである。
+   クライアントが `0xD9` の後に DA 応答を読まないことは
+   `the_restart_does_not_read_a_da_reply` が、書き込み経路が `0xD9` を送らないことは
    `a_write_stops_before_the_restart_so_the_caller_can_decide` が固定する。
 5. **citation のない定数がないか。** 👁
    `m241-flash` の全ての定数は `docs/reference/01-da-protocol.md` の関数と
@@ -186,7 +198,7 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
 | 項目 | 状態 | 固定するテスト |
 |---|---|---|
 | `0xD5` の最初セクタ消去失敗 → `0xA5` | 命令列のみ。実機で失敗を起こしていない。フェイクが模す | `a_failed_first_erase_is_a_rejected_error_with_nothing_written`（今回追加） |
-| `0xD9` が応答を返さないこと | 命令列のみ（`0x00101920`）。実機で測っていない | `the_restart_does_not_read_a_reply`（今回追加） |
+| `0xD9` が応答を返さないこと | 命令列のみ（`0x00101920`）。実機で測っていない | `the_restart_does_not_read_a_da_reply`（今回追加） |
 | 短い最終パケットのゼロ詰め | 書き込み方向は未検証。§4.4 は読み出し側の直列化から読んだ記述 | `the_final_packet_is_the_short_one_and_is_zero_filled`（今回追加、フェイクが受けた payload を見る） |
 | 拒否された `0xD3` が 1 バイト `A5` | 命令列のみ。実機で拒否させていない | `a_refused_range_is_one_byte_and_a_rejected_error` |
 | `0xD5` の 2 つの最終 `0x5A` の間にバイトを送るか | 未確定。送らない形だけ実機で通っている | `a_full_write_consumes_exactly_its_replies` |
@@ -221,6 +233,11 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
    無いこと。例外は `erased` — 空ブロックを読むときに使う語で、書き込みではない。
    静的検査で拾えない表現（算術組み立てや `format!` による動的組み立て、生
    `Transport::write_all` への直接書き込み）が無いことは `👁` で確認する。
+   同じゲートは `crates/m241-flash/src/da.rs` の `check_image` 本体に
+   `firmware::digest` / `digest::matches` / `sha256`（`sha256_hex` を含む）が
+   戻らないことも検査する。`AGENTS.md` §2.3 のバックアップ差分だけが受理規則で
+   あり、ベンダーイメージの digest で通す経路は削除済みである（`check_da_image`
+   の W2a 用 SHA-256 は対象外）。
 3. **ポートを開いたまま落ちたとき、装置が recording 停止のままにならないか。** 👁
    `log_stop` の後は必ず `log_resume` が走ること。`download_log` は失敗経路でも
    resume する（`pmtk.rs` のテスト `logging_is_resumed_even_when_the_transfer_fails`
@@ -244,6 +261,7 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
 | `cargo tree -p m241-flash --edges normal,build,dev` に `m241-core` がある | 正しい向きの依存が消えていない |
 | `crates/m241-core/Cargo.toml` と `crates/m241-gui/Cargo.toml` が `m241-flash` を名指ししない | 解決結果に出ない形の依存（dev 依存など）も塞ぐ |
 | `set_control_lines` が `crates/m241-core/src/protocol/brom.rs` / `crates/m241-core/src/protocol/port.rs` / `crates/m241-core/src/protocol/simulator.rs` 以外に無い | DTR/RTS を触る場所が増えていない（同名別パスのすり抜けも防ぐ） |
+| `crates/m241-flash/src/da.rs` の `check_image` / `all_within` 本体に `firmware::digest` / `digest::matches` / `sha256(_hex)` が無い | ベンダー digest による第二の受理経路が戻らない（差分ヘルパーへ移しても検出し、`check_da_image` の W2a 用 SHA-256 は対象外） |
 | `crates/m241-flash/src/da.rs` の `pub fn write` が本体のトップレベル（brace depth 1）で `write_range` より前に `check_layout()?` を含む | 開始アドレスのゲートが書き込み経路から外れていない（コメント・別関数・未呼び出しの入れ子関数では通らない） |
 
 すべての検査と `tools/check.sh` への配線は
@@ -264,9 +282,10 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
   レビュー節とテストで担保する。同ファイルの `write` が `check_layout()` を
   呼ぶこと自体は機械的に検査するが、そのゲートの中身は検査しない。
 
-## 書き込み可能な実行（`fw flash --yes` / `fw probe-da --yes`）の承認（2026-11-21 変更）
+## 書き込み可能な実行（`fw flash --yes` / `fw flash --recover --yes` / `fw probe-da --yes`）の承認（2026-11-21 変更）
 
-`fw flash --yes` と `fw probe-da --yes` の承認は原則としてユーザー本人が行う。その
+`fw flash --yes`（`--recover` を含む）と `fw probe-da --yes` の承認は原則として
+ユーザー本人が行う。その
 セッションまたは指示でユーザーが明示的にサブエージェントへ承認権限を委任した場合
 **に限り**、対象の実行を準備したセッションとは独立したサブエージェントが `--yes`
 付与可否を判定できる。破壊的変更に事前の人間承認を要する旨の明示的なユーザー指示が
@@ -309,6 +328,15 @@ follow-up **W2a** であり、それまでの承認は手動照合で行う（�
   待たず再起動または電源再投入し、`--assume-brom` または 4 探査同期で BootROM に再入して
   自機バックアップを書き戻す／部分書き込み状態からログ取得しない）、および `--yes`・
   解決済み `--port`・`--da`・イメージ・バックアップを含む完全なコマンド行を確認する。
+- **`fw flash --recover` の承認**: `--recover` は部分書き込み後のユニットに自機
+  バックアップを書き戻す唯一の経路で、`verify_device`（全 span 比較）を意図的に
+  省略する。承認者は、イメージがバックアップと**完全一致**（差分 0 バイト）であり、
+  パッチ済みイメージではないこと、ベクタ / family のマーカー検査は残ることを確認する。
+  イメージが 1 バイトでも違えば拒否する。通常の `fw flash --yes` では
+  `verify_device` が必須のままである。固定するテストは
+  `flash_recover_writes_the_backup_without_the_whole_unit_comparison`、
+  `flash_recover_refuses_an_image_that_is_not_the_backup`、
+  `flash_refuses_a_unit_that_does_not_hold_the_backup_before_any_write_opcode`。🧪
 - **記録主体の分離と永続記録**: 承認者はポートを開かず、準備ブランチも編集しない。
   `--yes` 実行**前**に承認者自身のセッションから直接、**永続的な**判定記録
   （承認者が投稿する PR コメント、または承認者が準備とは別のブランチ / PR で

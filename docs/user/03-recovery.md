@@ -25,15 +25,22 @@ can leave the unit unusable even with the BootROM intact.
    back in BootROM waiting state. A short press of the power button is not the
    same thing.
 2. Put the battery back, switch on, and reconnect.
-3. Write your own backup back:
+3. Write your own backup back with the explicit recovery mode:
 
    ```bash
-   m241 fw flash --da vendor/DA_v3.8.4.bin --fw backup/stock.bin --backup backup/stock.bin
+   m241 fw flash backup/stock.bin --da vendor/DA_v3.8.4.bin --backup backup/stock.bin --recover --yes
    ```
 
-   Passing the same file to `--fw` and `--backup` is deliberate: the difference
-   is zero bytes, and zero differing bytes is accepted. That is how you get a
-   known-good image past the check that normally only allows patch offsets.
+   `--recover` requires the image to be byte-identical to `--backup` and skips
+   the whole-unit comparison, because a partial write has already changed the
+   unit. It still checks the M-241 vector and family markers and keeps the
+   confirmation, layout and DA gates. This is the only supported path for a
+   partial unit: without `--recover`, `verify_device` refuses a unit that no
+   longer matches the backup. If the vector or family marker is itself damaged,
+   `--recover` refuses rather than writing blind; that state is not recoverable
+   by this build. A successful recovery leaves the unit in the
+   BootROM, so remove the battery for about ten seconds, put it back, and switch
+   it on before using the logger.
 
 4. If it still will not answer, try assuming the chip is already in BootROM:
 

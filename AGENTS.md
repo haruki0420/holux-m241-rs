@@ -129,9 +129,10 @@ that check.
 
 See §6.
 
-### 2.5 Who may approve a write-capable run (`fw flash --yes`, `fw probe-da --yes`)
+### 2.5 Who may approve a write-capable run (`fw flash --yes`, `fw flash --recover --yes`, `fw probe-da --yes`)
 
-By default, passing `--yes` to `fw flash` **or `fw probe-da`** requires the
+By default, passing `--yes` to `fw flash` (**including `--recover`**) or
+`fw probe-da` requires the
 user's own approval. Subagent approval under this section applies **only** when
 the user has explicitly delegated approval for these write-capable runs in that
 session or instruction; any explicit user requirement for prior human approval
@@ -192,10 +193,17 @@ the reviewer independently verifies:
   reply, or power-cycle, then re-enter BootROM with `--assume-brom` or retry the
   four-probe sync and write the user's own backup image back; do not download
   the log from a partly written unit);
+* for `fw flash --recover --yes`, the image must be **byte-identical** to the
+  backup (zero differing bytes); a patched image or any other image is a
+  refusal. `--recover` skips `verify_device` because a partial unit cannot match
+  the backup, so approval must confirm that the unit is the same one the backup
+  came from and that the run is a recovery, not a normal write. The request
+  names `--recover` explicitly; without it, the normal `verify_device` path
+  applies;
 * the exact full command line to run, including `--yes`, the resolved `--port`,
-  `--da`, the image path, and the backup path. `fw flash`'s flags are still a
-  stub (`crates/m241-cli/src/lib.rs`), so this is the intended shape; re-check
-  it against the real flags when they are implemented.
+  `--da`, the image path, and the backup path, plus `--recover` when used.
+  `fw flash` implements these flags; re-check the command against
+  `m241 fw flash --help` before approving.
 
 A missing item, a hash or byte-diff mismatch, an unsettled
 `FLASH_WRITE_START`, `--port auto`, or a non-independent/forked reviewer is a
