@@ -52,10 +52,12 @@ not a request: the child never starts. Read the session id from the tool result
 and say "running" only when that id exists.
 
 **Before asking the user to unplug the battery or the cable, look for a software
-way back.** A unit left in the DA's RAM is restarted with `0xD9`; if the CLI has
-no command for it, add one (`fw da-restart`) rather than asking for a physical
-power cycle. A unit that has booted its firmware is reached with the `$PMTK180`
-route or `--assume-brom`. A physical power cycle is the last resort.
+way back.** A unit left in the DA's RAM is sent the one-byte `0xD9` restart with
+`fw da-restart` — it has no reply, so the restart itself cannot be confirmed; run
+`m241 fw dump` to see what the unit answers. A unit that has booted its firmware
+is reached with the `$PMTK180` route; a unit that is already sitting in the
+BootROM is reached with `--assume-brom`. A physical power cycle is the last
+resort.
 
 **The simulator is a regression pin, not an oracle.** The hardware decides
 unknown behaviour; the fake records what the hardware has already shown. A green
@@ -385,8 +387,9 @@ pre-write drain is not a verdict, and a failure does not move the baud.
 
 Probing the stream twice is a bug, not a harmless extra check: the caller probes
 once and passes its `StreamState` to `enter_bootrom_after`, because a second
-probe consumes the line the hand-over depends on. ⚠️ 未検証 in the Rust client:
-the same sequence has not yet been re-run on hardware from `m241` itself.
+probe consumes the line the hand-over depends on. ✅ measured 2026-11-22:
+`fw dump` and both successful writes entered the BootROM through this path on the
+unit (`docs/dev/05-verification.md` §1.5).
 
 ### 4.7 The four sync probes must be back to back
 
