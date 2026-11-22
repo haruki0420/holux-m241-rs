@@ -51,7 +51,7 @@
 | **ezTour 仕様化** | 完了（`docs/dev/07-eztour-spec.ja.md` 615 行、クリーンルーム仕様） |
 | **読み書き分離 + safety ゲート** | 完了（`m241-core` / `m241-flash` 分離、`tools/check_safety.py` + 配線・検出力テスト 19 件） |
 | **コア読み取り・変換・EXIF/ジオタグ基盤** | 完了（PMTK / BootROM / ログ解析 / GPX・KML・CSV・NMEA・JSON 出力 / パッチ計画 / 自前 EXIF・geotag） |
-| **CLI 13 コマンド** | 完了（`device ports` / `info` / `doctor`、`fw dump` / `patch` / `flash`、`log info` / `download` / `read` / `erase` / `geotag`、`nmea repair` / `proxy`。`fw flash` は DA 書き込みと読み戻しまで配線済み・**実機未検証**。`log erase` は PR #12 で配線済み、実機記録は [`05-verification.md`](05-verification.md) §1a。スタブは残っていない） |
+| **CLI 15 コマンド** | 完了（`device ports` / `info` / `doctor`、`fw dump` / `patch` / `flash` / `probe-da` / `da-restart`、`log info` / `download` / `read` / `erase` / `geotag`、`nmea repair` / `proxy`。`fw flash` は DA 書き込みと読み戻しまで配線済み・**実機未検証**。`log erase` は PR #12 で配線済み、実機記録は [`05-verification.md`](05-verification.md) §1a。スタブは残っていない） |
 | **GUI 4 画面（実データ接続・再生・写真同期）** | 完了（接続 / ログ / ファーム / 設定。実ポート probe・実ログ読込・再生・写真同期・POI・始点終点・設定反映。132 テスト。実機未検証） |
 
 - **2026-11-21 のマージ**: review-gate (#2)、CLI 非破壊 3 コマンド (#3)、GUI 実データ接続 (#4)、
@@ -66,7 +66,7 @@
 | 項目 | 状態 | ブロッカー / 注意点 |
 |---|---|---|
 | **DA 書き込み実装**（`crates/m241-flash/src/da.rs`） | 実装済み。開始アドレスは確定済み（PR #13） | DA 側の開始アドレスは 2026-11-21 の `fw probe-da` で `0` に確定（`docs/dev/05-verification.md` §1.2）。`UNRESOLVED_STARTS` は空、`check_layout` は確定値 `0` を通す。通常の受理規則は自機バックアップとの差分のみ（同一または `PATCH_OFFSETS` のみ）。`--allow-vendor` は固定 V1.13 SHA-256 の公式イメージだけを受理する別ゲートで、個体データ 14 バイトを上書きする（実機未検証）。`write_range` は private、読み戻し・消去失敗 `0xA5`・ゼロ詰め・`0xD9` 無応答はテスト済み。**実機の書き込み・消去・再起動・`0xD9` 後の再入・ベンダーイメージ書き込みは未検証** |
-| **CLI 配線** | 完了（スタブなし） | `fw flash` は開始アドレス確定後、`verify_device` → DA RAM ロード → `0xD3`/`0xD5` → `0xD9` → NMEA probe + `$PMTK180*3B` で BootROM 再入 → 読み戻し照合まで配線済み。`--allow-vendor` は固定 SHA の V1.13 イメージを書き、dry-run で個体データ上書きを警告する。再入失敗は「読み戻し未実施」として報告し、不一致とは区別する。`log erase` は PR #12 で実装済み（実機記録は [`05-verification.md`](05-verification.md) §1a）。`device doctor` / `log geotag` / `nmea proxy` はマージ済み。**`fw flash` の実機の書き込み・消去・再起動・`0xD9` 後の再入・ベンダーイメージ書き込みは未検証** |
+| **CLI 配線** | 完了（スタブなし） | `fw flash` は開始アドレス確定後、`verify_device` → DA RAM ロード → `0xD3`/`0xD5` → `0xD9` → NMEA probe + `$PMTK180*3B` で BootROM 再入 → 読み戻し照合まで配線済み。`--allow-vendor` は固定 SHA の V1.13 イメージを書き、dry-run で個体データ上書きを警告する。再入失敗は「読み戻し未実施」として報告し、不一致とは区別する。`0xD3` 失敗時は `0xD9` で再起動し、`0xD5` 前だけ 1 回再試行する。`fw da-restart` は DA のまま残った端末に単独の `0xD9` を送る。`log erase` は PR #12 で実装済み（実機記録は [`05-verification.md`](05-verification.md) §1a）。`device doctor` / `log geotag` / `nmea proxy` はマージ済み。**`fw flash` の実機の書き込み・消去・再起動・`0xD9` 後の再入・ベンダーイメージ書き込みは未検証** |
 
 ### 3.2 ezTour 代替機能の再実装（[`07-eztour-spec.ja.md`](07-eztour-spec.ja.md) §8）
 
