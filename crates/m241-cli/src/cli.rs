@@ -15,10 +15,12 @@
 //! the handler for one verb is not buried in the middle of the enum that
 //! describes all seventeen.
 //!
-//! Two rules from `docs/reference/02-cli.md` are enforced here rather than in a
-//! handler, because clap can produce the documented exit code 2 for them:
+//! The rules below from `docs/reference/02-cli.md` are enforced here rather than
+//! in a handler, because clap can produce the documented exit code 2 for them:
 //!
 //! * `fw patch --dry-run` needs no `-o`, but a real run does;
+//! * `log geotag --scope selected` needs at least one `--photo`, and
+//!   `--scope by-camera` needs both `--camera-make` and `--camera-model`;
 //! * the value of a flag is validated while parsing, so a typo is a usage error
 //!   (exit 2) rather than a runtime failure halfway through a file. Concretely:
 //!   `--format` must be one of the five `ExportFormat` names; `--utc-offset-days`
@@ -356,6 +358,16 @@ pub enum LogCommand {
     Kmz(LogKmzOptions),
 }
 
+/// The `--scope` value that reads `--photo`: `07-eztour-spec.ja.md` §6.1-7's
+/// `selPhotos`.
+///
+/// The spelling lives in one constant because `--scope`'s possible values,
+/// [`ShiftScopeArg::label`] and the `required_if_eq` conditions must agree; a
+/// test pins the label against the value clap accepts.
+const SCOPE_SELECTED: &str = "selected";
+/// The `--scope` value that reads the camera flags: the spec's `byCamera`.
+const SCOPE_BY_CAMERA: &str = "by-camera";
+
 /// Which photos a `log geotag` clock shift moves: `07-eztour-spec.ja.md` §6.1-7's
 /// three scopes, spelled the way `--scope` accepts them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
@@ -371,12 +383,17 @@ pub enum ShiftScopeArg {
 
 impl ShiftScopeArg {
     /// The value `--scope` takes, for output.
+    ///
+    /// Deliberately the same words as the `ValueEnum` spellings: a test
+    /// compares this with `clap`'s possible value, so renaming a variant fails
+    /// to compile the test rather than silently changing a `required_if_eq`
+    /// condition.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
             Self::All => "all",
-            Self::Selected => "selected",
-            Self::ByCamera => "by-camera",
+            Self::Selected => SCOPE_SELECTED,
+            Self::ByCamera => SCOPE_BY_CAMERA,
         }
     }
 }
@@ -457,26 +474,33 @@ pub struct LogGeotagOptions {
     )]
     pub shift_seconds: i64,
 
-    /// Which photos the shift moves.
+    /// Which photos the shift moves. The `--shift-*` flags are the operation:
+    /// a `--scope` with an all-zero shift moves nothing.
+    ///
+    /// `--photo` is read by `selected` and the camera flags by `by-camera`; a
+    /// flag given under another scope is reported and ignored.
     #[arg(long, value_enum, default_value = "all", value_name = "SCOPE")]
     pub scope: ShiftScopeArg,
 
-    /// A photo to move under `--scope selected`; repeatable.
+    /// Select a photo out of `<PHOTOS>` to move, for `--scope selected`;
+    /// repeatable.
     ///
-    /// The value is compared exactly as given, so a path spelled differently
-    /// from the one in `<PHOTOS>` selects nothing.
-    #[arg(long, value_name = "PATH", required_if_eq("scope", "selected"))]
+    /// The value is compared with the paths `<PHOTOS>` expands to, so a
+    /// directory contributes `<DIR>/<NAME>` and a bare file name selects
+    /// nothing. A run in which no `--photo` matches is an error rather than a
+    /// silent no-op.
+    #[arg(long, value_name = "PATH", required_if_eq("scope", SCOPE_SELECTED))]
     pub photo: Vec<PathBuf>,
 
     /// Exif `Make` a photo must carry under `--scope by-camera`.
     ///
     /// Both camera flags are required by that scope, because the match is the
     /// exact pair of tags rather than a substring.
-    #[arg(long, value_name = "MAKE", required_if_eq("scope", "by-camera"))]
+    #[arg(long, value_name = "MAKE", required_if_eq("scope", SCOPE_BY_CAMERA))]
     pub camera_make: Option<String>,
 
     /// Exif `Model` a photo must carry under `--scope by-camera`.
-    #[arg(long, value_name = "MODEL", required_if_eq("scope", "by-camera"))]
+    #[arg(long, value_name = "MODEL", required_if_eq("scope", SCOPE_BY_CAMERA))]
     pub camera_model: Option<String>,
 
     /// Print the plan and modify no photos.
@@ -495,7 +519,7 @@ impl LogGeotagOptions {
     /// is deliberately not part of this sum: it moves the matching track, not a
     /// photo's clock, so the two adjustments are independent.
     #[must_use]
-    pub fn shift(&self) -> PhotoTimeShift {
+    pub fn photo_time_shift(&self) -> PhotoTimeShift {
         PhotoTimeShift {
             days: self.shift_days,
             hours: self.shift_hours,
@@ -505,11 +529,8 @@ impl LogGeotagOptions {
     }
 
     /// The photos `--scope` selects, from the flags that scope reads.
-    ///
-    /// The handler reports and ignores `--photo` or the camera flags under
-    /// another scope rather than inventing a second operation.
     #[must_use]
-    pub fn shift_scope(&self) -> PhotoShiftScope {
+    pub fn photo_shift_scope(&self) -> PhotoShiftScope {
         match self.scope {
             ShiftScopeArg::All => PhotoShiftScope::AllPhotos,
             ShiftScopeArg::Selected => PhotoShiftScope::SelectedPhotos(self.photo.clone()),
@@ -518,6 +539,27 @@ impl LogGeotagOptions {
                 model: self.camera_model.clone(),
             }),
         }
+    }
+
+    /// The flags given here that belong to a different `--scope`, with that
+    /// scope.
+    ///
+    /// The grammar is the one place that knows which flag belongs to which
+    /// scope; the handler only reports what this returns, so adding a scope
+    /// does not add a third copy of the table.
+    #[must_use]
+    pub fn flags_for_other_scopes(&self) -> Vec<(&'static str, ShiftScopeArg)> {
+        let mut others = Vec::new();
+        if self.scope != ShiftScopeArg::Selected && !self.photo.is_empty() {
+            others.push(("--photo", ShiftScopeArg::Selected));
+        }
+        if self.scope != ShiftScopeArg::ByCamera && self.camera_make.is_some() {
+            others.push(("--camera-make", ShiftScopeArg::ByCamera));
+        }
+        if self.scope != ShiftScopeArg::ByCamera && self.camera_model.is_some() {
+            others.push(("--camera-model", ShiftScopeArg::ByCamera));
+        }
+        others
     }
 }
 
@@ -945,7 +987,7 @@ mod tests {
         );
         assert_eq!(geotag.utc_offset_days, OffsetSpec::Auto);
         assert_eq!(geotag.tz_offset_minutes, 0);
-        assert_eq!(geotag.shift().total_seconds(), Some(0));
+        assert_eq!(geotag.photo_time_shift().total_seconds(), Some(0));
         assert_eq!(geotag.scope, ShiftScopeArg::All);
         assert!(geotag.photo.is_empty());
         assert_eq!(geotag.camera_make, None);
@@ -1029,7 +1071,7 @@ mod tests {
         assert_eq!(geotag.shift_minutes, -3);
         assert_eq!(geotag.shift_seconds, 30);
         assert_eq!(
-            geotag.shift().total_seconds(),
+            geotag.photo_time_shift().total_seconds(),
             Some(86_400 - 7_200 - 180 + 30)
         );
 
@@ -1051,7 +1093,7 @@ mod tests {
         else {
             panic!("expected log geotag");
         };
-        assert_eq!(geotag.shift().total_seconds(), Some(-90));
+        assert_eq!(geotag.photo_time_shift().total_seconds(), Some(-90));
     }
 
     #[test]
@@ -1094,7 +1136,7 @@ mod tests {
             vec![PathBuf::from("a.jpg"), PathBuf::from("b.jpg")]
         );
         assert_eq!(
-            geotag.shift_scope(),
+            geotag.photo_shift_scope(),
             PhotoShiftScope::SelectedPhotos(vec![PathBuf::from("a.jpg"), PathBuf::from("b.jpg"),])
         );
     }
@@ -1140,12 +1182,29 @@ mod tests {
             panic!("expected log geotag");
         };
         assert_eq!(
-            geotag.shift_scope(),
+            geotag.photo_shift_scope(),
             PhotoShiftScope::ByCamera(CameraModel {
                 make: Some(String::from("HOLUX")),
                 model: Some(String::from("M-241")),
             })
         );
+    }
+
+    #[test]
+    fn every_scope_is_spelled_the_same_way_wherever_it_is_written() {
+        for scope in [
+            ShiftScopeArg::All,
+            ShiftScopeArg::Selected,
+            ShiftScopeArg::ByCamera,
+        ] {
+            let possible =
+                clap::ValueEnum::to_possible_value(&scope).expect("every scope has a spelling");
+            assert_eq!(scope.label(), possible.get_name(), "{scope:?}");
+        }
+        // `required_if_eq` is built from these constants, so the assertion ties
+        // the parse-time requirement to the spelling this test just checked.
+        assert_eq!(ShiftScopeArg::Selected.label(), SCOPE_SELECTED);
+        assert_eq!(ShiftScopeArg::ByCamera.label(), SCOPE_BY_CAMERA);
     }
 
     #[test]

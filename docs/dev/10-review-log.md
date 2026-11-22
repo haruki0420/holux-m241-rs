@@ -870,3 +870,84 @@ Stage 2 の差分は本節と同じコミットで、範囲は `crates/m241-core
 ### Stage 3 検証
 
 未検証（別エージェントが記入する）。
+
+## 2026-11-22 / PR #23 `feat-geotag-cli` の Stage 2 修正
+
+仕様検収（Must 1 / Should 4 / Could 3）と可読性レビュー（Must 3 / Should 4 / Could 4）への対応。
+変更は `crates/m241-cli` と docs のみで、`m241-core` / `m241-flash` / `m241-gui` は変更していない。
+実機ポートは開いていない。Stage 1 がレビューした head は `fc70ecf`。
+
+### 仕様検収の Must への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| M1 | スコープ違いの `--photo` / `--camera-*` を警告して無視する挙動（`logcmd.rs:749-763`）にテストが無い | 無視されるフラグを 1 つずつ stderr に出し（下の可読性 S1 で表を grammar に一本化）、`--scope all` + `--photo` と `--scope selected` + camera flags の両方を、警告文と「どちらの選択が勝つか」で固定 | `a_photo_flag_under_the_all_scope_is_reported_and_ignored`, `camera_flags_under_the_selected_scope_are_reported_and_ignored` |
+
+### 可読性 Must への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| M1 | mtime 由来の撮影時刻では「次の実行に shift 不要」が偽 | rustdoc を「`DateTimeOriginal` を書けた写真では」に限定し、`--shift-*` が非 0 で mtime 由来自動写真があれば「shift は保存されない。次の実行でも同じ `--shift-*` を渡すこと」と stderr で警告。`02-cli.md` にも例外と警告を追記 | `a_shift_of_a_photo_with_only_a_file_time_is_not_written_into_it` |
+| M2 | `--photo` は展開後パスとの完全一致で、外すと無警告の no-op | `--scope selected` で 1 枚も展開後パスに一致しなければ `Error::State`（exit 1）。エラー文は「展開後のパスと比較する（ディレクトリは `<DIR>/<NAME>` を寄与）」と計画パスの実例を示す。`--photo` のヘルプと `02-cli.md` も同じ規則に修正 | `a_photo_selection_that_matches_none_of_the_planned_photos_is_an_error`, `a_selected_scope_can_name_a_photo_contributed_by_a_directory` |
+| M3 | shift 要約は 0 件マッチでも「shift した」と読める | 要約行を `shift: <N> s requested (<scope>)` に変え、要求値であることを明示（実績は per-plan の `capture` と `matched`/`written`）。`selected` の 0 件は M2 でエラーになり、要約も出ない。`by-camera` の 0 件を CLI 側で数えるには core の非公開照合規則（`PhotoShiftScope::includes`）を複製する必要があるため、枚数の表示は見送り、文言と docs で誤読を防ぐ形にした | `a_photo_flag_under_the_all_scope_is_reported_and_ignored`（`requested` 表記） |
+
+### 仕様検収の Should への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| S1 | mtime フォールバック写真はシフトが永続化されず docs の記述が当てはまらない | 可読性 M1 と同じ対応（docs の例外明記＋警告） | `a_shift_of_a_photo_with_only_a_file_time_is_not_written_into_it` |
+| S2 | `selected` の `<DIR>/<NAME>` 寄与パスの CLI 統合テストが無い | ディレクトリ入力 + `--photo <DIR>/<NAME>` の統合テストを追加 | `a_selected_scope_can_name_a_photo_contributed_by_a_directory` |
+| S3 | `--tz-offset-minutes` と shift の併用 e2e テストが無い | tz=540 + shift=3600 で「照合は tz+shift 後、書込 `DateTimeOriginal` は shift 済みローカル時刻、位置 utc は真 UTC」を固定 | `a_tz_offset_and_a_shift_compose_without_moving_the_written_position_time` |
+| S4 | dry-run の人間向け出力にシフト後 capture 時刻が無い | 人間向け plan 行を `(matched UTC, gap N s, capture <ISO-8601>)` に拡張（書き込み実行も同じ行）。docs も同じ表現に更新 | `a_photo_flag_under_the_all_scope_is_reported_and_ignored` |
+
+### 可読性 Should への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| S1 | スコープ→フラグ表が grammar と handler で二重化 | `LogGeotagOptions::flags_for_other_scopes()` に一本化し、handler は返り値を 1 行ずつ warn するだけにした（handler 側の表と 15 行の重複を削除） | 上記 2 本の警告テスト |
+| S2 | `--scope` の綴りが 3 箇所（ValueEnum / `label()` / `required_if_eq` リテラル）に複製 | `SCOPE_SELECTED` / `SCOPE_BY_CAMERA` 定数に集約し、`label()` と `required_if_eq` が同じ定数を使う。`label()` が clap の possible value 名と一致することをテストで固定（rename 時に parse 条件が黙って消えるのを防ぐ） | `every_scope_is_spelled_the_same_way_wherever_it_is_written` |
+| S3 | 新テストが「shift して再マッチ」を固定していない | `matched_utc`（と `gap_seconds`）を assert し、全点が同座標の合成トラックでもマッチ先が shift 後であることを固定。selected / by-camera / tz 併用の 3 本を強化 | `a_selected_scope_shift_moves_only_the_named_photos_clock`, `a_by_camera_scope_shift_moves_only_photos_from_that_camera`, `a_photo_flag_under_the_all_scope_is_reported_and_ignored`, `camera_flags_under_the_selected_scope_are_reported_and_ignored` |
+| S4 | `geotag_options()` が clap 既定値の写し | `Cli::try_parse_from` で実際に parse して既定値を取得するヘルパに変更（既定値の定義は `cli.rs` の 1 箇所だけになる） | 既存テスト群の前提（コンパイルと既定値依存テストで担保） |
+
+### Could
+
+- 対応:
+  - C1（テスト用 JPEG ビルダの重複）: `synthetic_jpeg_exif(datetime, camera)` に統合し、
+    `synthetic_jpeg_with_datetime` / `synthetic_jpeg_with_camera` は薄い wrapper にした。
+  - C2（テキスト dry-run の capture 時刻）: 仕様検収 Should 4 と同じ変更。
+  - C3（`--scope` だけ指定して shift 0 は no-op）: `--scope` のヘルプに「shift フラグが操作本体。
+    all-zero shift の `--scope` は何も動かさない」と明記（警告は追加していない）。
+  - C4（語と doc の細部）: `cli.rs` モジュール doc の parse 時ルール列挙を更新、`--photo` のヘルプ 1 行目を
+    「`<PHOTOS>` から選ぶ」に変更、`shift()` / `shift_scope()` を `photo_time_shift()` /
+    `photo_shift_scope()` に改名、`geotag_document` に shift を渡して `total_seconds()` の再計算を削除。
+- 見送り:
+  - C3 の警告化: `selected` の 0 件は仕様検収 M2 でエラーになり、`by-camera` の 0 件を CLI 側で
+    検出するには core の非公開照合規則を複製する必要がある。ヘルプでの明記に留めた。
+  - C4 の `--photo` 改名（`--select-photo` 等）: 引数名は Stage 1 仕様検収で承認済みのため変更しない。
+
+### 却下した指摘
+
+なし（仕様検収・可読性の Must / Should はすべて事実と一致した）。
+
+### 変異で確認したこと
+
+いずれも変異を入れて対応テストが落ちることを確認し、そのあと元に戻して
+`git diff` が変異前と同じ内容に戻ったことを確認した。
+
+- スコープ違いの警告文を変えると
+  `a_photo_flag_under_the_all_scope_is_reported_and_ignored` が落ちる。
+- mtime 由来自動写真の警告条件を偽にすると
+  `a_shift_of_a_photo_with_only_a_file_time_is_not_written_into_it` が落ちる。
+- `plan_with_time_shift` に `PhotoTimeShift::default()` を渡すと
+  `a_selected_scope_shift_moves_only_the_named_photos_clock` と
+  `a_by_camera_scope_shift_moves_only_photos_from_that_camera` が `matched_utc` / `capture_utc` で落ちる。
+- `--photo` 0 件マッチのエラー判定を外すと
+  `a_photo_selection_that_matches_none_of_the_planned_photos_is_an_error` が落ちる。
+
+### ゲート
+
+`./tools/check.sh` 6/6（`M241_VENDOR_IMAGE` を設定した状態。実機ポートは開いていない）。
+
+### Stage 3 検証
+
+未検証（別エージェントが記入する）。
