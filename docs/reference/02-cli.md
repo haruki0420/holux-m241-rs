@@ -352,8 +352,82 @@ time and writes GPS EXIF tags.
 
 Flags: `--max-gap <SECONDS>` (default `300`), `--utc-offset-days <DAYS|auto>`
 (default `auto`), `--tz-offset-minutes <MINUTES>` (default `0`, for cameras
-whose `DateTimeOriginal` is in local time), `--dry-run` (plan without modifying
-any photo), `--json`.
+whose `DateTimeOriginal` is in local time), the four `--shift-*` flags and
+`--scope` described below, `--dry-run` (plan without modifying any photo),
+`--json`.
+
+### Shifting photo clocks
+
+`--shift-days <DAYS>`, `--shift-hours <HOURS>`, `--shift-minutes <MINUTES>` and
+`--shift-seconds <SECONDS>` (each signed, default `0`) move the capture clock of
+the photos in `--scope` and match them against the track again. A day is 24
+hours (86,400 seconds), not a calendar day. The four values are summed, so there
+is no separate single-value shift flag: `--shift-seconds 90` is the one-flag
+form, and `--shift-days 1 --shift-hours -2` is the same 79,200 seconds. A shift
+that the four values cannot express as one number of seconds is a runtime error
+(exit code 1) before any photo is read. The shift is written into
+`DateTimeOriginal` in the same rewrite that writes the position, so a later run
+matches the photo without being told about the shift again. The exception is a
+photo whose capture time comes from the file's modification time rather than
+`DateTimeOriginal`: that time is not written (stamping a guess into the EXIF
+would turn it into a claim), and the rewrite moves the file's own mtime as well,
+so the same shift has to be given again on the next run. The run warns about such
+a photo. `--dry-run` reports the shifted capture time — in the human plan line as
+`capture <ISO-8601>` and in `--json` as `capture_utc` — and writes nothing;
+`--json` also carries the summed shift as `shift_seconds` and the scope as
+`shift_scope` beside the per-photo plans. The human summary prints
+`shift: <N> s requested (<scope>)` when the shift is not zero: it names the
+request, and `matched`/`written` (plus the per-photo lines) say what actually
+happened.
+
+`--tz-offset-minutes` is **not** a photo-clock shift: it moves only the track a
+photo is matched against and is never written into a photo. The two adjustments
+are independent and may be given together, so there is no mutual-exclusion rule
+to document; `--shift-seconds` already accepts any single value on its own. With
+both set, matching uses the tz-adjusted track and the shifted photo clock, the
+position written is the true UTC instant, and `DateTimeOriginal` receives the
+shifted (camera-local) clock.
+
+### Which photos a shift moves
+
+`--scope <all|selected|by-camera>` (default `all`) decides whose clock the
+`--shift-*` values move. The shift flags are the operation: a `--scope` with an
+all-zero shift moves nothing. A photo outside the scope is **not dropped**: it is
+planned at its unshifted time and stays eligible for a position under the same
+`--max-gap` rule, so being outside the scope never removes a tag the run would
+otherwise have written. The scope decides only whose clock moves. A zero shift
+with the default scope is exactly the behaviour of a run without any `--shift-*`
+flag.
+
+- `--scope selected` requires one or more `--photo <PATH>` (repeatable). The
+  value is compared with the paths `<PHOTOS>` **expands to**, not with the text
+  of the `<PHOTOS>` argument: a directory contributes its children as
+  `<DIR>/<NAME>`, so with `<PHOTOS>` = `photos`, `--photo photos/a.jpg` selects
+  the photo while `--photo a.jpg` or `--photo ./photos/a.jpg` does not. A run in
+  which no `--photo` matches any planned path is an error (exit code 1) that
+  lists a planned path as an example, rather than a silent no-op.
+- `--scope by-camera` requires both `--camera-make <MAKE>` and
+  `--camera-model <MODEL>`, because the match is the exact pair of Exif IFD0
+  tags: `Make` and `Model` are compared with trailing NUL and space padding
+  removed and with no case folding, and a name that is not valid UTF-8 is
+  treated as unknown, so that photo is never selected. The rule is unconfirmed
+  against ezTour and real camera files; see
+  [`06-open-questions.md`](../dev/06-open-questions.md).
+- `--photo` and the camera flags are read only by their own scope. Passing one
+  under another scope is reported on stderr (one warning per flag) and ignored,
+  rather than being turned into a second operation.
+
+Example: a camera whose clock was an hour fast, correcting two selected photos:
+
+```bash
+m241 log geotag track.bin photos/ --scope selected \
+  --photo photos/a.jpg --photo photos/b.jpg --shift-hours -1 --dry-run
+```
+
+Drop `--dry-run` to write the tags. `--shift-hours -1` moves both the match and
+the written `DateTimeOriginal`, so the next run needs no shift for those photos
+— unless their capture time came from the file's modification time, which is
+never written (see above).
 
 ## `m241 log kmz`
 
