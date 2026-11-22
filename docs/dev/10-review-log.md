@@ -1718,3 +1718,12 @@ Stage 3 検証者は worktree 編集禁止のため、この記録のみを修�
 ### Stage 3
 
 - 未実施（本節は Stage 2 の記録。`review-gate` は付けていない。Stage 3 は別エージェントが新しい head SHA で行う）。
+
+### Stage 3 差し戻し: main 追従（PR #37 の GUI モジュール分割）
+
+- Stage 3 は Must 8 件の解消を確認したが、`origin/main`（`e934157`、PR #37）との競合で blocked。`git merge origin/main` の 4 競合を解消した（マージコミット `0bf83b0`。最終 head は PR コメントを参照）。
+- `log.rs`: PR #37 の `ops` / `project` / `nmea` / `proxy` 分割の上に、タイル層・Mercator `MapView`・条件付き attribution・`sync_fit_zoom` を再適用。`map_panel(ui, settings)` と 2 箇所の呼び出しも再適用した。
+- `settings.rs`: 実測キャッシュ行・タイル ON/OFF・消去行を、PR #37 の座標形式行と同じページ順（キャッシュ → タイル → 単位 → テーマ → 言語 → 座標形式 → 動きの低減 → 消去）に再適用。`AppSettings` は `coord_format` と `map_tiles` の両方を保持する。
+- `Cargo.lock`: `ureq` / `image` / `dirs` と `serde_json` を統合。`DESIGN.md`: 地図節と PR #37 の設定/コンソール節の両方を残した。
+- 回帰: `cargo test -p m241-gui` は lib 232 / render 38 / design_gate 6 / design_invariants 6 全合格、`check.sh` 6/6。実ウィンドウは X11 16 枚 / Wayland 4 枚のタイル取得、headless は 0 枚（スクリーンショット 15 枚）。`pub(crate) mod tiles`、帰属条件、実測キャッシュ行はマージ後もテストで固定されている。
+- 1 点だけ main 側テストを変更した: PR #37 の座標形式行とタイル行で設定ページが 800pt を超えてスクロールするようになったため、`render.rs` の reduced-motion 表示テストは 1200pt で描画する。行はスクロールで到達でき、テストの意図（注記が設定値を反映する）は変えていない。
