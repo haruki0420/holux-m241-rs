@@ -337,3 +337,148 @@ A comp round needs image generation. Two ways to unblock, in preference order:
   warranted; not designed yet.
 - Table density on a 1024-wide window: the Log screen's three-zone layout needs a
   collapse rule below 1100px.
+
+## 10. As built — where the implementation approximates this document
+
+This section records every place the build departs from the world above. It adds
+no token and changes none; it exists so a reviewer can tell a deliberate
+approximation from a mistake.
+
+### Type
+
+- **No font file is committed or fetched.** `theme::install` promotes the OS's
+  own sans face to primary for `Proportional` and the OS's monospace face for
+  `Monospace`, and keeps `egui_system_font_provider` (locale `ja`) underneath
+  for glyphs those faces lack. On the reference Linux machine that resolves to
+  **LINE Seed JP** (Latin and Japanese) and **UDEV Gothic NF** (numbers).
+  Barlow and Noto Sans JP are therefore approximated, not shipped.
+- **The approximation is a build choice, not a licence limit.** Both Barlow and
+  Noto Sans JP are SIL Open Font License 1.1 and could be committed. This build
+  commits no font binary (a repository-size and provenance choice), so the OS
+  face stands in until bundling the brief's faces is a deliberate change. The
+  build never fetches a font at run time.
+- **Weights.** The OS faces are installed at one weight and `egui` does not
+  synthesise a bold, so Barlow's 600 / 500 / 400 are approximated with size and
+  the `ink` / `mute` pair: 24 and 20 are `ink`; 16, 13 and 11 choose by role.
+  The five sizes are exact; the weight step between them is not.
+- **Tabular figures.** `0x402F6` and `0x402F7` line up because every figure is
+  monospace on the header's own column fractions (`common::table_header`,
+  `common::table_row`), not because the proportional face happens to have
+  tabular digits.
+
+### Density and composition
+
+- `common::figure_row` (height 32) and `common::figure_row_compact` (height 28)
+  draw the caption at the left edge, the figure at the right edge and one `rule`
+  hairline underneath; `common::table_header` is 28.
+- The Log page's map is 160pt and its speed chart 80pt (`metric::PLOT`,
+  `metric::CHART`). That is smaller than a first draft and is what lets the
+  1280×800 page hold the heading, the file loader, the map, the speed chart and
+  the pinned export strip without scrolling. The selected-point block and the
+  point list do **not** fit above the fold at 1280×800 either: they are in the
+  scrolling body and reached by scroll at both documented sizes. An earlier
+  version of this section said §9 accepted the fold; §9 only leaves the collapse
+  rule open, so that sentence was wrong.
+- The Log screen's left column draws its three blocks (トラック / 写真 / 集計) on
+  one left edge, which is how §5's figure draws them. §5's prose says "same 8px
+  staircase rhythm"; the prose and the figure disagree, and the build follows the
+  figure, because a second staircase would compete with the rail's signature.
+- Body line-height 1.5 and the caption's +0.01em tracking are not implemented:
+  egui 0.37 sizes text by font and has no per-style line-height or letter-spacing
+  hook. The five sizes are exact; the leading and tracking are the OS face's.
+- There are no table skeleton rows for a Loading state. The only loading state
+  that exists is the read-only device probe, which has no table to skeleton, so
+  it prints the probing status line instead of inventing rows.
+- Footers are pinned, because the action is the reason the screen exists:
+  Connect carries 再読込 (secondary) / 接続して確認 (primary); Log carries the
+  export strip; Firmware carries 中止 / 続行・書き込む plus the step they belong
+  to; Settings carries the version and the session-scope sentence.
+
+### Buttons
+
+- primary = `ink` face with a `ground` word; secondary = `rule` outline, no
+  fill; destructive = the amber 書き込む, still the only amber-filled control.
+  A disabled primary becomes an outline with a `mute` word instead of a dimmed
+  bone face, so its label keeps the contrast pair it was designed for.
+- Focus is the theme's 2pt `ink` outline. Selection uses the `data` tint
+  (export-format chips) or an `ink` outline (segmented settings choices), never
+  amber.
+- A fourth, compact class (`common::tool_button`) covers the Log map's playback
+  controls and the export-format chips: a `rule` outline at 28pt, selected as an
+  `ink` outline, never a filled face. Leaving those on egui's default fill made
+  the toolbar the brightest surface on the page and gave the Log screen a second
+  primary action beside 中止. Step 1/2's 参照 / 吸い出す / 開く / 保存 also moved
+  to the secondary/primary classes, so only the destructive amber control is a
+  filled button.
+- The firmware write button is armed by its gates, but pressing it reaches
+  `attempt_flash`'s refusal: `m241-gui` does not link `m241-flash` (safety gate),
+  so no write runs from this screen yet. The panel and screen say 見本, and the
+  refusal names the reason after the press rather than hiding the control.
+
+### Copy and states
+
+- Device-panel row labels are Japanese: ファーム / ビルド / モデル / フラッシュ /
+  日付. The values are unchanged; the English labels in §5's figure were the
+  implementation's mixed-language leftover.
+- The log-file input's placeholder is `ログファイルのパス`, not a
+  `path/to/log.bin` sample.
+- Empty log: 「まだログがありません」, the path with the ログを開く primary
+  action, and a disabled ログを吸い出す marked 未検証.
+- The map says 「地図タイルなし・軌跡のみ」. No tile fetcher is linked, so the
+  canvas draws the track itself rather than claiming a map it does not have.
+- The screenshots show the firmware write step with the sample image applied in
+  memory and the confirmation armed — it is never written to disk, and the
+  panel and screen still carry 「見本」. That is why the amber button appears in
+  its armed state in the review images.
+- Settings ends with a colophon of facts read from `m241-core` (supported
+  firmware, patch offset). The offset is formatted from
+  `patch::EFFECTIVE_EPOCH_OFFSET`, not written as `0x402F4`, so it cannot drift
+  from the measured constant; the byte count is the V1.13 patch's figure. It is
+  reference material, not a sixth setting.
+- Step 3's figures are Japanese and partly unfilled: `ファーム` rather than §5's
+  `firmware`, and `DA 未取得` with `未検証 — 端末から読んでいません` because this
+  crate never reads the DA. The `差分` row is real: the bytes and offsets come
+  from the plan.
+- `KMZ` is a disabled export format marked `未対応`: the exporter has no KMZ
+  writer, and a button that quietly wrote GPX under a KMZ label would be worse.
+- The selected point shows time, coordinate, altitude and speed. It does not show
+  a satellite count because `TrackPoint` carries none — the log record has no
+  such field. The record count is printed without a thousands separator
+  (`10399`), not as §5's `10,399`.
+- The Connect screen's next-step rows carry no `→` (the figure in §5 draws one;
+  see below).
+- Settings' cache location is `—（未使用）`. No tile fetcher is linked, so there
+  is no cache directory to name; the row states that rather than printing a path
+  nothing writes to.
+- The port ComboBox and hover tooltips carry no drop shadow, and the rail's tab
+  transition is 150 ms ease-out (quadratic); reduced motion drops it to 0. These
+  are the design's own values, recorded because §3's motion and elevation rules
+  are easy to lose to a toolkit default.
+- The map's polyline is one `data` line, but the plotted records carry the
+  ten-colour cycle in `theme::TRACK_PALETTE` (DESIGN.md §3 does not list it).
+  This is inherited from the pre-GUI build and the ezTour reference spec
+  (07-eztour-spec §5); on a long track it reads as colour rather than data.
+  Replacing it with a single `data` colour (or adding the palette to §3) is
+  follow-up work, recorded here because §10 promises to name every departure.
+- The Connect screen's next-step rows have no `→`. DESIGN.md §5's mock marks the
+  list's direction, but a row that looks like a link and does nothing on click or
+  focus is a false affordance (design review, Should 3); the note says where the
+  row leads in words. §5's arrow remains in the mock.
+- UI copy separates the word from its explanation with parentheses, not an em
+  dash: 「見本（実機から読んだ値ではありません）」「未検証（端末から読んで
+  いません）」. The dash read as a generated label; the parentheses keep the
+  explanation without the tell.
+- The reduced-motion row is 「動きの低減」, not 「視差低減」: the setting turns
+  movement down, and parallax is its own effect (design review, Should 6).
+- Custom controls paint their focus ring from the widget's `Response`
+  (`common::focus_ring`). egui's `Button` draws its own outline only when it has
+  no explicit `.stroke()`, and every button here sets one to state its role, so
+  without the helper a focused 接続して確認 / 中止 / 書き込む was identical to an
+  unfocused one (design review, Must 1).
+- The write step's three prerequisites and the result of a press live in the
+  pinned footer, beside 書き込む, not at the bottom of the scrolling panel: at
+  1024×640 the panel's end is below the fold, so the gates were invisible while
+  the amber button was not (design review, Should 2).
+- A machine with no usable system font keeps egui's bundled Latin-only faces;
+  Japanese labels render as boxes there. This is the cost of not committing a
+  font file; the bundled faces are the fallback, not the design.

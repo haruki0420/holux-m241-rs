@@ -111,6 +111,13 @@ pub mod size {
 pub mod metric {
     /// One table row.
     pub const ROW: f32 = 32.0;
+    /// A compact row: one step tighter than [`ROW`], for a subordinate rail
+    /// block (DESIGN.md §5, ログ).
+    ///
+    /// Its own token rather than reusing [`TABLE_HEADER`]: a body row that borrows
+    /// the header's height makes two meanings share one number, and the next
+    /// change to the header silently moves every body row with it.
+    pub const ROW_COMPACT: f32 = 28.0;
     /// A table's header row, one step tighter than its body.
     pub const TABLE_HEADER: f32 = 28.0;
     /// A hairline rule, and the width of any ordinary divider.
@@ -153,14 +160,83 @@ pub mod metric {
     /// Width of a screen's subordinate rail block (DESIGN.md §5, ログ).
     pub const RAIL_BLOCK: f32 = 220.0;
     /// Height of the track canvas.
-    pub const PLOT: f32 = 240.0;
-    /// Height of the speed chart.
-    pub const CHART: f32 = 120.0;
+    ///
+    /// The design's 1280×800 page has to hold the map, the speed chart and the
+    /// selected-point block above the export footer. At 240 the speed chart and
+    /// the selected point both fell below the fold; 160 is the landscape
+    /// proportion DESIGN.md §5 draws, and the page ends where the design ends.
+    pub const PLOT: f32 = 160.0;
+    /// Height of the speed chart (a subordinate series, one step under the map).
+    pub const CHART: f32 = 80.0;
     /// Minimum width of a dialog's primary action, so two buttons line up.
     pub const ACTION_WIDTH: f32 = 128.0;
     /// Below this content width the Log screen stacks instead of splitting
     /// (DESIGN.md §9 leaves the breakpoint open; this is the one it names).
     pub const NARROW: f32 = 1_100.0;
+}
+
+/// The system font provider, shared by every context.
+///
+/// One provider per process rather than per [`egui::Context`]: enumerating the
+/// installed fonts costs hundreds of milliseconds, and the test suite installs
+/// the theme on dozens of headless contexts. The provider itself is
+/// `Send + Sync` and caches the OS font list after the first query.
+fn system_fonts() -> &'static std::sync::Arc<egui_system_font_provider::SystemFontProvider> {
+    use std::sync::{Arc, OnceLock};
+    static PROVIDER: OnceLock<Arc<egui_system_font_provider::SystemFontProvider>> = OnceLock::new();
+    PROVIDER.get_or_init(|| {
+        // The UI's copy is Japanese (DESIGN.md §3, Noto Sans JP). Asking for
+        // `ja` makes the OS fallback pick a Japanese face for Han characters
+        // instead of whichever Chinese face fontconfig lists first.
+        Arc::new(egui_system_font_provider::SystemFontProvider::new().with_locale(Some("ja")))
+    })
+}
+
+/// The glyph used to choose the proportional family from the OS.
+///
+/// `FallbackRequest::cluster` is an egui term: the provider answers "which
+/// installed face covers these characters". A Latin lowercase letter is the
+/// representative cluster for the proportional family because it is the glyph
+/// every Latin sans face is designed for and the one the body copy is set in;
+/// the Japanese glyphs are not needed here because [`system_fonts`] stays
+/// underneath as the fallback for them.
+const PROPORTIONAL_CLUSTER: &str = "a";
+
+/// The glyph used to choose the monospace family from the OS.
+///
+/// A digit rather than a letter: what the monospace face has to carry in this
+/// product is figures — offsets, timestamps, coordinates — and every monospace
+/// candidate covers `0` even when its Latin letters differ.
+const MONOSPACE_CLUSTER: &str = "0";
+
+/// Put the OS's own face at the head of `family`.
+///
+/// DESIGN.md asks for Barlow (Latin) and Noto Sans JP (Japanese). Neither file
+/// lives in this repository and the build must not fetch one, so the
+/// approximation is: the first face the OS offers for the family, promoted to
+/// primary, with [`system_fonts`] still installed underneath as the fallback
+/// for every glyph it lacks (Japanese, symbols). See `DESIGN.md` §10 for what
+/// exactly is approximated.
+///
+/// `cluster` is the representative glyph the OS is asked about, supplied by the
+/// caller as [`PROPORTIONAL_CLUSTER`] or [`MONOSPACE_CLUSTER`]; the constants
+/// carry the reason each family is represented by that character.
+fn promote_system_face(ctx: &egui::Context, cluster: &str, family: egui::FontFamily) {
+    use egui::epaint::text::{FallbackRequest, FontPriority, FontProvider, InsertFontFamily};
+    let request = FallbackRequest {
+        cluster,
+        family: &family,
+    };
+    let Some(mut insert) = system_fonts().font_for(&request) else {
+        // A machine with no fonts at all keeps egui's bundled defaults; the
+        // labels are then Latin-only, which is still better than not starting.
+        return;
+    };
+    insert.families = vec![InsertFontFamily {
+        family,
+        priority: FontPriority::Highest,
+    }];
+    ctx.add_font(insert);
 }
 
 /// Type scale (DESIGN.md §3): 11 / 13 / 16 / 20 / 24.
@@ -171,11 +247,11 @@ pub mod metric {
 /// different job, not a step in the scale.
 pub fn text_styles() -> Vec<(TextStyle, FontId)> {
     vec![
-        (TextStyle::Heading, FontId::proportional(24.0)),
-        (TextStyle::Body, FontId::proportional(16.0)),
-        (TextStyle::Button, FontId::proportional(13.0)),
-        (TextStyle::Small, FontId::proportional(11.0)),
-        (TextStyle::Monospace, FontId::monospace(13.0)),
+        (TextStyle::Heading, FontId::proportional(size::DISPLAY)),
+        (TextStyle::Body, FontId::proportional(size::BODY)),
+        (TextStyle::Button, FontId::proportional(size::UI)),
+        (TextStyle::Small, FontId::proportional(size::CAPTION)),
+        (TextStyle::Monospace, FontId::monospace(size::UI)),
     ]
 }
 
@@ -185,6 +261,11 @@ pub fn text_styles() -> Vec<(TextStyle, FontId)> {
 /// only, and a light OS theme must not produce a light widget set.
 pub fn install(ctx: &egui::Context) {
     ctx.set_theme(egui::ThemePreference::Dark);
+    // Fonts first: `add_font` must arrive before the first pass lays out text,
+    // or the frame is shaped with the bundled Latin-only defaults.
+    ctx.add_font_provider(system_fonts().clone());
+    promote_system_face(ctx, PROPORTIONAL_CLUSTER, egui::FontFamily::Proportional);
+    promote_system_face(ctx, MONOSPACE_CLUSTER, egui::FontFamily::Monospace);
     ctx.all_styles_mut(apply);
 }
 
@@ -202,8 +283,15 @@ fn apply(style: &mut egui::Style) {
     visuals.selection.bg_fill = DATA.gamma_multiply(0.35);
     visuals.selection.stroke = egui::Stroke::new(1.0, DATA);
 
+    // §3: the only elevation is a `rule` hairline. egui's dark defaults carry a
+    // drop shadow on windows and popups, which would put one on the port ComboBox
+    // and on every hover tooltip — a second elevation language borrowed from the
+    // toolkit rather than designed.
+    visuals.window_shadow = egui::epaint::Shadow::NONE;
+    visuals.popup_shadow = egui::epaint::Shadow::NONE;
+
     // Focus is a 2px ink outline. Not amber: amber means danger, not "here".
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(2.0, INK);
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(metric::FOCUS_RING, INK);
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, MUTE);
 
     for widget in [
@@ -302,5 +390,117 @@ mod tests {
             .find(|(slot, _)| *slot == TextStyle::Monospace)
             .map(|(_, font)| font.family.clone());
         assert!(matches!(mono, Some(egui::FontFamily::Monospace)));
+    }
+
+    #[test]
+    fn the_palette_is_the_ten_hex_values_the_design_names() {
+        // The tokens are the design (§3). A re-tuned colour here is a design
+        // change, not a detail, and the contrast test alone would accept a whole
+        // new palette as long as it cleared 4.5:1.
+        for (name, colour, expected) in [
+            ("GROUND", GROUND, Color32::from_rgb(0x14, 0x18, 0x1A)),
+            ("PANEL", PANEL, Color32::from_rgb(0x1B, 0x20, 0x23)),
+            ("RAIL", RAIL, Color32::from_rgb(0x11, 0x14, 0x16)),
+            ("RULE", RULE, Color32::from_rgb(0x2C, 0x34, 0x37)),
+            ("INK", INK, Color32::from_rgb(0xE8, 0xE6, 0xDF)),
+            ("MUTE", MUTE, Color32::from_rgb(0x9A, 0xA0, 0xA0)),
+            ("DANGER", DANGER, Color32::from_rgb(0xE3, 0xA0, 0x08)),
+            ("DATA", DATA, Color32::from_rgb(0x5F, 0xB3, 0xC4)),
+            ("OK", OK, Color32::from_rgb(0x6F, 0xBF, 0x73)),
+            ("ERR", ERR, Color32::from_rgb(0xE2, 0x70, 0x5E)),
+        ] {
+            assert_eq!(
+                colour, expected,
+                "{name} is not the token DESIGN.md §3 names"
+            );
+        }
+        assert_eq!(
+            TRACK_PALETTE,
+            [
+                DATA,
+                Color32::from_rgb(0xB4, 0x7E, 0xC8),
+                Color32::from_rgb(0xD9, 0x85, 0xA8),
+                Color32::from_rgb(0xA8, 0xB0, 0x5E),
+                Color32::from_rgb(0x74, 0xB8, 0x8E),
+                Color32::from_rgb(0xE0, 0xA0, 0x66),
+                Color32::from_rgb(0x86, 0x9E, 0xD6),
+                Color32::from_rgb(0x9B, 0x8F, 0xD9),
+                Color32::from_rgb(0xC9, 0x9A, 0x6E),
+                Color32::from_rgb(0x8F, 0x9A, 0xA6),
+            ],
+            "the ten-colour record cycle changed"
+        );
+    }
+
+    #[test]
+    fn the_type_scale_is_the_five_sizes_the_design_names() {
+        // 11 / 13 / 16 / 20 / 24. The ratio test above passes for many scales;
+        // this one names the values the tokens promise.
+        assert_eq!(
+            [
+                size::CAPTION,
+                size::UI,
+                size::BODY,
+                size::TITLE,
+                size::DISPLAY
+            ],
+            [11.0, 13.0, 16.0, 20.0, 24.0]
+        );
+        let sizes: Vec<f32> = text_styles().iter().map(|(_, font)| font.size).collect();
+        assert_eq!(sizes, [24.0, 16.0, 13.0, 11.0, 13.0]);
+    }
+
+    #[test]
+    fn the_spacing_scale_is_the_seven_steps_the_design_names() {
+        assert_eq!(
+            [
+                space::XS,
+                space::S,
+                space::M,
+                space::L,
+                space::XL,
+                space::XXL,
+                space::XXXL
+            ],
+            [4.0, 8.0, 12.0, 16.0, 24.0, 32.0, 48.0]
+        );
+    }
+
+    #[test]
+    fn the_only_corner_radius_is_two_points() {
+        // §3: a manual's tabs are square-cut. The gate forces every call site to
+        // reference the token; this pins the value the token holds.
+        assert_eq!(RADIUS, CornerRadius::same(2));
+    }
+
+    #[test]
+    fn the_page_has_no_shadow_elevation() {
+        // §3: elevation is one `rule` hairline. egui's dark default attaches a
+        // drop shadow to windows and popups, which is where the port ComboBox and
+        // the tooltips would pick one up; `apply` must zero both.
+        let mut style = egui::Style::default();
+        apply(&mut style);
+        assert_eq!(style.visuals.window_shadow, egui::epaint::Shadow::NONE);
+        assert_eq!(style.visuals.popup_shadow, egui::epaint::Shadow::NONE);
+    }
+
+    #[test]
+    fn the_focus_ring_is_two_points_of_ink() {
+        // §6: every control gets a 2px ink focus ring. The rail paints its own
+        // with `metric::FOCUS_RING`; ordinary widgets read the style's active
+        // stroke, so both have to name the same width or focus looks different
+        // depending on which control you tab to.
+        let mut style = egui::Style::default();
+        apply(&mut style);
+        let ring = style.visuals.widgets.active.bg_stroke;
+        assert_eq!(ring.width, metric::FOCUS_RING);
+        assert_eq!(ring.color, INK);
+    }
+
+    #[test]
+    fn the_row_heights_are_the_ones_the_design_names() {
+        assert_eq!(metric::ROW, 32.0, "a table row is 32 (DESIGN.md §3)");
+        assert_eq!(metric::TABLE_HEADER, 28.0, "a header row is 28");
+        assert_eq!(metric::ROW_COMPACT, 28.0, "a rail-block row is 28");
     }
 }

@@ -135,12 +135,15 @@ impl StepMarker {
     }
 
     /// The colour of the marker.
+    ///
+    /// An unreached step is `mute`, not `rule`: the rule colour is a hairline and
+    /// clears about 1.4:1, so a ring in it is invisible on the ground.
     #[must_use]
     fn colour(self) -> Color32 {
         match self {
             Self::Current => theme::INK,
             Self::Done => theme::DATA,
-            Self::Ahead => theme::RULE,
+            Self::Ahead => theme::MUTE,
         }
     }
 
@@ -202,13 +205,56 @@ pub enum DumpState {
     /// This is a state, not a message: the screen blocks the next action until the
     /// user says the unit is back, because a second read from a running unit is what
     /// makes the two-hash comparison meaningless.
-    WaitingForPowerCycle,
+    ///
+    /// `total` is the image size the first pass announced, kept so the bar can still
+    /// print `406,620 / 406,620 バイト` while it is held at 100% (DESIGN.md §6).
+    WaitingForPowerCycle { total: usize },
     /// Both passes finished and their digests matched.
     Verified { bytes: usize, digest: String },
     /// Both passes finished and the digests differed.
     Mismatch { first: String, second: String },
     /// The read was refused or failed. The device's words are kept verbatim.
     Failed(String),
+}
+
+/// The progress fraction the dump bar shows, for the states that have one.
+///
+/// DESIGN.md §6 says the bar is *held at 100%* while the screen waits for the
+/// power cycle. Keeping that number here, rather than in the matching branch,
+/// is what lets the render test read the painted width and the unit test read
+/// the same value: the rule exists once.
+fn dump_progress(state: &DumpState) -> Option<f32> {
+    match state {
+        DumpState::Idle => Some(0.0),
+        DumpState::FirstPass { read, total } => Some(dump_fraction(*read, *total)),
+        // The first pass finished, so the bar is full while the instruction
+        // asks for the physical power cycle.
+        DumpState::WaitingForPowerCycle { .. } => Some(1.0),
+        DumpState::Verified { .. } | DumpState::Mismatch { .. } | DumpState::Failed(_) => None,
+    }
+}
+
+/// Bytes read over the bytes the device announced, clamped to `0.0..=1.0`.
+fn dump_fraction(read: usize, total: usize) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        (read as f32 / total as f32).clamp(0.0, 1.0)
+    }
+}
+
+/// Draw the dump progress bar with its caption inside it.
+///
+/// `animate(false)`: the bar carries a measurement, not a motion, so it must
+/// not lag the number printed in it (DESIGN.md §3).
+fn dump_bar(ui: &mut Ui, fraction: f32, caption: String) {
+    let _bar = ui.add(
+        egui::ProgressBar::new(fraction)
+            .desired_width(ui.available_width())
+            .corner_radius(theme::RADIUS)
+            .animate(false)
+            .text(RichText::new(caption).size(size::CAPTION)),
+    );
 }
 
 /// The Firmware screen's own state.
@@ -306,6 +352,28 @@ impl FirmwareScreen {
     pub fn show_sample(&mut self) -> Result<(), String> {
         self.sample = true;
         self.load_sample()
+    }
+
+    /// Fill the sample at the write step, with the patched image in memory and
+    /// the confirmation armed.
+    ///
+    /// Screenshot-side state: it never writes the patched file to disk, and the
+    /// screen still labels every figure 見本. It exists so the review image shows
+    /// the write step as designed — file, size, digest, diff offsets and the
+    /// armed button — instead of a column of em dashes.
+    pub(crate) fn show_sample_write(&mut self) -> Result<(), String> {
+        self.show_sample()?;
+        let patched = {
+            let (Some(plan), Some(image)) = (self.plan.as_ref(), self.image.as_ref()) else {
+                return Err(String::from("見本の差分を用意できません"));
+            };
+            plan.apply(image).map_err(|err| err.to_string())?
+        };
+        self.patched_path = default_patched_name(&self.source);
+        self.patched = Some(patched);
+        self.confirmation = String::from(Self::CONFIRMATION);
+        self.step = Step::Flash;
+        Ok(())
     }
 
     /// Report dump progress to the screen. Called by whatever runs the read.
@@ -443,11 +511,6 @@ impl FirmwareScreen {
                 Step::Flash => self.flash_step(ui),
             }
 
-            if let Some((status, text)) = &self.message {
-                ui.add_space(space::M);
-                common::status_line(ui, *status, text);
-            }
-
             ui.add_space(space::L);
             self.sample_toggle(ui);
         });
@@ -458,8 +521,30 @@ impl FirmwareScreen {
     /// The footer form of the old `step_nav` and of the write row: the same
     /// controls, moved out of the scrolling body so they are on screen at every
     /// window height.
+    ///
+    /// Step 3's prerequisites and the result of a press also live here. At
+    /// 1024×640 the scrolling body ends just after the WRITE field, so a gate list
+    /// in the panel was off screen while the amber button was not — the design
+    /// review's Should 2. A precondition of a destructive action is part of the
+    /// action, and the refusal must be beside the control that produced it.
     fn action_bar(&mut self, ui: &mut Ui) {
+        if self.step == Step::Flash {
+            self.gate_rows(ui);
+            ui.add_space(space::XS);
+        }
         ui.horizontal(|ui| {
+            // The step the footer's actions belong to. Without it the buttons
+            // float under a scrolling body with no statement of which step they
+            // advance (DESIGN.md §5: the footer belongs to the step, not the page).
+            ui.label(
+                RichText::new(format!(
+                    "ステップ {} / 3　{}",
+                    self.step.index() + 1,
+                    self.step.label()
+                ))
+                .size(size::CAPTION)
+                .color(theme::MUTE),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.step == Step::Flash {
                     let response = self.write_button(ui);
@@ -468,49 +553,44 @@ impl FirmwareScreen {
                         self.message = Some((Status::Err, refusal));
                     }
                 } else if let Some(next) = self.step.next()
-                    && ui
-                        .add(
-                            egui::Button::new(RichText::new("続行").size(size::UI))
-                                .corner_radius(theme::RADIUS)
-                                .min_size(Vec2::new(metric::ACTION_WIDTH, 0.0)),
-                        )
-                        .clicked()
+                    && common::primary_button(ui, "続行", true).clicked()
                 {
                     self.step = next;
                 }
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("中止").size(size::UI))
-                            .corner_radius(theme::RADIUS)
-                            .min_size(Vec2::new(metric::ACTION_WIDTH * 0.7, 0.0)),
-                    )
-                    .clicked()
-                {
+                if common::secondary_button(ui, "中止", true).clicked() {
                     self.step = Step::Dump;
                     self.confirmation.clear();
                     self.undefined = false;
                 }
             });
         });
+        // The last thing the screen said, beside the action that produced it.
+        // It used to sit at the end of the scrolling body, which is off screen at
+        // the minimum window height — pressing 書き込む then looked like nothing
+        // happened.
+        if let Some((status, text)) = &self.message {
+            ui.add_space(space::S);
+            common::status_line(ui, *status, text);
+        }
     }
 
     /// 1 吸い出し 2 書き換え 3 書き戻し, drawn as a rail of its own.
     ///
     /// The step row is the only place a horizontal transition is allowed
     /// (DESIGN.md §3, motion thesis): it says where you are in a sequence. Ink for
-    /// the current step, data for a finished one, rule for one not started — never
-    /// amber, which is not a progress colour.
+    /// the reached stretch, rule for the one ahead, and three marker shapes so the
+    /// row still reads in monochrome — never amber, which is not a progress colour.
     fn step_row(&self, ui: &mut Ui) {
         let width = ui.available_width();
-        // Two rows tall: the dots sit on the line and the labels hang below it, so a
-        // one-row allocation clips exactly the words that say which step is which.
+        // Two rows tall: the markers and their track sit on the first row and the
+        // labels hang below it, so a one-row allocation clips exactly the words
+        // that say which step is which.
         let (rect, _response) =
             ui.allocate_exact_size(Vec2::new(width, metric::ROW * 2.0), Sense::hover());
         let painter = ui.painter_at(rect);
         let padding = space::L;
         let count = Step::ALL.len();
         let span = rect.width() - padding * 2.0;
-        // The line sits one row down, leaving the second row for the labels.
         let line_y = rect.top() + metric::ROW;
         let step_width = span / (count - 1) as f32;
 
@@ -518,7 +598,15 @@ impl FirmwareScreen {
             .map(|index| egui::pos2(rect.left() + padding + step_width * index as f32, line_y))
             .collect();
         if let (Some(first), Some(last)) = (positions.first(), positions.last()) {
+            // The whole track, then the reached stretch painted over it: progress
+            // is a length, not a colour, so the row survives a monochrome frame.
             painter.line_segment([*first, *last], Stroke::new(metric::HAIRLINE, theme::RULE));
+            if let Some(current) = positions.get(self.step.index()) {
+                painter.line_segment(
+                    [*first, *current],
+                    Stroke::new(metric::TRACK_LINE, theme::INK),
+                );
+            }
         }
 
         for step in Step::ALL {
@@ -538,9 +626,16 @@ impl FirmwareScreen {
                     Stroke::new(metric::HAIRLINE, marker.colour()),
                 );
             }
+            // The first and last labels anchor to their edge instead of centring:
+            // a centred label on the last marker runs off the content width.
+            let anchor = match step.index() {
+                0 => egui::Align2::LEFT_TOP,
+                index if index + 1 == count => egui::Align2::RIGHT_TOP,
+                _ => egui::Align2::CENTER_TOP,
+            };
             painter.text(
                 center + Vec2::new(0.0, space::M),
-                egui::Align2::CENTER_TOP,
+                anchor,
                 format!("{} {}", step.index() + 1, step.label()),
                 egui::FontId::proportional(size::CAPTION),
                 marker.label_colour(),
@@ -571,48 +666,39 @@ impl FirmwareScreen {
                 );
                 // A native file dialog needs `rfd`, a dependency this build does not
                 // carry; a button that does nothing would be worse than its absence.
-                let _disabled = ui.add_enabled(
-                    false,
-                    egui::Button::new(RichText::new("参照").size(size::UI))
-                        .corner_radius(theme::RADIUS)
-                        .min_size(Vec2::new(metric::ACTION_WIDTH * 0.6, 0.0)),
-                );
+                common::secondary_button(ui, "参照", false);
             });
 
             ui.add_space(space::M);
+            // The bar is drawn for every state that has a progress value. DESIGN.md
+            // §6's waiting state is one of them: the first pass finished, so the bar
+            // is held at 100% rather than removed while the instruction is on
+            // screen. The caption changes per state; the bar does not.
+            if let Some(fraction) = dump_progress(&self.dump) {
+                let caption = match &self.dump {
+                    DumpState::Idle => String::from("まだ読み取っていません"),
+                    DumpState::FirstPass { read, total } => format!(
+                        "{} / {} バイト",
+                        common::grouped(*read),
+                        common::grouped(*total)
+                    ),
+                    DumpState::WaitingForPowerCycle { total } => format!(
+                        "{} / {} バイト（読み取り完了）",
+                        common::grouped(*total),
+                        common::grouped(*total)
+                    ),
+                    DumpState::Verified { .. }
+                    | DumpState::Mismatch { .. }
+                    | DumpState::Failed(_) => String::new(),
+                };
+                dump_bar(ui, fraction, caption);
+            }
+
             match &self.dump {
-                DumpState::Idle => {
-                    let _bar = ui.add(
-                        egui::ProgressBar::new(0.0)
-                            .desired_width(ui.available_width())
-                            .corner_radius(theme::RADIUS)
-                            .text(RichText::new("まだ読み取っていません").size(size::CAPTION)),
-                    );
-                }
-                DumpState::FirstPass { read, total } => {
-                    let fraction = if *total == 0 {
-                        0.0
-                    } else {
-                        (*read as f32 / *total as f32).clamp(0.0, 1.0)
-                    };
-                    let _bar = ui.add(
-                        egui::ProgressBar::new(fraction)
-                            .desired_width(ui.available_width())
-                            .corner_radius(theme::RADIUS)
-                            .animate(false)
-                            .text(
-                                RichText::new(format!(
-                                    "{} / {} バイト",
-                                    common::grouped(*read),
-                                    common::grouped(*total)
-                                ))
-                                .size(size::CAPTION),
-                            ),
-                    );
-                }
-                DumpState::WaitingForPowerCycle => {
+                DumpState::WaitingForPowerCycle { .. } => {
                     // DESIGN.md §6: the instruction is an imperative, inline on the
                     // step, and never a modal.
+                    ui.add_space(space::S);
                     common::status_line(ui, Status::Waiting, "端末の操作待ちです");
                     ui.add_space(space::S);
                     ui.label(
@@ -632,14 +718,14 @@ impl FirmwareScreen {
                 DumpState::Verified { bytes, digest } => {
                     common::status_line(ui, Status::Ok, "2 回の読み取りが一致しました");
                     ui.add_space(space::S);
-                    common::figure_line(ui, "サイズ", &common::bytes(*bytes));
-                    common::figure_line(ui, "SHA-256", digest);
+                    common::figure_row(ui, "サイズ", &common::bytes(*bytes));
+                    common::figure_row(ui, "SHA-256", digest);
                 }
                 DumpState::Mismatch { first, second } => {
                     common::status_line(ui, Status::Err, "2 回の読み取りが一致しません");
                     ui.add_space(space::S);
-                    common::figure_line(ui, "1 回目", first);
-                    common::figure_line(ui, "2 回目", second);
+                    common::figure_row(ui, "1 回目", first);
+                    common::figure_row(ui, "2 回目", second);
                     ui.label(
                         RichText::new("このイメージは使いません。読み直してください。")
                             .size(size::UI)
@@ -650,18 +736,15 @@ impl FirmwareScreen {
                     // The device's own words first, our hint second (§6).
                     common::status_line(ui, Status::Err, reason);
                 }
+                // The bar above is the whole state; nothing else belongs under it.
+                DumpState::Idle | DumpState::FirstPass { .. } => {}
             }
 
             ui.add_space(space::M);
             ui.horizontal(|ui| {
-                let _ignored = ui.add_enabled(
-                    false,
-                    egui::Button::new(RichText::new("吸い出す").size(size::UI))
-                        .corner_radius(theme::RADIUS)
-                        .min_size(Vec2::new(metric::ACTION_WIDTH, 0.0)),
-                );
+                common::secondary_button(ui, "吸い出す", false);
                 ui.label(
-                    RichText::new("未検証 — 端末の読み出しはセッション層の実装後です")
+                    RichText::new("未検証（端末の読み出しはセッション層の実装後です）")
                         .size(size::CAPTION)
                         .color(theme::MUTE),
                 );
@@ -700,14 +783,7 @@ impl FirmwareScreen {
                         .font(egui::TextStyle::Monospace)
                         .desired_width(ui.available_width() - metric::ACTION_WIDTH - space::L),
                 );
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("開く").size(size::UI))
-                            .corner_radius(theme::RADIUS)
-                            .min_size(Vec2::new(metric::ACTION_WIDTH, 0.0)),
-                    )
-                    .clicked()
-                {
+                if common::secondary_button(ui, "開く", true).clicked() {
                     let source = self.source.clone();
                     self.message = Some(match self.open(&source) {
                         Ok(()) => (Status::Ok, format!("{} を読み込みました", self.source)),
@@ -759,34 +835,33 @@ impl FirmwareScreen {
         );
         ui.add_space(space::S);
 
-        // Ruled table: header in caption, figures in mono, a hairline per row. The
-        // offsets must align, which is why this column is monospace and right-aligned.
-        ui.label(
-            RichText::new("オフセット          変更前  変更後")
-                .size(size::CAPTION)
-                .color(theme::MUTE)
-                .monospace(),
+        // Ruled table: 28pt caption header, 32pt mono rows, a hairline per row.
+        // The offsets must align, which is why every cell is monospace on the
+        // same column fractions (DESIGN.md §3: `0x402F6` and `0x402F7`).
+        common::table_header(
+            ui,
+            &[
+                ("オフセット", 0.4, egui::Align::Min),
+                ("変更前", 0.3, egui::Align::Min),
+                ("変更後", 0.3, egui::Align::Min),
+            ],
         );
-        common::hairline(ui);
         for edit in &plan.edits {
-            ui.label(
-                RichText::new(format!(
-                    "0x{:05X}          0x{:02X}    0x{:02X}",
-                    edit.offset, edit.before, edit.after
-                ))
-                .size(size::UI)
-                .color(theme::INK)
-                .monospace(),
+            common::table_row(
+                ui,
+                &[
+                    (&format!("0x{:05X}", edit.offset), 0.4),
+                    (&format!("0x{:02X}", edit.before), 0.3),
+                    (&format!("0x{:02X}", edit.after), 0.3),
+                ],
             );
-            common::hairline(ui);
         }
 
-        if let Some(profile) = plan.profile.as_ref() {
-            ui.add_space(space::S);
-            common::figure_line(ui, "プロファイル", &profile.to_string());
-        }
         ui.add_space(space::S);
-        common::figure_line(
+        if let Some(profile) = plan.profile.as_ref() {
+            common::figure_row(ui, "プロファイル", &profile.to_string());
+        }
+        common::figure_row(
             ui,
             "ずれの量",
             &m241_core::firmware::patch::shift_description(),
@@ -809,14 +884,7 @@ impl FirmwareScreen {
                     .font(egui::TextStyle::Monospace),
             );
             ui.add_space(space::S);
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("書き換えたイメージを保存").size(size::UI))
-                        .corner_radius(theme::RADIUS)
-                        .min_size(Vec2::new(metric::ACTION_WIDTH * 2.0, 0.0)),
-                )
-                .clicked()
-            {
+            if common::primary_button(ui, "書き換えたイメージを保存", true).clicked() {
                 self.message = Some(match self.write_patched() {
                     Ok(()) => (Status::Ok, format!("{} に保存しました", self.patched_path)),
                     Err(reason) => (Status::Err, reason),
@@ -864,13 +932,30 @@ impl FirmwareScreen {
                     )
                 })
                 .unwrap_or_else(|| String::from("—"));
-            common::figure_line(ui, "firmware", &format!("{file}  {size}  {digest}"));
-            table_row(ui, "DA", "未取得", "未検証 — 端末から読んでいません");
+            common::figure_row(ui, "ファーム", &format!("{file}  {size}  {digest}"));
+            // DA is not read by this crate: the write path lives in `m241-flash`,
+            // which the GUI must not link (AGENTS.md §2, check_safety). The row
+            // says 未検証 rather than inventing the version the manual's figure
+            // shows.
+            common::figure_row_open(ui, "DA", "未取得");
+            ui.label(
+                RichText::new("未検証（端末から読んでいません）")
+                    .size(size::CAPTION)
+                    .color(theme::MUTE),
+            );
+            common::hairline(ui);
             let diff = self.plan.as_ref().map_or_else(
                 || String::from("—"),
-                |plan| format!("{} バイト", plan.edits.len()),
+                |plan| {
+                    let offsets: Vec<String> = plan
+                        .edits
+                        .iter()
+                        .map(|edit| format!("0x{:05X}", edit.offset))
+                        .collect();
+                    format!("{} バイト（{}）", plan.edits.len(), offsets.join(", "))
+                },
             );
-            common::figure_line(ui, "差分", &diff);
+            common::figure_row(ui, "差分", &diff);
 
             ui.add_space(space::M);
             ui.horizontal(|ui| {
@@ -879,16 +964,19 @@ impl FirmwareScreen {
                         .size(size::UI)
                         .color(theme::INK),
                 );
-                let _response = ui.add(
+                let _response = ui.add_sized(
+                    Vec2::new(metric::ACTION_WIDTH * 2.0, metric::ROW),
                     egui::TextEdit::singleline(&mut self.confirmation)
                         .hint_text(Self::CONFIRMATION)
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(metric::ACTION_WIDTH * 2.0),
+                        .font(egui::TextStyle::Monospace),
                 );
             });
 
             ui.add_space(space::S);
-            self.gate_rows(ui);
+            // gate_rows now lives in the pinned footer, beside the button it gates
+            // (design review, Should 2): at 1024×640 this panel end is below the
+            // fold, so the gate list here was invisible while the amber button was
+            // always on screen.
         });
     }
 
@@ -917,7 +1005,11 @@ impl FirmwareScreen {
             // 0.5 opacity on top would dim the label toward the dark face and take
             // it back under 4.5:1, which is the defect being fixed.
             ui.style_mut().visuals.disabled_alpha = 1.0;
-            ui.add_enabled(armed, button)
+            let response = ui.add_enabled(armed, button);
+            // An explicit amber stroke makes egui skip its own focus outline; the
+            // destructive control is the one place a lost focus ring is dangerous.
+            common::focus_ring(ui, &response);
+            response
         })
         .inner
     }
@@ -973,13 +1065,7 @@ impl FirmwareScreen {
                         .color(theme::INK)
                         .monospace(),
                 );
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("コピー").size(size::CAPTION))
-                            .corner_radius(theme::RADIUS),
-                    )
-                    .clicked()
-                {
+                if common::secondary_button(ui, "コピー", true).clicked() {
                     ui.ctx().copy_text(command.clone());
                 }
             });
@@ -1011,7 +1097,7 @@ impl FirmwareScreen {
     /// Load a synthetic stock V1.13 image and plan it.
     fn load_sample(&mut self) -> Result<(), String> {
         let bytes = sample_image();
-        self.source = String::from("backup/stock.bin（見本）");
+        self.source = String::from("backup/stock.bin");
         self.dump_path = String::from("backup/stock.bin");
         self.load_image(bytes)
     }
@@ -1124,22 +1210,6 @@ fn confirm_button_colours(amber: Color32, armed: bool) -> (Color32, Color32) {
     } else {
         (theme::GROUND, theme::INK)
     }
-}
-
-/// A label/value row that takes a whole line, for a long figure.
-fn table_row(ui: &mut Ui, label: &str, value: &str, note: &str) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).size(size::CAPTION).color(theme::MUTE));
-        ui.add_space(space::S);
-        ui.label(
-            RichText::new(value)
-                .size(size::UI)
-                .color(theme::INK)
-                .monospace(),
-        );
-        ui.add_space(space::S);
-        ui.label(RichText::new(note).size(size::CAPTION).color(theme::MUTE));
-    });
 }
 
 /// Version string for the footer figure; kept here so the shell does not have to
@@ -1388,14 +1458,117 @@ mod tests {
     }
 
     #[test]
-    fn the_dump_instruction_is_imperative_and_names_the_wait() {
-        // DESIGN.md §6, "Waiting for the user": the instruction is an imperative on
-        // the step, not a modal. The two numbers are the ones the hardware session
-        // used (pull the battery, wait ten seconds).
-        let text = "電池を抜いて 10 秒待ち、入れ直してから続行してください。\
-                    2 回目は電源を入れ直した状態から読みます。";
-        assert!(text.contains("電池を抜いて"));
-        assert!(text.contains("10 秒"));
+    fn the_waiting_state_holds_the_dump_progress_at_one_hundred_percent() {
+        // DESIGN.md §6, "Waiting for the user": progress held at 100%, the
+        // instruction an imperative. The render test reads the painted bar; this
+        // pins the value that bar is drawn from.
+        assert_eq!(
+            dump_progress(&DumpState::WaitingForPowerCycle { total: 406_620 }),
+            Some(1.0)
+        );
+        assert_eq!(dump_progress(&DumpState::Idle), Some(0.0));
+        assert_eq!(
+            dump_progress(&DumpState::FirstPass {
+                read: 203_310,
+                total: 406_620
+            }),
+            Some(0.5)
+        );
+        // A late report must not draw past the end of the bar.
+        assert_eq!(
+            dump_progress(&DumpState::FirstPass {
+                read: 500_000,
+                total: 406_620
+            }),
+            Some(1.0)
+        );
+        // The finished states carry their own blocks, not a bar.
+        assert_eq!(
+            dump_progress(&DumpState::Verified {
+                bytes: 406_620,
+                digest: String::new()
+            }),
+            None
+        );
+        assert_eq!(dump_progress(&DumpState::Failed(String::new())), None);
+    }
+
+    #[test]
+    fn an_unreached_step_marker_is_not_drawn_in_the_hairline_colour() {
+        // The Stage 2 readability review found that `StepMarker::colour` moved
+        // RULE → MUTE with no test pinning it: the test beside this one checks the
+        // label, so putting the ring back on the hairline colour stayed green. A
+        // rule is ~1.4:1 on the ground, so the ring disappears into it.
+        assert_eq!(StepMarker::Ahead.colour(), theme::MUTE);
+        for marker in [StepMarker::Ahead, StepMarker::Done, StepMarker::Current] {
+            assert_ne!(
+                marker.colour(),
+                theme::RULE,
+                "{marker:?} is drawn in the hairline colour"
+            );
+        }
+    }
+
+    #[test]
+    fn the_write_button_draws_the_focus_ring() {
+        // The destructive control sets an explicit amber stroke, which makes egui
+        // skip its own focus outline. Losing the ring on 書き込む is the worst
+        // place to lose it, so the ring is painted from the response and this test
+        // focuses the real button and looks for the 2pt ink rectangle.
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::Vec2::new(640.0, 400.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let mut screen = screen();
+        screen.show_sample_write().expect("the sample image loads");
+        let mut id = None;
+        let mut found = false;
+        for pass in 0..3 {
+            let output = ctx.run_ui(input.clone(), |ui| {
+                let response = screen.write_button(ui);
+                if pass == 0 {
+                    id = Some(response.id);
+                }
+            });
+            let shapes: Vec<egui::Shape> = output
+                .shapes
+                .iter()
+                .map(|clipped| clipped.shape.clone())
+                .collect();
+            output.drop_without_applying_deltas();
+            if pass > 0 {
+                let mut flat = Vec::new();
+                flatten_shapes(&shapes, &mut flat);
+                found = flat.iter().any(|shape| {
+                    matches!(
+                        shape,
+                        egui::Shape::Rect(rect)
+                            if (rect.stroke.width - metric::FOCUS_RING).abs() < f32::EPSILON
+                                && rect.stroke.color == theme::INK
+                    )
+                });
+            }
+            if pass == 0
+                && let Some(id) = id
+            {
+                ctx.memory_mut(|memory| memory.request_focus(id));
+            }
+        }
+        assert!(found, "the write button has no focus ring");
+    }
+
+    /// Flatten a frame's shapes so a test can look at leaf primitives.
+    fn flatten_shapes<'a>(shapes: &'a [egui::Shape], out: &mut Vec<&'a egui::Shape>) {
+        for shape in shapes {
+            match shape {
+                egui::Shape::Vec(children) => flatten_shapes(children, out),
+                other => out.push(other),
+            }
+        }
     }
 
     #[test]

@@ -348,7 +348,7 @@ fn the_firmware_screen_draws_every_dump_state() {
             read: 214_880,
             total: 406_620,
         },
-        DumpState::WaitingForPowerCycle,
+        DumpState::WaitingForPowerCycle { total: 406_620 },
         DumpState::Verified {
             bytes: 406_620,
             digest: String::from(
@@ -368,6 +368,147 @@ fn the_firmware_screen_draws_every_dump_state() {
         let shapes = render(&ctx, &mut app);
         assert!(shapes > 0, "{state:?} drew nothing");
     }
+}
+
+#[test]
+fn waiting_for_the_power_cycle_holds_the_progress_bar_at_one_hundred_percent() {
+    // DESIGN.md §6, "Waiting for the user": "Progress held at 100%, the
+    // instruction given as an imperative". The shipped screen drew the state line
+    // and the instruction but no bar, and the old test only inspected a local
+    // string — this reads the bar that reached the frame.
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Firmware);
+    app.firmware_mut().set_step(Step::Dump);
+    app.firmware_mut()
+        .set_dump_state(DumpState::WaitingForPowerCycle { total: 406_620 });
+
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    let mut flat = Vec::new();
+    flatten_shapes(&shapes, &mut flat);
+
+    // A progress bar is a track rect in the extreme background colour with a
+    // same-origin fill rect on top in another colour; the fill's width is the
+    // progress. Finding the pair geometrically keeps a single-line text field,
+    // which also uses the extreme background, out of the match.
+    let (track, fill) = flat
+        .iter()
+        .filter_map(|shape| match shape {
+            egui::Shape::Rect(rect) if rect.fill == theme::RAIL && rect.rect.width() > 200.0 => {
+                Some(rect.rect)
+            }
+            _ => None,
+        })
+        .find_map(|track| {
+            flat.iter()
+                .filter_map(|shape| match shape {
+                    egui::Shape::Rect(rect)
+                        if rect.fill != theme::RAIL
+                            && (rect.rect.min - track.min).length() < 0.5
+                            && (rect.rect.height() - track.height()).abs() < 0.5 =>
+                    {
+                        Some(rect.rect)
+                    }
+                    _ => None,
+                })
+                .next()
+                .map(|fill| (track, fill))
+        })
+        .expect("the waiting state drew no progress bar");
+
+    assert!(
+        (fill.width() - track.width()).abs() <= 1.0,
+        "the waiting bar is {:.1}% full ({:.1} of {:.1}pt); §6 holds it at 100%",
+        100.0 * fill.width() / track.width(),
+        fill.width(),
+        track.width()
+    );
+
+    // The instruction is part of the same state, and must be on the frame rather
+    // than only in the source: an imperative that the layout dropped is not shown.
+    assert!(
+        flat.iter().any(|shape| matches!(
+            shape,
+            egui::Shape::Text(text) if text.galley.job.text.contains("電池を抜いて")
+        )),
+        "the waiting state printed no power-cycle instruction"
+    );
+}
+
+#[test]
+fn an_empty_log_says_there_is_no_log_yet() {
+    // DESIGN.md §6 names the sentence. The old render test only asserted that the
+    // screen drew something, so a blank panel would have passed.
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Log);
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    let mut flat = Vec::new();
+    flatten_shapes(&shapes, &mut flat);
+    assert!(
+        flat.iter().any(|shape| matches!(
+            shape,
+            egui::Shape::Text(text) if text.galley.job.text.contains("まだログがありません")
+        )),
+        "the empty log did not say まだログがありません"
+    );
+}
+
+#[test]
+fn the_log_map_is_labelled_as_a_track_without_map_tiles() {
+    // §3 makes the map the one light surface, and §10 records that no tile
+    // fetcher is linked. The note is how a reader knows the dark canvas is not a
+    // broken map.
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Log);
+    app.log_mut().show_sample();
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    let mut flat = Vec::new();
+    flatten_shapes(&shapes, &mut flat);
+    assert!(
+        flat.iter().any(|shape| matches!(
+            shape,
+            egui::Shape::Text(text) if text.galley.job.text.contains("地図タイルなし")
+        )),
+        "the map did not say it has no tiles"
+    );
+}
+
+#[test]
+fn the_settings_screen_names_the_cache_location_and_the_patch_offset() {
+    // DESIGN.md §5's settings row list is size *and* location; §5 also requires
+    // the colophon's figures to be readable. The offset must be the one
+    // `m241-core` measures, not a second literal.
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Settings);
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    let mut flat = Vec::new();
+    flatten_shapes(&shapes, &mut flat);
+    let texts: Vec<&str> = flat
+        .iter()
+        .filter_map(|shape| match shape {
+            egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts.contains(&"地図キャッシュの場所"),
+        "the settings table has no cache location row: {texts:?}"
+    );
+    let offset = format!(
+        "0x{:05X}",
+        m241_core::firmware::patch::EFFECTIVE_EPOCH_OFFSET
+    );
+    assert!(
+        texts.contains(&"修正する位置"),
+        "the colophon has no patch-offset row: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|text| text.contains(&offset)),
+        "the colophon does not name the core patch offset {offset}: {texts:?}"
+    );
 }
 
 #[test]
@@ -578,7 +719,7 @@ fn the_firmware_sample_renders_one_sample_banner_and_captions_its_panels() {
 
         let banner_count = texts
             .iter()
-            .filter(|text| **text == "見本 — 実機から読んだ値ではありません")
+            .filter(|text| **text == "見本（実機から読んだ値ではありません）")
             .count();
         assert_eq!(
             banner_count, 1,
