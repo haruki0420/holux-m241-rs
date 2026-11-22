@@ -31,6 +31,17 @@ mod geotag_gate;
 mod editing;
 mod kmz_export;
 mod photo_shift;
+// The CLI-equivalent operations console: downloading, backing up and erasing,
+// JSON projects, NMEA repair/relay, and `log read`. The panels live in `ops`;
+// the transfer, the project document and the NMEA arithmetic have their own
+// modules below it.
+mod device;
+mod nmea;
+mod ops;
+mod project;
+mod proxy;
+#[cfg(test)]
+mod test_support;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -47,6 +58,7 @@ use crate::theme::{self, metric, size, space};
 
 use self::editing::TrackEditState;
 use self::geotag_gate::GeotagConfirmation;
+use self::ops::LogOps;
 use self::photo_shift::{PhotoShiftSettings, ScopeKind};
 
 /// Rows the point list shows before it scrolls.
@@ -119,6 +131,40 @@ fn geotag_targets(entries: &[PhotoEntry]) -> Vec<&Path> {
 /// The four places that build a [`PhotoEntry`] go through here so the
 /// `find_matching_point_index` rule cannot be spelled differently in one of
 /// them; the sample block and the three file paths all take the same route.
+/// One point's coordinate in the format the Settings screen selected.
+///
+/// A UTM refusal (a latitude outside its bands) falls back to decimal degrees
+/// rather than blanking the field: the point still has a coordinate, and the
+/// selected format is a display choice, not a measurement.
+fn coordinate_text(point: &TrackPoint, settings: &AppSettings) -> String {
+    match (point.latitude, point.longitude) {
+        (Some(latitude), Some(longitude)) => {
+            log::format_coordinate(latitude, longitude, settings.coord_format).map_or_else(
+                |_refused| common::coordinate(Some(latitude), Some(longitude)),
+                |(latitude, longitude)| format!("{latitude} {longitude}"),
+            )
+        }
+        _ => common::coordinate(None, None),
+    }
+}
+
+/// What each export format writes, in the product's voice.
+///
+/// NMEA is the one that needs the sentence: the core writes `$GPRMC` today and
+/// the GGA/GSA expansion is a separate core change, so a chip that just said
+/// "NMEA" would claim more than the file contains.
+fn export_format_note(format: ExportFormat) -> &'static str {
+    match format {
+        ExportFormat::Gpx => "GPX 1.1。地図アプリ向けの標準形式です",
+        ExportFormat::Kml => "KML 2.2。Google Earth などで開く形式です",
+        ExportFormat::Csv => "CSV。1 行 1 点で、表計算向けです",
+        ExportFormat::Nmea => {
+            "NMEA 0183。現在は $GPRMC を 1 点 1 文で出力します。$GPGGA / $GPGSA の追加はコア側で予定"
+        }
+        ExportFormat::Json => "JSON。点の配列と集計を 1 オブジェクトにします",
+    }
+}
+
 fn photo_entry(track: &Track, plan: GeotagPlan) -> PhotoEntry {
     let point_index = find_matching_point_index(track, &plan);
     PhotoEntry { plan, point_index }
@@ -163,13 +209,26 @@ pub struct LogScreen {
     /// 最大長辺 for photos embedded in a KMZ (`--max-photo-edge`); empty means
     /// the originals are embedded untouched.
     kmz_max_edge: String,
+    /// Bundle an `icon/` thumbnail with each photo in the KMZ.
+    kmz_icons: bool,
+    /// Camera clock offset from UTC in minutes for KMZ photo matching
+    /// (`log kmz --tz-offset-minutes`); empty or zero means UTC.
+    kmz_tz_offset_minutes: String,
     /// Clock shift and the photos it applies to.
     photo_shift: PhotoShiftSettings,
+    /// 「同じ場所の写真をまとめる」 threshold in metres; empty means no grouping.
+    photo_group_distance: String,
+    /// Largest accepted photo/point time gap in seconds (`--max-gap`).
+    photo_max_gap: String,
+    /// Keep the original JPEG as `<name>_original` before EXIF is written.
+    photo_keep_backup: bool,
     /// Split / merge / delete and the core editor's undo history.
     edit: TrackEditState,
     destination: String,
     outcome: Option<(Status, String)>,
     sample: bool,
+    /// The CLI-equivalent operations console (download, project, NMEA, read).
+    ops: LogOps,
 }
 
 impl Default for LogScreen {
@@ -194,11 +253,17 @@ impl Default for LogScreen {
             format: ExportFormat::Gpx,
             kmz: false,
             kmz_max_edge: String::new(),
+            kmz_icons: true,
+            kmz_tz_offset_minutes: String::from("0"),
             photo_shift: PhotoShiftSettings::default(),
+            photo_group_distance: String::new(),
+            photo_max_gap: String::from("300"),
+            photo_keep_backup: true,
             edit: TrackEditState::default(),
             destination: String::from("m241-track.gpx"),
             outcome: None,
             sample: false,
+            ops: LogOps::default(),
         }
     }
 }
@@ -259,7 +324,7 @@ impl LogScreen {
                     point: Some(point),
                     gap_seconds: Some(0),
                     skipped: None,
-                    keep_backup: false,
+                    keep_backup: self.photo_keep_backup,
                     group_id: None,
                 },
             ));
@@ -376,12 +441,17 @@ impl LogScreen {
         self.load_status.as_ref()
     }
 
-    /// Load a `.bin` binary log dump from disk (offline, read-only) via [`log::parse_dump`].
+    /// Load a log from disk (offline, read-only): `.bin` via [`log::parse_dump`],
+    /// `.gpx` via [`log::import_gpx`].
+    ///
+    /// The extension is the dispatch, because the two formats have no common
+    /// sniffing byte and the CLI splits them the same way (`log read` vs
+    /// `import_gpx`).
     ///
     /// # Errors
     ///
     /// Returns a Japanese error string if the path is empty, too large, unreadable,
-    /// or not a valid M-241 binary log dump.
+    /// or not a valid dump / GPX document.
     pub fn load_bin_file(&mut self, path: &Path) -> Result<(), String> {
         let path_text = path.to_string_lossy();
         if path_text.trim().is_empty() {
@@ -407,6 +477,13 @@ impl LogScreen {
             );
             self.load_status = Some((Status::Err, msg.clone()));
             return Err(msg);
+        }
+        let is_gpx = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("gpx"));
+        if is_gpx {
+            return self.load_gpx_file(path);
         }
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
@@ -435,6 +512,42 @@ impl LogScreen {
         self.load_status = Some((
             Status::Ok,
             format!("{} から {count} 点を読み込みました", path.display()),
+        ));
+        Ok(())
+    }
+
+    /// Load a GPX 1.0/1.1 document through the core's importer.
+    fn load_gpx_file(&mut self, path: &Path) -> Result<(), String> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) => {
+                let msg = format!("{} を GPX として読めません: {err}", path.display());
+                self.load_status = Some((Status::Err, msg.clone()));
+                return Err(msg);
+            }
+        };
+        let track = match log::import_gpx(&text) {
+            Ok(track) => track,
+            Err(err) => {
+                let msg = format!("{} を GPX として解析できません: {err}", path.display());
+                self.load_status = Some((Status::Err, msg.clone()));
+                return Err(msg);
+            }
+        };
+        let count = track.points.len();
+        self.sample = false;
+        self.log_path = path.display().to_string();
+        self.set_track(track, ParseReport::default());
+        self.destination = path
+            .with_extension(self.format.extension())
+            .display()
+            .to_string();
+        self.load_status = Some((
+            Status::Ok,
+            format!(
+                "{} から {count} 点を GPX として読み込みました",
+                path.display()
+            ),
         ));
         Ok(())
     }
@@ -556,6 +669,40 @@ impl LogScreen {
         self.map_zoom = zoom.clamp(min_zoom, MAX_ZOOM);
     }
 
+    /// The geotag options the photo block currently asks for.
+    ///
+    /// Grouping and the backup are carried into the plan (the core copies them
+    /// onto each [`GeotagPlan`]), so the plan a person reviews is the plan
+    /// `apply` writes.
+    ///
+    /// # Errors
+    ///
+    /// A non-numeric grouping distance. Zero (or an empty field) means "do not
+    /// group", which is the core's `None`.
+    fn geotag_options(&self) -> Result<GeotagOptions, String> {
+        let trimmed = self.photo_group_distance.trim();
+        let group_distance_meters = if trimmed.is_empty() {
+            None
+        } else {
+            let metres = trimmed.parse::<f64>().map_err(|_| {
+                format!("{trimmed:?} は距離（m）ではありません。数字か空欄にしてください")
+            })?;
+            (metres > 0.0).then_some(metres)
+        };
+        let max_gap_seconds = match self.photo_max_gap.trim() {
+            "" => GeotagOptions::default().max_gap_seconds,
+            text => text.parse::<u32>().map_err(|_| {
+                format!("{text:?} は秒数ではありません。一致させる最大の差を秒で入力してください")
+            })?,
+        };
+        Ok(GeotagOptions {
+            keep_backup: self.photo_keep_backup,
+            group_distance_meters,
+            max_gap_seconds,
+            ..GeotagOptions::default()
+        })
+    }
+
     /// Scan a file or directory for photos and build a read-only geotag plan.
     ///
     /// # Errors
@@ -572,7 +719,13 @@ impl LogScreen {
         };
         // The first plan is the unshifted one, so a photo list exists before a
         // `byCamera` scope can name the highlighted photo it compares against.
-        let options = GeotagOptions::default();
+        let options = match self.geotag_options() {
+            Ok(options) => options,
+            Err(message) => {
+                self.photo_status = Some((Status::Err, message.clone()));
+                return Err(message);
+            }
+        };
         let plans = match geotag::plan(&paths, &self.track, &options) {
             Ok(plans) => plans,
             Err(err) => {
@@ -639,7 +792,13 @@ impl LogScreen {
         if paths.is_empty() {
             return Ok(());
         }
-        let options = GeotagOptions::default();
+        let options = match self.geotag_options() {
+            Ok(options) => options,
+            Err(message) => {
+                self.photo_shift.status = Some((Status::Err, message.clone()));
+                return Err(message);
+            }
+        };
         match self
             .photo_shift
             .plan(&paths, &self.track, &options, self.selected_photo)
@@ -878,6 +1037,11 @@ impl LogScreen {
             ui.add_space(space::L);
 
             if self.track.points.is_empty() {
+                // Only the empty screen puts the console first: with no map,
+                // download is the action that fills the page. With a track, the
+                // map is the reason the page exists and keeps the top.
+                self.ops_ui(ui);
+                ui.add_space(space::L);
                 self.empty_state(ui);
                 return;
             }
@@ -904,6 +1068,7 @@ impl LogScreen {
                         self.map_panel(ui);
                         self.speed_panel(ui, settings);
                         self.selected_panel(ui, settings);
+                        self.ops_panel(ui);
                     });
                 });
             } else {
@@ -920,11 +1085,30 @@ impl LogScreen {
                 self.edit_section(ui);
                 ui.add_space(space::M);
                 self.speed_panel(ui, settings);
+                self.ops_panel(ui);
             }
 
             ui.add_space(space::L);
             self.point_table(ui, settings);
         });
+    }
+
+    /// The operations console below the map on a populated page.
+    fn ops_panel(&mut self, ui: &mut Ui) {
+        ui.add_space(space::L);
+        self.ops_ui(ui);
+    }
+
+    /// Draw the operations console without holding two `&mut` to this screen.
+    ///
+    /// The console takes the screen because a finished download or a loaded
+    /// project replaces the track and the export settings; taking the console
+    /// out first is what lets the call hold `&mut self` instead of a pile of
+    /// split field borrows.
+    fn ops_ui(&mut self, ui: &mut Ui) {
+        let mut ops = std::mem::take(&mut self.ops);
+        ops.ui(ui, self);
+        self.ops = ops;
     }
 
     fn advance_playback_if_due(&mut self, ui: &Ui, reduced_motion: bool) {
@@ -1019,7 +1203,7 @@ impl LogScreen {
             ui.add_space(space::S);
             ui.label(
                 RichText::new(
-                    "保存済みの .bin ログを開くか、端末をつないでからログを吸い出してください。",
+                    "保存済みの .bin / .gpx ログを開くか、端末をつないでからログを吸い出してください。",
                 )
                 .size(size::UI)
                 .color(theme::MUTE),
@@ -1047,12 +1231,9 @@ impl LogScreen {
                 common::status_line(ui, *status, message);
             }
             ui.add_space(space::S);
-            // The action that needs the session layer: disabled, and it says
-            // 未検証 in words rather than looking like a button that works.
-            let _download = common::secondary_button(ui, "ログを吸い出す", false);
             ui.label(
                 RichText::new(
-                    "未検証（端末からの直接吸い出しは CLI の `m241 log dump` を利用してください）",
+                    "端末から吸い出すときは上の「ログ操作」の「吸い出し」から実行します。",
                 )
                 .size(size::CAPTION)
                 .color(theme::MUTE),
@@ -1073,19 +1254,43 @@ impl LogScreen {
         }
     }
 
-    /// The 集計 figures: distance, duration, average speed.
+    /// The 集計 figures: distance, elapsed and moving time, average and top
+    /// speed, and the altitude range.
     ///
-    /// Three rows, the ones DESIGN.md §5's rail block names. The record count
-    /// lives on the Connect screen's log panel; repeating it here made this
-    /// subordinate block compete with the point list beside it.
+    /// The record count lives on the Connect screen's log panel; repeating it
+    /// here made this subordinate block compete with the point list beside it.
     fn summary_block(&self, ui: &mut Ui, settings: &AppSettings) {
         common::block_title(ui, "集計", self.sample);
         common::hairline(ui);
         ui.add_space(space::XS);
+        let moving = self.moving_seconds();
+        let altitude = self.altitude_range().map_or_else(
+            || String::from("—"),
+            |(low, high)| {
+                format!(
+                    "{} – {}",
+                    settings.units.format_altitude(Some(low)),
+                    settings.units.format_altitude(Some(high))
+                )
+            },
+        );
         for (label, value) in [
             ("距離", self.total_distance_with_settings(settings)),
             ("時間", self.elapsed()),
+            (
+                "移動時間",
+                if moving == 0 {
+                    String::from("—")
+                } else {
+                    common::duration(Some(moving))
+                },
+            ),
             ("平均", self.average_speed_with_settings(settings)),
+            (
+                "最高速度",
+                settings.units.format_speed(self.max_speed_kmh()),
+            ),
+            ("高度", altitude),
         ] {
             common::figure_row_compact(ui, label, &value);
         }
@@ -1175,6 +1380,100 @@ impl LogScreen {
         if let Some((status, message)) = &self.photo_status {
             ui.add_space(space::XS);
             common::status_line(ui, *status, message);
+        }
+
+        // The two options the CLI exposes as flags: grouping by distance and
+        // keeping a sibling `_original` before the rewrite. They are drawn before
+        // the empty check so the backup promise is visible before any photo is
+        // loaded, not only once a write is possible.
+        ui.add_space(space::XS);
+        let has_entries = !self.photo_entries.is_empty();
+        let mut options_changed = false;
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("グループ")
+                    .size(size::CAPTION)
+                    .color(theme::MUTE),
+            );
+            let reserve = if has_entries { 64.0 + space::S } else { 0.0 };
+            let width = (ui.available_width() - reserve).max(48.0);
+            // Re-plan when the field is done, not on every keystroke: planning
+            // reads every JPEG, and typing "500" would read the folder three
+            // times. The 再計画 button is the immediate path.
+            if ui
+                .add_sized(
+                    Vec2::new(width, metric::ROW),
+                    egui::TextEdit::singleline(&mut self.photo_group_distance)
+                        .hint_text(RichText::new("m").size(size::CAPTION))
+                        .font(egui::TextStyle::Monospace),
+                )
+                .lost_focus()
+            {
+                options_changed = true;
+            }
+            if has_entries && common::tool_button(ui, "再計画", false, true).clicked() {
+                options_changed = true;
+            }
+        });
+        ui.label(
+            RichText::new("同じ場所の写真をまとめる（m）。空欄なら 1 枚ずつ扱います")
+                .size(size::CAPTION)
+                .color(theme::MUTE),
+        );
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("一致の許容")
+                    .size(size::CAPTION)
+                    .color(theme::MUTE),
+            );
+            let width = (ui.available_width() - 40.0).max(48.0);
+            let response = ui.add_sized(
+                Vec2::new(width, metric::ROW),
+                egui::TextEdit::singleline(&mut self.photo_max_gap)
+                    .hint_text(RichText::new("秒（既定 300）").size(size::CAPTION))
+                    .font(egui::TextStyle::Monospace),
+            );
+            if response.lost_focus() {
+                options_changed = true;
+            }
+            ui.label(RichText::new("秒").size(size::CAPTION).color(theme::MUTE));
+        });
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("カメラ時差")
+                    .size(size::CAPTION)
+                    .color(theme::MUTE),
+            );
+            let width = (ui.available_width() - 40.0).max(48.0);
+            let _response = ui.add_sized(
+                Vec2::new(width, metric::ROW),
+                egui::TextEdit::singleline(&mut self.kmz_tz_offset_minutes)
+                    .hint_text(RichText::new("分（UTC との差）").size(size::CAPTION))
+                    .font(egui::TextStyle::Monospace),
+            );
+            ui.label(RichText::new("分").size(size::CAPTION).color(theme::MUTE));
+        });
+        ui.label(
+            RichText::new("カメラ時差は KMZ の写真照合だけに使います（例: UTC+9 は 540）")
+                .size(size::CAPTION)
+                .color(theme::MUTE),
+        );
+        if ui
+            .checkbox(
+                &mut self.photo_keep_backup,
+                RichText::new("元の写真を `_original` として残す（既定 ON）").size(size::CAPTION),
+            )
+            .changed()
+        {
+            options_changed = true;
+        }
+        ui.label(
+            RichText::new("オフにすると元の JPEG を直接書き換えます（元に戻せません）")
+                .size(size::CAPTION)
+                .color(theme::MUTE),
+        );
+        if options_changed && has_entries {
+            let _replanned = self.replan_photos();
         }
 
         ui.add_space(space::XS);
@@ -1279,6 +1578,26 @@ impl LogScreen {
     fn edit_section(&mut self, ui: &mut Ui) {
         common::block_title(ui, "編集", self.sample);
         common::hairline(ui);
+        // Name and colour are display-only: `Track` carries neither yet (the
+        // model extension is a separate core change). Showing where they will
+        // come from is honest about the gap; inventing a per-track colour would
+        // not be.
+        let name = if self.sample {
+            String::from("見本")
+        } else {
+            Path::new(self.log_path.trim()).file_stem().map_or_else(
+                || String::from("—"),
+                |stem| stem.to_string_lossy().into_owned(),
+            )
+        };
+        common::figure_row_compact(ui, "トラック名", &name);
+        common::figure_row_compact(ui, "色", "データ色（軌跡）");
+        ui.label(
+            RichText::new("名前と色は表示のみです（コアのモデル拡張待ち）")
+                .size(size::CAPTION)
+                .color(theme::MUTE),
+        );
+        ui.add_space(space::XS);
         if let Some(track) = self.edit.ui(ui) {
             self.adopt_edited_track(track);
         }
@@ -1655,7 +1974,7 @@ impl LogScreen {
             );
             ui.add_space(space::XS);
             ui.label(
-                RichText::new(common::coordinate(point.latitude, point.longitude))
+                RichText::new(coordinate_text(point, settings))
                     .size(size::UI)
                     .color(theme::INK)
                     .monospace(),
@@ -1740,7 +2059,7 @@ impl LogScreen {
         painter.text(
             rect.center() + Vec2::new(0.0, 0.0),
             Align2::CENTER_CENTER,
-            common::coordinate(point.latitude, point.longitude),
+            coordinate_text(point, settings),
             font.clone(),
             colour,
         );
@@ -1773,7 +2092,10 @@ impl LogScreen {
             for format in ExportFormat::ALL {
                 let label = format.extension().to_uppercase();
                 let selected = !self.kmz && self.format == format;
-                if common::tool_button(ui, &label, selected, true).clicked() {
+                if common::tool_button(ui, &label, selected, true)
+                    .on_hover_text(export_format_note(format))
+                    .clicked()
+                {
                     self.set_export_format(format);
                 }
             }
@@ -1832,9 +2154,11 @@ impl LogScreen {
         // the 未検証 marker rides here, so the pinned strip does not grow tall
         // enough to cut the speed chart at 1280×800.
         if self.kmz {
-            ui.horizontal(|ui| {
+            // Wrapped: the icon and camera-offset controls joined the row, and at
+            // 1024 the last field was clipped at the panel edge.
+            ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new("写真").size(size::CAPTION).color(theme::MUTE));
-                let width = (ui.available_width() - 240.0).max(120.0);
+                let width = (ui.available_width() - 300.0).max(120.0);
                 let _response = ui.add_sized(
                     Vec2::new(width, metric::ROW),
                     egui::TextEdit::singleline(&mut self.photo_path)
@@ -1842,6 +2166,10 @@ impl LogScreen {
                         .font(egui::TextStyle::Monospace),
                 );
                 kmz_export::max_edge_field(ui, &mut self.kmz_max_edge);
+                ui.checkbox(&mut self.kmz_icons, RichText::new("icon").size(size::CAPTION))
+                    .on_hover_text(
+                        "写真ごとに長辺 320 px のサムネイルを icon/ に同梱します",
+                    );
                 // Google Earth / `unzip` are not part of this build's checks, so
                 // the writer wears the word DESIGN.md §6 requires rather than
                 // looking like a format that has been opened and judged. The
@@ -1879,6 +2207,19 @@ impl LogScreen {
                     names.join("、")
                 ),
             );
+            if self.photo_keep_backup {
+                common::status_line(
+                    ui,
+                    Status::Info,
+                    "元の写真は同じフォルダに `<名前>_original` として残します",
+                );
+            } else {
+                common::status_line(
+                    ui,
+                    Status::Err,
+                    "元の写真を残しません（`_original` は作りません）。書き込むと元に戻せません",
+                );
+            }
             if let Some(note) = self.photo_shift.shift_note(&self.photo_entries) {
                 common::status_line(ui, Status::Waiting, &note);
             }
@@ -2036,10 +2377,32 @@ impl LogScreen {
             Ok(paths) => paths,
             Err(message) => return self.fail(message),
         };
+        let options = match self.geotag_options() {
+            Ok(options) => options,
+            Err(message) => return self.fail(message),
+        };
+        let tz_minutes = match self.kmz_tz_offset_minutes.trim() {
+            "" => 0,
+            text => match text.parse::<i32>() {
+                Ok(minutes) => minutes,
+                Err(_) => {
+                    return self.fail(format!(
+                        "{text:?} はカメラの時差（分）ではありません。例: UTC+9 は 540"
+                    ));
+                }
+            },
+        };
         let plans: Vec<GeotagPlan> = if self.photo_entries.is_empty() {
-            match geotag::plan(&paths, &self.track, &GeotagOptions::default()) {
-                Ok(plans) => plans,
-                Err(err) => return self.fail(format!("写真を計画できません: {err}")),
+            if tz_minutes == 0 {
+                match geotag::plan(&paths, &self.track, &options) {
+                    Ok(plans) => plans,
+                    Err(err) => return self.fail(format!("写真を計画できません: {err}")),
+                }
+            } else {
+                match kmz_export::plan_with_tz(&paths, &self.track, &options, tz_minutes) {
+                    Ok(plans) => plans,
+                    Err(message) => return self.fail(message),
+                }
             }
         } else {
             let shown: Vec<PathBuf> = self
@@ -2052,14 +2415,25 @@ impl LogScreen {
                     "一覧の写真と写真フォルダが一致しません。「読込」でこのフォルダを読み込んでから書き出してください",
                 ));
             }
-            self.photo_entries
-                .iter()
-                .map(|entry| entry.plan.clone())
-                .collect()
+            if tz_minutes == 0 {
+                self.photo_entries
+                    .iter()
+                    .map(|entry| entry.plan.clone())
+                    .collect()
+            } else {
+                // A camera-clock offset moves which point each photo matches,
+                // so the on-screen plan cannot be reused; the archive is
+                // re-planned in the camera's clock exactly as `log kmz` does.
+                match kmz_export::plan_with_tz(&paths, &self.track, &options, tz_minutes) {
+                    Ok(plans) => plans,
+                    Err(message) => return self.fail(message),
+                }
+            }
         };
         let embedded = plans.iter().filter(|plan| plan.will_write()).count();
         let reasons = kmz_export::skipped_reasons(&plans);
-        let archive = match kmz_export::build_archive(&self.track, &plans, max_edge) {
+        let archive = match kmz_export::build_archive(&self.track, &plans, max_edge, self.kmz_icons)
+        {
             Ok(archive) => archive,
             Err(message) => return self.fail(message),
         };
@@ -2353,6 +2727,52 @@ impl LogScreen {
         }
         let avg_kmh = (self.total_distance_km() / (f64::from(seconds) / 3_600.0)) as f32;
         settings.units.format_speed(Some(avg_kmh))
+    }
+
+    /// The fastest record the log carries, when any record has a speed.
+    fn max_speed_kmh(&self) -> Option<f32> {
+        self.track
+            .points
+            .iter()
+            .filter_map(|point| point.speed_kmh)
+            .max_by(f32::total_cmp)
+    }
+
+    /// Lowest and highest altitude the log carries, when any record has one.
+    fn altitude_range(&self) -> Option<(f32, f32)> {
+        let (mut low, mut high): (Option<f32>, Option<f32>) = (None, None);
+        for height in self.track.points.iter().filter_map(|point| point.height_m) {
+            low = Some(low.map_or(height, |current| current.min(height)));
+            high = Some(high.map_or(height, |current| current.max(height)));
+        }
+        low.zip(high)
+    }
+
+    /// Seconds spent moving: consecutive records with times, a short gap, and a
+    /// speed above walking pace at either end.
+    ///
+    /// `m241_core` has no `TrackStats` yet (a separate change), so this is the
+    /// existing data's honest answer: a gap longer than an hour is treated as a
+    /// pause rather than as moving time, and a record without a speed cannot
+    /// claim movement on its own.
+    fn moving_seconds(&self) -> u32 {
+        const MAX_GAP_SECONDS: u32 = 3_600;
+        let mut total = 0u32;
+        for pair in self.track.points.windows(2) {
+            let (Some(before), Some(after)) = (pair.first(), pair.get(1)) else {
+                continue;
+            };
+            let (Some(start), Some(end)) = (before.utc, after.utc) else {
+                continue;
+            };
+            let gap = end.saturating_sub(start);
+            let moving = before.speed_kmh.is_some_and(|speed| speed > 0.5)
+                || after.speed_kmh.is_some_and(|speed| speed > 0.5);
+            if moving && gap > 0 && gap <= MAX_GAP_SECONDS {
+                total = total.saturating_add(gap);
+            }
+        }
+        total
     }
 }
 
@@ -3538,7 +3958,7 @@ mod tests {
         let metric_settings = AppSettings::default();
         let imperial_settings = AppSettings {
             units: crate::screens::settings::UnitSystem::Imperial,
-            reduced_motion: false,
+            ..AppSettings::default()
         };
         assert!(
             screen
@@ -4001,6 +4421,216 @@ mod tests {
             screen.track().points.len(),
             sample_track().points.len(),
             "a refused split changed the track"
+        );
+    }
+
+    #[test]
+    fn a_gpx_file_loads_through_the_core_importer() {
+        // `log read` accepts a dump; the open action also accepts the GPX this
+        // tool writes, because a round trip through GPX is how a person moves a
+        // track between machines without the raw dump.
+        let dir = ScratchDir::new("gpx-load");
+        let path = dir.0.join("track.gpx");
+        let expected = sample_track();
+        std::fs::write(&path, log::export::to_gpx(&expected)).expect("write the gpx");
+        let mut screen = LogScreen::default();
+        screen
+            .load_bin_file(&path)
+            .expect("the GPX loads through import_gpx");
+        assert_eq!(screen.track().points.len(), expected.points.len());
+        assert!(
+            screen
+                .load_status()
+                .is_some_and(|(status, message)| *status == Status::Ok && message.contains("GPX")),
+            "got {:?}",
+            screen.load_status()
+        );
+    }
+
+    #[test]
+    fn the_summary_reports_top_speed_altitude_range_and_moving_time() {
+        let mut screen = sample();
+        let top = screen.max_speed_kmh().expect("the sample carries speeds");
+        assert!(top > 20.0, "the top speed looked wrong: {top}");
+        let (low, high) = screen.altitude_range().expect("the sample carries heights");
+        assert!(low <= high, "the altitude range is inverted: {low} {high}");
+        assert!(
+            screen.moving_seconds() > 0,
+            "a track with speeds reported no moving time"
+        );
+
+        let texts = screen_texts(&mut screen);
+        for label in ["最高速度", "高度", "移動時間"] {
+            assert!(
+                texts.iter().any(|text| text.contains(label)),
+                "the summary has no {label} row: {texts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_selected_point_uses_the_chosen_coordinate_format() {
+        let screen = sample();
+        let point = screen.track().points.first().copied().expect("a point");
+        let mut settings = AppSettings::default();
+        let decimal = coordinate_text(&point, &settings);
+        assert!(
+            decimal.contains('.'),
+            "decimal degrees looked wrong: {decimal}"
+        );
+        settings.coord_format = m241_core::log::CoordFormat::Dms;
+        let dms = coordinate_text(&point, &settings);
+        assert!(dms.contains('°') && dms.contains('\''), "got {dms}");
+        settings.coord_format = m241_core::log::CoordFormat::Utm;
+        let utm = coordinate_text(&point, &settings);
+        assert!(utm.contains('E') && utm.contains('N'), "got {utm}");
+    }
+
+    #[test]
+    fn the_photo_options_group_by_distance_and_default_the_backup_on() {
+        let mut screen = sample();
+        assert!(screen.photo_keep_backup, "the backup must default on");
+        assert!(screen.geotag_options().expect("valid options").keep_backup);
+        assert_eq!(
+            screen
+                .geotag_options()
+                .expect("valid options")
+                .group_distance_meters,
+            None
+        );
+        assert_eq!(
+            screen
+                .geotag_options()
+                .expect("valid options")
+                .max_gap_seconds,
+            m241_core::log::geotag::DEFAULT_MAX_GAP_SECONDS
+        );
+
+        let dir = ScratchDir::new("photo-options");
+        let _pair = photo_pair(&dir);
+        screen.photo_group_distance = String::from("1000000");
+        screen
+            .load_photos_from_path(&dir.0)
+            .expect("load the photos");
+        let groups: Vec<Option<usize>> = screen
+            .photo_entries()
+            .iter()
+            .map(|entry| entry.plan.group_id)
+            .collect();
+        assert_eq!(groups.len(), 2);
+        assert!(
+            groups.first().copied().flatten().is_some(),
+            "grouping set no group id: {groups:?}"
+        );
+        assert_eq!(
+            groups.first().copied().flatten(),
+            groups.get(1).copied().flatten(),
+            "both photos should share a group: {groups:?}"
+        );
+
+        screen.photo_keep_backup = false;
+        screen.load_photos_from_path(&dir.0).expect("load again");
+        assert!(
+            screen
+                .photo_entries()
+                .iter()
+                .all(|entry| !entry.plan.keep_backup),
+            "turning the backup off did not reach the plans"
+        );
+
+        screen.photo_group_distance = String::from("wide");
+        assert!(
+            screen.load_photos_from_path(&dir.0).is_err(),
+            "a non-numeric distance was accepted"
+        );
+        screen.photo_group_distance.clear();
+        screen.photo_max_gap = String::from("soon");
+        assert!(
+            screen.load_photos_from_path(&dir.0).is_err(),
+            "a non-numeric gap was accepted"
+        );
+    }
+
+    #[test]
+    fn a_kmz_camera_offset_matches_in_the_camera_clock_and_keeps_utc_times() {
+        // The camera is set to UTC+9: its `DateTimeOriginal` is the UTC capture
+        // plus 32,400 s. Without the offset the nearest point is nine hours away;
+        // with it the photo matches, and the plan's capture time is put back on
+        // UTC so the archive's `<TimeStamp>` agrees with the track.
+        let dir = ScratchDir::new("kmz-tz");
+        let utc = 1_763_000_000;
+        let _photo = minimal_jpeg_with_mtime(&dir.0, "a.jpg", utc + 32_400);
+        let track = Track {
+            points: vec![TrackPoint {
+                utc: Some(utc),
+                latitude: Some(35.681_236),
+                longitude: Some(139.767_125),
+                ..TrackPoint::default()
+            }],
+            damaged_blocks: Vec::new(),
+        };
+        let options = GeotagOptions {
+            max_gap_seconds: 300,
+            ..GeotagOptions::default()
+        };
+        let paths = vec![dir.0.join("a.jpg")];
+        let without = geotag::plan(&paths, &track, &options).expect("plan without tz");
+        assert!(
+            !without.first().is_some_and(GeotagPlan::will_write),
+            "the unshifted plan unexpectedly matched"
+        );
+        let with = super::kmz_export::plan_with_tz(&paths, &track, &options, 540)
+            .expect("plan in the camera clock");
+        let plan = with.first().expect("one plan");
+        assert!(plan.will_write(), "the shifted plan did not match");
+        assert_eq!(
+            plan.capture_time.map(CaptureTime::utc),
+            Some(utc),
+            "the capture time was not put back on UTC"
+        );
+    }
+
+    #[test]
+    fn a_kmz_with_the_icon_option_bundles_an_icon_entry() {
+        let dir = ScratchDir::new("kmz-icons");
+        let _pair = photo_pair(&dir);
+        let mut screen = sample();
+        screen.load_photos_from_path(&dir.0).expect("load photos");
+        screen.set_kmz_export();
+        let output_dir = dir.0.join("out");
+        std::fs::create_dir_all(&output_dir).expect("create the output directory");
+        let with_icons = output_dir.join("with-icons.kmz");
+        screen.set_destination(with_icons.display().to_string());
+        screen.export().expect("export with icons");
+        let archive = std::fs::read(&with_icons).expect("read the archive");
+        assert!(
+            archive.windows(5).any(|window| window == b"icon/"),
+            "the icon/ entries are missing"
+        );
+
+        let without_icons = output_dir.join("without-icons.kmz");
+        screen.kmz_icons = false;
+        screen.set_destination(without_icons.display().to_string());
+        screen.export().expect("export without icons");
+        let archive = std::fs::read(&without_icons).expect("read the archive");
+        assert!(
+            !archive.windows(5).any(|window| window == b"icon/"),
+            "the icon/ entries were written with the option off"
+        );
+    }
+
+    #[test]
+    fn the_edit_block_shows_the_track_name_and_colour_as_display_only() {
+        let mut screen = sample();
+        screen.log_path = String::from("holiday.gpx");
+        let texts = screen_texts(&mut screen);
+        assert!(
+            texts.iter().any(|text| text.contains("holiday")),
+            "the track name is missing: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("データ色")),
+            "the colour row is missing: {texts:?}"
         );
     }
 }

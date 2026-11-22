@@ -20,10 +20,16 @@ use std::path::{Path, PathBuf};
 
 use egui::{RichText, Ui};
 use m241_core::Track;
-use m241_core::log::geotag::GeotagPlan;
-use m241_core::log::kmz::export_kmz;
+use m241_core::log::geotag::{CaptureTime, GeotagOptions, GeotagPlan};
+use m241_core::log::kmz::{KmzIconOptions, export_kmz, export_kmz_with_icons};
 
 use crate::theme::size;
+
+/// Long edge of the optional `icon/` thumbnail bundled with each photo.
+///
+/// Independent of the photo's own 最大長辺: the photo entry keeps its size, the
+/// KML marker gets a small square the map can draw quickly.
+const ICON_MAX_EDGE: u32 = 320;
 
 /// The 最大長辺 field: `None` for "leave the photo alone", `Some(px)` otherwise.
 ///
@@ -110,6 +116,56 @@ pub(super) fn collect_photos(path: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
+/// Plan the archive's photos in the camera's clock, the way `log kmz` does.
+///
+/// `tz_offset_minutes` is the camera's offset from UTC: `DateTimeOriginal` has
+/// no zone, so a camera set to UTC+9 would otherwise look nine hours away from
+/// every point. Matching runs on a shifted copy of the track; the returned
+/// plans' capture times are put back on UTC, because the archive's `<TimeStamp>`
+/// must agree with the UTC track it is drawn on.
+///
+/// # Errors
+///
+/// The core planner's refusal, re-worded for the rail.
+pub(super) fn plan_with_tz(
+    photos: &[PathBuf],
+    track: &Track,
+    options: &GeotagOptions,
+    tz_offset_minutes: i32,
+) -> Result<Vec<GeotagPlan>, String> {
+    let delta_seconds = i64::from(tz_offset_minutes) * 60;
+    let mut matching_track = track.clone();
+    if delta_seconds != 0 {
+        for point in &mut matching_track.points {
+            point.utc = point.utc.map(|utc| shift_utc(utc, delta_seconds));
+        }
+    }
+    let mut plans = m241_core::log::geotag::plan(photos, &matching_track, options)
+        .map_err(|err| format!("写真を計画できません: {err}"))?;
+    if delta_seconds != 0 {
+        for plan in &mut plans {
+            plan.capture_time = plan
+                .capture_time
+                .map(|capture| shift_capture(capture, -delta_seconds));
+        }
+    }
+    Ok(plans)
+}
+
+/// `capture` moved by `delta_seconds`, clamped like every other time shift here.
+fn shift_capture(capture: CaptureTime, delta_seconds: i64) -> CaptureTime {
+    match capture {
+        CaptureTime::Exif(utc) => CaptureTime::Exif(shift_utc(utc, delta_seconds)),
+        CaptureTime::FileModified(utc) => CaptureTime::FileModified(shift_utc(utc, delta_seconds)),
+    }
+}
+
+/// A timestamp shifted by seconds, clamped to the `u32` range.
+fn shift_utc(utc: u32, delta_seconds: i64) -> u32 {
+    let shifted = i64::from(utc) + delta_seconds;
+    u32::try_from(shifted.clamp(0, i64::from(u32::MAX))).unwrap_or(utc)
+}
+
 /// Build the archive from the plans, reading each accepted photo's bytes.
 ///
 /// # Errors
@@ -120,6 +176,7 @@ pub(super) fn build_archive(
     track: &Track,
     plans: &[GeotagPlan],
     max_edge: Option<u32>,
+    bundle_icons: bool,
 ) -> Result<Vec<u8>, String> {
     let mut photos = Vec::with_capacity(plans.len());
     for plan in plans {
@@ -130,7 +187,18 @@ pub(super) fn build_archive(
             .map_err(|err| format!("{} を読めません: {err}", plan.photo.display()))?;
         photos.push(photo);
     }
-    export_kmz(track, &photos).map_err(|err| format!("KMZ を組み立てられませんでした: {err}"))
+    let archive = if bundle_icons {
+        export_kmz_with_icons(
+            track,
+            &photos,
+            &KmzIconOptions {
+                max_edge_pixels: ICON_MAX_EDGE,
+            },
+        )
+    } else {
+        export_kmz(track, &photos)
+    };
+    archive.map_err(|err| format!("KMZ を組み立てられませんでした: {err}"))
 }
 
 /// Why photos in `plans` will not be bundled, up to three, for the status line.
