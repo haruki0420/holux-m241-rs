@@ -1,0 +1,139 @@
+name: Release
+
+# A stable `vX.Y.Z` tag is the only trigger: the tag is the release version and
+# the workspace version in `Cargo.toml` must match it (checked in the build job;
+# the tag is not used to rewrite the version). The pattern excludes pre-release
+# tags such as `v1.0.0-rc1`, which would otherwise be published as `--latest`.
+# Building here stays separate from `ci.yml` so a tag can be moved only by
+# re-pushing it, not by a branch push.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            cli: target/release/m241
+            gui: target/release/m241-gui
+          - os: windows-latest
+            platform: windows-x86_64
+            cli: target/release/m241.exe
+            gui: target/release/m241-gui.exe
+          - os: macos-latest
+            platform: macos-aarch64
+            cli: target/release/m241
+            gui: target/release/m241-gui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The tag is the version. Refuse a tag that does not match `Cargo.toml`
+      # so the asset name, the tag and `m241 --version` cannot disagree.
+      - name: Check the tag matches the workspace version
+        shell: bash
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          version=$(grep -m1 '^version = "' Cargo.toml | sed 's/^version = "\(.*\)"$/\1/')
+          if [ "v${version}" != "$tag" ]; then
+            echo "::error::tag ${tag} does not match the workspace version ${version} in Cargo.toml"
+            exit 1
+          fi
+          echo "tag ${tag} matches the workspace version ${version}"
+      # The same packages `ci.yml` uses: `serialport` links libudev on Linux,
+      # and egui links the X11 / Wayland / GL stack.
+      - name: Install the Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libudev-dev \
+            libxkbcommon-dev libwayland-dev libx11-dev libxi-dev \
+            libgl1-mesa-dev libegl1-mesa-dev pkg-config
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: Build
+        run: cargo build --release --locked
+      # Rename per platform so the assets from the three matrix jobs do not
+      # collide on the release, and keep the Windows `.exe` suffix.
+      - name: Collect the release assets (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp "${{ matrix.cli }}" "dist/m241-${{ matrix.platform }}"
+          cp "${{ matrix.gui }}" "dist/m241-gui-${{ matrix.platform }}"
+      - name: Collect the release assets (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "${{ matrix.cli }}" "dist/m241-${{ matrix.platform }}.exe"
+          Copy-Item "${{ matrix.gui }}" "dist/m241-gui-${{ matrix.platform }}.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m241-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: publish the GitHub Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The only job that writes: `gh release create` / `upload` uses
+    # `GITHUB_TOKEN`, scoped to the release on this repository.
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      # MIT requires the copyright and permission notice to travel with the
+      # binaries, so the release carries `LICENSE` as an asset too.
+      - name: Add the license
+        run: cp LICENSE dist/LICENSE
+      - name: Write the SHA-256 checksums
+        run: |
+          cd dist
+          # GitHub Releases do not preserve POSIX execute bits, so there is
+          # nothing to restore here; the README tells users to `chmod +x` after
+          # download. The checksum covers bytes only.
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create or update the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # A re-pushed tag reuses the existing release; replace the assets.
+            gh release upload "$tag" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$tag" \
+              --generate-notes \
+              --verify-tag \
+              --latest
+          fi

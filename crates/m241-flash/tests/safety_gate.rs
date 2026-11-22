@@ -9,6 +9,8 @@
 //! * each forbidden command, escape form, write-shaped identifier, misplaced
 //!   `set_control_lines` reference, reversed dependency, and digest-based image
 //!   acceptance fails and names the violated rule;
+//! * `DaDigest::for_test_da` without its cfg gate fails, because a shipped
+//!   build could otherwise name any digest as the DA's;
 //! * `DownloadAgent::write` without its `check_layout()?` call at the body's
 //!   top level fails, including when the call appears only in a comment,
 //!   another function, or an uncalled nested function;
@@ -97,9 +99,16 @@ pub fn all_within(backup: &[u8], image: &[u8]) -> bool {
     backup == image
 }
 
-// W2a may hash the DA file here; only the firmware acceptance is forbidden a digest.
+// The DA check may hash the file; only the firmware acceptance is forbidden a digest.
 pub fn check_da_image(image: &[u8]) -> bool {
     m241_core::firmware::sha256_hex(image).len() == 64
+}
+
+// The one DA digest token constructor a shipped build must not see.
+#[must_use]
+#[cfg(any(test, feature = \"simulator\"))]
+pub fn for_test_da(sha256_hex: &str) -> DaDigest {
+    DaDigest::from_hex(sha256_hex)
 }
 
 pub fn write(backup: &[u8], image: &[u8]) -> Result<()> {
@@ -392,6 +401,24 @@ pub fn write(backup: &[u8], image: &[u8]) -> Result<()> {
             "{label} did not name the rule:\n{report}"
         );
     }
+}
+
+#[test]
+fn a_da_digest_constructor_outside_its_cfg_gate_is_reported() {
+    // The `DaDigest` token is what keeps "the DA must be the vendor image" a
+    // compile-time property: a shipped build can construct it only from the
+    // pinned digest. `for_test_da` is the one other constructor, and its cfg
+    // attribute is what keeps it out. Removing that attribute is the change the
+    // gate has to catch, because nothing in `cargo test` compiles the shipped
+    // branch that would then be missing its only guard.
+    let ungated = CLEAN_DA_RS.replace("#[cfg(any(test, feature = \"simulator\"))]\n", "");
+    assert_ne!(
+        ungated, CLEAN_DA_RS,
+        "the clean fixture must carry the cfg attribute this test removes"
+    );
+    let repo = FakeRepo::new("da-digest-ungated", &[]);
+    repo.write_flash_da(&ungated);
+    repo.assert_reports("DaDigest::for_test_da");
 }
 
 #[test]
