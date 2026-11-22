@@ -23,13 +23,24 @@ Open because: the flash geometry is only known from the DA report, and no
 datasheet-level probe was done.
 
 A further observation (2026-11-22, `docs/dev/05-verification.md` §1.5): after the
-three writes, `m241 log download` returned 3,228 bytes / 135 records and then
-3,260 / 137, but the unit's only block failed its header checksum and every
-record failed its per-record checksum, so the decoded dates were nonsense. Cause
-undetermined: a 64 KiB block that is still being written may not carry a final
-header, which would make the record boundaries — and therefore the checksums —
-wrong, or the log area is damaged. The decoded dates are not used as evidence
-either way.
+three writes, `m241 log download` returned 3,228 bytes and then 3,260. The bytes
+hold only the settings / state journal — no track point at all. The parser that
+ran then read the journal as 20-byte records, which is why every record checksum
+failed and the decoded dates were nonsense; that was a parser misread, not
+damage. PR #34 (merged) recognises and skips the journal: re-parsing the same
+dumps gives 0 points with `journal_only: true`, and the pre-write 2026-11-21 dump
+gives 10,942 points with 0 record-checksum mismatches (the old parser had
+exported 4,481 of its 11,088 points from checksum-failing bytes). The write
+therefore did not damage the log area, as far as these dumps show.
+
+What remains open in this area:
+
+* **Whether the firmware writes any track point with no fix.** The post-write
+  dumps are journal-only, so this is 未検証 with or without a fix.
+* **Where the log area physically lives** — the question this section is named
+  for.
+* **The shape on other firmware / units.** V1.12 was never dumped, and the
+  4 MiB units and GR-245 variants were never available.
 
 What would settle it: a full-chip read past `0x80000`, or a schematic.
 
@@ -256,7 +267,10 @@ Open because three paths were not exercised: the Log screen (its file-path field
 needs keyboard input, and no keyboard could be injected into the X11 window in
 that session), the 追従 render (it needs a log loaded through that field), and a
 photo geotag / JPEG write through the GUI (it needs a real camera JPEG and a
-photo folder; every test JPEG here is synthetic).
+photo folder; every test JPEG here is synthetic). The Log screen also carries the
+KMZ writer, the photo clock shift and track editing wired by PR #31; because the
+screen itself could not be opened, none of them was exercised either, and no KMZ
+output has been opened in Google Earth or `unzip`.
 
 What would settle it: a session that opens a log file in the GUI and writes a
 real camera JPEG through it, plus a check that the screens are reachable without
