@@ -22,8 +22,10 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use m241_core::log::{ParseReport, export, import_nmea, parse_dump};
-use m241_core::{ExportFormat, Track};
+use m241_core::log::{
+    CoordFormat, ParseReport, export, format_coordinate, import_nmea, parse_dump,
+};
+use m241_core::{ExportFormat, Track, TrackPoint};
 use serde_json::Value;
 
 use super::nmea::{OffsetSpec, apply_to_track};
@@ -49,14 +51,19 @@ pub struct NmeaCounts {
 /// The facts a read announced outside the export.
 ///
 /// `log read` writes these into `--format json` and nowhere else: `offset_days`
-/// when something was shifted, `nmea` when the input was a capture. A field is
-/// absent when the fact does not apply, exactly as the CLI leaves it out.
+/// when something was shifted, `nmea` when the input was a capture, and
+/// `input: "gpx"` when it was a GPX document. A field is absent when the fact
+/// does not apply, exactly as the CLI leaves it out. The `position` object is
+/// derived from the track at export time instead ([`position_document`]), as the
+/// CLI derives it from the track it read.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReadFacts {
     /// Days applied to the track; `0` means no field is written.
     pub offset_days: i32,
-    /// Line counts for an NMEA capture; `None` for a dump.
+    /// Line counts for an NMEA capture; `None` for anything else.
     pub nmea: Option<NmeaCounts>,
+    /// The track came from a GPX document (`log read --gpx`).
+    pub gpx: bool,
 }
 
 /// A project document with every required key checked and its paths resolved.
@@ -260,6 +267,7 @@ pub fn load_log(input: &Path, nmea: bool, offset: OffsetSpec) -> Result<LoadedLo
         facts: ReadFacts {
             offset_days: shift,
             nmea: nmea_counts,
+            gpx: false,
         },
     })
 }
@@ -289,7 +297,12 @@ pub fn read_and_export(
             "{trimmed} はすでに存在します。上書きする場合は「上書き」を入れてください"
         ));
     }
-    let document = attach_read_report(export(&loaded.track, format), format, loaded.facts);
+    let document = attach_read_report(
+        export(&loaded.track, format),
+        format,
+        loaded.facts,
+        &loaded.track,
+    );
     write_text(path, &document)?;
     let message = format!(
         "{} 点を {trimmed} に {} で書き出しました",
@@ -308,8 +321,13 @@ pub fn read_and_export(
 /// them. It lives here rather than in `m241-core` because core's `export` has no
 /// notion of how the track was read; the GUI must not be the second front end
 /// with a different JSON schema.
-pub fn attach_read_report(exported: String, format: ExportFormat, facts: ReadFacts) -> String {
-    if format != ExportFormat::Json || (facts.offset_days == 0 && facts.nmea.is_none()) {
+pub fn attach_read_report(
+    exported: String,
+    format: ExportFormat,
+    facts: ReadFacts,
+    track: &Track,
+) -> String {
+    if format != ExportFormat::Json {
         return exported;
     }
     let Ok(Value::Object(mut object)) = serde_json::from_str(&exported) else {
@@ -327,8 +345,50 @@ pub fn attach_read_report(exported: String, format: ExportFormat, facts: ReadFac
                 "ignored": nmea.ignored,
             }),
         );
+    } else if facts.gpx {
+        object.insert(String::from("input"), Value::from("gpx"));
+    }
+    // `log read` has no `--simplify` control here, so a `simplify` field cannot
+    // apply; the GUI never thins the points it exports.
+    if let Some(position) = position_document(track) {
+        object.insert(String::from("position"), position);
     }
     format!("{}\n", Value::Object(object))
+}
+
+/// The `position` object `--format json` carries, as `log read` writes it.
+///
+/// The first and last points that carry a coordinate, rendered in **decimal**
+/// degrees: that is the CLI's default `--coord-format` and the format its
+/// `log project load` uses, so the object is the same from either front end. The
+/// GUI also has a display-only coordinate setting; it is not passed here, so a
+/// JSON export does not change shape when the person changes the display.
+///
+/// `None` when either end has no positioned point (the CLI produces the object
+/// only when both exist), or when the coordinate cannot be rendered (a
+/// non-finite or out-of-range value from a damaged dump — the CLI refuses such a
+/// read; the export bar leaves the field out rather than inventing a position).
+fn position_document(track: &Track) -> Option<Value> {
+    let start = track.points.iter().find_map(TrackPoint::position)?;
+    let end = track.points.iter().rev().find_map(TrackPoint::position)?;
+    let start = rendered_position(start)?;
+    let end = rendered_position(end)?;
+    Some(serde_json::json!({
+        "format": "decimal",
+        "start": start,
+        "end": end,
+    }))
+}
+
+/// One rendered coordinate pair, with the decoded numbers beside the text.
+fn rendered_position((lat, lon): (f64, f64)) -> Option<Value> {
+    let (latitude, longitude) = format_coordinate(lat, lon, CoordFormat::Decimal).ok()?;
+    Some(serde_json::json!({
+        "latitude": latitude,
+        "longitude": longitude,
+        "lat": lat,
+        "lon": lon,
+    }))
 }
 
 /// The inputs of [`save_project`].
@@ -791,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dump_json_export_has_neither_read_report_field() {
+    fn a_dump_json_export_carries_the_position_and_no_input_facts() {
         let scratch = ScratchDir::new("read-json-plain");
         let input = scratch.join("track.bin");
         std::fs::write(&input, one_day_dump()).expect("write the dump");
@@ -810,6 +870,72 @@ mod tests {
                 .expect("one JSON object");
         assert!(document.get("offset_days").is_none(), "got {document}");
         assert!(document.get("nmea").is_none(), "got {document}");
+        assert!(document.get("input").is_none(), "got {document}");
+        assert!(document.get("simplify").is_none(), "got {document}");
+        // `log read --format json` carries the first and last positioned point
+        // in decimal degrees; the GUI writes the same object.
+        let position = &document["position"];
+        assert_eq!(position["format"], "decimal", "got {document}");
+        let (track, _) =
+            parse_dump(&std::fs::read(&input).expect("read the dump")).expect("parse the dump");
+        let point = track.points.first().expect("one point");
+        let (lat, lon) = point.position().expect("the synthetic point has a fix");
+        let (latitude, longitude) =
+            format_coordinate(lat, lon, CoordFormat::Decimal).expect("decimal render");
+        assert_eq!(position["start"]["latitude"], latitude);
+        assert_eq!(position["start"]["longitude"], longitude);
+        assert_eq!(position["start"]["lat"], Value::from(lat));
+        assert_eq!(position["start"]["lon"], Value::from(lon));
+        assert_eq!(position["end"], position["start"], "one point is both ends");
+    }
+
+    #[test]
+    fn an_unpositioned_track_writes_no_position_object() {
+        // The CLI produces `position` only when a first *and* a last positioned
+        // point exist; a track of time-only records carries no position field.
+        let track = Track {
+            points: vec![TrackPoint {
+                utc: Some(1_700_000_000),
+                ..TrackPoint::default()
+            }],
+            damaged_blocks: Vec::new(),
+        };
+        let exported = attach_read_report(
+            export(&track, ExportFormat::Json),
+            ExportFormat::Json,
+            ReadFacts::default(),
+            &track,
+        );
+        let document: Value = serde_json::from_str(&exported).expect("one JSON object");
+        assert!(document.get("position").is_none(), "got {document}");
+    }
+
+    #[test]
+    fn a_gpx_source_is_named_in_the_json_like_the_cli() {
+        let track = Track {
+            points: vec![TrackPoint {
+                utc: Some(1_700_000_000),
+                latitude: Some(35.68),
+                longitude: Some(139.76),
+                ..TrackPoint::default()
+            }],
+            damaged_blocks: Vec::new(),
+        };
+        let facts = ReadFacts {
+            gpx: true,
+            ..ReadFacts::default()
+        };
+        let exported = attach_read_report(
+            export(&track, ExportFormat::Json),
+            ExportFormat::Json,
+            facts,
+            &track,
+        );
+        let document: Value = serde_json::from_str(&exported).expect("one JSON object");
+        assert_eq!(document["input"], "gpx", "got {document}");
+        assert!(document.get("nmea").is_none(), "got {document}");
+        assert!(document.get("offset_days").is_none(), "got {document}");
+        assert!(document.get("position").is_some(), "got {document}");
     }
 
     #[test]

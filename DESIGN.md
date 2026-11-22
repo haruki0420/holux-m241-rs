@@ -524,6 +524,9 @@ approximation from a mistake.
   project file's directory with `/` separators, as `02-cli.md` specifies, so a
   saved project directory can be moved with the files it names. An absolute path
   stays absolute.
-- The 「読み書き」 panel's JSON output and a project load carry `nmea` and
-  `offset_days` when they apply, exactly as `log read --format json` does: the
-  machine-readable output must not depend on which front end wrote it.
+- The 「読み書き」 panel's JSON output, a project load and the ログを開く GPX path
+  carry `nmea` / `input: "gpx"` / `offset_days` / `position` exactly as
+  `log read --format json` does: the machine-readable output must not depend on
+  which front end wrote it. `position` is decimal degrees (the CLI default; the
+  Settings coordinate format is display-only) and `simplify` never appears
+  because the GUI cannot thin points.

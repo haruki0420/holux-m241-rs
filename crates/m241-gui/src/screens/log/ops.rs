@@ -1653,6 +1653,10 @@ mod tests {
         assert_eq!(written["offset_days"], 1);
         assert_eq!(written["nmea"]["imported"], 1);
         assert_eq!(written["nmea"]["ignored"], 1);
+        assert_eq!(
+            written["position"]["format"], "decimal",
+            "a project load writes the CLI's position object: {written}"
+        );
     }
 
     #[test]
@@ -1728,6 +1732,7 @@ mod tests {
                 dropped: 1,
                 ignored: 2,
             }),
+            gpx: false,
         });
         log.set_destination(output.display().to_string());
         log.export().expect("export the read's track");
@@ -1740,6 +1745,10 @@ mod tests {
         assert_eq!(document["nmea"]["imported"], 3);
         assert_eq!(document["nmea"]["dropped"], 1);
         assert_eq!(document["nmea"]["ignored"], 2);
+        assert_eq!(
+            document["position"]["format"], "decimal",
+            "the export bar writes the CLI's position object too: {document}"
+        );
 
         // A track from another source clears the facts: a download's JSON is the
         // exporter's object, with no counts from a previous read.

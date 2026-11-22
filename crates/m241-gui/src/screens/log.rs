@@ -587,6 +587,14 @@ impl LogScreen {
         self.sample = false;
         self.log_path = path.display().to_string();
         self.set_track(track, ParseReport::default());
+        // A GPX document is the GUI's `log read --gpx`: the JSON export says so
+        // with `"input": "gpx"`, as the CLI does, and `auto` was not applied to
+        // its dates (there is no shift here to report).
+        self.set_read_facts(ReadFacts {
+            offset_days: 0,
+            nmea: None,
+            gpx: true,
+        });
         self.destination = path
             .with_extension(self.format.extension())
             .display()
@@ -2348,10 +2356,15 @@ impl LogScreen {
         let document = log::export(&self.track, self.format);
         // Same fields as `log read --format json`: the NMEA counts and the day
         // shift are facts about how this track was read, so they ride along
-        // when that read's output is JSON. `None` (a download, the sample)
-        // writes the exporter's object untouched.
-        let document =
-            project::attach_read_report(document, self.format, self.read_facts.unwrap_or_default());
+        // when that read's output is JSON, and the `position` object is derived
+        // from the track the CLI derives it from. `None` (a download, the
+        // sample) writes the exporter's own object plus the position.
+        let document = project::attach_read_report(
+            document,
+            self.format,
+            self.read_facts.unwrap_or_default(),
+            &self.track,
+        );
         match std::fs::write(&dest_path, document) {
             Ok(()) => {
                 self.outcome = Some((

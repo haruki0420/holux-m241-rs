@@ -866,7 +866,17 @@ each other rather than two implementations of one idea.
 | プロジェクト | `log project save`, `log project load` | Same eight-key JSON schema, same path rule: a relative `log` / `photos` / `output` is resolved against the cwd once and stored relative to the project file's directory with `/` separators. A KMZ project with an NMEA input or `photos: null` is refused here too. |
 | NMEA 修復 | `nmea repair` | Same algorithm and checksum rewrite; input and output are files (the GUI has no stdin/stdout). |
 | NMEA 中継 | `nmea proxy` | Same relay and loopback-only bind rule; the screen log replaces stdout, and `--max-lines` has a field (empty means until 停止). The GUI fills the bind with `127.0.0.1:10110` by default where an omitted CLI `--bind` means no TCP listener; emptying the field gives the CLI's behaviour. |
-| 読み書き | `log read` | Same formats and `--utc-offset-days`; `--format json` carries the same `"nmea"` and `"offset_days"` fields, from this panel and from the project-load path. The GUI refuses an existing output unless 上書き is ticked, where the CLI replaces it. |
+| 読み書き | `log read` | Same formats and `--utc-offset-days`. `--format json` carries the same fields for the inputs the GUI reads: `"nmea"` for a capture, `"input": "gpx"` for a GPX document, `"offset_days"` when shifted, and the `"position"` object. This holds from the read panel, the project-load path and the screen's ログを開く GPX path. The GUI refuses an existing output unless 上書き is ticked, where the CLI replaces it. |
+
+The JSON object is the same from either front end, key for key: `nmea`,
+`input: "gpx"`, `offset_days` and `position` are written exactly as `log read`
+writes them (verified by diffing both outputs for a dump, an NMEA capture and a
+GPX document — byte-identical). Two fields never appear from the GUI because it
+has no control that would produce them: `"simplify"` (no point thinning) and
+`--cache` / `--csv-report` (no such panels). The `position` object is always
+decimal degrees, the CLI's default `--coord-format` and what `log project load`
+uses; the Settings screen's coordinate format is display-only and does not
+change the JSON.
 
 `--port auto` means "the one plausible M-241 cable" in both. The CLI classifies
 by USB ids and description (`m241-cli/src/link.rs::identify`); the GUI has only

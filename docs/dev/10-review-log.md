@@ -1439,7 +1439,9 @@ Could 9）と可読性（Must 4 / Should 17 / Could 13）の 2 本で、レビ�
 - project: `a_project_in_a_subdirectory_stores_paths_relative_to_its_directory`、
   `an_absolute_path_is_stored_absolute_and_read_back_as_the_same_file`、
   `a_json_read_export_carries_the_nmea_counts_and_the_day_shift`、
-  `a_dump_json_export_has_neither_read_report_field`、
+  `a_dump_json_export_carries_the_position_and_no_input_facts`、
+  `an_unpositioned_track_writes_no_position_object`、
+  `a_gpx_source_is_named_in_the_json_like_the_cli`、
   `the_read_report_is_only_added_to_json`。
 - ops: `the_transfer_panels_draw_the_controls_their_refusals_name`、
   `a_status_from_another_panel_is_not_drawn`、
@@ -1461,6 +1463,39 @@ Could 9）と可読性（Must 4 / Should 17 / Could 13）の 2 本で、レビ�
   で 6 パネルを再出力し、消去パネルのポート欄・上書き欄、中継の「最大行数」、KMZ icon が
   既定 OFF で表示されることを目視。
 - 実機の吸い出し・中継・消去は未検証のまま（GUI から実行していない）。
+
+### main 追従（PR #36 の core/CLI 変更）後の再突き合わせ（2026-11-23）
+
+- main の `5b2ffce`（PR #36）へ `06e4e1d` で merge。競合は本ファイル末尾のみで、
+  PR #37 節と PR #36 節を両方残して解消（`### Stage 3 検証` は両節がそれぞれ持つ）。
+- PR #36 で CLI の `attach_read_report` が `ReadReport` を受け取る形になり、`log read --format json`
+  は `input:"gpx"` / `simplify` / `position` を追加していた。GUI の JSON は `input` と `position`
+  を欠いていたため、GUI 側を新しい CLI に合わせた:
+  - `position`（最初と最後の位置点、decimal 度、`format` / `start` / `end` と
+    `latitude`/`longitude`/`lat`/`lon`）を書き出しバー・読み書きパネル・プロジェクト読込に追加。
+    `TrackPoint::position()` と core の `format_coordinate` を使い、CLI の `position_report` と同じ
+    規則（両端が揃ったときだけ）にした。
+  - 画面の「ログを開く」で GPX を読んだ場合、`log read --gpx` と同じく `"input": "gpx"` を付与。
+  - JSON は CLI と同じく常に `serde_json::Value` で再直列化してから付与する形にした（従来は
+    付与する事実が無いとき core のバイト列をそのまま書いていた）。
+  - `simplify` は GUI に間引きの操作子が無いため対象外（CLI でも `--simplify` 指定時のみ）。
+    `--cache` / `--csv-report` / `--coord-format` も GUI に対応する操作子が無い。`position` は
+    CLI の既定と同じ decimal 固定（Settings の座標形式は表示専用）。
+- 実出力での再突き合わせ（`/var/tmp` の合成 2 点ダンプと、そこから CLI で作った NMEA/GPX。
+  リポジトリ外で破棄）:
+  - dump: `m241 log read --format json` と GUI の読み書き → **file diff なし**
+  - NMEA: `--nmea --utc-offset-days 1` → **file diff なし**
+  - GPX: `--gpx` と GUI の「ログを開く」→ JSON → **file diff なし**
+- 追加テスト: `a_dump_json_export_carries_the_position_and_no_input_facts`、
+  `an_unpositioned_track_writes_no_position_object`、
+  `a_gpx_source_is_named_in_the_json_like_the_cli`。既存の JSON テスト
+  （`the_export_bar_writes_the_read_report_into_json`、
+  `a_project_load_writes_the_read_report_fields_it_stored`）に `position` の assert を追加。
+  旧 `a_dump_json_export_has_neither_read_report_field` は上記の position テストに置き換え。
+- ゲート: 最終 head（本節を含む）で `./tools/check.sh` 6/6、`cargo test -p m241-gui` は
+  lib 178 passed。`git diff origin/main...HEAD` は `crates/m241-gui`（`Cargo.toml` /
+  `Cargo.lock` の `serde_json` 追加を含む）と docs のみ（merge で取り込んだ core/CLI は
+  PR の差分に出ない）。
 
 ### Stage 3 検証
 
