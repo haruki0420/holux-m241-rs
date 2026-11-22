@@ -242,6 +242,19 @@ pub struct FakeDa {
     /// stored here, not in `output`, so the client's `clear_input` cannot remove
     /// it; `dispatch_da_command` queues it when the `0xD3` frame is complete.
     d3_prefix: Option<Vec<u8>>,
+    /// The status byte the fake returns after an accepted `0xD3`.
+    ///
+    /// [`STATUS_OK`] by default. A test replaces it to drive the client's
+    /// `0xD3 status byte was 0x..` refusal: the status is the second half of
+    /// the `5A 00` reply and the check that stops a resynchronised `0x5A` from
+    /// counting as success on its own.
+    d3_status: u8,
+    /// Whether the next `0xD5` header write fails at the transport, once.
+    ///
+    /// Models a port that goes away between the accepted `0xD3` and the first
+    /// `0xD5` byte. The client sets `program_started` before that write, so a
+    /// test can check that the CLI does not retry it as if `0xD3` had failed.
+    fail_write_command: bool,
     /// Every opcode the host sent, in order: the BootROM's frames and the DA's.
     opcodes: Vec<u8>,
     /// The two-byte trailer of each packet, as it arrived, parallel to
@@ -255,12 +268,11 @@ pub struct FakeDa {
     /// in a `0xD5` packet stage is visible even though the byte is not parsed as
     /// a command there.
     restart_requests: usize,
-    /// Whether every `0xD3` is refused, as an unmappable range would be.
-    refuse_ranges: bool,
     /// How many upcoming `0xD3` commands to refuse, then accept again.
     ///
-    /// A count rather than a bool so a test can fail the first attempt and let
-    /// the automatic retry succeed, or fail both attempts.
+    /// One counter, not a bool beside it: a test can fail the first attempt and
+    /// let the automatic retry succeed, fail both attempts, or use
+    /// [`FakeDa::refusing_ranges`] to set `usize::MAX` and refuse every one.
     refuse_ranges_remaining: usize,
     /// Every `0xD3` range the host sent, in order, accepted or refused.
     ///
@@ -331,7 +343,11 @@ pub struct FakeDa {
     /// `StreamState::Unknown` branch.
     firmware_sentence: &'static [u8],
     /// Whether `$PMTK180*3B` was seen and handed the chip back to the BootROM.
-    pmtk180: bool,
+    ///
+    /// A count, not a bool: the initial entry and the retry after a failed
+    /// `0xD3` both use the same hand-over, and a test checks that the retry
+    /// performed it again instead of reusing the first one's outcome.
+    pmtk180_requests: usize,
     /// Every baud rate the host set, in order.
     ///
     /// A history, not the current value: the read-back's correctness depends on
@@ -381,10 +397,11 @@ impl FakeDa {
             retries_sent: 0,
             page_prefix: None,
             d3_prefix: None,
+            d3_status: STATUS_OK,
+            fail_write_command: false,
             opcodes: Vec::new(),
             restarted: false,
             restart_requests: 0,
-            refuse_ranges: false,
             refuse_ranges_remaining: 0,
             ranges_recorded: Vec::new(),
             fail_first_erase: false,
@@ -401,7 +418,7 @@ impl FakeDa {
             firmware_served: false,
             nmea_after_restart: true,
             firmware_sentence: FIRMWARE_NMEA_LINE,
-            pmtk180: false,
+            pmtk180_requests: 0,
             bauds: Vec::new(),
             control_lines: Vec::new(),
         }
@@ -434,7 +451,7 @@ impl FakeDa {
     /// one-byte refusal path is reached at all.
     #[must_use]
     pub fn refusing_ranges(mut self, refuse: bool) -> Self {
-        self.refuse_ranges = refuse;
+        self.refuse_ranges_remaining = if refuse { usize::MAX } else { 0 };
         self
     }
 
@@ -459,7 +476,7 @@ impl FakeDa {
     /// Used to check that a client which met a single-byte refusal can still
     /// drive the same fake with a well-formed command afterwards.
     pub fn set_accepting_ranges(&mut self) {
-        self.refuse_ranges = false;
+        self.refuse_ranges_remaining = 0;
     }
 
     /// Start refusing every `0xD3` on a fake that already exists.
@@ -467,7 +484,27 @@ impl FakeDa {
     /// The counterpart of [`FakeDa::set_accepting_ranges`], so one fake can
     /// serve an accepted range, a refusal, and an accepted range again.
     pub fn set_refusing_ranges(&mut self, refuse: bool) {
-        self.refuse_ranges = refuse;
+        self.refuse_ranges_remaining = if refuse { usize::MAX } else { 0 };
+    }
+
+    /// Replace the status byte an accepted `0xD3` returns after its `0x5A`.
+    ///
+    /// `docs/reference/01-da-protocol.md` §4.1: the real DA only ever writes
+    /// `0x00` there, so anything else is this fake standing in for a reply the
+    /// client must refuse.
+    pub fn set_d3_status(&mut self, status: u8) {
+        self.d3_status = status;
+    }
+
+    /// Make the next `0xD5` header write fail at the transport, once.
+    ///
+    /// The client marks programming as started before that write because a
+    /// failed write cannot prove that no byte was sent; this exercises that
+    /// boundary without a partial packet.
+    #[must_use]
+    pub fn failing_write_command(mut self) -> Self {
+        self.fail_write_command = true;
+        self
     }
 
     /// How many packets the fake accepted and programmed.
@@ -744,7 +781,17 @@ impl FakeDa {
     /// Whether `$PMTK180*3B` handed the restarted chip back to the BootROM.
     #[must_use]
     pub fn pmtk180(&self) -> bool {
-        self.pmtk180
+        self.pmtk180_requests > 0
+    }
+
+    /// How many `$PMTK180*3B` hand-overs the host sent.
+    ///
+    /// The initial entry, the retry after a failed `0xD3` and the read-back
+    /// re-entry each send one; a count is what shows the retry did not reuse
+    /// the first entry's result.
+    #[must_use]
+    pub fn pmtk180_requests(&self) -> usize {
+        self.pmtk180_requests
     }
 
     /// Every baud rate the host set, in order.
@@ -852,7 +899,7 @@ impl FakeDa {
             line.pop();
         }
         if line == b"$PMTK180*3B" {
-            self.pmtk180 = true;
+            self.pmtk180_requests = self.pmtk180_requests.saturating_add(1);
             self.mode = Mode::BootRom;
             // Whatever the firmware had queued is not a BootROM reply.
             self.output.clear();
@@ -1283,8 +1330,11 @@ impl FakeDa {
                     return;
                 };
                 self.ranges_recorded.push((start, end));
-                let refuse = self.refuse_ranges || self.refuse_ranges_remaining > 0;
-                if self.refuse_ranges_remaining > 0 {
+                // One counter: a positive value refuses this command, and
+                // `usize::MAX` (set by `refusing_ranges(true)`) refuses every
+                // one without the count moving.
+                let refuse = self.refuse_ranges_remaining > 0;
+                if refuse && self.refuse_ranges_remaining != usize::MAX {
                     self.refuse_ranges_remaining -= 1;
                 }
                 // From the disassembly: `0xD3` records the range and touches no
@@ -1310,7 +1360,8 @@ impl FakeDa {
                 // `measured elsewhere:` on success `0xD3` answers with **two**
                 // bytes, ACK then status. A client that reads one leaves the
                 // status byte in the buffer and shifts every later frame.
-                self.queue_bytes(&[ACK, STATUS_OK]);
+                let status = self.d3_status;
+                self.queue_bytes(&[ACK, status]);
             }
             OPCODE_WRITE => {
                 self.da_packet_len = be_u32(&frame, 1)
@@ -1522,6 +1573,15 @@ impl Transport for FakeDa {
             self.line.clear();
             self.output.clear();
             return Ok(());
+        }
+        // A `0xD5` header is the only five-byte write that starts with the write
+        // opcode; the packets that follow are `PACKET_SIZE + 2` bytes.
+        if self.fail_write_command && buf.len() == 5 && buf.first().copied() == Some(OPCODE_WRITE) {
+            self.fail_write_command = false;
+            return Err(m241_core::Error::Io {
+                path: Some(String::from("SIM0")),
+                source: std::io::Error::other("simulated failure writing the 0xD5 header"),
+            });
         }
         for byte in buf {
             self.consume(*byte);

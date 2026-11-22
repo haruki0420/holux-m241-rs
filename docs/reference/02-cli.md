@@ -156,11 +156,16 @@ If the DA phase fails, the CLI leaves the chip in a defined restart state:
 `0xD3` failing before any `0xD5` byte sends `0xD9` (no reply wait), re-enters
 the BootROM through the same NMEA/`$PMTK180` route, reloads the DA, and retries
 the write **once**. Both attempts use only `FLASH_WRITE_START = 0` and
-`FLASH_WRITE_LENGTH = 0x6345C`; the range is not recomputed. If the retry also
-fails, the error says the unit was restarted, so the battery does not need to
-be removed, and names `fw dump`. If `0xD5` has already started, the CLI sends
-`0xD9` but does **not** retry automatically, because the range may be partly
-written; the error names `fw dump` and `--recover` with the user's backup.
+`FLASH_WRITE_LENGTH = 0x6345C`; the range is not recomputed. The retry does not
+repeat the whole-unit `verify_device` comparison: `0xD3` records a range and
+calls no flash driver, so a failure before `0xD5` cannot have changed the flash,
+and `AGENTS.md` §2.3's comparison before the DA is loaded was satisfied by the
+first load. If the retry also fails before `0xD5`, the error says `0xD9` was
+sent and that nothing was written, so the battery does not need to be removed,
+and names `fw dump`. (`0xD9` has no reply, so no message claims the restart was
+confirmed.) If `0xD5` has already started, the CLI sends `0xD9` but does **not**
+retry automatically, because the range may be partly written; the error names
+`fw dump` and `--recover` with the user's backup.
 
 Flags: `--backup <FILE>` (required), `--da <FILE>` (required unless
 `--dry-run`), `--port <PORT|auto>`, `--yes`, `--recover` (write the backup back
@@ -172,10 +177,12 @@ An approval under `AGENTS.md` §2.5 requires an explicit resolved port;
 `--port auto` is not approvable for a write-capable run, and
 `--recover --yes` / `--allow-vendor --yes` are inside the same approval rule.
 
-🧪 The whole write path, including the post-`0xD9` NMEA re-entry and read-back,
-has been exercised only against the fake Download Agent. No unit has been
-flashed by this build, and the re-entry/read-back after `0xD9` is unverified on
-hardware; see `docs/dev/05-verification.md`.
+🧪 The whole write path — the post-`0xD9` NMEA re-entry and read-back, the
+automatic `0xD9` restart with its one retry, and the `0xD3` reply
+resynchronisation — has been exercised only against the fake Download Agent. No
+unit has been flashed by this build, and the re-entry/read-back after `0xD9`, the
+retry loop and the resynchronised `0xD3` reply are unverified on hardware; see
+`docs/dev/05-verification.md`.
 
 ## `m241 fw probe-da`
 
@@ -246,15 +253,18 @@ never touches DTR/RTS, and needs no `--yes`, because restarting the chip neither
 erases nor programs flash. On success it prints:
 
 ```text
-DA restart sent; the unit boots its firmware. No flash was written.
+DA restart sent; no flash was written. 0xD9 has no reply, so the restart cannot be confirmed from this command: run `m241 fw dump` to check the unit answers.
 ```
 
-The unit then boots its firmware. If a later command needs the BootROM, pass
-`--assume-brom` (the chip is silent and listening) or use the normal NMEA probe
-and `$PMTK180*3B` route. `fw flash` uses the same byte automatically when its DA
-phase fails, before it decides whether a retry is safe; this command is for the
-case where that automatic restart could not be sent or the unit was left by an
-earlier run.
+⚠️ 未検証 on hardware: no unit has been sent a standalone `0xD9` after a failed
+DA phase; the command has run against the fake only
+(`docs/dev/05-verification.md` §2). If the restart works, the unit boots its
+firmware, but the command cannot confirm that. If a later command needs the
+BootROM, pass `--assume-brom` (the chip is silent and listening) or use the
+normal NMEA probe and `$PMTK180*3B` route. `fw flash` uses the same byte
+automatically when its DA phase fails, before it decides whether a retry is
+safe; this command is for the case where that automatic restart could not be
+sent or the unit was left by an earlier run.
 
 Flags: `--port <PORT|auto>` (default `auto`).
 
