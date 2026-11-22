@@ -55,6 +55,14 @@ structurally is everything inside `m241-flash`: the fixed range,
 describe the GUI's gates as equivalent to the removed edge. See
 [`docs/dev/11-safety-review.md`](docs/dev/11-safety-review.md).
 
+**The GUI's map is the one network consumer.** With map tiles on (the default)
+the Log screen fetches OpenStreetMap raster tiles for the area on screen, through
+the `TileFetcher` seam in `crates/m241-gui/src/screens/log/tiles.rs`.
+`--screenshot` and a headless render never fetch: the window gate is
+`native_pixels_per_point`, and the sample frame says it shows no tiles. Every
+offline command stays offline; `nmea proxy`'s TCP listener is loopback by default.
+A second network consumer needs the same seam and an update to `DESIGN.md`.
+
 **Long commands go in the background.** A first `cargo build` of the GUI pulls
 in `wgpu` and takes several minutes. Do not block a turn on it.
 
