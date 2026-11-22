@@ -234,7 +234,7 @@ impl Drop for FakeRepo {
 fn without_layout_gate(da_rs: &str) -> String {
     da_rs
         .replace("\r\n", "\n")
-        .replacen("        check_layout()?;\n", "", 1)
+        .replace("        check_layout()?;\n", "")
 }
 
 #[test]

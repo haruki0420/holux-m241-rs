@@ -220,6 +220,14 @@ reconstructed from the repository.
    output file and exit status 0; a checksum mismatch inside `write16` is printed
    and the write continues. The pattern is reasonable for a script its author
    watched run, and wrong for a tool whose user will not read stderr.
+5. **Writing a published vendor image over the unit's per-unit fields.** The
+   vendor utility's image is the stock release: its bytes at the per-unit
+   regions replace the individual values from the unit's own dump. This project
+   keeps that as a separate, explicit gate (`--allow-vendor`, fixed V1.13
+   SHA-256, `--yes`, `verify_device`, read-back and a warning that 14 bytes are
+   overwritten); the normal path still writes only the user's own backup with
+   the WNRO bytes moved. The user made that trade-off deliberately; it is not
+   inferred from the vendor tool's behaviour.
 
 ## Designs this project deliberately does not adopt
 

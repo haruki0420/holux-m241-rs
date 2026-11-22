@@ -40,10 +40,13 @@
 //!    a different unit is refused (`AGENTS.md` §2.3). [`check_image`], which
 //!    [`DownloadAgent::write`] always runs, accepts only an identical image or
 //!    an image that differs from the user's own backup at that profile's patch
-//!    offsets. There is no second, digest-based route: a vendor release has
-//!    per-unit fields different from any one unit's dump, and `AGENTS.md` §2.3
-//!    says the backup check must not be weakened. Write your own backup with the
-//!    WNRO patch applied.
+//!    offsets. There is no digest branch in `check_image`. The one exception is
+//!    the separate, explicit vendor gate ([`accept_vendor_image`]): only the
+//!    pinned V1.13 vendor image with a fixed full SHA-256 can obtain a
+//!    [`VendorImage`] token, and [`DownloadAgent::write_vendor`] is the only
+//!    writer that accepts it. It still requires the same backup check by the
+//!    caller, and it overwrites the unit's per-unit data by design
+//!    (`AGENTS.md` §2.3, user decision).
 //! 4. **The write is read back and compared.**
 //!    [`PendingWrite::verify_written`] restarts the chip (`0xD9`), hands the
 //!    transport to the caller's BootROM re-entry step, and compares the span
@@ -158,9 +161,11 @@
 //! bytes are what gets erased and reprogrammed. What keeps that safe is the
 //! image rule: [`check_image`] refuses any difference from the user's backup
 //! outside [`PATCH_OFFSETS`], and [`DownloadAgent::verify_device`] refuses a
-//! unit whose span does not equal that backup. [`check_layout`] passes only
-//! while the list is empty and the start is the settled `0`; a non-empty list,
-//! or any other start, refuses every write.
+//! unit whose span does not equal that backup. The explicit vendor gate writes
+//! the pinned V1.13 file instead, still after `verify_device` and with a
+//! read-back. [`check_layout`] passes only while the list is empty and the start
+//! is the settled `0`; a non-empty list, or any other start, refuses every
+//! write.
 //!
 //! # What is verified and what is not
 //!
@@ -210,6 +215,7 @@ use std::time::Duration;
 
 use m241_core::Result;
 use m241_core::error::Error;
+use m241_core::firmware::digest::matches;
 use m241_core::firmware::image::{
     EFFECTIVE_EPOCH_OFFSET, FAMILY, FAMILY_OFFSET, FAMILY_SIZE, FirmwareImage,
 };
@@ -1718,22 +1724,76 @@ impl<T: Transport> DownloadAgent<T> {
         self.write_range(backup, FLASH_WRITE_START, image)
     }
 
+    /// `0xD3` + `0xD5` for an official vendor image that passed [`accept_vendor_image`].
+    ///
+    /// This is the **only** write path outside the strict backup diff. The token
+    /// proves the image is the pinned V1.13 vendor release; `backup` is still
+    /// required and is checked for the profile's shape, because it is the only
+    /// way back. The caller must run [`Self::verify_device`] against the unit
+    /// before loading the DA (the CLI does); this method cannot see the unit.
+    ///
+    /// Writing the vendor image replaces the unit's per-unit data
+    /// ([`VENDOR_PER_UNIT_DATA_BYTES`] bytes) with the vendor values. The CLI
+    /// warns about that before the port is opened; this API only enforces the
+    /// token and the layout.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Safety`] from the confirmation, [`check_layout`], a token for
+    ///   another profile, or a `backup` that is not a valid V1.13 image. Nothing
+    ///   was sent.
+    /// * The same DA errors as [`Self::write`] once the range is recorded.
+    pub fn write_vendor(
+        &mut self,
+        confirmation: Confirmation,
+        backup: &[u8],
+        vendor: VendorImage<'_>,
+    ) -> Result<PendingWrite> {
+        if !confirmation.is_given() {
+            return Err(Error::Safety {
+                reason: String::from(
+                    "DownloadAgent::write_vendor was given a confirmation token that was never \
+                     granted",
+                ),
+            });
+        }
+        check_layout()?;
+        if vendor.profile().name != PROFILE_V1_13.name {
+            return Err(Error::Safety {
+                reason: format!(
+                    "the vendor token is for {}, but the shipped range is V1.13",
+                    vendor.profile().name
+                ),
+            });
+        }
+        // The backup is not the image here; it only has to be a structurally
+        // valid V1.13 dump. `verify_device` is the caller's step.
+        check_image(vendor.profile(), backup, backup)?;
+        self.write_range_accepted(FLASH_WRITE_START, vendor.image())
+    }
+
     /// The write with an explicit start, used by [`Self::write`] and the tests.
     ///
-    /// Private. [`Self::write`] is the only non-test caller and it runs
-    /// [`check_layout`] first, which accepts only the settled `0`, so a release
-    /// build has no reachable way to write at a range a caller chooses.
-    /// **Every** write goes through the checks in this function:
-    /// [`check_image`] against `backup`, which is `AGENTS.md` §2.3's rule, so
-    /// `0xD3` cannot go out for a buffer that was never compared with the user's
-    /// own dump.
+    /// Private and **strict**: it runs [`check_image`] against `backup`, which
+    /// is `AGENTS.md` §2.3's backup-diff rule. Vendor images do not come through
+    /// this function; [`Self::write_vendor`] reaches
+    /// [`Self::write_range_accepted`] only with a [`VendorImage`] token.
     fn write_range(&mut self, backup: &[u8], start: u32, image: &[u8]) -> Result<PendingWrite> {
         // The shipped range is V1.13's ([`check_layout`] refuses any other
         // length), so the profile accepting the image is that one. A V1.12 or
         // V1.14 image cannot arrive here: `check_image` refuses a length that is
         // not the profile's, and the profile is V1.13.
         let accepted = check_image(&PROFILE_V1_13, backup, image)?;
-        let image = accepted.image;
+        self.write_range_accepted(start, accepted.image)
+    }
+
+    /// Program an image whose acceptance the caller has already established.
+    ///
+    /// Private. The only callers are [`Self::write_range`] (strict backup diff)
+    /// and [`Self::write_vendor`] (a [`VendorImage`] token). This is the one
+    /// place that can reach `0xD3` without repeating a check, so it must not
+    /// become public.
+    fn write_range_accepted(&mut self, start: u32, image: &[u8]) -> Result<PendingWrite> {
         let mut packets = 0usize;
         let mut progress = Progress::NothingWritten;
         let end = range_end(start);
@@ -2175,13 +2235,107 @@ fn check_layout_of(
 ///
 /// There is exactly one acceptance rule (`AGENTS.md` §2.3): the image is the
 /// user's own backup, or differs from it only at that profile's patch offsets.
-/// No digest, vendor package, or "known profile" route exists.
+/// No digest, vendor package, or "known profile" route exists here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AcceptedImage<'a> {
     /// The profile the image was read against.
     pub profile: &'static FirmwareProfile,
     /// The image itself, after checking.
     pub image: &'a [u8],
+}
+
+/// The full SHA-256 of the one official V1.13 vendor image this build accepts.
+///
+/// `AGENTS.md` §2.3's vendor gate is deliberately a single fixed digest, not a
+/// profile list: this is the file measured for V1.13 (406,620 bytes), and a
+/// different vendor build must be added by name, length and digest with its own
+/// review. V1.12 is not accepted by this gate yet.
+pub const VENDOR_V1_13_SHA256: &str =
+    "32fe52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435";
+
+/// How many per-unit bytes the vendor image replaces with `0xFF`.
+///
+/// The V1.13 vendor file differs from a unit's own dump in 14 per-unit bytes:
+/// `0x5C`–`0x5F` (4), `0xF8`–`0xFD` (6), and the four-byte trailer at
+/// `0x63458`–`0x6345B`. The CLI warning quotes this number; the token and
+/// writer do not derive a range from it.
+pub const VENDOR_PER_UNIT_DATA_BYTES: usize = 14;
+
+/// An official vendor image that passed the fixed-SHA gate.
+///
+/// The fields are private and there is no public constructor: [`accept_vendor_image`]
+/// is the only way to obtain one. That makes "write this vendor image" a
+/// distinct, named step from [`DownloadAgent::write`]'s strict backup-diff path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VendorImage<'a> {
+    profile: &'static FirmwareProfile,
+    image: &'a [u8],
+}
+
+impl<'a> VendorImage<'a> {
+    /// The profile the vendor image belongs to (V1.13).
+    #[must_use]
+    pub fn profile(self) -> &'static FirmwareProfile {
+        self.profile
+    }
+
+    /// The vendor image bytes.
+    #[must_use]
+    pub fn image(self) -> &'a [u8] {
+        self.image
+    }
+}
+
+/// Accept an official V1.13 vendor image by its fixed full SHA-256.
+///
+/// `AGENTS.md` §2.3's vendor gate: the image must be the one pinned V1.13
+/// release, at the profile's length, with the exact digest. There is no
+/// "close enough" hash, no prefix match and no other profile: V1.12 and any
+/// other vendor build are refused. The returned token is the only input
+/// [`DownloadAgent::write_vendor`] accepts.
+///
+/// This is intentionally separate from [`check_image`]. The strict function
+/// never gains a digest branch; the safety gate pins that separation.
+///
+/// # Errors
+///
+/// [`Error::Safety`] when `profile` is not the pinned V1.13 profile, when
+/// `image` is not that profile's length, or when its full SHA-256 is not
+/// [`VENDOR_V1_13_SHA256`].
+pub fn accept_vendor_image<'a>(
+    profile: &'static FirmwareProfile,
+    image: &'a [u8],
+) -> Result<VendorImage<'a>> {
+    if profile.name != PROFILE_V1_13.name
+        || profile.size != PROFILE_V1_13.size
+        || !profile.sha256.eq_ignore_ascii_case(VENDOR_V1_13_SHA256)
+    {
+        return Err(Error::Safety {
+            reason: format!(
+                "the vendor gate is pinned to V1.13 ({} bytes, SHA-256 {VENDOR_V1_13_SHA256}); \
+                 profile {} is not that release. V1.12 and other vendor builds are not supported",
+                PROFILE_V1_13.size, profile.name
+            ),
+        });
+    }
+    if image.len() != PROFILE_V1_13.size {
+        return Err(Error::Safety {
+            reason: format!(
+                "the vendor image is {} bytes; the pinned V1.13 image is {} bytes",
+                image.len(),
+                PROFILE_V1_13.size
+            ),
+        });
+    }
+    if !matches(image, VENDOR_V1_13_SHA256) {
+        return Err(Error::Safety {
+            reason: format!(
+                "the image's SHA-256 is not the pinned V1.13 vendor digest \
+                 {VENDOR_V1_13_SHA256}. Only that exact official image may use --allow-vendor"
+            ),
+        });
+    }
+    Ok(VendorImage { profile, image })
 }
 
 /// How many differing offsets [`WritePlan`] keeps.
@@ -2216,6 +2370,10 @@ pub struct WritePlan {
     pub start: u32,
     /// `0xD5` packets a write of `write_length` would take.
     pub packets: usize,
+    /// `true` when the image came through [`accept_vendor_image`], not the
+    /// strict backup-diff path. The CLI uses this to print the per-unit-data
+    /// warning and the vendor label.
+    pub vendor: bool,
     /// Bytes that differ from the backup, when the backup is the same length.
     pub differing_bytes: Option<usize>,
     /// The offsets where the image differs from the backup, truncated to the
@@ -2321,10 +2479,8 @@ fn all_within(backup: &[u8], image: &[u8], offsets: &[usize]) -> bool {
 /// Decide whether `image` could be written over `backup`, and describe it.
 ///
 /// Sends nothing, opens nothing, and does not touch [`check_layout`]: this is
-/// the function `fw flash --dry-run` calls, and the one a real write would call
-/// before the port is opened. The two answer the same questions, so a dry run
-/// that says "acceptable" cannot be followed by a write that refuses for a
-/// reason the plan did not name.
+/// the function `fw flash --dry-run` calls for the strict path. A vendor image
+/// is described by [`write_plan_vendor`] after [`accept_vendor_image`].
 ///
 /// The result's start is [`FLASH_WRITE_START`], the settled DA-side base. The
 /// plan reports the range a real write would use; it does not grant permission
@@ -2336,9 +2492,7 @@ fn all_within(backup: &[u8], image: &[u8], offsets: &[usize]) -> bool {
 /// `profile` is the image's, and `backup` must be the same length as the image
 /// (see [`check_image`]). Because every differing byte must be in the patch
 /// table, a backup from another unit or another model is refused: its per-unit
-/// fields differ outside those offsets. That is the intended refusal, not a
-/// consent prompt — a cross-model vendor image can neither be produced by
-/// patching this unit's dump nor written by this build.
+/// fields differ outside those offsets.
 ///
 /// # Errors
 ///
@@ -2349,6 +2503,47 @@ pub fn write_plan(
     image: &[u8],
 ) -> Result<WritePlan> {
     check_image(profile, backup, image)?;
+    Ok(build_write_plan(profile, backup, image, false))
+}
+
+/// Describe a vendor image that passed [`accept_vendor_image`].
+///
+/// The vendor image is not compared with `backup` for acceptance; it differs by
+/// design in the per-unit fields. The backup is still required and is checked
+/// for the profile's shape, because it is the only way back and the CLI runs
+/// [`DownloadAgent::verify_device`] against it before the DA is loaded.
+///
+/// # Errors
+///
+/// [`Error::Safety`] when `profile` and the token disagree, or when `backup` is
+/// not a structurally valid image of that profile. A V1.12 token cannot exist:
+/// [`accept_vendor_image`] refuses every profile but the pinned V1.13.
+pub fn write_plan_vendor(
+    profile: &'static FirmwareProfile,
+    backup: &[u8],
+    vendor: VendorImage<'_>,
+) -> Result<WritePlan> {
+    if vendor.profile().name != profile.name || profile.name != PROFILE_V1_13.name {
+        return Err(Error::Safety {
+            reason: format!(
+                "the vendor token is for profile {} but the plan is for {}; the vendor gate is \
+                 V1.13 only",
+                vendor.profile().name,
+                profile.name
+            ),
+        });
+    }
+    check_image(profile, backup, backup)?;
+    Ok(build_write_plan(profile, backup, vendor.image(), true))
+}
+
+/// The shared plan arithmetic. The caller has already accepted `image`.
+fn build_write_plan(
+    profile: &'static FirmwareProfile,
+    backup: &[u8],
+    image: &[u8],
+    vendor: bool,
+) -> WritePlan {
     let device_type = FirmwareImage::new(image)
         .map(|parsed| parsed.device_type())
         .unwrap_or_default();
@@ -2368,16 +2563,17 @@ pub fn write_plan(
             .count()
     });
     let write_length = profile_write_length(profile);
-    Ok(WritePlan {
+    WritePlan {
         profile,
         size: image.len(),
         device_type,
         write_length,
         start: FLASH_WRITE_START,
         packets: write_length.div_ceil(PACKET_SIZE),
+        vendor,
         differing_bytes,
         differing_offsets,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -2435,6 +2631,17 @@ mod tests {
     /// The V1.13 stock image.
     fn stock_image() -> Vec<u8> {
         stock_image_of(&PROFILE_V1_13)
+    }
+
+    /// The pinned vendor image, when `M241_VENDOR_IMAGE` points at it.
+    ///
+    /// The binary is not committed (`AGENTS.md` §6), so CI cannot provide it.
+    /// Tests that need the exact bytes return early when the variable is unset;
+    /// the wrong-digest and wrong-profile tests run without it, and the
+    /// mutation that removes the digest comparison fails through those.
+    fn vendor_image() -> Option<Vec<u8>> {
+        let path = std::env::var_os("M241_VENDOR_IMAGE")?;
+        Some(std::fs::read(path).expect("M241_VENDOR_IMAGE must be readable"))
     }
 
     /// `profile`'s stock image with the measured three-byte patch applied.
@@ -3652,6 +3859,54 @@ mod tests {
             requests.iter().map(|(_, bytes)| *bytes).sum::<usize>(),
             FLASH_WRITE_LENGTH
         );
+    }
+
+    #[test]
+    fn the_vendor_gate_accepts_only_the_pinned_v1_13_digest() {
+        assert_eq!(VENDOR_PER_UNIT_DATA_BYTES, 14);
+        assert_eq!(VENDOR_V1_13_SHA256, PROFILE_V1_13.sha256);
+
+        let stock = stock_image();
+        let err = accept_vendor_image(&PROFILE_V1_13, &stock).expect_err("not the vendor digest");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        assert!(
+            format!("{err}").contains(VENDOR_V1_13_SHA256),
+            "the refusal names the pinned digest: {err}"
+        );
+
+        let short = &stock[..FLASH_WRITE_LENGTH - 2];
+        assert!(
+            accept_vendor_image(&PROFILE_V1_13, short).is_err(),
+            "a wrong-length image is refused before the digest"
+        );
+
+        let v112 = stock_image_of(&PROFILE_V1_12);
+        let err = accept_vendor_image(&PROFILE_V1_12, &v112).expect_err("V1.12 is out of scope");
+        assert!(
+            format!("{err}").contains("V1.13"),
+            "the refusal says the gate is V1.13 only: {err}"
+        );
+
+        if let Some(vendor) = vendor_image() {
+            let token =
+                accept_vendor_image(&PROFILE_V1_13, &vendor).expect("the pinned vendor image");
+            assert_eq!(token.image(), vendor.as_slice());
+            assert_eq!(token.profile().name, PROFILE_V1_13.name);
+        }
+    }
+
+    #[test]
+    fn a_vendor_plan_is_distinct_from_the_backup_patch_plan() {
+        let Some(vendor) = vendor_image() else {
+            return;
+        };
+        let backup = stock_image();
+        let token = accept_vendor_image(&PROFILE_V1_13, &vendor).expect("the pinned image");
+        let plan = write_plan_vendor(&PROFILE_V1_13, &backup, token).expect("a vendor plan");
+        assert!(plan.vendor, "the plan must carry the vendor marker");
+        assert_eq!(plan.profile.name, PROFILE_V1_13.name);
+        assert_eq!(plan.size, FLASH_WRITE_LENGTH);
+        assert!(plan.differing_bytes.is_some_and(|count| count > 0));
     }
 
     #[test]

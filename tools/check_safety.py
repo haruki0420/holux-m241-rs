@@ -44,14 +44,16 @@ Seven checks, each for a different way the split can rot:
    trait) and `src/protocol/simulator.rs` (the fake records it so a test can
    prove it was not pulsed). A second call site is how a "safe because it is
    gated" function stops being gated.
-6. **No digest-based image acceptance in `m241-flash`.** `AGENTS.md` §2.3
-   allows an image only when it is the user's own backup or differs from it at
-   the recorded patch offsets. A second route that accepts an image because its
-   SHA-256 matches a vendor profile weakens that check even though the code
-   still "checks the backup" first. The rule is textual because no byte fixture
-   can stand in for the vendor package: a synthetic image never hashes to the
-   real digest, so an end-to-end test alone cannot catch the old branch coming
-   back.
+6. **No digest-based acceptance in the strict backup-diff path.**
+   `AGENTS.md` §2.3 allows an image in the strict path only when it is the
+   user's own backup or differs from it at the recorded patch offsets. A digest
+   branch in `check_image` / `all_within` would be a second acceptance route
+   that weakens that check. The vendor image is a **separate** fixed-SHA gate
+   (`accept_vendor_image`), pinned to one V1.13 release and tested separately;
+   this check deliberately does not treat that function as the strict path.
+   The rule is textual because a synthetic fixture never hashes to the real
+   vendor digest, so an end-to-end test alone cannot catch the old strict-path
+   branch coming back.
 7. **The write path runs the layout gate.** `crates/m241-flash/src/da.rs`'s
    `pub fn write` must call `check_layout()?` at its own brace depth, before it
    reaches `write_range`. That call is what refuses every start other than the
@@ -489,13 +491,15 @@ def function_body_range(text: str, name: str) -> tuple[int, int] | None:
 def check_flash_acceptance() -> list[str]:
     """`check_image` and `all_within` must accept images only by the backup diff.
 
-    `check_image` is the one place a write is allowed to decide that an image is
+    `check_image` is the place the strict path decides that an image is
     acceptable. It must compare the image with the user's backup and permit only
-    the recorded patch offsets; a digest comparison is the vendor release gate
-    `AGENTS.md` §2.3 removed. A synthetic test fixture cannot catch that branch
-    because it does not hash to the real vendor digest, so this check looks at
-    the function source. Comments and doc comments are stripped first: the file
-    explains why there is no digest route, and that prose must remain allowed.
+    the recorded patch offsets; a digest comparison here would be a second
+    acceptance route. The vendor image is a separate fixed-SHA gate
+    (`accept_vendor_image`), not part of this check. A synthetic test fixture
+    cannot catch a digest branch in the strict path because it does not hash to
+    the real vendor digest, so this check looks at the function source.
+    Comments and doc comments are stripped first: the file explains why the
+    strict path has no digest route, and that prose must remain allowed.
 
     The ranges are the `check_image`/`all_within` bodies, not all of `da.rs`:
     `check_da_image` is the DA file's own length/head check, and follow-up W2a
@@ -520,7 +524,7 @@ def check_flash_acceptance() -> list[str]:
         for match in DIGEST_ACCEPTANCE.finditer(line):
             problems.append(
                 f"{relative(FLASH_DA)}:{number}: digest-based image acceptance "
-                f"`{match.group(0)}`; AGENTS.md §2.3 allows only the backup diff"
+                f"`{match.group(0)}` in the strict path; AGENTS.md §2.3 allows only the backup diff"
             )
     return problems
 
@@ -636,8 +640,8 @@ def main() -> int:
         return 1
     print(
         "no write path in m241-core or m241-gui; the dependency runs one way; "
-        "m241-flash accepts images only by the backup diff; "
-        "DownloadAgent::write runs check_layout() first"
+        "the strict image path accepts only the backup diff; the vendor gate is a separate "
+        "fixed-SHA function; DownloadAgent::write runs check_layout() first"
     )
     return 0
 
