@@ -376,13 +376,19 @@ approximation from a mistake.
   1280×800 page hold the heading, the file loader, the map, the speed chart and
   the pinned export strip without scrolling. The selected-point block and the
   point list do **not** fit above the fold at 1280×800 either: they are in the
-  scrolling body and reached by scroll at both documented sizes. An earlier
-  version of this section said §9 accepted the fold; §9 only leaves the collapse
-  rule open, so that sentence was wrong.
-- The Log screen's left column draws its three blocks (トラック / 写真 / 集計) on
-  one left edge, which is how §5's figure draws them. §5's prose says "same 8px
-  staircase rhythm"; the prose and the figure disagree, and the build follows the
-  figure, because a second staircase would compete with the rail's signature.
+  scrolling body and reached by scroll at both documented sizes. On the rail, the
+  photo block's shift/scope controls are the last rows inside the viewport; the
+  集計 figures and the 編集 block sit below the fold for the same reason — both
+  are reached by scroll. An
+  earlier version of this section said §9 accepted the fold; §9 only leaves the
+  collapse rule open, so that sentence was wrong.
+- The Log screen's left column draws its four blocks (トラック / 写真 / 集計 /
+  編集) on one left edge, which is how §5's figure draws them. 集計 keeps the
+  third position §5's figure gives it, and 編集 is last because its fields are the
+  tallest: of the two, 集計 is the one the scroll reaches first. §5's prose says
+  "same 8px staircase rhythm"; the prose and the figure disagree, and the build
+  follows the figure, because a second staircase would compete with the rail's
+  signature.
 - Body line-height 1.5 and the caption's +0.01em tracking are not implemented:
   egui 0.37 sizes text by font and has no per-style line-height or letter-spacing
   hook. The five sizes are exact; the leading and tracking are the OS face's.
@@ -439,8 +445,11 @@ approximation from a mistake.
   `firmware`, and `DA 未取得` with `未検証 — 端末から読んでいません` because this
   crate never reads the DA. The `差分` row is real: the bytes and offsets come
   from the plan.
-- `KMZ` is a disabled export format marked `未対応`: the exporter has no KMZ
-  writer, and a button that quietly wrote GPX under a KMZ label would be worse.
+- `KMZ` is an export chip beside GPX/KML/CSV that writes a KMZ archive rather
+  than a sixth `ExportFormat` (the archive bundles photos, so it is not a
+  rendering of the track alone). It is marked `未検証`: the core writer is
+  covered by tests, but Google Earth and `unzip` have not been run against this
+  build's output, and a chip that looked judged would claim more than that.
 - The selected point shows time, coordinate, altitude and speed. It does not show
   a satellite count because `TrackPoint` carries none — the log record has no
   such field. The record count is printed without a thousands separator
