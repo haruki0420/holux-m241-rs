@@ -466,10 +466,45 @@ fn an_empty_log_says_there_is_no_log_yet() {
 }
 
 #[test]
-fn the_log_map_is_labelled_as_a_track_without_map_tiles() {
-    // §3 makes the map the one light surface, and §10 records that no tile
-    // fetcher is linked. The note is how a reader knows the dark canvas is not a
-    // broken map.
+fn a_sample_map_does_not_credit_tiles_it_does_not_show() {
+    // The OSM licence requires the attribution where OSM content is shown. A
+    // sample frame draws no tile, so crediting OSM there would be a false
+    // statement about where the pixels came from. The two tests this replaces
+    // asserted the credit and "shows no tiles" on the same frame, which made the
+    // contradiction itself the passing contract.
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Log);
+    app.log_mut().show_sample();
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    let mut flat = Vec::new();
+    flatten_shapes(&shapes, &mut flat);
+    let texts: Vec<&str> = flat
+        .iter()
+        .filter_map(|shape| match shape {
+            egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.contains("© OpenStreetMap contributors")),
+        "a sample frame credited OSM tiles it did not draw: {texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("見本：地図タイルは表示しません")),
+        "the sample map did not say it shows no tiles: {texts:?}"
+    );
+}
+
+#[test]
+fn a_sample_map_says_it_shows_no_tiles() {
+    // §3 makes the map the one light surface; §10 records that the screenshot is
+    // produced offline. The note is how a reader knows the dark canvas is the
+    // sample frame rather than a broken tile fetch.
     let ctx = context();
     let mut app = App::default();
     app.select(Screen::Log);
@@ -480,9 +515,45 @@ fn the_log_map_is_labelled_as_a_track_without_map_tiles() {
     assert!(
         flat.iter().any(|shape| matches!(
             shape,
-            egui::Shape::Text(text) if text.galley.job.text.contains("地図タイルなし")
+            egui::Shape::Text(text) if text.galley.job.text.contains("見本：地図タイルは表示しません")
         )),
-        "the map did not say it has no tiles"
+        "the sample map did not say it shows no tiles"
+    );
+}
+
+#[test]
+fn a_headless_render_says_why_it_shows_no_tiles() {
+    // The screenshot renderer and every test use a headless context. The map
+    // must name that reason rather than sit on "loading" forever, and it must
+    // not credit tiles it cannot draw. The fetch count itself is asserted in
+    // `App`'s unit test, where a fake fetcher is injected: this frame-level test
+    // alone cannot tell a fetch from no fetch.
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Log);
+    app.log_mut()
+        .set_track(mixed_track(), ParseReport::default());
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    let mut flat = Vec::new();
+    flatten_shapes(&shapes, &mut flat);
+    let texts: Vec<&str> = flat
+        .iter()
+        .filter_map(|shape| match shape {
+            egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.contains("地図タイルは表示しません（ヘッドレス）")),
+        "the headless map did not explain its state: {texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.contains("© OpenStreetMap contributors")),
+        "the headless map credited tiles it did not draw: {texts:?}"
     );
 }
 
@@ -1132,14 +1203,29 @@ fn settings_screen_renders_live_controls_and_applies_reduced_motion_to_rail() {
     app.settings_mut().units = m241_gui::screens::settings::UnitSystem::Imperial;
 
     assert!((app.settings().rail_transition_secs() - 0.0).abs() < f32::EPSILON);
-    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    // Taller than the documented 800pt window on purpose: the map cache rows,
+    // the map-tiles switch and the clear-cache action lengthened the page, so at
+    // 800pt the scroll area clips the last rows (the note is still reachable by
+    // scrolling). This test is about the note reflecting the setting, not about
+    // everything fitting without a scroll.
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 1200.0);
     let mut flat = Vec::new();
     flatten_shapes(&shapes, &mut flat);
     let has_zero_ms = flat.iter().any(|shape| match shape {
         egui::Shape::Text(text) => text.galley.job.text.contains("0 ms"),
         _ => false,
     });
-    assert!(has_zero_ms, "reduced motion 0 ms note did not render");
+    let texts: Vec<&str> = flat
+        .iter()
+        .filter_map(|shape| match shape {
+            egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        has_zero_ms,
+        "reduced motion 0 ms note did not render: {texts:?}"
+    );
 }
 
 /// A minimal JPEG whose bytes carry no position, timestamped for the sample track.

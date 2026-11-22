@@ -61,9 +61,12 @@ modified unit is identifiable at a glance.
 
 - It does not ship proprietary binaries, firmware images or vendor tools.
 - It does not modify your device without an explicit, typed confirmation.
-- It does not collect telemetry or upload your logs. Everything runs locally; the
-  only network feature is the optional NMEA relay, which binds to loopback by
-  default.
+- It does not collect telemetry or upload your logs. Reading, parsing and
+  writing the log all happen locally. Two network features exist: the optional
+  NMEA relay, which binds to loopback by default, and the background map tiles
+  (on by default), which ask OpenStreetMap for the map area currently on screen
+  — that area follows the track. The Settings screen turns the tiles off; with
+  them off, nothing about the track leaves the machine.
 
 ## 7. If you are not comfortable with the above
 

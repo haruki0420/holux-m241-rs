@@ -1,9 +1,10 @@
 //! 設定 — the Settings screen (DESIGN.md §5).
 //!
-//! Plain rows, no rail block: map cache size and location, units, theme, language,
-//! reduced motion. Units and reduced motion are live in-app controls held in
-//! [`AppSettings`]; the remaining fixed rows explain honestly why they cannot be
-//! changed yet (DESIGN.md §7).
+//! Plain rows, no rail block: map cache size and location, the map-tiles switch,
+//! units, theme, language, coordinate format, reduced motion, and the clear-cache
+//! action. Units, the coordinate format, the map tiles and reduced motion are live
+//! in-app controls held in [`AppSettings`]; the remaining fixed rows explain
+//! honestly why they cannot be changed yet (DESIGN.md §7).
 
 use egui::{RichText, Ui};
 use m241_core::firmware::PROFILE_V1_13;
@@ -11,6 +12,7 @@ use m241_core::firmware::patch::EFFECTIVE_EPOCH_OFFSET;
 use m241_core::log::CoordFormat;
 
 use crate::screens::common;
+use crate::screens::log::tiles;
 use crate::theme::{self, size, space};
 
 /// Display unit system for speed, distance, and altitude on the Log screen.
@@ -92,6 +94,11 @@ pub struct AppSettings {
     pub reduced_motion: bool,
     /// How a selected point's coordinate is written on the Log screen.
     pub coord_format: CoordFormat,
+    /// When true, the Log screen's map fetches OpenStreetMap tiles for its
+    /// background. Default on: the map is the reason that screen exists, and
+    /// turning it off is for a metered or offline connection rather than the
+    /// normal state.
+    pub map_tiles: bool,
 }
 
 impl Default for AppSettings {
@@ -100,6 +107,7 @@ impl Default for AppSettings {
             units: UnitSystem::default(),
             reduced_motion: false,
             coord_format: CoordFormat::Decimal,
+            map_tiles: true,
         }
     }
 }
@@ -128,21 +136,18 @@ struct Row {
     note: &'static str,
 }
 
-const ROW_CACHE: Row = Row {
-    label: "地図キャッシュ",
-    value: "0 B",
-    note: "地図タイルをまだ読んでいないため、キャッシュは空です",
-};
+/// The cache's size row. Its value is measured from the tile cache, so the row
+/// is drawn from a live figure rather than a constant (DESIGN.md §5, §10).
+const ROW_CACHE_LABEL: &str = "地図キャッシュ";
 
-/// Where the map cache lives. DESIGN.md §5 names both the size and the location.
-///
-/// No tile fetcher is linked, so there is no cache directory to name yet. The row
-/// says that instead of printing a path nothing writes to (DESIGN.md §10).
-const ROW_CACHE_LOCATION: Row = Row {
-    label: "地図キャッシュの場所",
-    value: "—（未使用）",
-    note: "地図タイルを読まないため、キャッシュは作りません",
-};
+/// Where the cache lives, as the OS resolves it.
+const ROW_CACHE_LOCATION_LABEL: &str = "地図キャッシュの場所";
+
+/// The map tiles' on/off switch. The value is live, like 動きの低減.
+const ROW_TILES_LABEL: &str = "地図タイルを使う（要インターネット）";
+
+/// The clear-cache action's label.
+const ROW_CLEAR_LABEL: &str = "地図キャッシュを消去";
 
 const ROW_UNITS: Row = Row {
     label: "単位",
@@ -178,13 +183,7 @@ const ROW_COORD_LABEL: &str = "座標形式";
 /// 動きの低減 is absent from this list on purpose: unlike the fixed rows it has no
 /// static value, because its value is whatever the buttons currently show.
 #[cfg(test)]
-const FIXED_ROWS: [Row; 5] = [
-    ROW_CACHE,
-    ROW_CACHE_LOCATION,
-    ROW_UNITS,
-    ROW_THEME,
-    ROW_LANG,
-];
+const FIXED_ROWS: [Row; 3] = [ROW_UNITS, ROW_THEME, ROW_LANG];
 
 /// The three coordinate formats the Log screen can show (ezTour §3.3/§3.6).
 const COORD_FORMATS: [(CoordFormat, &str); 3] = [
@@ -236,8 +235,20 @@ pub fn ui(ui: &mut Ui, settings: &mut AppSettings) {
                 ("値", 0.5, egui::Align::Max),
             ],
         );
-        fixed_row(ui, ROW_CACHE);
-        fixed_row(ui, ROW_CACHE_LOCATION);
+        cache_rows(ui);
+        option_row(
+            ui,
+            ROW_TILES_LABEL,
+            &tiles_note(settings.map_tiles),
+            settings,
+            |ui, settings| {
+                for (value, label) in [(true, "オン"), (false, "オフ")] {
+                    if common::choice_button(ui, label, settings.map_tiles == value).clicked() {
+                        settings.map_tiles = value;
+                    }
+                }
+            },
+        );
         option_row(
             ui,
             ROW_UNITS.label,
@@ -290,6 +301,7 @@ pub fn ui(ui: &mut Ui, settings: &mut AppSettings) {
                 }
             },
         );
+        clear_cache_row(ui);
 
         // The colophon of a reference manual: the facts a person needs when the
         // box and the release note are long gone. The figures are read from
@@ -345,6 +357,81 @@ fn fixed_row(ui: &mut Ui, row: Row) {
     ui.add_space(space::XS);
 }
 
+/// The tile cache's two rows: how much it holds, and where it is (DESIGN.md §5).
+///
+/// Both values come from the tile module: the size is measured, the path is the
+/// one the fetcher writes to. A row that printed a constant would be a claim
+/// about a cache that has stopped existing.
+fn cache_rows(ui: &mut Ui) {
+    let usage = tiles::cache_usage();
+    let size = usage.map_or_else(|| String::from("—"), |usage| usage.label());
+    dynamic_row(
+        ui,
+        ROW_CACHE_LABEL,
+        &size,
+        "タイルは 30 日で古くなり、200 MB を超えると古い順に消えます",
+    );
+    let location = tiles::CachePaths::locate().map_or_else(
+        || String::from("—（この環境では決められません）"),
+        |cache| cache.root.display().to_string(),
+    );
+    dynamic_row(
+        ui,
+        ROW_CACHE_LOCATION_LABEL,
+        &location,
+        "背景地図のタイルを保存する場所です",
+    );
+}
+
+/// A settings row whose value is measured at draw time.
+fn dynamic_row(ui: &mut Ui, label: &str, value: &str, note: &str) {
+    common::figure_row_open(ui, label, value);
+    note_label(ui, note);
+    common::hairline(ui);
+    ui.add_space(space::XS);
+}
+
+/// The 地図タイル row's explanation, which states the live value in words.
+///
+/// The "on" note names the recipient: turning the map on sends the tile
+/// coordinates of the area on screen to OpenStreetMap, and a setting that only
+/// says "uses the internet" does not tell a person what leaves the machine.
+fn tiles_note(enabled: bool) -> String {
+    if enabled {
+        String::from("オン（表示中の範囲を OpenStreetMap に送り、背景に表示します）")
+    } else {
+        String::from("オフ（模式キャンバスのみ。オフラインでもこの画面は使えます）")
+    }
+}
+
+/// The clear-cache action. Deleting local tiles is not a destructive device
+/// action, so it carries no amber; the result is stated as text beside it.
+fn clear_cache_row(ui: &mut Ui) {
+    let id = ui.scope_id().with("m241-settings-cache-cleared");
+    let mut status: Option<String> = ui.data(|data| data.get_temp(id));
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(ROW_CLEAR_LABEL)
+                .size(size::CAPTION)
+                .color(theme::MUTE),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if common::choice_button(ui, "消去", false).clicked() {
+                status = Some(match tiles::clear_cache() {
+                    Ok(()) => String::from("キャッシュを消去しました"),
+                    Err(message) => message,
+                });
+                ui.data_mut(|data| data.insert_temp(id, status.clone()));
+            }
+        });
+    });
+    if let Some(message) = &status {
+        note_label(ui, message);
+    }
+    common::hairline(ui);
+    ui.add_space(space::XS);
+}
+
 /// A settings row whose value is a pair of live controls rather than a figure.
 fn option_row(
     ui: &mut Ui,
@@ -389,30 +476,72 @@ mod tests {
         }
     }
 
+    /// The text primitives of one frame, nested shape vectors included.
+    fn flatten_texts<'a>(shapes: &'a [egui::Shape], out: &mut Vec<&'a str>) {
+        for shape in shapes {
+            match shape {
+                egui::Shape::Vec(children) => flatten_texts(children, out),
+                egui::Shape::Text(text) => out.push(text.galley.job.text.as_str()),
+                _ => {}
+            }
+        }
+    }
+
     #[test]
-    fn the_rows_are_the_ones_the_design_names() {
-        // DESIGN.md §5 lists the cache's size and location, units, theme, language
-        // and reduced motion; the coordinate format is the ezTour display choice
-        // added with the Log screen's selected-point expansion. The location row is a token: the Stage 1 review found
-        // the published build listed the size only, and this test used to pin the
-        // five rows without it, so the omission could not fail.
-        let labels: Vec<&str> = FIXED_ROWS
-            .iter()
-            .map(|row| row.label)
-            .chain(std::iter::once(ROW_COORD_LABEL))
-            .chain(std::iter::once(ROW_MOTION_LABEL))
-            .collect();
+    fn the_rendered_rows_are_the_ones_the_design_names_in_order() {
+        // The previous version compared a hand-written label array with itself:
+        // swapping or deleting a row in `ui()` left it green. This draws the
+        // real page and checks the labels appear in the rendered frame, in
+        // DESIGN.md §5's order.
+        let context = egui::Context::default();
+        crate::theme::install(&context);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let mut settings = AppSettings::default();
+        let mut texts: Vec<String> = Vec::new();
+        // Two passes: immediate-mode layout settles on the first.
+        for _ in 0..2 {
+            let output = context.run_ui(input.clone(), |ui| super::ui(ui, &mut settings));
+            let shapes: Vec<egui::Shape> = output
+                .shapes
+                .iter()
+                .map(|clipped| clipped.shape.clone())
+                .collect();
+            let mut flat = Vec::new();
+            flatten_texts(&shapes, &mut flat);
+            texts = flat.into_iter().map(str::to_owned).collect();
+            output.drop_without_applying_deltas();
+        }
+        let expected = [
+            ROW_CACHE_LABEL,
+            ROW_CACHE_LOCATION_LABEL,
+            ROW_TILES_LABEL,
+            ROW_UNITS.label,
+            ROW_THEME.label,
+            ROW_LANG.label,
+            ROW_COORD_LABEL,
+            ROW_MOTION_LABEL,
+            ROW_CLEAR_LABEL,
+        ];
+        // A greedy subsequence: every expected label must be drawn, and the
+        // order it is drawn in must be the expected one.
+        let mut found: Vec<&str> = Vec::new();
+        let mut position = 0;
+        for text in &texts {
+            if position < expected.len() && text == expected[position] {
+                found.push(expected[position]);
+                position += 1;
+            }
+        }
         assert_eq!(
-            labels,
-            [
-                "地図キャッシュ",
-                "地図キャッシュの場所",
-                "単位",
-                "テーマ",
-                "言語",
-                "座標形式",
-                "動きの低減"
-            ]
+            found,
+            expected.to_vec(),
+            "the settings page did not render DESIGN.md §5's rows in order; frame texts: {texts:?}"
         );
     }
 
@@ -485,6 +614,24 @@ mod tests {
         assert!((settings.rail_transition_secs() - 0.15).abs() < f32::EPSILON);
         settings.reduced_motion = true;
         assert!((settings.rail_transition_secs() - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn map_tiles_default_on_and_the_note_states_the_live_value() {
+        // A default of off would leave the new map feature invisible to anyone
+        // who never opens Settings; the note must state which way it is, and the
+        // "on" note must name where the displayed area is sent.
+        assert!(AppSettings::default().map_tiles);
+        assert!(tiles_note(true).starts_with("オン"));
+        assert!(tiles_note(false).starts_with("オフ"));
+        assert!(
+            tiles_note(true).contains("OpenStreetMap に送"),
+            "the on note does not say what leaves the machine: {}",
+            tiles_note(true)
+        );
+        for note in [tiles_note(true), tiles_note(false)] {
+            assert!(!note.contains(".md") && !note.contains('§'));
+        }
     }
 
     #[test]

@@ -53,6 +53,11 @@ mod geotag_gate;
 mod editing;
 mod kmz_export;
 mod photo_shift;
+// Background map tiles (DESIGN.md §5, §10). Crate-visible rather than public:
+// the Settings screen needs the cache path, its usage and its clear action, and
+// nothing outside this crate needs the tile machinery. Making the module public
+// turned 34 helpers into a crate-external API that no consumer used.
+pub(crate) mod tiles;
 // The CLI-equivalent operations console: downloading, backing up and erasing,
 // JSON projects, NMEA repair/relay, and `log read`. The panels live in `ops`;
 // the transfer, the project document and the NMEA arithmetic have their own
@@ -83,6 +88,7 @@ use self::geotag_gate::GeotagConfirmation;
 use self::ops::LogOps;
 use self::photo_shift::{PhotoShiftSettings, ScopeKind};
 use self::project::ReadFacts;
+use self::tiles::{MapOptions, MapView};
 
 /// Rows the point list shows before it scrolls.
 ///
@@ -104,11 +110,12 @@ const MAX_LOG_BYTES: usize = 16 * 1024 * 1024;
 const FOLLOW_MIN_ZOOM: f32 = 12.0;
 
 /// Lowest zoom the user can ask for while not following.
-const MIN_ZOOM: f32 = 1.0;
+const MIN_ZOOM: f32 = tiles::MIN_TILE_ZOOM as f32;
 
-/// Highest zoom the projection allows; above this the whole loop fits in a few
-/// pixels and the shape stops being readable.
-const MAX_ZOOM: f32 = 18.0;
+/// Highest zoom the map allows. OSM serves tiles to 19 and the projection is
+/// defined there; the track is drawn over the same view, so the limit is the
+/// tiles' rather than a separate one.
+const MAX_ZOOM: f32 = tiles::MAX_TILE_ZOOM as f32;
 
 /// Playback step while motion is allowed (DESIGN.md §3: 150 ms is the authored
 /// transition; a track that steps four points a second reads as playback).
@@ -222,8 +229,10 @@ pub struct LogScreen {
     follow: bool,
     /// When true, the map projects the whole track bounds to fit the canvas.
     fit_mode: bool,
-    /// Logical slippy-map zoom level (`1.0..=18.0`), clamped >= 12 while following.
+    /// Logical slippy-map zoom level (`1.0..=19.0`), clamped >= 12 while following.
     map_zoom: f32,
+    /// Background tiles, their textures and the fetch workers.
+    tiles: tiles::MapTiles,
     /// Path input for loading photos (directory or single JPEG).
     photo_path: String,
     /// Read-only photo plans loaded via `geotag::plan`.
@@ -284,6 +293,7 @@ impl Default for LogScreen {
             follow: false,
             fit_mode: true,
             map_zoom: FOLLOW_MIN_ZOOM,
+            tiles: tiles::MapTiles::default(),
             photo_path: String::new(),
             photo_entries: Vec::new(),
             selected_photo: None,
@@ -328,6 +338,9 @@ impl LogScreen {
         self.fit_mode = true;
         self.follow = false;
         self.map_zoom = self.compute_fit_zoom();
+        // A different log means a different part of the world: the previous
+        // textures, pending requests and failures belong to the old one.
+        self.tiles.reset();
         self.hidden_days.clear();
         self.close_geotag_confirmation();
         self.outcome = None;
@@ -353,6 +366,20 @@ impl LogScreen {
     pub fn show_sample(&mut self) {
         self.sample = true;
         self.set_track(sample_track(), ParseReport::default());
+    }
+
+    /// Install a fake tile fetcher with no cache (tests only).
+    ///
+    /// The render and App tests draw the real screen; without this seam the
+    /// "headless never fetches" test could only inspect the caption, which is
+    /// exactly the hole the Stage 1 review found: a broken window gate could
+    /// have opened a real socket and left the test green.
+    #[cfg(test)]
+    pub(crate) fn set_tile_fetcher_for_test(
+        &mut self,
+        fetcher: std::sync::Arc<dyn tiles::TileFetcher>,
+    ) {
+        self.tiles = tiles::MapTiles::with_fetcher_for_test(fetcher);
     }
 
     /// Fill the photo block with two sample entries, for the screenshot renderer.
@@ -1124,14 +1151,14 @@ impl LogScreen {
                     );
                     ui.add_space(space::L);
                     ui.vertical(|ui| {
-                        self.map_panel(ui);
+                        self.map_panel(ui, settings);
                         self.speed_panel(ui, settings);
                         self.selected_panel(ui, settings);
                         self.ops_panel(ui);
                     });
                 });
             } else {
-                self.map_panel(ui);
+                self.map_panel(ui, settings);
                 ui.add_space(space::M);
                 ui.horizontal_top(|ui| {
                     ui.vertical(|ui| self.summary_block(ui, settings));
@@ -1675,13 +1702,16 @@ impl LogScreen {
         self.last_step_at = None;
         self.fit_mode = true;
         self.map_zoom = self.compute_fit_zoom();
+        // Split / merge / delete can move the track out of the area whose tiles
+        // are held, so the map layer is rebuilt from the new bounds.
+        self.tiles.reset();
         self.hidden_days.clear();
         self.close_geotag_confirmation();
         self.relink_photos();
     }
 
-    /// 地図: the track painted from latitude and longitude, with playback and follow controls.
-    fn map_panel(&mut self, ui: &mut Ui) {
+    /// 地図: the track painted over the background tiles, with playback and follow controls.
+    fn map_panel(&mut self, ui: &mut Ui, settings: &AppSettings) {
         let sample = self.sample;
         common::sample_panel(ui, "地図", sample, |ui| {
             let height = metric::PLOT;
@@ -1690,7 +1720,10 @@ impl LogScreen {
             let painter = ui.painter_at(rect);
             painter.rect_filled(rect, theme::RADIUS, theme::RAIL);
 
+            let view = self.sync_fit_zoom(rect);
             let plotted: Vec<(usize, egui::Pos2)> = self.plotted_points(rect);
+            let mut background = None;
+            let mut attribution = None;
             if plotted.is_empty() {
                 painter.text(
                     rect.center(),
@@ -1702,7 +1735,25 @@ impl LogScreen {
             } else {
                 let first_index = plotted.first().map(|(index, _pos)| *index);
                 let last_index = plotted.last().map(|(index, _pos)| *index);
+                // The grid stays underneath the tiles: it is the offline canvas,
+                // and it also fills a tile that has not arrived yet.
                 draw_grid(&painter, rect);
+                let drawn = tiles::draw_map(
+                    ui,
+                    &painter,
+                    view,
+                    &mut self.tiles,
+                    MapOptions {
+                        enabled: settings.map_tiles,
+                        sample,
+                    },
+                );
+                background = Some(drawn.background);
+                // OSM requires the credit where its tiles are shown; a sample,
+                // offline or still-loading frame shows none, so it carries none.
+                if drawn.tiles > 0 {
+                    attribution = Some(tiles::draw_attribution(&painter, rect));
+                }
                 let line: Vec<egui::Pos2> = plotted.iter().map(|(_index, pos)| *pos).collect();
                 if line.len() > 1 {
                     // The spec's track numbers (07-eztour §5 「幅 5・不透明度 0.7」)
@@ -1792,18 +1843,17 @@ impl LogScreen {
                 }
             }
 
-            let mode_note = if self.follow {
-                format!("追従 zoom {:.0}（地図タイルなし・軌跡のみ）", self.map_zoom)
-            } else {
-                format!("zoom {:.0}（地図タイルなし・軌跡のみ）", self.map_zoom)
+            // One caption, bottom-right: the zoom, and the map's state when the
+            // tiles are not on screen (offline, sample, loading). The
+            // attribution owns the bottom-left corner; `draw_note` lifts this
+            // caption above it when a narrow canvas would make them collide.
+            let follow_label = if self.follow { "追従 " } else { "" };
+            let status_note = background.and_then(|background| background.note());
+            let mode_note = match status_note {
+                Some(extra) => format!("{follow_label}zoom {:.0}（{extra}）", view.zoom),
+                None => format!("{follow_label}zoom {:.0}", view.zoom),
             };
-            painter.text(
-                rect.right_bottom() + Vec2::new(-space::S, -space::S),
-                Align2::RIGHT_BOTTOM,
-                mode_note,
-                FontId::proportional(size::CAPTION),
-                theme::MUTE,
-            );
+            let _note_rect = tiles::draw_note(&painter, rect, &mode_note, attribution);
 
             // Clicking the map selects the nearest plotted point: the map is a
             // picker, not a picture, and a track you cannot ask about is a diagram.
@@ -2553,84 +2603,82 @@ impl LogScreen {
         Err(message)
     }
 
+    /// The view for this frame, publishing the fitted zoom to the `+`/`−` buttons.
+    ///
+    /// Fit is computed from the canvas size and the Mercator bbox; the buttons
+    /// work from `map_zoom`, which [`Self::compute_fit_zoom`] estimates from the
+    /// degree span. On an east-west track the two differ by about one and a half
+    /// levels, so `+` straight after 全点表示 could shrink the map. Publishing
+    /// the zoom that was actually drawn keeps a press monotonic, and the label
+    /// already shows `view.zoom`.
+    fn sync_fit_zoom(&mut self, rect: Rect) -> MapView {
+        let view = self.map_view(rect);
+        if self.fit_mode {
+            self.map_zoom = view.zoom as f32;
+        }
+        view
+    }
+
+    /// The view the map and the track are both drawn through.
+    ///
+    /// `fit_mode` fits the whole track; otherwise the canvas is centred on the
+    /// selected point (or on the track's middle when nothing is selected) at
+    /// `map_zoom`. Both branches use the Mercator projection the tiles are laid
+    /// out in: a track drawn through a different projection drifts off the
+    /// roads the tiles show, which is the defect the map exists to remove.
+    fn map_view(&self, rect: Rect) -> MapView {
+        let points: Vec<(f64, f64)> = self
+            .track
+            .points
+            .iter()
+            .filter_map(|point| Some((point.latitude?, point.longitude?)))
+            .collect();
+        if points.is_empty() || self.fit_mode {
+            return MapView::fit(rect, space::M, &points);
+        }
+        let (center_latitude, center_longitude) = self
+            .selected
+            .and_then(|index| self.track.points.get(index))
+            .and_then(|point| Some((point.latitude?, point.longitude?)))
+            .unwrap_or_else(|| {
+                let Some(&(first_latitude, first_longitude)) = points.first() else {
+                    return (0.0, 0.0);
+                };
+                let (mut min_latitude, mut max_latitude) = (first_latitude, first_latitude);
+                let (mut min_longitude, mut max_longitude) = (first_longitude, first_longitude);
+                for &(latitude, longitude) in &points {
+                    min_latitude = min_latitude.min(latitude);
+                    max_latitude = max_latitude.max(latitude);
+                    min_longitude = min_longitude.min(longitude);
+                    max_longitude = max_longitude.max(longitude);
+                }
+                (
+                    (min_latitude + max_latitude) / 2.0,
+                    (min_longitude + max_longitude) / 2.0,
+                )
+            });
+        MapView::new(
+            center_latitude,
+            center_longitude,
+            f64::from(self.map_zoom),
+            rect,
+        )
+    }
+
     /// Every point with a position, as (index, pixel).
     ///
     /// Kept as indices rather than as a filtered copy so a click on the map can
     /// select the *original* row in the table.
     fn plotted_points(&self, rect: Rect) -> Vec<(usize, egui::Pos2)> {
-        let fixes: Vec<(usize, f64, f64)> = self
-            .track
+        let view = self.map_view(rect);
+        self.track
             .points
             .iter()
             .enumerate()
-            .filter_map(|(index, point)| match (point.latitude, point.longitude) {
-                (Some(latitude), Some(longitude)) => Some((index, latitude, longitude)),
-                _ => None,
-            })
-            .collect();
-        let Some(&(_, first_latitude, first_longitude)) = fixes.first() else {
-            return Vec::new();
-        };
-
-        if !self.fit_mode {
-            let (center_lat, center_lon) = self
-                .selected
-                .and_then(|idx| self.track.points.get(idx))
-                .and_then(|p| Some((p.latitude?, p.longitude?)))
-                .unwrap_or_else(|| {
-                    let (mut min_lat, mut max_lat) = (first_latitude, first_latitude);
-                    let (mut min_lon, mut max_lon) = (first_longitude, first_longitude);
-                    for (_, lat, lon) in &fixes {
-                        min_lat = min_lat.min(*lat);
-                        max_lat = max_lat.max(*lat);
-                        min_lon = min_lon.min(*lon);
-                        max_lon = max_lon.max(*lon);
-                    }
-                    ((min_lat + max_lat) / 2.0, (min_lon + max_lon) / 2.0)
-                });
-            let deg_per_px = 360.0 / (256.0 * 2.0_f64.powf(f64::from(self.map_zoom)));
-            let lon_scale = center_lat.to_radians().cos().abs().max(0.1);
-            let center = rect.center();
-            return fixes
-                .iter()
-                .map(|(index, lat, lon)| {
-                    let dx = ((*lon - center_lon) * lon_scale / deg_per_px) as f32;
-                    let dy = ((center_lat - *lat) / deg_per_px) as f32;
-                    (*index, egui::pos2(center.x + dx, center.y + dy))
-                })
-                .collect();
-        }
-
-        let (mut min_latitude, mut max_latitude) = (first_latitude, first_latitude);
-        let (mut min_longitude, mut max_longitude) = (first_longitude, first_longitude);
-        for (_, latitude, longitude) in &fixes {
-            min_latitude = min_latitude.min(*latitude);
-            max_latitude = max_latitude.max(*latitude);
-            min_longitude = min_longitude.min(*longitude);
-            max_longitude = max_longitude.max(*longitude);
-        }
-
-        let padding = space::M;
-        let width = (rect.width() - padding * 2.0).max(1.0);
-        let height = (rect.height() - padding * 2.0).max(1.0);
-        let latitude_span = (max_latitude - min_latitude).max(f64::EPSILON);
-        let longitude_span = (max_longitude - min_longitude).max(f64::EPSILON);
-        // One scale for both axes, so the drawn shape is the shape of the trip
-        // rather than a stretched one that fits the rectangle.
-        let scale = (width as f64 / longitude_span).min(height as f64 / latitude_span);
-        let drawn_width = longitude_span * scale;
-        let drawn_height = latitude_span * scale;
-        let left = rect.left() + padding + ((width as f64 - drawn_width) / 2.0) as f32;
-        let top = rect.top() + padding + ((height as f64 - drawn_height) / 2.0) as f32;
-
-        fixes
-            .iter()
-            .map(|(index, latitude, longitude)| {
-                let x = left + ((longitude - min_longitude) * scale) as f32;
-                // Latitude grows northwards and y grows downwards, so the
-                // subtraction is what puts north at the top.
-                let y = top + ((max_latitude - latitude) * scale) as f32;
-                (*index, egui::pos2(x, y))
+            .filter_map(|(index, point)| {
+                let latitude = point.latitude?;
+                let longitude = point.longitude?;
+                Some((index, view.project(latitude, longitude)))
             })
             .collect()
     }
@@ -4663,5 +4711,182 @@ mod tests {
             texts.iter().any(|text| text.contains("データ色")),
             "the colour row is missing: {texts:?}"
         );
+    }
+
+    /// A fake tile fetcher for the full-screen tests: a 1×1 PNG.
+    #[derive(Debug, Default)]
+    struct CountingTiles;
+
+    impl tiles::TileFetcher for CountingTiles {
+        fn fetch(&self, _tile: tiles::TileId) -> Result<Vec<u8>, tiles::TileError> {
+            Ok(tiny_png())
+        }
+    }
+
+    /// A 1×1 opaque PNG.
+    fn tiny_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("PNG header");
+            writer
+                .write_image_data(&[255_u8, 0, 0, 255])
+                .expect("PNG data");
+        }
+        bytes
+    }
+
+    /// A raw input that looks like an X11 window to the map gate.
+    fn windowed_input() -> egui::RawInput {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(1280.0, 800.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        input.viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                native_pixels_per_point: Some(1.0),
+                inner_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1280.0, 800.0),
+                )),
+                ..egui::ViewportInfo::default()
+            },
+        );
+        input
+    }
+
+    /// Draw one full screen frame and return every text primitive it produced.
+    fn frame_texts(
+        context: &egui::Context,
+        input: &egui::RawInput,
+        screen: &mut LogScreen,
+    ) -> Vec<String> {
+        let output = context.run_ui(input.clone(), |ui| screen.ui(ui));
+        let shapes: Vec<egui::Shape> = output
+            .shapes
+            .iter()
+            .map(|clipped| clipped.shape.clone())
+            .collect();
+        let mut flat = Vec::new();
+        flatten(&shapes, &mut flat);
+        let texts = flat
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect();
+        output.drop_without_applying_deltas();
+        texts
+    }
+
+    #[test]
+    fn the_attribution_is_drawn_only_when_a_tile_is_on_screen() {
+        // The credit names where the pixels came from. A sample or loading
+        // frame has no OSM pixels, so it must not carry the credit; the two
+        // tests this replaces asserted the credit and "no tiles" on the same
+        // frame, which made the contradiction a passing contract.
+        let context = egui::Context::default();
+        crate::theme::install(&context);
+        let input = windowed_input();
+        let mut screen = LogScreen::default();
+        screen.set_tile_fetcher_for_test(std::sync::Arc::new(CountingTiles));
+        screen.set_track(sample_track(), ParseReport::default());
+        for _ in 0..200 {
+            let _texts = frame_texts(&context, &input, &mut screen);
+            if screen.tiles.texture_count() > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            screen.tiles.texture_count() > 0,
+            "the fake fetch produced no texture"
+        );
+        let texts = frame_texts(&context, &input, &mut screen);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("© OpenStreetMap contributors")),
+            "a frame with OSM tiles carried no attribution: {texts:?}"
+        );
+
+        // The same screen switched to the sample: no OSM pixels, no credit.
+        screen.sample = true;
+        screen.tiles.reset();
+        let texts = frame_texts(&context, &input, &mut screen);
+        assert!(
+            !texts
+                .iter()
+                .any(|text| text.contains("© OpenStreetMap contributors")),
+            "a sample frame credited OSM tiles it did not draw: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("見本：地図タイルは表示しません")),
+            "the sample frame did not say it shows no tiles: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_new_track_forgets_the_previous_areas_tiles() {
+        // The stage 1 review found `set_track` leaving the old textures, pending
+        // requests and failures in place: after loading another log the map kept
+        // drawing the previous area under the new track.
+        let context = egui::Context::default();
+        crate::theme::install(&context);
+        let input = windowed_input();
+        let mut screen = LogScreen::default();
+        screen.set_tile_fetcher_for_test(std::sync::Arc::new(CountingTiles));
+        screen.set_track(sample_track(), ParseReport::default());
+        for _ in 0..200 {
+            let _texts = frame_texts(&context, &input, &mut screen);
+            if screen.tiles.texture_count() > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            screen.tiles.texture_count() > 0,
+            "the fake fetch produced no texture"
+        );
+        screen.set_track(sample_track(), ParseReport::default());
+        assert_eq!(
+            screen.tiles.texture_count(),
+            0,
+            "the previous track's tiles survived set_track"
+        );
+    }
+
+    #[test]
+    fn a_fit_view_publishes_its_zoom_to_the_zoom_buttons() {
+        // Fit is computed by `MapView::fit` (canvas + Mercator); `+`/`−` work
+        // from `map_zoom`. Without publishing the fitted zoom, `+` right after
+        // 全点表示 could lower the displayed zoom.
+        let mut screen = sample();
+        let rect = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(770.0, 320.0));
+        let view = screen.sync_fit_zoom(rect);
+        assert!(screen.fit_mode, "a fresh track must start in fit mode");
+        assert!(
+            (screen.map_zoom - view.zoom as f32).abs() < 1e-6,
+            "the buttons' zoom {} differs from the drawn zoom {}",
+            screen.map_zoom,
+            view.zoom
+        );
+        let before = screen.map_zoom;
+        screen.set_zoom(screen.map_zoom + 1.0);
+        assert!(
+            screen.map_zoom > before,
+            "`+` after 全点表示 lowered the zoom: {before} -> {}",
+            screen.map_zoom
+        );
+        assert!(!screen.fit_mode, "a zoom press must leave fit mode");
     }
 }

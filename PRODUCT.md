@@ -13,7 +13,7 @@ chrome and font rendering.)
 
 ## Stack
 
-Rust. Four-crate workspace: `m241-core` (read-only protocol, firmware, log, EXIF/geotag), `m241-flash` (destructive write/erase path: `LogEraser` and Download Agent), `m241-cli` (`m241 device|fw|log|nmea <verb>`), `m241-gui` (`eframe`/`egui` + `walkers` for OpenStreetMap tiles). The GUI calls the same `m241-core` and `m241-flash` functions the CLI calls, never a subprocess: the Firmware screen's dump, write, recovery and read-back go through `m241_flash::flow`, so the GUI and the CLI share one safety path (user decision, 2026-11-23).
+Rust. Four-crate workspace: `m241-core` (read-only protocol, firmware, log, EXIF/geotag), `m241-flash` (destructive write/erase path: `LogEraser` and Download Agent), `m241-cli` (`m241 device|fw|log|nmea <verb>`), `m241-gui` (`eframe`/`egui` + `ureq` for OpenStreetMap tiles). The GUI calls the same `m241-core` and `m241-flash` functions the CLI calls, never a subprocess: the Firmware screen's dump, write, recovery and read-back go through `m241_flash::flow`, so the GUI and the CLI share one safety path (user decision, 2026-11-23).
 
 ## Users
 
@@ -52,7 +52,11 @@ implementations.
 - The user alternates between the device (OLED, five-way button) and the app, so
   the app must tell them **when to go press a button on the device**. The
   power-cycle between the two dump passes is part of the workflow, not an error.
-- Track logs are personal location data and never leave the machine.
+- Track logs are personal location data. They are read and written locally and
+  are never uploaded. The one network path is the background map: with tiles on
+  (the default) the area currently shown — which follows the track — is
+  requested from OpenStreetMap. The Settings screen turns the tiles off, and
+  then nothing about the track leaves the machine.
 
 ## Capabilities and Constraints
 
@@ -63,7 +67,8 @@ Confirmed for v2:
 - Binary log parsing; GPX, KML, KMZ, CSV export.
 - Photo matching by capture time and EXIF GPS write-back.
 - NMEA date repair and live relay.
-- OpenStreetMap tiles through `walkers`, with an on-disk cache.
+- OpenStreetMap tiles through `ureq`, with an on-disk cache (on by default; the
+  Settings screen switches it off).
 - CLI subcommands grouped as `m241 device|fw|log|nmea <verb>`.
 
 Constraints:
