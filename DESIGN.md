@@ -271,8 +271,10 @@ disabled until the field contains `WRITE`.
 ### 設定 — Settings
 
 Plain rows, no rail block: map cache size and location, the map-tiles switch,
-units, theme (light theme is not built; the row states that), language, reduced
-motion, and the clear-cache action.
+units, theme (light theme is not built; the row states that), language, the
+coordinate format (10進度 / 度分秒 / UTM; display only — the stored data is
+unchanged, and UTM falls back to decimal degrees below its latitude bands),
+reduced motion, and the clear-cache action.
 
 ## 6. States the build must ship
 
@@ -282,7 +284,7 @@ motion, and the clear-cache action.
 | Sync failed | Connect, Firmware | The device's own words first, the hint second |
 | Device state undefined | Firmware step 3 failure | `danger` border on the panel, the recovery command as copyable text |
 | Waiting for the user | Firmware step 2 | Progress held at 100%, the instruction given as an imperative |
-| Empty log | Log | "まだログがありません" plus the download action |
+| Empty log | Log | "まだログがありません" plus the download action, which lives in the ログ操作 console drawn first on the empty page |
 | Offline map | Log | Schematic grid plus 「地図タイルを取得できません（オフライン）」 in `mute`; the track still draws |
 | Unverified feature | Anywhere | The word 未検証 beside it, `mute`, never `danger` |
 | Loading | Any | Skeleton rows in the table, never a centred spinner |
@@ -311,6 +313,17 @@ UI changes:
 2. Review against this document, not against taste: contrast measured, rail
    staircase verified, amber inventory verified to be exactly one control.
 3. Findings recorded in `docs/dev/10-review-log.md` with Must / Should / Could.
+
+The ログ操作 console is a design decision about the standard set: the two Log
+images carry the sample track, so the console sits below the map and the eight
+images show none of its six panels. The console is drawn **first only on an
+empty log**, where download is the action that fills the page; that is the
+state the standard set does not render. Its panels are reviewed from the opt-in
+`M241_GUI_OPS_SCREENSHOTS=<dir>` run (`cargo test -p m241-gui` writes
+`ops-<mode>.png` for each panel, from the empty log at 1024×640). Adding a ninth
+standard image that empties the log would be the alternative; keeping the
+standard set to the four screens × two sizes and reviewing the console from an
+explicit run is the choice recorded here.
 
 Three checks are mechanical and belong in CI, not in a human pass:
 
@@ -542,3 +555,31 @@ approximation from a mistake.
 - A machine with no usable system font keeps egui's bundled Latin-only faces;
   Japanese labels render as boxes there. This is the cost of not committing a
   font file; the bundled faces are the fallback, not the design.
+- The ログ操作 console is six chip-selected panels under one 「ログ操作」 heading
+  rather than six rail entries: the rail is navigation for the product's four
+  screens, and these are modes of one task. Each panel's caption names the CLI
+  command it replaces, and its status line only appears on the panel that
+  produced it. The erase panel is gates only — a mandatory backup, a
+  confirmation, then a refusal that says the log console calls no erase client
+  (the GUI links `m241-flash` for the Firmware screen, not for this panel) and
+  that erasing the user's track needs the user's own instruction — and carries
+  no amber: the press cannot erase anything, so an amber control would promise a
+  destructive action this build does not have.
+- The download and erase panels each draw their own port field and 上書き
+  checkbox. They were one shared value first, and the erase panel told the user
+  to tick a control it did not draw; the labels are constants because the
+  refusal quotes them.
+- The KMZ `icon/` thumbnails are an opt-in checkbox, default off. The core
+  records the `icon/` semantics as unconfirmed, and the CLI's `log kmz` writes
+  no `icon/` entry, so the default GUI archive is the same shape as the CLI's;
+  turning the option on keeps the row marked 未検証.
+- A relative `log` / `photos` / `output` in a project is stored relative to the
+  project file's directory with `/` separators, as `02-cli.md` specifies, so a
+  saved project directory can be moved with the files it names. An absolute path
+  stays absolute.
+- The 「読み書き」 panel's JSON output, a project load and the ログを開く GPX path
+  carry `nmea` / `input: "gpx"` / `offset_days` / `position` exactly as
+  `log read --format json` does: the machine-readable output must not depend on
+  which front end wrote it. `position` is decimal degrees (the CLI default; the
+  Settings coordinate format is display-only) and `simplify` never appears
+  because the GUI cannot thin points.

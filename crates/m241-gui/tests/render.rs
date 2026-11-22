@@ -1203,14 +1203,29 @@ fn settings_screen_renders_live_controls_and_applies_reduced_motion_to_rail() {
     app.settings_mut().units = m241_gui::screens::settings::UnitSystem::Imperial;
 
     assert!((app.settings().rail_transition_secs() - 0.0).abs() < f32::EPSILON);
-    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
+    // Taller than the documented 800pt window on purpose: the map cache rows,
+    // the map-tiles switch and the clear-cache action lengthened the page, so at
+    // 800pt the scroll area clips the last rows (the note is still reachable by
+    // scrolling). This test is about the note reflecting the setting, not about
+    // everything fitting without a scroll.
+    let shapes = render_shapes_at(&ctx, &mut app, 1280.0, 1200.0);
     let mut flat = Vec::new();
     flatten_shapes(&shapes, &mut flat);
     let has_zero_ms = flat.iter().any(|shape| match shape {
         egui::Shape::Text(text) => text.galley.job.text.contains("0 ms"),
         _ => false,
     });
-    assert!(has_zero_ms, "reduced motion 0 ms note did not render");
+    let texts: Vec<&str> = flat
+        .iter()
+        .filter_map(|shape| match shape {
+            egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        has_zero_ms,
+        "reduced motion 0 ms note did not render: {texts:?}"
+    );
 }
 
 /// A minimal JPEG whose bytes carry no position, timestamped for the sample track.

@@ -21,6 +21,10 @@ m241-core.workspace = true
 m241-flash.workspace = true
 egui.workspace = true
 eframe.workspace = true
+# The `log project save|load` JSON document the CLI defines. The GUI reads and
+# writes the same schema, so a project made here loads with `m241 log project
+# load` and the reverse; a hand-written parser would be a second schema.
+serde_json.workspace = true
 # Writing the PNGs that `--screenshot` produces. Chosen over a hand-written
 # compressor because a screenshot is a review artifact and a byte-exact encoder
 # is not this crate's subject; `png` is already in the tree through eframe's

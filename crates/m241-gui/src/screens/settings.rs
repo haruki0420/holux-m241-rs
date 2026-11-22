@@ -1,13 +1,15 @@
 //! 設定 — the Settings screen (DESIGN.md §5).
 //!
-//! Plain rows, no rail block: map cache size and location, units, theme, language,
-//! reduced motion. Units and reduced motion are live in-app controls held in
-//! [`AppSettings`]; the remaining fixed rows explain honestly why they cannot be
-//! changed yet (DESIGN.md §7).
+//! Plain rows, no rail block: map cache size and location, the map-tiles switch,
+//! units, theme, language, coordinate format, reduced motion, and the clear-cache
+//! action. Units, the coordinate format, the map tiles and reduced motion are live
+//! in-app controls held in [`AppSettings`]; the remaining fixed rows explain
+//! honestly why they cannot be changed yet (DESIGN.md §7).
 
 use egui::{RichText, Ui};
 use m241_core::firmware::PROFILE_V1_13;
 use m241_core::firmware::patch::EFFECTIVE_EPOCH_OFFSET;
+use m241_core::log::CoordFormat;
 
 use crate::screens::common;
 use crate::screens::log::tiles;
@@ -90,6 +92,8 @@ pub struct AppSettings {
     /// When true, rail tab transitions drop to 0 ms and playback steps at half
     /// the rate (500 ms instead of 250 ms).
     pub reduced_motion: bool,
+    /// How a selected point's coordinate is written on the Log screen.
+    pub coord_format: CoordFormat,
     /// When true, the Log screen's map fetches OpenStreetMap tiles for its
     /// background. Default on: the map is the reason that screen exists, and
     /// turning it off is for a metered or offline connection rather than the
@@ -100,8 +104,9 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
-            units: UnitSystem::Metric,
+            units: UnitSystem::default(),
             reduced_motion: false,
+            coord_format: CoordFormat::Decimal,
             map_tiles: true,
         }
     }
@@ -170,12 +175,22 @@ const ROW_LANG: Row = Row {
 /// it under that name (design review, Should 6).
 const ROW_MOTION_LABEL: &str = "動きの低減";
 
+/// The coordinate-format row's label.
+const ROW_COORD_LABEL: &str = "座標形式";
+
 /// The rows DESIGN.md §5 names, in its order (checked in tests).
 ///
 /// 動きの低減 is absent from this list on purpose: unlike the fixed rows it has no
 /// static value, because its value is whatever the buttons currently show.
 #[cfg(test)]
 const FIXED_ROWS: [Row; 3] = [ROW_UNITS, ROW_THEME, ROW_LANG];
+
+/// The three coordinate formats the Log screen can show (ezTour §3.3/§3.6).
+const COORD_FORMATS: [(CoordFormat, &str); 3] = [
+    (CoordFormat::Dms, "度分秒"),
+    (CoordFormat::Decimal, "10進度"),
+    (CoordFormat::Utm, "UTM"),
+];
 
 /// Draw the screen body. The rail is drawn by the shell, not here.
 pub fn ui(ui: &mut Ui, settings: &mut AppSettings) {
@@ -251,6 +266,19 @@ pub fn ui(ui: &mut Ui, settings: &mut AppSettings) {
         );
         fixed_row(ui, ROW_THEME);
         fixed_row(ui, ROW_LANG);
+        option_row(
+            ui,
+            ROW_COORD_LABEL,
+            "選択した点と点の一覧の座標表示を切り替えます（UTM は緯度 -80〜84 度のみ）",
+            settings,
+            |ui, settings| {
+                for (format, label) in COORD_FORMATS {
+                    if common::choice_button(ui, label, settings.coord_format == format).clicked() {
+                        settings.coord_format = format;
+                    }
+                }
+            },
+        );
         let motion_note = if settings.reduced_motion {
             "オン（0 ms。タブ切替の移動アニメーションを無効化中）".to_owned()
         } else {
@@ -496,6 +524,7 @@ mod tests {
             ROW_UNITS.label,
             ROW_THEME.label,
             ROW_LANG.label,
+            ROW_COORD_LABEL,
             ROW_MOTION_LABEL,
             ROW_CLEAR_LABEL,
         ];
@@ -580,6 +609,14 @@ mod tests {
     }
 
     #[test]
+    fn reduced_motion_drops_rail_transition_to_zero() {
+        let mut settings = AppSettings::default();
+        assert!((settings.rail_transition_secs() - 0.15).abs() < f32::EPSILON);
+        settings.reduced_motion = true;
+        assert!((settings.rail_transition_secs() - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn map_tiles_default_on_and_the_note_states_the_live_value() {
         // A default of off would leave the new map feature invisible to anyone
         // who never opens Settings; the note must state which way it is, and the
@@ -598,10 +635,16 @@ mod tests {
     }
 
     #[test]
-    fn reduced_motion_drops_rail_transition_to_zero() {
-        let mut settings = AppSettings::default();
-        assert!((settings.rail_transition_secs() - 0.15).abs() < f32::EPSILON);
-        settings.reduced_motion = true;
-        assert!((settings.rail_transition_secs() - 0.0).abs() < f32::EPSILON);
+    fn the_coordinate_format_row_offers_the_three_core_formats() {
+        // The formats are the core's `CoordFormat` variants, not a GUI copy: a
+        // fourth core format is a compile error here rather than a menu that
+        // silently cannot show it.
+        assert_eq!(COORD_FORMATS.len(), 3);
+        let labels: Vec<&str> = COORD_FORMATS
+            .iter()
+            .map(|(_format, label)| *label)
+            .collect();
+        assert_eq!(labels, ["度分秒", "10進度", "UTM"]);
+        assert_eq!(AppSettings::default().coord_format, CoordFormat::Decimal);
     }
 }
