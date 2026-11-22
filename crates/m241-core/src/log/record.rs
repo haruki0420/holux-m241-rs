@@ -17,7 +17,7 @@
 //! * the trailer is **one** checksum byte, with no `'*'` separator.
 
 use crate::error::{Error, Result};
-use crate::log::block::{bit, field_layout};
+use crate::log::block::{Field, bit, field_layout};
 use crate::types::TrackPoint;
 
 /// Smallest possible record: UTC + lat + lon + height + checksum.
@@ -40,8 +40,9 @@ pub mod bit_index {
 /// `record` may be longer than the record itself — the caller usually hands over
 /// the rest of the block — in which case the layout decides how much is read.
 /// The caller checks the trailer separately with
-/// [`crate::log::block::checksum_matches`]: a bad checksum marks a point, it does
-/// not discard it.
+/// [`crate::log::block::checksum_matches_length`] and does **not** export a
+/// record that fails: a failed checksum is not a point with a plausible payload,
+/// it is bytes the format does not vouch for.
 ///
 /// # Errors
 ///
@@ -49,6 +50,32 @@ pub mod bit_index {
 /// which means the record is truncated.
 pub fn decode(record: &[u8], bitmask: u32) -> Result<TrackPoint> {
     let layout = field_layout(bitmask, record);
+    decode_with_layout(record, &layout)
+}
+
+/// Decode a record whose boundary came from the data rather than the mask.
+///
+/// A stale mask can declare fields the detected record has no room for: the
+/// measured 16-byte mask over 20-byte records is four bytes short, and a 20-byte
+/// mask over 16-byte records declares a speed field that does not exist. The mask
+/// still says what each field means, so the fields whose bytes fit before the
+/// trailer are decoded and the rest are dropped. [`decode`] is this function with
+/// the mask's own length.
+///
+/// # Errors
+///
+/// As [`decode`].
+pub fn decode_with_length(record: &[u8], bitmask: u32, length: usize) -> Result<TrackPoint> {
+    let body_length = length.saturating_sub(1);
+    let layout: Vec<Field> = field_layout(bitmask, record)
+        .into_iter()
+        .filter(|entry| entry.offset.saturating_add(entry.size) <= body_length)
+        .collect();
+    decode_with_layout(record, &layout)
+}
+
+/// The shared decoding body: fields come from `layout`, bytes from `record`.
+fn decode_with_layout(record: &[u8], layout: &[Field]) -> Result<TrackPoint> {
     let mut point = TrackPoint::default();
 
     // The fix flags decide whether the position is real. MTK stores
@@ -56,12 +83,12 @@ pub fn decode(record: &[u8], bitmask: u32) -> Result<TrackPoint> {
     // claim one — reporting (0, 0) would place the track off West Africa. A mask
     // without VALID has no flag to contradict the coordinates, so the position is
     // trusted; that is how the measured 16-byte log behaves.
-    let valid = field(record, &layout, bit::VALID)
+    let valid = field(record, layout, bit::VALID)
         .and_then(read_u16)
         .unwrap_or(0);
     let has_fix = valid & 0x0001 == 0;
 
-    for entry in &layout {
+    for entry in layout {
         let Some(bytes) = record.get(entry.offset..entry.offset.saturating_add(entry.size)) else {
             return Err(Error::Log {
                 message: format!(
@@ -215,6 +242,22 @@ mod tests {
         let record = decode(&body, 0x8000_003D).expect("20-byte record");
         assert_eq!(record.speed_kmh, Some(42.5));
         assert_eq!(record.height_m, Some(80.0));
+    }
+
+    #[test]
+    fn a_twenty_byte_mask_over_a_sixteen_byte_record_drops_the_speed_field() {
+        // The mirror of the measured stale-mask block: the header still asks for
+        // speed, but the record has no room for it. The boundary decides what is
+        // read; the speed field is dropped rather than losing the whole record.
+        let record = sixteen_byte_record();
+        let decoded = decode_with_length(&record, 0x8000_003D, 16).expect("16-byte boundary");
+        assert_eq!(decoded.utc, Some(1_700_000_000));
+        assert_eq!(decoded.height_m, Some(80.0));
+        assert_eq!(decoded.speed_kmh, None);
+        assert!(
+            decode(&record, 0x8000_003D).is_err(),
+            "the mask alone cannot decode a record four bytes shorter than it claims"
+        );
     }
 
     #[test]

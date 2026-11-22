@@ -4,6 +4,8 @@
 //! ```text
 //!   block      a 64 KiB block and its 0x200-byte header, whose bitmask
 //!              decides which fields each record in that block carries
+//!   journal    the settings entries a block carries between record runs;
+//!              recognised and skipped, never read as track records
 //!   record     one record -> a TrackPoint, for that block's bitmask
 //!   parse      a whole dump -> `Track`, tolerating the damage real dumps have
 //!   export     a `Track` -> GPX / KML / CSV / NMEA / JSON
@@ -44,6 +46,7 @@ pub mod exif;
 pub mod export;
 pub mod geotag;
 pub mod import;
+pub mod journal;
 pub mod kmz;
 pub mod parse;
 pub mod record;

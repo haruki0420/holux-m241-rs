@@ -383,9 +383,24 @@ pub fn xor_checksum(body: &[u8]) -> u8 {
 /// Whether the trailer of `record` matches the XOR of its field bytes.
 ///
 /// `record` is the whole record; [`record_length`] must fit inside it.
+///
+/// The mask-shaped entry point of [`checksum_matches_length`]. Kept public because
+/// it is the check a caller makes when it trusts the mask; the parser itself uses
+/// `checksum_matches_length` instead, because a stale mask cannot name the
+/// boundary (see [`crate::log::parse`]'s module doc).
 #[must_use]
 pub fn checksum_matches(record: &[u8], bitmask: u32) -> bool {
-    let length = record_length(bitmask, record);
+    checksum_matches_length(record, record_length(bitmask, record))
+}
+
+/// Whether the trailer of a `length`-byte record matches the XOR of its fields.
+///
+/// This is the same check as [`checksum_matches`], for a caller that has
+/// detected the record length from the data because the block header's mask
+/// disagrees with it. A length below the one trailer byte, or one that does not
+/// fit inside `record`, is not a valid record.
+#[must_use]
+pub fn checksum_matches_length(record: &[u8], length: usize) -> bool {
     if length < CHECKSUM_BYTES {
         return false;
     }

@@ -88,7 +88,8 @@ impl TrackPoint {
 pub struct Track {
     /// Points in the order the device recorded them.
     pub points: Vec<TrackPoint>,
-    /// Blocks whose header checksum did not match. Empty is the normal case.
+    /// Blocks that contain a record whose checksum did not match. Empty is the
+    /// normal case.
     pub damaged_blocks: Vec<u32>,
 }
 
@@ -124,7 +125,7 @@ pub struct LogSummary {
     pub records: usize,
     /// Records that carry a position.
     pub fixes: usize,
-    /// How many blocks had a header checksum that did not match.
+    /// How many blocks contain a record whose checksum did not match.
     ///
     /// A count, not the list: [`Track::damaged_blocks`] is the list, and the two
     /// sharing a name made `summary.damaged_blocks` read as if it were one.

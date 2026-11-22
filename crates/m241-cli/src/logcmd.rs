@@ -75,7 +75,7 @@ pub fn download(options: &DownloadOptions, session: Session<'_>) -> Result<()> {
         }
     };
     let summary = report.summary(&track);
-    warn_about_damage(session.console, &summary, &report, None);
+    warn_about_parse_report(session.console, &summary, &report, None);
 
     if options.json {
         return session.console.json(&serde_json::json!({
@@ -263,7 +263,7 @@ pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
         let bytes = fileio::read(&options.file)?;
         let (track, report) = parse_dump(&bytes)?;
         let summary = report.summary(&track);
-        warn_about_damage(session.console, &summary, &report, None);
+        warn_about_parse_report(session.console, &summary, &report, None);
         (track, None)
     };
 
@@ -441,7 +441,7 @@ fn apply_utc_offset(track: &mut Track, spec: OffsetSpec, console: &dyn Console) 
 pub fn edit(options: &LogEditOptions, session: Session<'_>) -> Result<()> {
     let bytes = fileio::read(&options.log)?;
     let (track, report) = parse_dump(&bytes)?;
-    warn_about_damage(session.console, &report.summary(&track), &report, None);
+    warn_about_parse_report(session.console, &report.summary(&track), &report, None);
     let mut editor = TrackEditor::from_track(track);
 
     match requested_edit(options) {
@@ -589,7 +589,7 @@ fn merge_in_time_order(
     for path in merge_paths {
         let bytes = fileio::read(path)?;
         let (track, report) = parse_dump(&bytes)?;
-        warn_about_damage(console, &report.summary(&track), &report, Some(path));
+        warn_about_parse_report(console, &report.summary(&track), &report, Some(path));
         all.push(track);
     }
     let mut indices: Vec<usize> = (0..all.len()).collect();
@@ -641,7 +641,7 @@ fn second_sibling(path: &Path) -> PathBuf {
 pub fn kmz(options: &LogKmzOptions, session: Session<'_>) -> Result<()> {
     let bytes = fileio::read(&options.log)?;
     let (mut track, report) = parse_dump(&bytes)?;
-    warn_about_damage(session.console, &report.summary(&track), &report, None);
+    warn_about_parse_report(session.console, &report.summary(&track), &report, None);
     apply_utc_offset(&mut track, options.utc_offset_days, session.console);
 
     let photo_paths = expand_photo_inputs(&options.photos)?;
@@ -744,7 +744,7 @@ pub fn info(options: &LogInfoOptions, session: Session<'_>) -> Result<()> {
     let bytes = fileio::read(&options.file)?;
     let (track, report) = parse_dump(&bytes)?;
     let summary = report.summary(&track);
-    warn_about_damage(session.console, &summary, &report, None);
+    warn_about_parse_report(session.console, &summary, &report, None);
 
     if options.json {
         return session.console.json(&serde_json::json!({
@@ -764,6 +764,10 @@ pub fn info(options: &LogInfoOptions, session: Session<'_>) -> Result<()> {
     Ok(())
 }
 
+/// The one wording for a dump that holds only the settings journal, shared by the
+/// stdout summary and the stderr warning so the two cannot drift apart.
+const NO_TRACK_POINTS: &str = "no track points (settings journal only)";
+
 /// The labelled lines `log info` prints on stdout.
 fn print_info(
     console: &dyn Console,
@@ -772,7 +776,7 @@ fn print_info(
     summary: LogSummary,
     report: &ParseReport,
 ) {
-    let lines = [
+    let mut lines = vec![
         ("file", file.display().to_string()),
         ("size", size.to_string()),
         ("records", summary.records.to_string()),
@@ -784,6 +788,24 @@ fn print_info(
         ("start", timestamp(summary.started_at)),
         ("end", timestamp(summary.ended_at)),
     ];
+    if report.journal_items > 0 {
+        lines.push(("journal items", report.journal_items.to_string()));
+    }
+    if report.empty_records > 0 {
+        lines.push(("empty records", report.empty_records.to_string()));
+    }
+    if report.layout_mismatched_blocks > 0 {
+        lines.push((
+            "layout mismatches",
+            report.layout_mismatched_blocks.to_string(),
+        ));
+    }
+    if report.unparsed_bytes > 0 {
+        lines.push(("unparsed bytes", report.unparsed_bytes.to_string()));
+    }
+    if report.is_journal_only() {
+        lines.push(("track", String::from(NO_TRACK_POINTS)));
+    }
     for (label, value) in lines {
         console.result(&format!("{label:<18}: {value}"));
     }
@@ -811,6 +833,11 @@ fn parse_document(report: &ParseReport) -> serde_json::Value {
         "records": report.records,
         "bad_checksums": report.bad_checksums,
         "truncated_records": report.truncated_records,
+        "empty_records": report.empty_records,
+        "journal_items": report.journal_items,
+        "journal_only": report.is_journal_only(),
+        "layout_mismatched_blocks": report.layout_mismatched_blocks,
+        "unparsed_bytes": report.unparsed_bytes,
         "used_bytes": report.used_bytes,
     })
 }
@@ -841,7 +868,7 @@ pub fn geotag(options: &LogGeotagOptions, session: Session<'_>) -> Result<()> {
     let bytes = fileio::read(&options.log)?;
     let (mut track, report) = parse_dump(&bytes)?;
     let summary = report.summary(&track);
-    warn_about_damage(session.console, &summary, &report, None);
+    warn_about_parse_report(session.console, &summary, &report, None);
 
     let offset_days = apply_utc_offset(&mut track, options.utc_offset_days, session.console);
     let photo_paths = expand_photo_inputs(&options.photos)?;
@@ -1133,11 +1160,14 @@ fn timestamp(utc: Option<u32>) -> String {
     utc.map_or_else(|| String::from("-"), export::utc_iso)
 }
 
-/// Say on stderr what the parser had to skip.
+/// Say on stderr what the parser observed and had to skip.
 ///
 /// A warning, never an error: one damaged block is a track worth keeping, and
-/// refusing the whole dump would throw the trip away.
-fn warn_about_damage(
+/// refusing the whole dump would throw the trip away. A dump with no track points
+/// is not damage either, but it is worth saying out loud, so it is included here.
+/// The facts repeat the ones `log info` prints on stdout, because a conversion
+/// must not hide what it gave up on.
+fn warn_about_parse_report(
     console: &dyn Console,
     summary: &LogSummary,
     report: &ParseReport,
@@ -1146,20 +1176,38 @@ fn warn_about_damage(
     let source = source.map_or_else(String::new, |path| format!("{}: ", path.display()));
     if summary.damaged_block_count > 0 {
         console.warn(&format!(
-            "{source}{} of {} blocks failed their header checksum; their records are still exported",
+            "{source}{} of {} blocks contain records whose checksum did not match; those \
+             records were skipped",
             summary.damaged_block_count, report.blocks
         ));
     }
+    if report.layout_mismatched_blocks > 0 {
+        console.warn(&format!(
+            "{source}{} of {} blocks: the header mask disagreed with the record length in \
+             the data; the detected record length was used",
+            report.layout_mismatched_blocks, report.blocks
+        ));
+    }
+    if report.unparsed_bytes > 0 {
+        console.warn(&format!(
+            "{source}{} bytes could not be read as records or settings journal items and \
+             were skipped",
+            report.unparsed_bytes
+        ));
+    }
+    if report.is_journal_only() {
+        console.warn(&format!("{source}{NO_TRACK_POINTS}"));
+    }
     if report.truncated_records > 0 {
         console.warn(&format!(
-            "{source}{} records were cut short (the log was probably still being written); they \
-             were skipped",
+            "{source}{} records were cut short: the bytes ran out before the record did \
+             (typically the final write); they were skipped",
             report.truncated_records
         ));
     }
     if report.bad_checksums > 0 {
         console.warn(&format!(
-            "{source}{} records failed their per-record checksum; they are exported and marked",
+            "{source}{} records failed their per-record checksum; they were skipped",
             report.bad_checksums
         ));
     }
@@ -1172,7 +1220,7 @@ mod tests {
     use crate::link::PortEntry;
     use crate::testing::{
         AutoConfirm, DeviceHandle, FakePorts, RecordingConsole, Scratch, ScriptedLinks,
-        ScriptedTransport, synthetic_dump,
+        ScriptedTransport, synthetic_dump, synthetic_journal_only_dump,
     };
     use m241_core::Error;
     use m241_core::protocol::simulator::FakeDevice;
@@ -1256,6 +1304,79 @@ mod tests {
         assert_eq!(document["summary"]["records"], 2);
         assert_eq!(document["summary"]["fixes"], 2);
         assert_eq!(document["parse"]["blocks"], 1);
+    }
+
+    #[test]
+    fn info_reports_a_journal_only_dump_as_having_no_track_points() {
+        let scratch = Scratch::new("info-journal-only");
+        let path = scratch.join("journal-only.bin");
+        fileio::write(&path, &synthetic_journal_only_dump()).expect("write dump");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        info(
+            &LogInfoOptions {
+                file: path,
+                json: true,
+            },
+            Session::new(&links, &console, &confirm),
+        )
+        .expect("info");
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(document["summary"]["records"], 0);
+        assert_eq!(document["summary"]["fixes"], 0);
+        assert_eq!(document["parse"]["journal_only"], true);
+        assert_eq!(document["parse"]["journal_items"], 23);
+        assert_eq!(document["parse"]["bad_checksums"], 0);
+        assert_eq!(document["parse"]["damaged_blocks"], 0);
+        let stderr = console.stderr();
+        assert!(
+            stderr.contains("no track points (settings journal only)"),
+            "the result must say the dump is journal-only: {stderr}"
+        );
+        assert!(
+            !stderr.contains("header checksum"),
+            "a journal is not a failed header checksum: {stderr}"
+        );
+    }
+
+    /// The value after the `:` on the labelled line that starts with `label`.
+    fn labelled_value<'a>(text: &'a str, label: &str) -> Option<&'a str> {
+        text.lines().find_map(|line| {
+            let (found, value) = line.split_once(':')?;
+            (found.trim_end() == label).then(|| value.trim())
+        })
+    }
+
+    #[test]
+    fn info_prints_the_journal_only_state_and_its_item_count() {
+        let scratch = Scratch::new("info-journal-only-text");
+        let path = scratch.join("journal-only.bin");
+        fileio::write(&path, &synthetic_journal_only_dump()).expect("write dump");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        info(
+            &LogInfoOptions {
+                file: path,
+                json: false,
+            },
+            Session::new(&links, &console, &confirm),
+        )
+        .expect("info");
+        let text = console.stdout();
+        assert_eq!(labelled_value(&text, "records"), Some("0"), "got {text}");
+        assert_eq!(
+            labelled_value(&text, "journal items"),
+            Some("23"),
+            "the count must be the 23 journal items the fixture holds: {text}"
+        );
+        assert_eq!(
+            labelled_value(&text, "track"),
+            Some("no track points (settings journal only)"),
+            "got {text}"
+        );
     }
 
     #[test]
@@ -1572,6 +1693,81 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_mask_is_warned_about_and_does_not_lose_the_records() {
+        // The header asks for 20-byte records while the data is 16-byte records:
+        // the reverse of the measured block 0. Every record must still be
+        // exported, the disagreement must be warned about, and the warning must
+        // not call it a short write.
+        let mut dump = synthetic_dump(2);
+        dump[2..6].copy_from_slice(&0x8800_003Du32.to_le_bytes());
+        let path = Scratch::new("read-stale-mask").join("stale.bin");
+        fileio::write(&path, &dump).expect("write dump");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        read(
+            &LogReadOptions {
+                nmea: false,
+                file: path,
+                format: m241_core::ExportFormat::Csv,
+                output: None,
+                utc_offset_days: crate::cal::OffsetSpec::Days(0),
+            },
+            fast(&links, &console, &confirm),
+        )
+        .expect("read");
+        assert_eq!(
+            console.stdout().lines().count(),
+            3,
+            "the header plus both records: {}",
+            console.stdout()
+        );
+        assert!(
+            console.stderr().contains("header mask disagreed"),
+            "the disagreement must be reported: {}",
+            console.stderr()
+        );
+        assert!(
+            !console.stderr().contains("cut short"),
+            "a layout mismatch is not a short write: {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
+    fn read_a_journal_only_dump_writes_an_empty_track_and_warns() {
+        let path = Scratch::new("read-journal-only").join("journal-only.bin");
+        fileio::write(&path, &synthetic_journal_only_dump()).expect("write dump");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let confirm = AutoConfirm;
+        read(
+            &LogReadOptions {
+                nmea: false,
+                file: path,
+                format: m241_core::ExportFormat::Csv,
+                output: None,
+                utc_offset_days: crate::cal::OffsetSpec::Days(0),
+            },
+            fast(&links, &console, &confirm),
+        )
+        .expect("a journal-only dump is not an error");
+        assert_eq!(
+            console.stdout().lines().count(),
+            1,
+            "only the CSV header is written: {}",
+            console.stdout()
+        );
+        assert!(
+            console
+                .stderr()
+                .contains("no track points (settings journal only)"),
+            "the warning must say why the track is empty: {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
     fn damage_is_warned_about_on_stderr_only() {
         let scratch = Scratch::new("read-damage");
         // Corrupt one record's checksum byte inside the block.
@@ -1601,8 +1797,27 @@ mod tests {
             console.stderr()
         );
         assert!(
+            !console.stderr().contains("header checksum"),
+            "the warning must describe record checksums, not a header checksum: {}",
+            console.stderr()
+        );
+        assert!(
+            console.stderr().contains("skipped"),
+            "a failed record must not be exported silently: {}",
+            console.stderr()
+        );
+        assert!(
             !console.stdout().contains("warning"),
             "stdout must stay machine-readable: {}",
+            console.stdout()
+        );
+        // The contract behind the message: the failed record is not exported.
+        // Two records were written, one checksum byte was corrupted, so the CSV
+        // holds its header plus exactly one data row.
+        assert_eq!(
+            console.stdout().lines().count(),
+            2,
+            "the failed record must not reach the export: {}",
             console.stdout()
         );
     }

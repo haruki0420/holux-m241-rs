@@ -253,9 +253,10 @@ fn the_log_screen_draws_a_track_and_a_pickable_point() {
 
 #[test]
 fn the_log_screen_survives_a_damaged_track() {
-    // A dump with a failed block checksum is a normal dump, not an error: the points
-    // are kept and the damage is reported. The screen must render the warning rather
-    // than panic on the report.
+    // A dump with failed record checksums is a normal dump, not an error: the
+    // records that pass stay in the track, the failed ones are dropped, and the
+    // damage is reported. The screen must render the warning rather than panic on
+    // the report.
     let ctx = context();
     let mut app = App::default();
     app.select(Screen::Log);
