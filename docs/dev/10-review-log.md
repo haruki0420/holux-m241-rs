@@ -1247,3 +1247,63 @@ Could 9）と可読性（Must 4 / Should 17 / Could 13）の 2 本で、レビ�
 ### Stage 3 検証
 
 未検証（別エージェントが記入する）。
+
+---
+
+## 2026-11-23 / PR #34 ログの設定ジャーナル Stage 2 修正（`fix-log-journal`）
+
+- 対象: PR #34（base `origin/main` = `7dda90f`、Stage 1 レビュー head `e683f00`）。修正コードの head は `bd65a07`、本節はその次の commit。
+- Stage 1: [仕様検収](https://github.com/haruki0420/holux-m241-rs/pull/34#issuecomment-7082342578) と[可読性](https://github.com/haruki0420/holux-m241-rs/pull/34#issuecomment-7082341031)。実装者はどちらのレビューにも参加していない。
+- 実機ポートは開いていない。実ファイル（2026-11-21 の 225,028 B、2026-11-22 の 3,228 / 3,260 B）は読み取りのみで、リポジトリには入れていない。
+
+### Must への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| 仕様 M-1 | journal type を「3, 4, 7 / type 2 未観測」と誤記 | 実測（2026-11-21: type 3 ×68 / 4 ×68 / 7 ×75 / 6 ×2 / 2 ×1、names 34、items 248）に修正。type 2 は file offset `0x220` に値 `0x8800_003D`（直後の 20 B レコード・blocks 1–3 の header mask と同値）で 1 回観測、と事実を分離。parser が適用しない理由も明記 | docs ゲート、`a_stale_sixteen_byte_mask_still_reads_twenty_byte_records`（type 2 を含む fixture） |
+| 仕様 S-1 / 可読性 M3 | mask 20 B / データ 16 B で block 全損 + 「cut short」誤診断 | `record::decode_with_length` を追加し、検出長に収まるフィールドだけで decode。「境界=データ・意味=mask」の不変条件を module doc に明記。decode 失敗は truncated ではなく damage として歩を進める。CLI の truncated 文言も「バイトが尽きた」に変更 | `a_stale_twenty_byte_mask_still_reads_sixteen_byte_records`（core）、`a_twenty_byte_mask_over_a_sixteen_byte_record_drops_the_speed_field`（record）、`a_stale_mask_is_warned_about_and_does_not_lose_the_records`（CLI） |
+| 仕様 S-2 / 可読性 M4 | 再同期が 2 連続 checksum で偶然一致（ランダム 50 本中 4 本が点を出力） | 受理条件を名前付き定数化: 宣言長 = 2 連続（または 1 レコード + journal/padding 境界）、非宣言長 = 3 連続、再同期 = 4 連続。境界付き 1 レコードと「1 レコード後ろが grid」も許容。確率をコメントに明記し「random bytes では受理されない」断定を撤回 | `random_bytes_do_not_become_track_points`（50 seeds で 0 点）、`resync_needs_an_unbroken_run_not_two_lucky_checksums`、`one_record_before_a_journal_cluster_is_not_lost` |
+| 可読性 M5 | `is_journal_only` の doc が「erased も」と書き、空レコード未計上 | 定義を「journal item ≥1 かつ records / empty_records / bad_checksums / truncated_records / unparsed_bytes がすべて 0」に一本化。空レコードを `empty_records` で計上。CLI の断定を共有定数 1 つに | `a_journal_with_unreadable_bytes_is_not_journal_only`、`a_record_without_a_time_or_a_position_is_counted_as_empty`、`an_erased_block_is_not_journal_only`、CLI の journal-only 2 件 |
+| 可読性 M1 | 旧「checksum 不一致でも点を残す」の why が消えた | parse.rs module doc に (a) 旧ポリシーを捨てた実測（11-21: 11,088 点中 4,481 が checksum 不一致、うち 3,244 は block 0 の stale mask / 11-22 journal-only が 135・137 点）、(b) 代償（1 byte XOR のため壊れた実レコードも 1 点失う）、(c) mask を上書きする不変条件を追加 | doc、既存の fail-closed テスト |
+| 可読性 M2 | 実装と矛盾する rustdoc 3 箇所 | `record.rs` の契約（失敗は破棄）、`journal.rs` の認識契約（type/value は未確定なので検証しない・その代償）、`m241-gui/tests/render.rs` の 1 行コメントを実装に一致 | 各 doc、既存テスト（GUI はテスト 1 行のみ変更） |
+
+### Should への対応
+
+| # | 指摘 | 対応 |
+|---|---|---|
+| 仕様 S-2 文言 / docs | 「anything unrecognised fails the checksum」の断定 | 再同期の受理条件・確率・`unparsed_bytes` の代償を `03-hardware-facts.md` の本文に反映 |
+| 仕様 S-4 | mask と実長が食い違うときのフィールド意味 | `03-hardware-facts.md` に行を追加（境界=データ、意味=mask、収まらないフィールドは decode しない。block 0 の 3,244 点は speed なし、speed ありは 7,698 = blocks 1–3） |
+| 仕様 S-5 | `record.rs` の旧仕様 rustdoc | 可読性 M2 と同時に修正 |
+| 可読性 S2 | 判定に効く数値の why が無い | `DECLARED_LEADING_RECORDS` / `DETECTED_LEADING_RECORDS` / `RESYNC_LEADING_RECORDS` / `RESYNC_SCAN_BYTES` / `DETECTION_SAMPLE_RECORDS` に根拠と代償を rustdoc。走査上限の代償も明記 |
+| 可読性 S3 | journal の語・単位が混在 | `journal.rs` module doc で entry / name / cluster / item を定義。「settings journal」に統一。`journal_items` が name を含むことを doc 化 |
+| 可読性 S4 | `layout_mismatches` の名前と struct doc | `layout_mismatched_blocks` に改名（JSON キーも同じ）。struct doc を「観測とスキップ、単位はフィールドごと」に書き直し、`used_bytes` の doc も実装に一致 |
+| 可読性 S5 | `warn_about_damage` の責務拡大と二重文言 | `warn_about_parse_report` に改名し doc を「利用者に伝える parse 結果」に。journal-only の文言を `NO_TRACK_POINTS` 1 つに共有 |
+| 可読性 S6 | fixture の mask・`u16::MAX`・truncate の意図 | CLI fixture の mask が実測値（bit 27 込み）である理由、`COUNT_NOT_FULL` の使用、truncate の意図をコメント（entry 組立の重複は下記「見送り」） |
+| 可読性 S7 | テスト名・文言だけのテスト | `a_hundred_records_of_twenty_bytes_...` に改名。journal-only の text テストはラベル行をパースして個数 23 を検証。damage テストに CSV 行数（破損レコードが export されない）を追加。stale mask の CLI レベルテストと journal-only の `log read` テストを追加 |
+| 可読性 S8 | 新規 `pub` と `checksum_matches` | `journal::ENTRY_SIZE/NAME_SIZE` を private に。`checksum_matches` は mask を信頼できる呼び出し元向けとして rustdoc に理由を書き、parser は `checksum_matches_length` を使うと明記 |
+| 可読性 C2 | `used_bytes` の doc | 実装（レコードのみ・checksum 失敗分も含む）に一致 |
+| 可読性 C3 | journal の why が弱い | module doc に「旧 parser が configuration バイトから座標を捏造して export していた」と実測件数を明記 |
+| 可読性 C5 | 名前 | `Evidence` → `LengthEvidence`、`DETECTED_RECORD_LENGTHS` → `CANDIDATE_RECORD_LENGTHS`。resync は同じ定数を再利用 |
+| 可読性 C6 | ブロック単位で固定する理由 | 検出長を再検出しない理由（type 2 は未確認、構成変更は次 block の header に出る）をコメント |
+| 仕様 C-1 / C-3 | `log info` の節が無い / journal-only read の扱い | `02-cli.md` に `m241 log info` 節（text 行・JSON 全フィールドの単位と意味・exit code）を追加。`log read` の journal-only は警告 + 空 track + exit 0 と明記 |
+
+### 見送った指摘と理由
+
+- 仕様 S-3（`docs/dev/06-open-questions.md` §1 の「header checksum・原因未確定」更新）: この修正の write scope（`03-hardware-facts.md` / `02-cli.md`）外。本 PR の facts と `05-verification.md` の分析で原因は説明済みなので、follow-up として別途更新する。
+- 仕様 C-5（`AGENTS.md` §5 に stale mask の実測を反映）: 同じく write scope 外（`AGENTS.md` は本 PR の非変更要件）。follow-up。
+- 可読性 S1（`parse_dump` の Step enum 化）: 挙動を変えない大規模な構造変更で、Stage 1 の Must を直す今回の範囲を超える。例外経路（resync・decode 失敗）は追加テストで固定したので、次の整理で行う。
+- 可読性 S6 の 16 B entry 組立の重複: core の `journal_entry` はテスト専用の private helper、CLI fixture は別クレート。共有にはテスト支援 API の公開が要り、本 PR の目的に対して公開面を広げる。mask・`COUNT_NOT_FULL`・truncate の意味は揃えた。
+- 可読性 C4（GUI が journal-only を表示しない）: `m241-gui` 本体は本 PR の変更範囲外（テスト 1 行のみ許可）。CLI で区別できることを優先し、GUI は follow-up。
+
+### 検証
+
+- `M241_VENDOR_IMAGE=<vendor V1.13> TMPDIR=/var/tmp ./tools/check.sh`: **6/6**（修正コード head `bd65a07`）。
+- 実ファイル（読み取りのみ、リポジトリ外）:
+  - 2026-11-21 225,028 B: 10,942 点 / bad_checksums 0 / damaged 0 / journal_items 248 / layout_mismatched_blocks 1 / unparsed 0 / used_bytes 218,840（修正前と同値）
+  - 2026-11-22 3,228 B / 3,260 B: 0 点 / journal_only true / journal_items 164 / 166（修正前と同値）
+- 追加テスト（core）: `a_stale_twenty_byte_mask_still_reads_sixteen_byte_records`, `one_record_before_a_journal_cluster_is_not_lost`, `resync_needs_an_unbroken_run_not_two_lucky_checksums`, `a_journal_with_unreadable_bytes_is_not_journal_only`, `a_record_without_a_time_or_a_position_is_counted_as_empty`, `random_bytes_do_not_become_track_points`（50 seeds）。ほか record 1 件、CLI 2 件。
+- 実測の再現: 旧ポリシーの checksum 不一致は、旧グリッドを Python で再現して 11-21 が 4,481 件、11-22 が 135 / 137 件であることを確認した（リポジトリ外・読み取りのみ）。
+
+### Stage 3 検証
+
+未検証（別エージェントが記入する）。
