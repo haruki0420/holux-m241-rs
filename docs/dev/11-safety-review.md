@@ -37,8 +37,11 @@
 ```
 m241-core（読み取り専用）←── m241-flash（書き込み）
         ↑                          ↑
-   m241-gui                   m241-cli
+   m241-gui ───────────────────────┘
+        └── m241-cli ──────────────┘
 ```
+
+（`m241-cli` は `m241-core` と `m241-flash` の両方に依存する。）
 
 - **`m241-core`** — PMTK の読み取り（`$PMTK605` / `$PMTK182,2,8` /
   `$PMTK182,7`）、BootROM の読み出し（`0xA2` / `0xAF` / `0xA4`）、ログの解析、
@@ -49,15 +52,60 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
   Download Agent（[`01-da-protocol.md`](../reference/01-da-protocol.md)）。
   `m241-core` に依存してよい。**逆は禁止。**
 - **`m241-cli`** — 両方に依存する。`fw flash` と `log erase` があるため。
-- **`m241-gui`** — `m241-core` のみ。今は書き込み経路を呼ばないので、書き込み
-  クレートをリンクしない。
+- **`m241-gui`** — `m241-core` と `m241-flash` の両方に依存する。ユーザーの明示的な
+  指示（2026-11-23）で、GUI を主要な操作面にし、書き込み・復旧・`probe-da`・
+  `da-restart` を GUI から実行できるようにした。GUI は `m241_flash::flow` の
+  セッション（`DownloadAgent` の同じ安全経路）だけを通り、破壊的オペコードを
+  自分では持たない。
 
 依存の向きが分離の土台なので、`✓` `cargo tree -p m241-core --edges normal,build,dev`
-および `cargo tree -p m241-gui --edges normal,build,dev` に `m241-flash` が現れない
-こと、`cargo tree -p m241-flash --edges normal,build,dev` に `m241-core` が現れる
-こと、`crates/m241-core/Cargo.toml` と `crates/m241-gui/Cargo.toml` が `m241-flash`
-を名指ししないことを検査する（dev / build 依存も含む。`cargo test -p m241-core` や
-`cargo test -p m241-gui` からリンクできてしまえば分離の意味が無い）。
+に `m241-flash` が現れないこと、`m241-core/Cargo.toml` が `m241-flash` を名指し
+しないこと、`cargo tree -p m241-flash --edges normal,build,dev` に `m241-core` が
+現れること、`cargo tree -p m241-gui --edges normal,build,dev` に `m241-core` と
+`m241-flash` の両方が現れることを検査する（dev / build 依存も含む）。
+GUI 側の新しい不変条件は次のとおり。
+
+- GUI の書き込みは `m241_flash::flow::flash` を通る（`crates/m241-gui/src/device.rs`）。
+  GUI が独自に `0xD3` / `0xD5` を送る第 2 の実装を持たない。
+- `Confirmation` を作れる GUI ファイルを限定する: ファーム画面は「`WRITE` と入力」、
+  接続画面は「`PROBE` と入力」から作る。`Confirmation::granted` はこの 2 画面
+  （とジョブ enum を持つ `device.rs` のテスト）以外では検出され、`Job::Flash` は
+  ファーム画面以外での構築が検出される。`--yes` 相当の省略経路は GUI に存在しない。
+  `0xD9` 再起動も `RESTART` の入力なしには実行できない（これはゲートの対象外で、
+  アクション先頭の再検査と単体テストで固定する）。
+- GUI のコードに破壊的オペコード（`OPCODE_*`、裸の `0xD3` 等の整数リテラル、
+  `\xNN` 形式、`$PMTK182,6`）が現れない。走査は 2 系統: 識別子と裸リテラルは
+  コメント・文字列の中身をマスクしたソース（画面の運用文 `0xD9` を誤検出しない）、
+  `\xNN` と `$PMTK182,6` はコメントのみ除いたソース（この 2 形態は文字列の中に
+  しか現れないため、マスクすると死んだパターンになる — Stage 1 の Must 1）。
+  `theme.rs` の RGB 値とログ fixture の `0xD9` だけはパスを限定して除外する。
+- GUI の吸い出しは CLI と同じ **2 回読み**（1 回目の後に電池を抜き差し）で、
+  SHA-256 が一致したときだけファイルを保存する。1 回読みの切り詰めを
+  「検証済み」にしない。
+
+## GUI からの書き込み（2026-11-23 の設計変更）
+
+以前は「`m241-gui` は `m241-flash` をリンクしない」ことが不変条件だった。ユーザーが
+GUI を主要な操作面にするよう明示的に指示したため、この向きだけを変更した。
+
+- 維持するもの: `m241-core` は読み取り専用（書き込み API を持たない）。範囲は
+  `FLASH_WRITE_START` / `FLASH_WRITE_LENGTH` の固定値、`check_layout` /
+  `check_image` / `verify_device` / 読み戻しは CLI と同じものを通す。
+- 新しく固定するもの: GUI の書き込みは `m241-flash` の共有セッション
+  （`m241_flash::flow::flash`）を通る。`Confirmation` はファーム画面でユーザーが
+  `WRITE` を入力したときだけ構築され、`--yes` に相当するボタンや自動化経路は無い。
+  `fw probe-da` は `PROBE`、`fw da-restart` は `RESTART` の入力で確認する。
+- GUI は破壊的オペコードを自分では持たない（`tools/check_safety.py` がコード中の
+  `OPCODE_*` / 裸の整数リテラル / `\xNN` / `$PMTK182,6` を検査）。UI 文言・コメントは
+  対象外。**このゲートは旧ゲート（依存グラフで構造的に禁止）より弱い。** 旧ゲートは
+  GUI 内の変更では迂回できなかったが、新しいゲートはテキスト検査であり、チェッカー
+  自身を弱める編集と一緒なら通る。構造で残っている保証は `m241-flash` 側
+  （固定範囲・`check_layout`・`check_image`・`verify_device`・読み戻し）だけ。
+- GUI の吸い出しは CLI と同じ 2 回読みで、ハッシュが一致したときだけ保存する。
+  1 回読みの切り詰めを「検証済み」にしない。
+- 実機での GUI 書き込みは未検証である。シミュレータで「2 回読み→ダンプ→パッチ→
+  書き込み→読み戻し一致」「2 回の読み取り不一致は保存しない」「不一致→復旧」
+  「WRITE 未入力では書かない」を固定している。
 
 ## 書き込み経路のレビュー（必須）
 
@@ -273,9 +321,12 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
 | `$PMTK182,6` / `0xD3` / `0xD4` / `0xD5` / `0xD9`（`b'\xd3'`・`\xD5` 等を含む）が `crates/m241-core/src`・`crates/m241-core/tests` のコードに無い | 破壊的コマンドが読み取り側に戻らない |
 | `erase` / `erase_*` / `flash_write` / `program` / `program_*` という識別子が無い | 書き込みの語彙が読み取り側に戻らない（`erased` は許可） |
 | `cargo tree -p m241-core --edges normal,build,dev` に `m241-flash` が無い | 依存の向きが逆転していない |
-| `cargo tree -p m241-gui --edges normal,build,dev` に `m241-flash` が無い | GUI が意図せず書き込みクレートをリンクしていない |
+| `cargo tree -p m241-gui --edges normal,build,dev` に `m241-core` と `m241-flash` がある | GUI が書き込みクレートを経由して共有セッションに到達できる（リンクしない状態に戻っていない） |
 | `cargo tree -p m241-flash --edges normal,build,dev` に `m241-core` がある | 正しい向きの依存が消えていない |
-| `crates/m241-core/Cargo.toml` と `crates/m241-gui/Cargo.toml` が `m241-flash` を名指ししない | 解決結果に出ない形の依存（dev 依存など）も塞ぐ |
+| `crates/m241-core/Cargo.toml` が `m241-flash` を名指ししない | 解決結果に出ない形の依存（dev 依存など）も塞ぐ。読み取り専用バイナリが書き込みルーチンを持たない |
+| `crates/m241-gui/Cargo.toml` が `m241-flash` を名指しし、`device.rs` が `flow::flash(` を呼び、`firmware.rs` が `Confirmation::granted` と `CONFIRMATION` を持つ | GUI の書き込みが共有経路を通り、`WRITE` 入力からしか確認トークンを作らない |
+| `crates/m241-gui/src`・`tests` のコードに `OPCODE_*` / 裸の `0xD3` 等の整数リテラル / `\xNN` / `$PMTK182,6` が無い（裸リテラルと識別子は文字列をマスク、`\xNN` と PMTK は文字列を保持して走査） | GUI が破壊的オペコードを自分で送る第 2 の実装を持たない |
+| `Confirmation::granted` が `firmware.rs` / `connect.rs` / `device.rs`（テスト）以外に無く、`Job::Flash` が `device.rs` / `firmware.rs` 以外に無い | タイプ語を検査しない画面から書き込み経路を作れない（テキスト検査であり、型による証明ではない） |
 | `set_control_lines` が `crates/m241-core/src/protocol/brom.rs` / `crates/m241-core/src/protocol/port.rs` / `crates/m241-core/src/protocol/simulator.rs` 以外に無い | DTR/RTS を触る場所が増えていない（同名別パスのすり抜けも防ぐ） |
 | `crates/m241-flash/src/da.rs` の `check_image` / `all_within` 本体に `firmware::digest` / `digest::matches` / `sha256(_hex)` が無い | strict なバックアップ差分経路に digest 受理が戻らない（差分ヘルパーへ移しても検出。vendor は固定 SHA の別関数 `accept_vendor_image`、`check_da_image` の DA 用 SHA-256 は対象外） |
 | `crates/m241-flash/src/da.rs` の `pub fn write` / `write_vendor` が本体のトップレベル（brace depth 1）で `write_range` / `write_range_accepted` より前に `check_layout()?` を含む | 開始アドレスのゲートが書き込み経路から外れていない（コメント・別関数・未呼び出しの入れ子関数では通らない。`write_range(_accepted)` に到達する公開関数を名前ではなく呼び出しで探す） |

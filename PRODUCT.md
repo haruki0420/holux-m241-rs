@@ -13,7 +13,7 @@ chrome and font rendering.)
 
 ## Stack
 
-Rust. Four-crate workspace: `m241-core` (read-only protocol, firmware, log, EXIF/geotag), `m241-flash` (destructive write/erase path: `LogEraser` and Download Agent), `m241-cli` (`m241 device|fw|log|nmea <verb>`), `m241-gui` (`eframe`/`egui` + `walkers` for OpenStreetMap tiles). The GUI calls the same `m241-core` functions the CLI calls, never a subprocess, and does not link `m241-flash`.
+Rust. Four-crate workspace: `m241-core` (read-only protocol, firmware, log, EXIF/geotag), `m241-flash` (destructive write/erase path: `LogEraser` and Download Agent), `m241-cli` (`m241 device|fw|log|nmea <verb>`), `m241-gui` (`eframe`/`egui` + `walkers` for OpenStreetMap tiles). The GUI calls the same `m241-core` and `m241-flash` functions the CLI calls, never a subprocess: the Firmware screen's dump, write, recovery and read-back go through `m241_flash::flow`, so the GUI and the CLI share one safety path (user decision, 2026-11-23).
 
 ## Users
 

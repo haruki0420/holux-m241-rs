@@ -18,6 +18,10 @@ and asks you to remove the battery for about ten seconds, put it back, switch on
 and press Enter. A second read from a fresh boot is what makes the comparison
 mean something.
 
+The GUI's 吸い出す does the same two reads: the first pass ends with a
+power-cycle prompt, and the second pass is compared with it. Both paths save the
+file only when the two hashes agree.
+
 **This step never writes to the device.** It can be repeated as often as you like.
 
 ## Step 3 shows what will change

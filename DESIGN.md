@@ -416,10 +416,12 @@ approximation from a mistake.
   primary action beside 中止. Step 1/2's 参照 / 吸い出す / 開く / 保存 also moved
   to the secondary/primary classes, so only the destructive amber control is a
   filled button.
-- The firmware write button is armed by its gates, but pressing it reaches
-  `attempt_flash`'s refusal: `m241-gui` does not link `m241-flash` (safety gate),
-  so no write runs from this screen yet. The panel and screen say 見本, and the
-  refusal names the reason after the press rather than hiding the control.
+- The firmware write button is armed by its gates, and pressing it runs the same
+  session the CLI uses (`m241_flash::flow`) after the user types `WRITE`: the
+  range is the fixed constant, the unit is compared with the backup, the image
+  is written and the range is read back before success is shown. The GUI links
+  `m241-flash` (user decision, 2026-11-23); the safety gate requires the write
+  to go through `flow::flash` and the confirmation to come from the typed word.
 
 ### Copy and states
 

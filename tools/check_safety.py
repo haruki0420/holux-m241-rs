@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail if the read-only crate can reach the write path.
+"""Fail if the read-only crate can reach the write path, or the GUI can bypass it.
 
 Run from the repository root:
 
@@ -11,7 +11,13 @@ write or erase routine. That is not a property the compiler can verify on its
 own: nothing stops someone adding `0xD3` back to a helper in `m241-core`, or
 naming the write crate in its manifest. This gate is the mechanical half.
 
-Eight checks, each for a different way the split can rot:
+The GUI is the other half. It is allowed to write (the user's explicit
+decision), so the gate checks the direction that remains: the GUI must reach the
+write path through the shared session, must build its `WRITE` / `PROBE`
+confirmations where the typed word is checked, and must not carry a destructive
+opcode of its own.
+
+Nine checks, each for a different way the split can rot:
 
 1. **No destructive command in `m241-core`'s sources or tests.** `$PMTK182,6`
    (erase the log) and the DA opcodes `0xD3` / `0xD4` / `0xD5` / `0xD9` (record
@@ -28,14 +34,15 @@ Eight checks, each for a different way the split can rot:
    The suffix forms are included because `program_chip` is as much a write
    routine as `program`, and the review that caught it is the review this gate
    exists to make unnecessary.
-3. **The dependency runs one way.** `cargo tree -p m241-core` and
-   `cargo tree -p m241-gui` must not contain `m241-flash`, and `m241-flash`'s
-   tree must contain `m241-core`. Both directions are checked; only one of them
-   is the dangerous one, but a check that only forbids the bad direction would
-   pass if the good one were never declared.
-4. **Neither read-only manifest names the write crate.** Both
-   `crates/m241-core/Cargo.toml` and `crates/m241-gui/Cargo.toml` are checked as
-   text as well as by `cargo tree`, so a dependency that is declared and then
+3. **The dependency runs one way, from the reader to the writer.** `m241-core`
+   must not contain `m241-flash`; `m241-flash` must contain `m241-core`; and
+   `m241-gui` must contain both. The GUI writes firmware now — the user's
+   explicit decision — so it is required to link the write crate rather than
+   forbidden from it. What must never happen is the reverse edge: a read-only
+   binary that can reach the erase.
+4. **The manifests match the graph.** `crates/m241-core/Cargo.toml` must not
+   name the write crate, and `crates/m241-gui/Cargo.toml` must name it, checked
+   as text as well as by `cargo tree`, so a dependency that is declared and then
    optimised out of the resolved graph is still a finding.
 5. **DTR/RTS only in the BootROM entry path.** `set_control_lines` pulses the
    reset lines, which at a streaming firmware leaves the unit unresponsive until
@@ -62,7 +69,25 @@ Eight checks, each for a different way the split can rot:
    covered, and a future public writer is found by its range call rather than by
    its name. The check looks inside each body only, so a call in another
    function, a comment, or an uncalled nested function does not satisfy it.
-8. **The DA digest token has one production constructor.** `DaDigest` is what
+8. **The GUI's write goes through the shared session and its own typed word.**
+   `crates/m241-gui/src/device.rs` must call `flow::flash(`, and the firmware
+   screen must build the confirmation from its own typed word
+   (`Confirmation::granted` plus `Self::CONFIRMATION`). Without the first, the
+   GUI would be a second write implementation; without the second, a path could
+   write without the user typing anything. The connect screen must do the same
+   for `fw probe-da` (`PROBE_CONFIRMATION` plus `Confirmation::granted`), and
+   `Confirmation::granted` / `Job::Flash` may be constructed only in the files
+   that own those actions. Destructive opcodes (`0xD3`, `0xD4`, `0xD5`,
+   `0xD9`, `PMTK182,6`) must not appear in the GUI's code at all: it reaches
+   them only through `m241-flash`. The opcode scan has two halves because the
+   forms live in different places: identifiers and bare integer literals are
+   scanned with comments and string contents blanked (the screen says `0xD9` in
+   its operator prose on purpose), while `\\xNN` escapes and `$PMTK182,6` can
+   only appear inside a string literal and are scanned with comments stripped
+   but strings kept. This check proves the token is built in the right file, not
+   that the user typed the word: the action's own re-check and its unit test are
+   what refuse an untyped write, and the gate says so rather than implying more.
+9. **The DA digest token has one production constructor.** `DaDigest` is what
    `check_da_image_against` / `DaLoader::load_against` take, and the only
    constructor that exists in a normal build is `DaDigest::vendor()`, which is
    the pinned vendor `DA_v3.8.4.bin` digest. `DaDigest::for_test_da` is the one
@@ -150,6 +175,62 @@ DIGEST_ACCEPTANCE = re.compile(
     r"(?i)(?:firmware\s*::\s*digest|digest\s*::\s*matches|sha256(?:_hex)?\b)"
 )
 
+#: Destructive vocabulary the GUI must not carry itself. It reaches these
+#: through `m241-flash`; naming one here would be a second write implementation.
+#:
+#: The scan is split by where each form can appear. Identifiers and bare integer
+#: literals are matched against masked source (comments and string contents
+#: blanked), because the screen says `0xD9` / `0xD5` in operator prose on
+#: purpose. `\xNN` escapes and `$PMTK182,6` can only ever appear inside a string
+#: literal, so they are matched against comment-stripped source where strings are
+#: kept — masking both was the bug that made those two patterns unfireable.
+GUI_DESTRUCTIVE_CODE = (
+    re.compile(r"\bOPCODE_(?:MEM_CMD|WRITE|RESTART|ERASE_RANGE|READ_RANGE)\b"),
+    re.compile(
+        r"(?i)\b0x[dD]([3459])(?:_?(?:[ui](?:8|16|32|64|128|size)))?(?![0-9a-zA-Z_])"
+    ),
+)
+GUI_DESTRUCTIVE_TEXT = (
+    re.compile(r"(?i)\\x[dD][3459]"),
+    re.compile(r"PMTK182,6"),
+)
+
+#: GUI files whose `0xD9`-shaped literal is data, not an opcode. `theme.rs` names
+#: RGB channels (`Color32::from_rgb(0xD9, 0x85, 0xA8)`), and the log screen and its
+#: render test hold bytes of a journal fixture the parser is tested against. The
+#: exemption is path- and literal-scoped on purpose: every other GUI file is
+#: scanned, so the rule stays "no opcode anywhere it could become code" instead
+#: of narrowing the scan to the three files that talk to the device today. A test
+#: file is exempt for the literal only: the escape and `PMTK182,6` scans still
+#: run there, and tests are not shipped.
+GUI_OPCODE_LITERAL_EXEMPT = {
+    "src/theme.rs",
+    "src/screens/log.rs",
+    "tests/render.rs",
+}
+
+#: The GUI's write path must be the shared session, not a second implementation.
+GUI_FLOW_CALL = re.compile(r"\bflow\s*::\s*flash\s*\(")
+GUI_CONFIRMATION = re.compile(r"\bConfirmation\s*::\s*granted\s*\(")
+GUI_WORD = re.compile(r"\bCONFIRMATION\b")
+GUI_PROBE_WORD = re.compile(r"\bPROBE_CONFIRMATION\b")
+
+#: Only the screens that own the typed word may construct the token or the
+#: flash job: `firmware.rs` for `WRITE`, `connect.rs` for `PROBE`, and
+#: `device.rs` because it is where the job enum, its dispatch and its own test
+#: fixtures live. A construction anywhere else is a call path that reaches the
+#: writer without the screen's check — the regression `safety_gate.rs` records as
+#: the gate's own mutation. `device.rs` holds no production token construction:
+#: `run` only passes the token a screen already built, and the write job itself
+#: cannot be constructed outside `firmware.rs` (next rule).
+GUI_CONFIRMATION_ALLOWED = {
+    "src/screens/firmware.rs",
+    "src/screens/connect.rs",
+    "src/device.rs",
+}
+GUI_FLASH_JOB = re.compile(r"\bJob\s*::\s*Flash\b")
+GUI_FLASH_JOB_ALLOWED = {"src/device.rs", "src/screens/firmware.rs"}
+
 #: The one constructor of the DA digest token that a shipped build must not
 #: have. `DaDigest::vendor()` is the pinned value; this is the test-only one.
 DA_DIGEST_TEST_CTOR = re.compile(r"\bpub\s+fn\s+for_test_da\s*\(")
@@ -168,7 +249,9 @@ RAW_STRING_START = re.compile(r'(?:b|c)?r(#*)"')
 #: reaches `write_range` or `write_range_accepted`.
 PUB_FN = re.compile(r"\bpub\s+fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 WRITE_LAYOUT_CALL = re.compile(r"\bcheck_layout\s*\(\s*\)\s*\?")
-WRITE_RANGE_CALL = re.compile(r"\b(write_range|write_range_accepted)\s*\(")
+WRITE_RANGE_CALL = re.compile(
+    r"\b(write_range(?:_accepted)?(?:_with_progress)?)\s*\("
+)
 
 
 def rust_sources(root: Path) -> list[Path]:
@@ -645,17 +728,22 @@ def check_dependency_direction() -> list[str]:
 
     if GUI_MANIFEST.is_file():
         gui_manifest = GUI_MANIFEST.read_text(encoding="utf-8")
-        for name in ("m241-flash", "m241_flash"):
-            if name in gui_manifest:
-                problems.append(
-                    f"{relative(GUI_MANIFEST)}: names `{name}`; m241-gui must not "
-                    "depend on the write crate"
-                )
+        if "m241-flash" not in gui_manifest and "m241_flash" not in gui_manifest:
+            problems.append(
+                f"{relative(GUI_MANIFEST)}: does not name `m241-flash`; the GUI's write "
+                "actions must go through the shared write crate"
+            )
         gui_tree = cargo_tree("m241-gui")
         if gui_tree is None:
             problems.append("cargo tree -p m241-gui could not be read")
-        elif "m241-flash" in gui_tree:
-            problems.append("m241-gui's dependency tree contains m241-flash")
+        else:
+            if "m241-flash" not in gui_tree:
+                problems.append(
+                    "m241-gui's dependency tree does not contain m241-flash; the GUI "
+                    "cannot reach the shared write session"
+                )
+            if "m241-core" not in gui_tree:
+                problems.append("m241-gui's dependency tree does not contain m241-core")
     else:
         problems.append(
             f"{relative(GUI_MANIFEST)} is missing; cannot verify m241-gui dependencies"
@@ -675,6 +763,120 @@ def check_dependency_direction() -> list[str]:
     return problems
 
 
+def gui_relative(path: Path) -> str:
+    """The path relative to `crates/m241-gui`, or the absolute path if outside."""
+    try:
+        return str(path.relative_to(GUI)).replace("\\", "/")
+    except ValueError:
+        return str(path)
+
+
+def check_gui_write_route() -> list[str]:
+    """The GUI must write through `m241-flash` and its own typed words.
+
+    The GUI is allowed to reach the write path (the user's decision), so the
+    gate that replaces "must not link the writer" is "must use the same writer,
+    and must not carry the destructive bytes itself". Both halves are textual:
+    the call graph is what the property is about, and a source check is what
+    survives a refactor that moves the call somewhere else.
+
+    What this check does and does not prove: it proves `flow::flash(` is called,
+    that `firmware.rs` / `connect.rs` build their confirmation tokens from a
+    typed-word constant, and that no other GUI file constructs the token or the
+    flash job. It cannot prove the user typed the word — the action re-checks
+    the field (`FirmwareScreen::start_write` / `ConnectScreen::start_probe_da`)
+    and their unit tests are what refuse an untyped call. This docstring says so
+    because a gate that claims more than it checks is how the previous version
+    stayed green while two of its three opcode patterns could never fire.
+    """
+    problems = []
+    device = GUI / "src" / "device.rs"
+    firmware = GUI / "src" / "screens" / "firmware.rs"
+    connect = GUI / "src" / "screens" / "connect.rs"
+    if not device.is_file():
+        problems.append(
+            f"{relative(device)} is missing; cannot verify that the GUI writes through flow::flash"
+        )
+    else:
+        text = device.read_text(encoding="utf-8")
+        if GUI_FLOW_CALL.search(text) is None:
+            problems.append(
+                f"{relative(device)}: no `flow::flash(` call; the GUI must use the "
+                "shared session rather than a second write path"
+            )
+    if not firmware.is_file():
+        problems.append(
+            f"{relative(firmware)} is missing; cannot verify the typed confirmation"
+        )
+    else:
+        text = firmware.read_text(encoding="utf-8")
+        if GUI_CONFIRMATION.search(text) is None or GUI_WORD.search(text) is None:
+            problems.append(
+                f"{relative(firmware)}: does not build the confirmation from its typed "
+                "word; a write route without `WRITE` must not exist"
+            )
+    if not connect.is_file():
+        problems.append(
+            f"{relative(connect)} is missing; cannot verify the `PROBE` confirmation "
+            "of the DA probe (the DA runs in RAM and can program flash itself)"
+        )
+    else:
+        text = connect.read_text(encoding="utf-8")
+        if GUI_CONFIRMATION.search(text) is None or GUI_PROBE_WORD.search(text) is None:
+            problems.append(
+                f"{relative(connect)}: does not build the DA-probe confirmation from its "
+                "typed `PROBE` word; a probe route without it loads the DA unacknowledged"
+            )
+
+    for path in rust_sources(GUI / "src") + rust_sources(GUI / "tests"):
+        relative_path = gui_relative(path)
+        text = path.read_text(encoding="utf-8")
+        masked = masked_source(text)
+        # Identifiers are safe to scan everywhere: `OPCODE_*` has no prose use.
+        for number, line in enumerate(masked.splitlines(), start=1):
+            for match in GUI_DESTRUCTIVE_CODE[0].finditer(line):
+                problems.append(
+                    f"{relative(path)}:{number}: destructive command "
+                    f"`{match.group(0)}` in the GUI; reach flash through m241-flash"
+                )
+        # Bare integer literals are code, so masked source hides the operator
+        # prose that names `0xD9`; the two data uses are exempt and listed.
+        if relative_path not in GUI_OPCODE_LITERAL_EXEMPT:
+            for number, line in enumerate(masked.splitlines(), start=1):
+                for match in GUI_DESTRUCTIVE_CODE[1].finditer(line):
+                    problems.append(
+                        f"{relative(path)}:{number}: destructive command "
+                        f"`{match.group(0)}` in the GUI; reach flash through m241-flash"
+                    )
+        # Escapes and the PMTK erase sentence only exist inside string literals,
+        # so they are scanned with comments stripped and strings kept.
+        for number, line in code_lines(text):
+            for pattern in GUI_DESTRUCTIVE_TEXT:
+                for match in pattern.finditer(line):
+                    problems.append(
+                        f"{relative(path)}:{number}: destructive command "
+                        f"`{match.group(0)}` in the GUI; reach flash through m241-flash"
+                    )
+        # The token and the flash job may be built only by the screens that own
+        # the typed word (and device.rs, which names the enum).
+        if relative_path not in GUI_CONFIRMATION_ALLOWED:
+            for number, line in enumerate(masked.splitlines(), start=1):
+                for match in GUI_CONFIRMATION.finditer(line):
+                    problems.append(
+                        f"{relative(path)}:{number}: `Confirmation::granted(` outside the "
+                        "screens that check the typed word; there is no --yes equivalent "
+                        "in the GUI"
+                    )
+        if relative_path not in GUI_FLASH_JOB_ALLOWED:
+            for number, line in enumerate(masked.splitlines(), start=1):
+                for match in GUI_FLASH_JOB.finditer(line):
+                    problems.append(
+                        f"{relative(path)}:{number}: `Job::Flash` constructed outside the "
+                        "Firmware screen; the write must come from its typed word"
+                    )
+    return problems
+
+
 def main() -> int:
     if not CORE_SRC.is_dir():
         print(f"no m241-core sources found at {relative(CORE_SRC)}")
@@ -689,6 +891,7 @@ def main() -> int:
         + check_dependency_direction()
         + check_write_layout_gate()
         + check_da_digest_gate()
+        + check_gui_write_route()
     )
     print(
         f"checked {len(files)} m241-core source/test file(s) for destructive commands, "
@@ -701,10 +904,12 @@ def main() -> int:
         print(f"{len(problems)} safety violation(s)")
         return 1
     print(
-        "no write path in m241-core or m241-gui; the dependency runs one way; "
+        "no write path in m241-core; m241-gui writes through m241-flash only; "
+        "the dependency runs one way; "
         "the strict image path accepts only the backup diff; the vendor gate is a separate "
         "fixed-SHA function; every public writer runs check_layout() first; the DA digest "
-        "token has no production constructor but the pinned one"
+        "token has no production constructor but the pinned one; the GUI carries no opcode "
+        "and builds its WRITE / PROBE tokens only in the screens that check the typed word"
     )
     return 0
 

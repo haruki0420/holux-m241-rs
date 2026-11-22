@@ -51,6 +51,11 @@
 
 pub mod da;
 pub mod erase;
+/// One device session over an open transport: dump, flash with its read-back,
+/// recovery, and the DA probe. The GUI drives the unit through these functions
+/// and so reaches flash by the same `DownloadAgent` path the CLI uses; see
+/// [`flow`].
+pub mod flow;
 /// The fake Download Agent the write path's tests run against.
 ///
 /// Off by default: a shipped binary has no reason to carry a destructive

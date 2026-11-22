@@ -1972,6 +1972,7 @@ dependencies = [
  "egui",
  "egui_system_font_provider",
  "m241-core",
+ "m241-flash",
  "png",
 ]
 
