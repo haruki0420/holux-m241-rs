@@ -33,6 +33,9 @@ pub(super) enum EditCommand {
 
 impl EditCommand {
     /// The sentence the confirmation prompt shows.
+    ///
+    /// Every point number here is 1-based, the way the fields and the list show
+    /// them; the command carries 0-based indices and the summary converts once.
     fn summary(&self) -> String {
         match self {
             Self::Split {
@@ -40,14 +43,19 @@ impl EditCommand {
                 start,
                 end: Some(end),
             } => format!(
-                "トラック {} の {start}..{end} の範囲を分割",
-                track.saturating_add(1)
+                "トラック {} の {}〜{end} 点目を分割",
+                track.saturating_add(1),
+                start.saturating_add(1)
             ),
             Self::Split {
                 track,
                 start,
                 end: None,
-            } => format!("トラック {} の {start} 点目で分割", track.saturating_add(1)),
+            } => format!(
+                "トラック {} の {} 点目の前で分割",
+                track.saturating_add(1),
+                start.saturating_add(1)
+            ),
             Self::MergeAll => String::from("すべてのトラックを編集順に結合"),
             Self::Delete { track, points } => format!(
                 "トラック {} から {} 点（{}）を削除",
@@ -65,11 +73,12 @@ pub(super) struct TrackEditState {
     editor: TrackEditor,
     /// Zero-based track the range fields apply to.
     pub(super) track_index: usize,
-    /// First point of the split range.
+    /// First point of the split range, 1-based as the field shows it.
     pub(super) split_from: String,
-    /// Last point of the split range; empty for a single cut at `split_from`.
+    /// Last point of the split range (1-based); empty for a single cut at
+    /// `split_from`.
     pub(super) split_to: String,
-    /// Comma- or space-separated point numbers to delete.
+    /// Comma- or space-separated 1-based point numbers to delete.
     pub(super) delete_list: String,
     pending: Option<EditCommand>,
     /// Inline result of the last request, confirmation or undo.
@@ -197,9 +206,15 @@ impl TrackEditState {
 
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("対象").size(size::CAPTION).color(theme::MUTE));
-            let _response = ui.add(
-                egui::DragValue::new(&mut self.track_index).range(0..=count.saturating_sub(1)),
-            );
+            // The editor indexes tracks from 0; the field shows 1..=count so the
+            // number on screen matches the confirmation sentence below.
+            let mut shown = self.track_index.saturating_add(1);
+            if ui
+                .add(egui::DragValue::new(&mut shown).range(1..=count.max(1)))
+                .changed()
+            {
+                self.track_index = shown.saturating_sub(1).min(count.saturating_sub(1));
+            }
             ui.label(
                 RichText::new(format!("/ {count} トラック"))
                     .size(size::CAPTION)
@@ -216,6 +231,7 @@ impl TrackEditState {
                 let _response = ui.add(
                     egui::TextEdit::singleline(value)
                         .desired_width(30.0)
+                        .hint_text("点")
                         .font(egui::TextStyle::Monospace),
                 );
             }
@@ -225,7 +241,7 @@ impl TrackEditState {
                 self.request_split();
             }
             ui.label(
-                RichText::new("終了が空なら 1 箇所")
+                RichText::new("点番号は 1 始まり。終了が空なら 1 箇所")
                     .size(size::CAPTION)
                     .color(theme::MUTE),
             );
@@ -270,38 +286,48 @@ impl TrackEditState {
     }
 
     /// Parse and validate the range fields into a command.
+    ///
+    /// The fields are 1-based point numbers; `EditCommand` carries 0-based
+    /// indices. The end is an inclusive 1-based number, which is the exclusive
+    /// 0-based split boundary the core takes (`end == length` means "to the last
+    /// point", so no second cut is needed).
     fn split_command(&self) -> Result<EditCommand, String> {
         let track = self.editor.track(self.track_index).ok_or_else(|| {
-            String::from("対象のトラックが見つかりません。トラック番号を確認してください")
+            String::from("対象のトラックが見つかりません。対象を選び直してください")
         })?;
         let length = track.points.len();
         let start = parse_point(&self.split_from, "分割開始")?;
-        if start >= length {
+        if start == 0 || start > length {
             return Err(format!(
-                "分割開始は 0..{} の範囲で指定してください（{length} 点）",
-                length.saturating_sub(1)
+                "分割開始は 1..={length} の範囲で指定してください（{length} 点）"
             ));
         }
+        let start = start - 1;
         let end = if self.split_to.trim().is_empty() {
             None
         } else {
             let end = parse_point(&self.split_to, "分割終了")?;
-            if end > length {
-                return Err(format!("分割終了は {length} 以下にしてください"));
+            if end == 0 || end > length {
+                return Err(format!(
+                    "分割終了は 1..={length} の範囲で指定してください（{length} 点）"
+                ));
             }
             Some(end)
         };
-        let start_is_edge = start == 0;
         match end {
-            Some(end) if end <= start => {
-                return Err(String::from("分割終了は分割開始より後にしてください"));
-            }
-            Some(end) if start_is_edge && end == length => {
-                return Err(String::from("範囲が全点なので分割されません"));
-            }
-            None if start_is_edge => {
+            Some(end) if end < start.saturating_add(1) => {
                 return Err(String::from(
-                    "分割開始が 0 です。終了を指定するか 1 以上を入力してください",
+                    "分割終了は分割開始以降の点番号にしてください（例: 開始 10・終了 20）",
+                ));
+            }
+            Some(end) if start == 0 && end == length => {
+                return Err(String::from(
+                    "範囲が全点なので分割されません。開始を 2 以上にするか、終了を最終点より前にしてください",
+                ));
+            }
+            None if start == 0 => {
+                return Err(String::from(
+                    "分割開始が 1 です。終了を指定するか 2 以上を入力してください",
                 ));
             }
             _ => {}
@@ -314,9 +340,11 @@ impl TrackEditState {
     }
 
     /// Parse and validate the delete list into a command.
+    ///
+    /// The list is 1-based point numbers; the command carries 0-based indices.
     fn delete_command(&self) -> Result<EditCommand, String> {
         let track = self.editor.track(self.track_index).ok_or_else(|| {
-            String::from("対象のトラックが見つかりません。トラック番号を確認してください")
+            String::from("対象のトラックが見つかりません。対象を選び直してください")
         })?;
         let length = track.points.len();
         let mut points: Vec<usize> = self
@@ -326,21 +354,22 @@ impl TrackEditState {
             })
             .filter(|part| !part.is_empty())
             .map(|part| {
-                part.parse::<usize>()
-                    .map_err(|_| format!("{part:?} は点番号ではありません（カンマ区切りで入力）"))
+                part.parse::<usize>().map_err(|_| {
+                    format!("{part:?} は点番号ではありません（1 始まりの数字をカンマ区切りで）")
+                })
             })
             .collect::<Result<_, _>>()?;
         if points.is_empty() {
             return Err(String::from(
-                "削除する点番号を入力してください（カンマ区切り）",
+                "削除する点番号を入力してください（1 始まり。例: 3,5,9）",
             ));
         }
-        if let Some(out_of_range) = points.iter().find(|point| **point >= length) {
+        if let Some(out_of_range) = points.iter().find(|point| **point == 0 || **point > length) {
             return Err(format!(
-                "点番号 {out_of_range} は範囲外です（0..{}）",
-                length.saturating_sub(1)
+                "点番号 {out_of_range} は範囲外です（1..={length}）"
             ));
         }
+        points.iter_mut().for_each(|point| *point -= 1);
         points.sort_unstable();
         points.dedup();
         Ok(EditCommand::Delete {
@@ -357,32 +386,30 @@ impl TrackEditState {
                     .editor
                     .track(*track)
                     .map(|held| held.points.len())
-                    .ok_or_else(|| String::from("対象のトラックが見つかりません"))?;
+                    .ok_or_else(|| {
+                        String::from("対象のトラックが見つかりません。対象を選び直してください")
+                    })?;
                 // Split at the later edge first: the earlier index still refers
                 // to the first half after that, which is what makes the range
                 // land in one piece.
                 if let Some(end) = end
                     && *end < length
                 {
-                    self.editor
-                        .split(*track, *end)
-                        .map_err(|err| err.to_string())?;
+                    self.editor.split(*track, *end).map_err(edit_error)?;
                 }
                 if *start > 0 {
-                    self.editor
-                        .split(*track, *start)
-                        .map_err(|err| err.to_string())?;
+                    self.editor.split(*track, *start).map_err(edit_error)?;
                 }
                 Ok(())
             }
             EditCommand::MergeAll => {
                 let indices: Vec<usize> = (0..self.track_count()).collect();
-                self.editor.merge(&indices).map_err(|err| err.to_string())
+                self.editor.merge(&indices).map_err(edit_error)
             }
             EditCommand::Delete { track, points } => self
                 .editor
                 .delete_points(*track, points)
-                .map_err(|err| err.to_string()),
+                .map_err(edit_error),
         }
     }
 
@@ -411,25 +438,34 @@ impl TrackEditState {
     }
 }
 
-/// Parse one non-negative point number, naming the field it came from.
+/// Parse one 1-based point number, naming the field it came from.
 fn parse_point(text: &str, what: &str) -> Result<usize, String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
-        return Err(format!("{what}を入力してください"));
+        return Err(format!("{what}を入力してください（1 始まりの点番号）"));
     }
     trimmed
         .parse::<usize>()
-        .map_err(|_| format!("{what}は 0 以上の点番号で入力してください"))
+        .map_err(|_| format!("{what}は 1 以上の点番号で入力してください（例: 10。0 は使えません）"))
 }
 
-/// `1, 3, 5` for the confirmation prompt.
+/// A core editing error plus the core's own next-step hint, when it has one.
+///
+/// `execute` pre-validates every range so these are fallbacks; the hint keeps
+/// the sentence actionable in the case the pre-check and the core disagree.
+fn edit_error(err: m241_core::Error) -> String {
+    err.hint()
+        .map_or_else(|| err.to_string(), |hint| format!("{err}。{hint}"))
+}
+
+/// `1, 3, 5` for the confirmation prompt, in the 1-based numbers the fields use.
 fn join(points: &[usize]) -> String {
     let mut shown = String::new();
     for (index, point) in points.iter().enumerate() {
         if index > 0 {
             shown.push_str(", ");
         }
-        shown.push_str(&point.to_string());
+        shown.push_str(&point.saturating_add(1).to_string());
     }
     shown
 }

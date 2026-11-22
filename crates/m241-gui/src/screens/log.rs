@@ -107,6 +107,16 @@ fn geotag_targets(entries: &[PhotoEntry]) -> Vec<&Path> {
         .collect()
 }
 
+/// One plan paired with the track point it will be written from.
+///
+/// The four places that build a [`PhotoEntry`] go through here so the
+/// `find_matching_point_index` rule cannot be spelled differently in one of
+/// them; the sample block and the three file paths all take the same route.
+fn photo_entry(track: &Track, plan: GeotagPlan) -> PhotoEntry {
+    let point_index = find_matching_point_index(track, &plan);
+    PhotoEntry { plan, point_index }
+}
+
 /// The Log screen's own state.
 #[derive(Debug)]
 pub struct LogScreen {
@@ -234,8 +244,9 @@ impl LogScreen {
             let Some(point) = self.track.points.get(index).copied() else {
                 continue;
             };
-            entries.push(PhotoEntry {
-                plan: GeotagPlan {
+            entries.push(photo_entry(
+                &self.track,
+                GeotagPlan {
                     photo: PathBuf::from("photos").join(name),
                     capture_time: point.utc.map(CaptureTime::Exif),
                     point: Some(point),
@@ -244,24 +255,31 @@ impl LogScreen {
                     keep_backup: false,
                     group_id: None,
                 },
-                point_index: Some(index),
-            });
+            ));
         }
         self.photo_path = String::from("photos");
         self.photo_entries = entries;
+        // The block is captioned 「見本」 and the status says so too: the
+        // screenshot's photo rows must not read as "two JPEGs were loaded". One
+        // line, so the rail keeps its §5 height at 1280×800.
         self.photo_status = Some((
             Status::Ok,
-            format!(
-                "{} 枚を読み込みました（一致 {} 枚）",
-                self.photo_entries.len(),
-                self.matched_photo_count()
-            ),
+            format!("見本の写真 {} 枚（未読込）", self.photo_entries.len()),
         ));
         self.selected_photo = None;
         self.sync_photo_to_selected();
         if self.selected_photo.is_none() && !self.photo_entries.is_empty() {
             self.selected_photo = Some(0);
         }
+    }
+
+    /// Fill the shift controls with sample values for the screenshot renderer.
+    ///
+    /// No file is read: the camera is invented and the entries are the sample
+    /// photo block, so the frame shows the controls the wiring added without
+    /// pretending a real camera was resolved.
+    pub fn show_sample_photo_shift(&mut self) {
+        self.photo_shift.show_sample(&self.photo_entries);
     }
 
     /// Set the KMZ 最大長辺 field; empty means the original bytes are embedded.
@@ -420,12 +438,14 @@ impl LogScreen {
     /// would change, and selecting another point re-syncs the highlighted photo,
     /// so the prompt's premise has moved.
     pub fn select_point(&mut self, index: Option<usize>) {
+        let previous_photo = self.selected_photo;
         self.selected = index.filter(|i| *i < self.track.points.len());
         self.close_geotag_confirmation();
         if self.follow && self.map_zoom < FOLLOW_MIN_ZOOM {
             self.map_zoom = FOLLOW_MIN_ZOOM;
         }
         self.sync_photo_to_selected();
+        self.replan_by_camera_if_base_changed(previous_photo);
     }
 
     /// Toggle playback on or off.
@@ -558,19 +578,18 @@ impl LogScreen {
         self.photo_path = path.display().to_string();
         self.photo_entries = plans
             .into_iter()
-            .map(|plan| {
-                let point_index = find_matching_point_index(&self.track, &plan);
-                PhotoEntry { plan, point_index }
-            })
+            .map(|plan| photo_entry(&self.track, plan))
             .collect();
         self.photo_shift.selected.clear();
+        self.photo_shift.pending = false;
         self.close_geotag_confirmation();
         self.sync_photo_to_selected();
         if self.selected_photo.is_none() && !self.photo_entries.is_empty() {
             self.selected_photo = Some(0);
         }
         // A non-default shift or scope is now applicable, because the highlighted
-        // photo exists; the unshifted plan above is the fallback when it fails.
+        // photo exists; the unshifted plan above stays on screen if it fails, and
+        // `replan_photos` marks it stale so it is not written.
         if self.photo_shift.kind != ScopeKind::All
             || self
                 .photo_shift
@@ -585,29 +604,31 @@ impl LogScreen {
         let matched = self.matched_photo_count();
         self.photo_status = Some((
             Status::Ok,
-            format!("{total} 枚を読み込みました（一致 {matched} 枚）"),
+            format!("{total} 枚を読み込みました（一致 {matched} 枚・5 分以内）"),
         ));
         Ok(matched)
     }
 
     /// Re-plan the loaded photos with the current shift and scope.
     ///
-    /// The plans are the screen's only record of "what would be written"; when a
-    /// re-plan fails, keeping the previous ones would let a scope the person
-    /// could not apply be written anyway, so the entries are dropped instead and
-    /// the message says the photos must be loaded again.
+    /// On success the entries are replaced by the new decision. On failure the
+    /// previous entries stay on screen so the list and controls remain
+    /// operable, and [`PhotoShiftSettings::plan_stale`] is set: the plan a
+    /// person reviews must be the plan `apply` writes, so an older plan must not
+    /// be written while the controls ask for something else.
     ///
     /// # Errors
     ///
-    /// The scope's own refusal (no highlighted photo for `byCamera`, a photo
-    /// whose Make/Model cannot be read, an unreadable photo, a shift that does
-    /// not fit in seconds).
+    /// The scope's own refusal, re-worded for the rail. The caller decides
+    /// whether the older plan can still be shown (an explicit control change) or
+    /// must be dropped (a track edit moved the points it names).
     fn replan_photos(&mut self) -> Result<(), String> {
         let paths: Vec<PathBuf> = self
             .photo_entries
             .iter()
             .map(|entry| entry.plan.photo.clone())
             .collect();
+        self.photo_shift.pending = false;
         if paths.is_empty() {
             return Ok(());
         }
@@ -617,14 +638,14 @@ impl LogScreen {
             .plan(&paths, &self.track, &options, self.selected_photo)
         {
             Ok(plans) => {
+                self.photo_shift.note_plans(&plans);
                 self.photo_entries = plans
                     .into_iter()
-                    .map(|plan| {
-                        let point_index = find_matching_point_index(&self.track, &plan);
-                        PhotoEntry { plan, point_index }
-                    })
+                    .map(|plan| photo_entry(&self.track, plan))
                     .collect();
                 self.close_geotag_confirmation();
+                self.photo_shift.plan_stale = false;
+                self.photo_status = None;
                 self.photo_shift.status = Some((
                     Status::Ok,
                     format!("{} 枚を再計画しました", self.photo_entries.len()),
@@ -632,12 +653,11 @@ impl LogScreen {
                 Ok(())
             }
             Err(message) => {
-                self.photo_entries.clear();
-                self.selected_photo = None;
+                self.photo_shift.plan_stale = true;
                 self.close_geotag_confirmation();
                 self.photo_shift.status = Some((
                     Status::Err,
-                    format!("{message}。写真を読み込み直してください"),
+                    format!("{message}。前の計画のままなので書き込みは止めています"),
                 ));
                 Err(message)
             }
@@ -652,6 +672,7 @@ impl LogScreen {
             return;
         };
         let point_index = entry.point_index;
+        let previous_photo = self.selected_photo;
         self.selected_photo = Some(photo_index);
         if let Some(point_index) = point_index
             && point_index < self.track.points.len()
@@ -665,6 +686,31 @@ impl LogScreen {
         } else {
             self.close_geotag_confirmation();
         }
+        self.replan_by_camera_if_base_changed(previous_photo);
+    }
+
+    /// Re-plan when the highlighted photo's camera changes under `byCamera`.
+    ///
+    /// The highlighted row is both "the photo the map points at" and the base
+    /// photo `byCamera` reads Make/Model from. Selecting another photo of the
+    /// same camera leaves the scope identical, so only a *camera* change
+    /// re-plans; that keeps playback from re-reading the folder every step while
+    /// still making the list follow the highlighted camera.
+    fn replan_by_camera_if_base_changed(&mut self, previous_photo: Option<usize>) {
+        if self.photo_shift.kind != ScopeKind::ByCamera || self.selected_photo == previous_photo {
+            return;
+        }
+        let Some(photo) = self
+            .selected_photo
+            .and_then(|index| self.photo_entries.get(index))
+            .map(|entry| entry.plan.photo.clone())
+        else {
+            return;
+        };
+        if self.photo_shift.by_camera_unchanged(&photo) {
+            return;
+        }
+        let _replan_failed = self.replan_photos();
     }
 
     /// Apply the planned geotags to disk.
@@ -688,6 +734,14 @@ impl LogScreen {
     ///
     /// Returns a Japanese error string if no matched photos exist or writing EXIF fails.
     fn apply_geotags(&mut self, _confirmation: GeotagConfirmation) -> Result<usize, String> {
+        if self.photo_shift.plan_stale {
+            let msg = String::from(
+                "写真の計画が最新ではないため書き込みません。範囲かシフトを直すか、写真を読み込み直してください",
+            );
+            self.outcome = Some((Status::Err, msg.clone()));
+            self.close_geotag_confirmation();
+            return Err(msg);
+        }
         let plans: Vec<GeotagPlan> = self
             .photo_entries
             .iter()
@@ -700,6 +754,11 @@ impl LogScreen {
             self.close_geotag_confirmation();
             return Err(msg);
         }
+        // Counted before the write and before the shift is cleared: the message
+        // has to say how many clocks moved, and `shifted_count` reads the value
+        // that is about to be zeroed.
+        let moved = self.photo_shift.shifted_count(&plans);
+        let shift_seconds = self.photo_shift.shift.total_seconds();
         let result = geotag::apply(&plans);
         // Closed before the branch: success and failure both end the confirmation,
         // because a failed write leaves nothing the person can approve again.
@@ -710,23 +769,25 @@ impl LogScreen {
                 // The shift is written into `DateTimeOriginal` by `apply`, so it
                 // must not stay armed: the next plan would move the same clocks a
                 // second time. Zeroing it keeps the controls and the files in step.
-                let shifted = self
-                    .photo_shift
-                    .shift
-                    .total_seconds()
-                    .is_some_and(|seconds| seconds != 0);
                 self.photo_shift.shift = PhotoTimeShift::default();
                 self.photo_shift.status = None;
-                let msg = if shifted {
+                let msg = if shift_seconds.is_some_and(|seconds| seconds != 0) {
                     format!(
-                        "{count} 枚の写真に位置とシフト後の時刻を書き込みました（シフト値は 0 に戻しました）"
+                        "{count} 枚の写真に位置情報を書き込みました（シフト: 範囲内 {} 枚 / 範囲外 {} 枚。シフト値は 0 に戻しました）",
+                        moved.min(count),
+                        count.saturating_sub(moved)
                     )
                 } else {
                     format!("{count} 枚の写真に位置情報を書き込みました")
                 };
+                // Re-plan before recording the message: a byCamera re-plan that
+                // fails has to keep its own error visible instead of being
+                // overwritten by the success sentence.
+                if self.relink_photos() {
+                    self.photo_shift.status = None;
+                }
                 self.outcome = Some((Status::Ok, msg.clone()));
                 self.photo_status = Some((Status::Ok, msg));
-                self.relink_photos();
                 Ok(count)
             }
             Err(err) => {
@@ -740,8 +801,21 @@ impl LogScreen {
     /// Open the geotag confirmation prompt.
     ///
     /// Only meaningful when a photo would be written; with none, the prompt would
-    /// offer to change zero files.
+    /// offer to change zero files. A pending control value is planned first, and
+    /// a failed re-plan refuses with its own sentence rather than offering to
+    /// write the older plan the person is no longer looking at.
     fn open_geotag_confirmation(&mut self) {
+        if self.photo_shift.pending {
+            let _replan_failed = self.replan_photos();
+        }
+        if self.photo_shift.plan_stale {
+            let msg = String::from(
+                "写真の計画が最新ではないため確認を開けません。範囲かシフトを直すか、写真を読み込み直してください",
+            );
+            self.outcome = Some((Status::Err, msg));
+            self.confirm_geotag = false;
+            return;
+        }
         self.confirm_geotag = self.matched_photo_count() > 0;
     }
 
@@ -1049,16 +1123,23 @@ impl LogScreen {
         ui.add_space(space::M);
         self.photo_rail_section(ui);
 
-        ui.add_space(space::M);
-        self.edit_section(ui);
+        // 集計 keeps DESIGN.md §5/§10's position directly after the photo block;
+        // 編集 came last because its fields are tall and would push the figures
+        // below the fold on a 1280×800 window. `S` rather than `M` is what keeps
+        // the 集計 caption inside the rail's viewport at that size.
+        ui.add_space(space::S);
+        self.summary_block(ui, settings);
 
         ui.add_space(space::M);
-        self.summary_block(ui, settings);
+        self.edit_section(ui);
     }
 
     /// 写真 rail block: load a photo folder/file with `geotag::plan` and sync with the track.
     fn photo_rail_section(&mut self, ui: &mut Ui) {
-        ui.label(RichText::new("写真").size(size::CAPTION).color(theme::MUTE));
+        // The sample marker is the block title here too: the screenshot's photo
+        // rows are invented, and every other invented figure on the screen
+        // already wears 「見本」 (DESIGN.md §10).
+        common::block_title(ui, "写真", self.sample);
         common::hairline(ui);
         ui.add_space(space::XS);
 
@@ -1096,6 +1177,12 @@ impl LogScreen {
                     .size(size::CAPTION)
                     .color(theme::MUTE),
             );
+            // A refused load or a track edit that invalidated the plan drops the
+            // entries; its reason still has to be drawn where the photo controls
+            // are, not only where the list used to be.
+            if let Some((status, message)) = &self.photo_shift.status {
+                common::status_line(ui, *status, message);
+            }
             return;
         }
 
@@ -1167,9 +1254,10 @@ impl LogScreen {
             self.select_photo(index);
         }
 
-        ui.add_space(space::S);
-        let controls_changed = self.photo_shift.ui(ui);
-        if shift_selection_changed || controls_changed {
+        // `photo_shift.ui` opens with its own `space::S`; a second one here
+        // pushed 集計's heading past the rail's viewport at 1280×800.
+        let controls_settled = self.photo_shift.ui(ui, &self.photo_entries);
+        if shift_selection_changed || controls_settled {
             let _replanned = self.replan_photos();
         }
     }
@@ -1732,11 +1820,14 @@ impl LogScreen {
 
         // KMZ is the one writer that needs a second input, so its folder and its
         // long-edge limit sit directly under the action that reads them rather
-        // than in the photo block, which is scrolled away at the footer.
+        // than in the photo block, which is scrolled away at the footer. The row
+        // stays a single line: the matching rule lives with the photo list and
+        // the 未検証 marker rides here, so the pinned strip does not grow tall
+        // enough to cut the speed chart at 1280×800.
         if self.kmz {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("写真").size(size::CAPTION).color(theme::MUTE));
-                let width = (ui.available_width() - 180.0).max(120.0);
+                let width = (ui.available_width() - 240.0).max(120.0);
                 let _response = ui.add_sized(
                     Vec2::new(width, metric::ROW),
                     egui::TextEdit::singleline(&mut self.photo_path)
@@ -1744,12 +1835,17 @@ impl LogScreen {
                         .font(egui::TextStyle::Monospace),
                 );
                 kmz_export::max_edge_field(ui, &mut self.kmz_max_edge);
+                // Google Earth / `unzip` are not part of this build's checks, so
+                // the writer wears the word DESIGN.md §6 requires rather than
+                // looking like a format that has been opened and judged. The
+                // explanation is on hover: the pinned strip has one row for it.
+                ui.label(
+                    RichText::new("未検証")
+                        .size(size::CAPTION)
+                        .color(theme::MUTE),
+                )
+                .on_hover_text("表示中の写真計画（5 分以内）をそのまま同梱します。CLI と同じ export_kmz ですが、Google Earth や unzip での表示は未検証です");
             });
-            ui.label(
-                RichText::new("写真は撮影時刻で軌跡に一致させます（5 分以内）")
-                    .size(size::CAPTION)
-                    .color(theme::MUTE),
-            );
         }
 
         if self.confirm_geotag {
@@ -1776,6 +1872,9 @@ impl LogScreen {
                     names.join("、")
                 ),
             );
+            if let Some(note) = self.photo_shift.shift_note(&self.photo_entries) {
+                common::status_line(ui, Status::Waiting, &note);
+            }
             ui.horizontal_wrapped(|ui| {
                 if common::primary_button(ui, "書き込む", true).clicked()
                     && let Some(confirmation) = self.confirm_geotag_write()
@@ -1867,6 +1966,12 @@ impl LogScreen {
 
     /// Match the photos in 写真 to the track and write a KMZ archive.
     ///
+    /// The plans are the ones on screen — the same list `apply_geotags` writes
+    /// and the rail shows — not a second planning pass from the folder. The one
+    /// exception is an empty photo block: with nothing displayed there is no
+    /// review to honour, so the archive is planned the way the CLI does (no
+    /// shift, every photo), and no controls are on screen to disagree with it.
+    ///
     /// The order of the checks follows the fields the person can fix: the
     /// destination, the long-edge limit, then the folder. Each refusal is stored
     /// in [`Self::outcome`], which the export bar prints under the action.
@@ -1878,8 +1983,43 @@ impl LogScreen {
         if self.track.points.is_empty() {
             return self.fail(String::from("書き出す点がありません"));
         }
+        if self.photo_shift.pending && !self.photo_entries.is_empty() {
+            let _replan_failed = self.replan_photos();
+        }
+        if self.photo_shift.plan_stale {
+            return self.fail(String::from(
+                "写真の計画が最新ではないため KMZ を書き出しません。範囲かシフトを直すか、写真を読み込み直してください",
+            ));
+        }
+        // The KML `<TimeStamp>` is the plan's capture time, and an armed shift
+        // moves that time while the photo's Exif clock only changes when the
+        // tags are written. Refusing here keeps the archive from disagreeing
+        // with the photos it bundles; the next step is the geotag write, which
+        // zeroes the shift.
+        if self
+            .photo_shift
+            .shift
+            .total_seconds()
+            .is_some_and(|seconds| seconds != 0)
+        {
+            return self.fail(String::from(
+                "シフトを設定したままでは KMZ の時刻と写真 Exif が食い違います。先に「写真に位置」で書き込むとシフトは 0 に戻ります",
+            ));
+        }
         let dest_path = self.checked_destination()?;
         let dest_trimmed = self.destination.trim().to_owned();
+        // The chip and the destination can disagree (the field is editable), and
+        // a ZIP named `.gpx` would lie about its contents: refuse here rather than
+        // write an archive under the wrong extension.
+        let extension_matches = dest_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("kmz"));
+        if !extension_matches {
+            return self.fail(String::from(
+                "保存先の拡張子が .kmz ではありません。KMZ チップを選び直すか、保存先を .kmz にしてください",
+            ));
+        }
         let max_edge = match kmz_export::parse_max_edge(&self.kmz_max_edge) {
             Ok(max_edge) => max_edge,
             Err(message) => return self.fail(message),
@@ -1889,29 +2029,47 @@ impl LogScreen {
             Ok(paths) => paths,
             Err(message) => return self.fail(message),
         };
-        let plans = match self.photo_shift.plan(
-            &paths,
-            &self.track,
-            &GeotagOptions::default(),
-            self.selected_photo,
-        ) {
-            Ok(plans) => plans,
+        let plans: Vec<GeotagPlan> = if self.photo_entries.is_empty() {
+            match geotag::plan(&paths, &self.track, &GeotagOptions::default()) {
+                Ok(plans) => plans,
+                Err(err) => return self.fail(format!("写真を計画できません: {err}")),
+            }
+        } else {
+            let shown: Vec<PathBuf> = self
+                .photo_entries
+                .iter()
+                .map(|entry| entry.plan.photo.clone())
+                .collect();
+            if shown != paths {
+                return self.fail(String::from(
+                    "一覧の写真と写真フォルダが一致しません。「読込」でこのフォルダを読み込んでから書き出してください",
+                ));
+            }
+            self.photo_entries
+                .iter()
+                .map(|entry| entry.plan.clone())
+                .collect()
+        };
+        let embedded = plans.iter().filter(|plan| plan.will_write()).count();
+        let reasons = kmz_export::skipped_reasons(&plans);
+        let archive = match kmz_export::build_archive(&self.track, &plans, max_edge) {
+            Ok(archive) => archive,
             Err(message) => return self.fail(message),
         };
-        let (archive, embedded, skipped) =
-            match kmz_export::build_archive(&self.track, &plans, max_edge) {
-                Ok(result) => result,
-                Err(message) => return self.fail(message),
-            };
         match std::fs::write(&dest_path, archive) {
             Ok(()) => {
-                self.outcome = Some((
-                    Status::Ok,
-                    format!(
-                        "{dest_trimmed} に {} 点・{embedded} 枚を書き出しました（対象外 {skipped} 枚）",
-                        self.track.points.len()
-                    ),
-                ));
+                let mut message = format!(
+                    "{dest_trimmed} に {} 点・{embedded} 枚を書き出しました",
+                    self.track.points.len()
+                );
+                if !reasons.is_empty() {
+                    message.push_str(&format!(
+                        "（対象外 {} 枚: {}）",
+                        plans.len().saturating_sub(embedded),
+                        reasons.join("、")
+                    ));
+                }
+                self.outcome = Some((Status::Ok, message));
                 Ok(())
             }
             Err(err) => self.fail(format!("KMZ を書き出せませんでした: {err}")),
@@ -2095,34 +2253,40 @@ impl LogScreen {
         }
     }
 
-    fn relink_photos(&mut self) {
+    /// Re-plan after a track edit, returning whether the entries still describe
+    /// the track.
+    ///
+    /// The edit moved the points the old plan names, so a re-plan failure here
+    /// cannot keep the entries: a row whose `point_index` points at a deleted
+    /// record would write a coordinate the edit removed. The entries are dropped
+    /// with the reason and the person is asked to load the photos again. An
+    /// explicit control change can keep its older list instead — that plan still
+    /// matched the track, and [`Self::replan_photos`] marks it stale so it is not
+    /// written.
+    fn relink_photos(&mut self) -> bool {
         if self.photo_entries.is_empty() {
-            return;
+            return true;
         }
-        let paths: Vec<PathBuf> = self
-            .photo_entries
-            .iter()
-            .map(|entry| entry.plan.photo.clone())
-            .collect();
-        // Re-planning with the current shift/scope, not `geotag::plan`: an edit
-        // to the track changes which point a photo matches, and the shift the
-        // person armed must survive that re-match. `apply` zeroes the shift once
-        // it has been written, so this cannot move a clock twice.
-        if let Ok(plans) = self.photo_shift.plan(
-            &paths,
-            &self.track,
-            &GeotagOptions::default(),
-            self.selected_photo,
-        ) {
-            self.photo_entries = plans
-                .into_iter()
-                .map(|plan| {
-                    let point_index = find_matching_point_index(&self.track, &plan);
-                    PhotoEntry { plan, point_index }
-                })
-                .collect();
-            self.sync_photo_to_selected();
-        }
+        // Re-pick the highlighted photo against the edited track first: a
+        // `byCamera` re-plan reads its Make/Model from that row, so it has to be
+        // the row the new points point at.
+        self.sync_photo_to_selected();
+        let Err(message) = self.replan_photos() else {
+            return true;
+        };
+        self.photo_entries.clear();
+        self.selected_photo = None;
+        self.photo_shift.selected.clear();
+        self.photo_shift.pending = false;
+        self.photo_shift.plan_stale = false;
+        self.close_geotag_confirmation();
+        self.photo_shift.status = Some((
+            Status::Err,
+            format!(
+                "トラック編集で写真の対応を更新できませんでした: {message}。写真を読み込み直してください"
+            ),
+        ));
+        false
     }
 
     /// `11/14` → count, in the order the device recorded them.
@@ -2535,8 +2699,63 @@ mod tests {
         bytes.extend_from_slice(b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0");
         // EOI
         bytes.extend_from_slice(&[0xFF, 0xD9]);
+        write_jpeg_with_mtime(dir, name, &bytes, utc)
+    }
+
+    /// A JPEG whose Exif IFD0 names `make` / `model`, written for the camera
+    /// scope tests.
+    ///
+    /// The core's fixture builders are `#[cfg(test)]` inside `m241-core`, so a
+    /// GUI test cannot reuse them; this is the smallest block `CameraModel`
+    /// reads (big-endian TIFF with two ASCII IFD0 entries). The names are longer
+    /// than four bytes on purpose, so both values live in the value area instead
+    /// of the inline field.
+    fn jpeg_with_camera(dir: &Path, name: &str, make: &str, model: &str, utc: u32) -> PathBuf {
+        let mut tiff = Vec::new();
+        tiff.extend_from_slice(b"MM");
+        tiff.extend_from_slice(&42_u16.to_be_bytes());
+        tiff.extend_from_slice(&8_u32.to_be_bytes());
+        let make_end = 8 + 2 + 12 * 2 + 4; // IFD0 count, two entries, next-IFD link
+        let model_end = make_end + make.len() + 1;
+        tiff.extend_from_slice(&2_u16.to_be_bytes());
+        push_ascii_entry(&mut tiff, 0x010F, make, make_end);
+        push_ascii_entry(&mut tiff, 0x0110, model, model_end);
+        tiff.extend_from_slice(&0_u32.to_be_bytes());
+        tiff.extend_from_slice(make.as_bytes());
+        tiff.push(0);
+        tiff.extend_from_slice(model.as_bytes());
+        tiff.push(0);
+
+        let mut payload = b"Exif\0\0".to_vec();
+        payload.extend_from_slice(&tiff);
+        let mut bytes = vec![0xFF, 0xD8];
+        push_jpeg_segment(&mut bytes, 0xE0, b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0");
+        push_jpeg_segment(&mut bytes, 0xE1, &payload);
+        bytes.extend_from_slice(&[0xFF, 0xD9]);
+        write_jpeg_with_mtime(dir, name, &bytes, utc)
+    }
+
+    fn push_ascii_entry(out: &mut Vec<u8>, tag: u16, text: &str, value_offset: usize) {
+        out.extend_from_slice(&tag.to_be_bytes());
+        out.extend_from_slice(&2_u16.to_be_bytes());
+        out.extend_from_slice(
+            &u32::try_from(text.len() + 1)
+                .expect("a test name fits")
+                .to_be_bytes(),
+        );
+        out.extend_from_slice(&u32::try_from(value_offset).expect("fits").to_be_bytes());
+    }
+
+    fn push_jpeg_segment(out: &mut Vec<u8>, marker: u8, payload: &[u8]) {
+        out.extend_from_slice(&[0xFF, marker]);
+        let length = u16::try_from(payload.len() + 2).expect("a test segment fits");
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(payload);
+    }
+
+    fn write_jpeg_with_mtime(dir: &Path, name: &str, bytes: &[u8], utc: u32) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, &bytes).expect("write jpeg");
+        std::fs::write(&path, bytes).expect("write jpeg");
         let file = std::fs::File::options()
             .write(true)
             .open(&path)
@@ -2545,6 +2764,61 @@ mod tests {
             .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::from(utc)));
         file.set_times(times).expect("set jpeg mtime");
         path
+    }
+
+    /// Every text run the screen tessellated at 1280×800, with its position.
+    ///
+    /// Two passes settle the immediate-mode layout; the collection ignores clip
+    /// rectangles, so a line the body would let a person scroll to still counts
+    /// as drawn. That is the right question for "is the refusal on screen rather
+    /// than only in a field nobody sees".
+    fn screen_text_runs(screen: &mut LogScreen) -> Vec<(String, egui::Pos2)> {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(1280.0, 800.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let mut runs = Vec::new();
+        for _pass in 0..2 {
+            let output = ctx.run_ui(input.clone(), |ui| {
+                screen.ui_with_settings(ui, &AppSettings::default());
+            });
+            runs.clear();
+            collect_text_runs(&output.shapes, &mut runs);
+            output.drop_without_applying_deltas();
+        }
+        runs
+    }
+
+    fn screen_texts(screen: &mut LogScreen) -> Vec<String> {
+        screen_text_runs(screen)
+            .into_iter()
+            .map(|(text, _pos)| text)
+            .collect()
+    }
+
+    fn collect_text_runs(
+        shapes: &[egui::epaint::ClippedShape],
+        out: &mut Vec<(String, egui::Pos2)>,
+    ) {
+        for clipped in shapes {
+            collect_shape_texts(&clipped.shape, out);
+        }
+    }
+
+    fn collect_shape_texts(shape: &egui::Shape, out: &mut Vec<(String, egui::Pos2)>) {
+        match shape {
+            egui::Shape::Text(text) => out.push((text.galley.job.text.clone(), text.pos)),
+            egui::Shape::Vec(children) => {
+                for child in children {
+                    collect_shape_texts(child, out);
+                }
+            }
+            _ => {}
+        }
     }
 
     #[test]
@@ -3417,7 +3691,10 @@ mod tests {
     }
 
     #[test]
-    fn the_camera_scope_refuses_a_photo_whose_make_and_model_cannot_be_read() {
+    fn a_failed_replan_keeps_the_list_and_draws_the_reason_beside_the_controls() {
+        // The failure this covers: the old code cleared `photo_entries` before
+        // the list was drawn, so the refusal was never rendered, the list and
+        // the shift controls vanished, and a stale "OK 2 枚" stayed behind.
         let dir = ScratchDir::new("shift-camera");
         let (_photo_a, _photo_b) = photo_pair(&dir);
         let mut screen = sample();
@@ -3428,9 +3705,237 @@ mod tests {
             .replan_photos()
             .expect_err("the synthetic JPEG names no camera");
         assert!(error.contains("カメラ名"), "got {error}");
+        assert_eq!(
+            screen.photo_entries.len(),
+            2,
+            "a failed re-plan kept neither the list nor the controls it belongs to"
+        );
+        let (status, message) = screen
+            .photo_shift
+            .status
+            .as_ref()
+            .expect("the reason is stored beside the controls");
+        assert_eq!(*status, Status::Err);
+        assert!(message.contains("カメラ名"), "got {message}");
+        // The older plan must not be written while the controls ask for another.
+        screen.open_geotag_confirmation();
+        assert!(!screen.geotag_confirmation_open());
+        assert!(matches!(screen.outcome(), Some((Status::Err, _))));
+
+        // Rendered: the list rows and the refusal are both in the frame, so the
+        // error is shown where the person can act on it.
+        let texts = screen_texts(&mut screen);
+        assert!(
+            texts.iter().any(|text| text.contains("a.jpg")),
+            "the photo list vanished from the frame: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("カメラ名")),
+            "the refusal was not drawn next to the photo controls: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("全写真")),
+            "the scope controls were not drawn: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn the_camera_scope_shows_the_base_camera_and_replans_when_it_changes() {
+        let dir = ScratchDir::new("shift-camera-pick");
+        // Two cameras: the first two photos share one, the third is another.
+        let _first = jpeg_with_camera(&dir.0, "a.jpg", "HOLUX", "M-241X", 1_763_000_000);
+        let _same = jpeg_with_camera(&dir.0, "b.jpg", "HOLUX", "M-241X", 1_763_000_030);
+        let _other = jpeg_with_camera(&dir.0, "c.jpg", "Other", "X-1000", 1_763_000_060);
+        let mut screen = sample();
+        screen.load_photos_from_path(&dir.0).expect("load photos");
+        // The list is sorted by path: a, b, c.
+        screen.select_photo(0);
+        screen.photo_shift.kind = ScopeKind::ByCamera;
+        screen.photo_shift.shift.seconds = 900;
+        screen.replan_photos().expect("the first camera resolves");
+
+        assert_eq!(
+            screen.photo_shift.camera_label().as_deref(),
+            Some("HOLUX M-241X"),
+            "the resolved camera is not shown to the person"
+        );
+        let capture_time = |screen: &LogScreen, index: usize| {
+            screen
+                .photo_entries
+                .get(index)
+                .and_then(|entry| entry.plan.capture_time)
+                .map(CaptureTime::utc)
+        };
+        assert_eq!(capture_time(&screen, 0), Some(1_763_000_900));
+        assert_eq!(capture_time(&screen, 1), Some(1_763_000_930));
+        assert_eq!(
+            capture_time(&screen, 2),
+            Some(1_763_000_060),
+            "a different camera's clock moved"
+        );
+
+        // Highlighting a photo of the other camera re-plans without a control
+        // change: the list now follows the new base camera.
+        screen.select_photo(2);
+        assert_eq!(
+            screen.photo_shift.camera_label().as_deref(),
+            Some("Other X-1000")
+        );
+        assert_eq!(
+            capture_time(&screen, 0),
+            Some(1_763_000_000),
+            "the first camera's clocks stayed shifted after the base changed"
+        );
+        assert_eq!(capture_time(&screen, 1), Some(1_763_000_030));
+        assert_eq!(capture_time(&screen, 2), Some(1_763_000_960));
+
+        let texts = screen_texts(&mut screen);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("基準カメラ: Other X-1000")),
+            "the resolved camera is not drawn: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("範囲内 1 枚")),
+            "the moved-photo count is not drawn: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn a_shift_write_reports_the_in_scope_and_out_of_scope_counts() {
+        let dir = ScratchDir::new("shift-report");
+        let (_photo_a, _photo_b) = photo_pair(&dir);
+        let mut screen = sample();
+        screen.load_photos_from_path(&dir.0).expect("load photos");
+        screen.photo_shift.kind = ScopeKind::Selected;
+        let _checked = screen.photo_shift.selected.insert(0);
+        screen.photo_shift.shift.seconds = 900;
+        screen.replan_photos().expect("the selected scope resolves");
+        screen.open_geotag_confirmation();
+        assert!(screen.geotag_confirmation_open());
+        let confirmation = screen
+            .confirm_geotag_write()
+            .expect("the prompt yields the token");
+        let written = screen
+            .apply_geotags(confirmation)
+            .expect("the confirmed write succeeds");
+        assert_eq!(written, 2);
+        let (_status, message) = screen.outcome().expect("the write left an outcome");
+        assert!(
+            message.contains("範囲内 1 枚") && message.contains("範囲外 1 枚"),
+            "the success sentence does not say how many clocks moved: {message}"
+        );
+        assert!(
+            message.contains("2 枚の写真に位置情報"),
+            "the sentence lost the written count: {message}"
+        );
+    }
+
+    #[test]
+    fn a_track_edit_that_breaks_the_photo_plan_drops_the_stale_list() {
+        // relink runs after an edit, so its failure cannot keep entries whose
+        // point indices name records the edit removed. The list is dropped and
+        // the person is asked to load the folder again.
+        let dir = ScratchDir::new("relink-failure");
+        let (_photo_a, _photo_b) = photo_pair(&dir);
+        let mut screen = sample();
+        screen.load_photos_from_path(&dir.0).expect("load photos");
+        screen.select_photo(0);
+        screen.photo_shift.kind = ScopeKind::ByCamera;
+        screen.set_track(sample_track(), ParseReport::default());
         assert!(
             screen.photo_entries.is_empty(),
-            "a scope that cannot apply must not leave stale plans"
+            "a stale plan survived the edit that invalidated it"
+        );
+        let (_status, message) = screen
+            .photo_shift
+            .status
+            .as_ref()
+            .expect("the relink failure is reported");
+        assert!(message.contains("読み込み直して"), "got {message}");
+    }
+
+    #[test]
+    fn a_kmz_export_while_a_shift_is_armed_asks_for_the_geotag_write_first() {
+        // The KML `<TimeStamp>` is the plan's capture time; an armed shift moves
+        // it while the photo's Exif clock only changes on the geotag write, so
+        // exporting a KMZ then would put a time in the archive the photo does not
+        // carry.
+        let dir = ScratchDir::new("kmz-shift");
+        let (_photo_a, _photo_b) = photo_pair(&dir);
+        let mut screen = sample();
+        screen.load_photos_from_path(&dir.0).expect("load photos");
+        screen.photo_shift.kind = ScopeKind::All;
+        screen.photo_shift.shift.seconds = 900;
+        screen.replan_photos().expect("replan with the shift");
+        screen.set_kmz_export();
+        screen.set_destination(dir.0.join("out.kmz").display().to_string());
+        let error = screen.export().expect_err("an armed shift refuses the KMZ");
+        assert!(error.contains("写真に位置"), "got {error}");
+        assert!(
+            !dir.0.join("out.kmz").exists(),
+            "a refused KMZ export wrote a file"
+        );
+    }
+
+    #[test]
+    fn a_kmz_export_names_the_first_photos_it_could_not_bundle() {
+        let dir = ScratchDir::new("kmz-skipped");
+        let _matched = minimal_jpeg_with_mtime(&dir.0, "a.jpg", 1_763_000_000);
+        let _far = minimal_jpeg_with_mtime(&dir.0, "b.jpg", 1_763_020_000);
+        let mut screen = sample();
+        screen.load_photos_from_path(&dir.0).expect("load photos");
+        screen.set_kmz_export();
+        let destination = dir.0.join("track.kmz");
+        screen.set_destination(destination.display().to_string());
+        screen.export().expect("write the archive");
+        let (_status, message) = screen.outcome().expect("an outcome was recorded");
+        assert!(
+            message.contains("対象外 1 枚") && message.contains("b.jpg"),
+            "the archive did not name the photo it left out: {message}"
+        );
+    }
+
+    #[test]
+    fn a_kmz_export_refuses_a_folder_the_rail_was_not_loaded_from() {
+        // The KMZ now bundles the displayed plan, so a footer path that points
+        // somewhere else would produce an archive the person never reviewed.
+        let dir = ScratchDir::new("kmz-other-folder");
+        let (_photo_a, _photo_b) = photo_pair(&dir);
+        let other = ScratchDir::new("kmz-other-target");
+        let _other_photo = minimal_jpeg_with_mtime(&other.0, "c.jpg", 1_763_000_000);
+        let mut screen = sample();
+        screen.load_photos_from_path(&dir.0).expect("load photos");
+        screen.set_kmz_export();
+        screen.set_destination(dir.0.join("out.kmz").display().to_string());
+        screen.photo_path = other.0.display().to_string();
+        let error = screen.export().expect_err("the folders differ");
+        assert!(error.contains("一致しません"), "got {error}");
+    }
+
+    #[test]
+    fn the_photo_block_is_captioned_as_sample() {
+        // The screenshot is taken with `show_sample_photos`; the block must wear
+        // 「見本」 like every other invented figure, or the image reads as proof
+        // that two JPEGs were loaded.
+        let mut screen = LogScreen::default();
+        screen.show_sample();
+        screen.show_sample_photos();
+        let runs = screen_text_runs(&mut screen);
+        // The block title 「写真」 carries a 「見本」 on the same caption row, to
+        // its right. Comparing y positions is what ties the marker to this block
+        // rather than to the five other sample captions on the screen.
+        let marked = runs.iter().any(|(text, pos)| {
+            *text == "写真"
+                && runs.iter().any(|(marker, marker_pos)| {
+                    marker == "見本" && (marker_pos.y - pos.y).abs() < 2.0 && marker_pos.x > pos.x
+                })
+        });
+        assert!(marked, "the photo block has no 見本 marker: {runs:?}");
+        assert!(
+            runs.iter().any(|(text, _pos)| text.contains("見本の写真")),
+            "the sample photo status does not say it is a sample"
         );
     }
 
@@ -3476,7 +3981,9 @@ mod tests {
     #[test]
     fn an_edge_split_that_would_leave_an_empty_half_is_refused() {
         let mut screen = sample();
-        screen.edit.split_from = String::from("0");
+        // Point numbers are 1-based: 1 with an empty end is the first-point cut
+        // that would leave an empty left half.
+        screen.edit.split_from = String::from("1");
         screen.edit.split_to.clear();
         screen.edit.request_split();
         assert!(

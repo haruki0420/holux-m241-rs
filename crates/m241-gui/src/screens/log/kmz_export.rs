@@ -1,13 +1,20 @@
 //! KMZ writing for the Log screen (DESIGN.md §5's `[ KMZ ]` button).
 //!
-//! The CLI's `log kmz` semantics are reused rather than re-invented: photos are
-//! matched to the track by capture time through the same `GeotagPlan`, and
-//! `--max-photo-edge` is this screen's 最大長辺. An empty limit means the bytes go
-//! in untouched (the CLI's absent flag); zero is refused, because a zero-pixel
-//! long edge is not a limit.
+//! The archive planner is the core's `GeotagPlan`, so a KMZ bundles the same
+//! track/photo pairing the rail shows. This is a simplified `log kmz`: one path
+//! (a file or a directory's immediate files, dotfiles skipped), the default
+//! five-minute gap, and no `--tz-offset-minutes` (a camera clock correction is
+//! the rail's shift instead). The CLI's shift and scope flags are not inherited
+//! here: the screen refuses to write a KMZ while a shift is armed, because the
+//! KML `<TimeStamp>` would then disagree with the photo's own Exif clock.
+//!
+//! An empty limit means the bytes go in untouched (the CLI's absent flag); zero
+//! is refused, because a zero-pixel long edge is not a limit.
 //!
 //! Nothing here opens a device or a network socket: the archive is assembled
-//! from the track already in memory and the photos on disk.
+//! from the track already in memory and the photos on disk. Google Earth and
+//! `unzip` have not been run against this output, so the screen marks the writer
+//! 未検証 rather than claiming the archive opens there.
 
 use std::path::{Path, PathBuf};
 
@@ -31,10 +38,10 @@ pub(super) fn parse_max_edge(text: &str) -> Result<Option<u32>, String> {
     }
     let pixels = trimmed
         .parse::<u32>()
-        .map_err(|_| format!("{trimmed:?} はピクセル数ではありません"))?;
+        .map_err(|_| format!("{trimmed:?} はピクセル数ではありません（例: 1600。空欄は原寸）"))?;
     if pixels == 0 {
         return Err(String::from(
-            "最大長辺は 1 以上のピクセル数で指定してください（空欄は上限なし）",
+            "最大長辺は 1 以上のピクセル数で指定してください（例: 1600。空欄は原寸）",
         ));
     }
     Ok(Some(pixels))
@@ -63,8 +70,8 @@ pub(super) fn max_edge_field(ui: &mut Ui, value: &mut String) {
 /// The regular files under `path`, sorted, or `path` itself when it is a file.
 ///
 /// A directory contributes its immediate files and skips dotfiles, the same rule
-/// the photo loader and the CLI use. The planner rejects a non-JPEG with its own
-/// reason, so this does not pre-filter by extension.
+/// the photo loader uses. The planner rejects a non-JPEG with its own reason, so
+/// this does not pre-filter by extension.
 ///
 /// # Errors
 ///
@@ -105,10 +112,6 @@ pub(super) fn collect_photos(path: &Path) -> Result<Vec<PathBuf>, String> {
 
 /// Build the archive from the plans, reading each accepted photo's bytes.
 ///
-/// Returns the archive with the number of embedded photos and the number the
-/// planner left out. The reasons are on each plan (`GeotagPlan::skipped`) and the
-/// caller reports the count rather than guessing why.
-///
 /// # Errors
 ///
 /// A photo that cannot be read, or an `export_kmz` refusal (a non-finite
@@ -117,19 +120,44 @@ pub(super) fn build_archive(
     track: &Track,
     plans: &[GeotagPlan],
     max_edge: Option<u32>,
-) -> Result<(Vec<u8>, usize, usize), String> {
+) -> Result<Vec<u8>, String> {
     let mut photos = Vec::with_capacity(plans.len());
-    let mut skipped = 0_usize;
     for plan in plans {
         let Some(mut photo) = plan.to_kmz_photo(max_edge) else {
-            skipped += 1;
             continue;
         };
         photo.jpeg_bytes = std::fs::read(&plan.photo)
             .map_err(|err| format!("{} を読めません: {err}", plan.photo.display()))?;
         photos.push(photo);
     }
-    let archive = export_kmz(track, &photos)
-        .map_err(|err| format!("KMZ を組み立てられませんでした: {err}"))?;
-    Ok((archive, photos.len(), skipped))
+    export_kmz(track, &photos).map_err(|err| format!("KMZ を組み立てられませんでした: {err}"))
+}
+
+/// Why photos in `plans` will not be bundled, up to three, for the status line.
+///
+/// The core keeps the precise reason in English on each plan; the screen's
+/// voice is Japanese, so this names the two facts the person can act on — which
+/// file, and whether its clock or its position was the problem — rather than
+/// repeating the core sentence. A count alone (the previous message) did not say
+/// what to fix.
+pub(super) fn skipped_reasons(plans: &[GeotagPlan]) -> Vec<String> {
+    plans
+        .iter()
+        .filter(|plan| !plan.will_write())
+        .take(3)
+        .map(|plan| {
+            let name = plan.photo.file_name().map_or_else(
+                || plan.photo.display().to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            let reason = if plan.capture_time.is_none() {
+                String::from("撮影時刻を読めません")
+            } else if let Some(gap) = plan.gap_seconds {
+                format!("最も近い点と {gap} 秒差で一致しません")
+            } else {
+                String::from("位置のある点がありません")
+            };
+            format!("{name}（{reason}）")
+        })
+        .collect()
 }

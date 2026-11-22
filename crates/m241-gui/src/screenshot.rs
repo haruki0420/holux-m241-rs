@@ -497,8 +497,12 @@ fn prepare(app: &mut App, screen: Screen) {
             app.log_mut().show_sample();
             // The photo block and the KMZ row are the wiring this artifact is
             // reviewed for, so the Log frame is taken with sample photos loaded
-            // (no file touched) and the KMZ writer selected.
+            // (no file touched) and the KMZ writer selected. The shift controls
+            // are filled with a sample camera as well: the block carries 「見本」,
+            // and the frame shows the resolved-camera and moved-photo readouts
+            // without reading a JPEG.
             app.log_mut().show_sample_photos();
+            app.log_mut().show_sample_photo_shift();
             app.log_mut().set_kmz_export();
             app.log_mut().set_kmz_max_edge("1600");
         }
