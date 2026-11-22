@@ -896,7 +896,7 @@ each other rather than two implementations of one idea.
 | GUI panel | CLI command | Notes |
 |---|---|---|
 | 吸い出し | `log download --port auto -o … --force` | Same PMTK182 path (`PmtkClient::download_log`), so logging is paused and resumed by core. An empty log writes no file; the CLI writes the 0-byte file. |
-| 消去 | `log erase --port auto -o … --force --yes` | Saves the mandatory backup and takes the confirmation, then **stops at a refusal**: `m241-gui` does not link `m241-flash`, so the erase itself runs only from the CLI with its own approval. |
+| 消去 | `log erase --port auto -o … --force --yes` | Saves the mandatory backup and takes the confirmation, then **stops at a refusal**: the GUI links `m241-flash` for the Firmware screen's write path, but the log console calls no erase client, and erasing the user's track needs the user's own instruction, so the erase itself runs only from the CLI. |
 | プロジェクト | `log project save`, `log project load` | Same eight-key JSON schema, same path rule: a relative `log` / `photos` / `output` is resolved against the cwd once and stored relative to the project file's directory with `/` separators. A KMZ project with an NMEA input or `photos: null` is refused here too. |
 | NMEA 修復 | `nmea repair` | Same algorithm and checksum rewrite; input and output are files (the GUI has no stdin/stdout). |
 | NMEA 中継 | `nmea proxy` | Same relay and loopback-only bind rule; the screen log replaces stdout, and `--max-lines` has a field (empty means until 停止). The GUI fills the bind with `127.0.0.1:10110` by default where an omitted CLI `--bind` means no TCP listener; emptying the field gives the CLI's behaviour. |

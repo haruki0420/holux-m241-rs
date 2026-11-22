@@ -511,8 +511,10 @@ approximation from a mistake.
   screens, and these are modes of one task. Each panel's caption names the CLI
   command it replaces, and its status line only appears on the panel that
   produced it. The erase panel is gates only — a mandatory backup, a
-  confirmation, then a refusal that names the crate boundary — and carries no
-  amber: the press cannot erase anything, so an amber control would promise a
+  confirmation, then a refusal that says the log console calls no erase client
+  (the GUI links `m241-flash` for the Firmware screen, not for this panel) and
+  that erasing the user's track needs the user's own instruction — and carries
+  no amber: the press cannot erase anything, so an amber control would promise a
   destructive action this build does not have.
 - The download and erase panels each draw their own port field and 上書き
   checkbox. They were one shared value first, and the erase panel told the user

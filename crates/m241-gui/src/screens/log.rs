@@ -16,8 +16,10 @@
 //!   `device`'s PMTK182 worker on a thread (`Port::open` +
 //!   `PmtkClient::download_log`), and the NMEA relay opens the port too. Those
 //!   paths are unverified on hardware from this screen, and the panels say so.
-//!   The erase itself cannot run: `m241-gui` does not link `m241-flash`, so the
-//!   confirmed action stops at a refusal that names the crate boundary.
+//!   The log erase cannot run from this panel: the GUI links `m241-flash` for
+//!   the Firmware screen's write path, but the log console has no route to the
+//!   erase client, and erasing the user's track needs the user's own
+//!   instruction — so the confirmed action stops at a refusal that says so.
 //! * `project` is the CLI-compatible JSON project document and the `log read`
 //!   conversion; `nmea` is the date repair and day arithmetic; `proxy` is the
 //!   relay thread; `device` is the transfer worker.

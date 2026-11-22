@@ -1496,10 +1496,21 @@ Could 9）と可読性（Must 4 / Should 17 / Could 13）の 2 本で、レビ�
   lib 178 passed。`git diff origin/main...HEAD` は `crates/m241-gui`（`Cargo.toml` /
   `Cargo.lock` の `serde_json` 追加を含む）と docs のみ（merge で取り込んだ core/CLI は
   PR の差分に出ない）。
+- PR #38（`812a0b5`、GUI のファーム書き込み）を merge した。GUI が `m241-flash` をリンクする
+  ようになり「GUI は書き込みクレートをリンクしない」という前提は消えたため、ログ操作コンソールの
+  消去拒否文・module doc・`DESIGN.md` / `02-cli.md` を「GUI はファーム書き込み用に
+  `m241-flash` をリンクするが、この画面からログ消去の経路は呼び出さない（端末のログを消すには
+  ユーザーの明示的な承認が必要）」に更新した。挙動は変えていない。今回の merge は conflict
+  なし（自動マージ）で、PR #37 / #36 / #38 の節をすべて残した。
 
-### Stage 3 検証
+### Stage 3 検証（検証者記録の代筆）
 
-未検証（別エージェントが記入する）。
+Stage 3 再検証は head `d14a129`（PR #36 追従後、PR #38 マージ前）で合格:
+`./tools/check.sh` は **6/6 PASS**、`cargo test -p m241-gui` は **226 passed**
+（lib 178 + design_gate 6 + design_invariants 6 + render 36）。GUI と新しい CLI の
+`--format json` を dump / NMEA / GPX の 3 ケースで突き合わせ、**raw 一致**を確認した。
+Stage 3 検証者は worktree 編集禁止のため、この記録のみを修正担当が代筆した
+（検証対象のコード・テストは変更していない）。
 
 ---
 

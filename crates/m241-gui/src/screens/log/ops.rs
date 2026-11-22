@@ -18,9 +18,11 @@
 //! What runs where:
 //!
 //! * download and the erase backup use the PMTK182 path on a thread;
-//! * the erase itself cannot run here — `m241-gui` does not link `m241-flash`,
-//!   which is the crate that owns `LogEraser` — so the confirmation stops at a
-//!   refusal that says so;
+//! * the log erase itself cannot run from this panel. The GUI links
+//!   `m241-flash` for the Firmware screen's write path (user decision,
+//!   2026-11-23), but the log console calls no erase client: `log erase`
+//!   destroys the user's track, which needs the user's own instruction, so the
+//!   confirmation stops at a refusal that says so;
 //! * project save/load, `log read`, NMEA repair and the NMEA relay are offline
 //!   file work, except the relay's serial source. The file work itself lives in
 //!   `device`, `project`, `nmea` and `proxy`; the panels format the result.
@@ -43,10 +45,13 @@ use crate::theme::{self, metric, size, space};
 /// How long a running transfer or relay waits before the next frame.
 const REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 
-/// The refusal the erase action ends at. The write path is a separate crate this
-/// one deliberately does not depend on (see `tools/check_safety.py`), so the
-/// screen can take a backup and a confirmation but cannot send the erase.
-const ERASE_REFUSAL: &str = "バックアップは保存済みですが、この画面から消去は実行していません。消去の経路（m241-flash）は GUI にリンクされていないためです。CLI の `m241 log erase` と同じ手順ですが、実行には端末のログを消すことへのユーザーの明示的な承認が別途必要です。";
+/// The refusal the erase action ends at.
+///
+/// The GUI links `m241-flash` for the Firmware screen's write path (user
+/// decision, 2026-11-23), but this console calls no erase client, and `log erase`
+/// destroys the user's track — which needs the user's own instruction — so the
+/// screen takes a backup and a confirmation and stops here.
+const ERASE_REFUSAL: &str = "バックアップは保存済みですが、この画面から消去は実行していません。GUI はファーム書き込み用に m241-flash をリンクしていますが、この画面からログ消去の経路は呼び出していません。CLI の `m241 log erase` と同じ手順ですが、実行には端末のログを消すことへのユーザーの明示的な承認が別途必要です。";
 
 /// The port row's label, on both transfer panels.
 ///
@@ -664,7 +669,7 @@ impl LogOps {
         }
         ui.label(
             RichText::new(
-                "消去の経路（m241-flash）は GUI にリンクされていません。この画面はバックアップと確認までを担い、実行は CLI と別承認に残します。",
+                "GUI はファーム書き込み用に m241-flash をリンクしていますが、この画面からログ消去は呼び出しません。バックアップと確認までを担い、実行は CLI とユーザーの明示的な承認に残します。",
             )
             .size(size::CAPTION)
             .color(theme::MUTE),
