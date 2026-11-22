@@ -457,6 +457,7 @@ nothing on this page makes the final head verified.
 | `0xD6`'s page length for arguments other than 64 | only a 64-byte page-length argument was measured (64 data bytes + 2-byte trailer) |
 | `fw probe-da` on stock V1.13 and on a second unit | the 2026-11-21 run read the unit from §1.1, which already carries the WNRO patch (the version marker is patched to V1.14); its first 64 bytes match the vendor V1.13 image's, but no stock unit and no second unit were probed |
 | The `0xA8` jump frame's count word | the protocol page gives it no meaning; the only client that ran the jump on a unit sent `0`, and this crate does too. Whether the BootROM reads the field at all is not established (`docs/dev/03-hardware-facts.md` "DA jump") |
+| New GPX / KML / NMEA exports opened in an external application | ⚠️ not opened in Google Earth, a GPX viewer or an NMEA tool. The **KML 2.0 element order was checked on 2026-11-23** with `xmllint --schema` against a minimal schema that copies KML's `FeatureType` sequence: the current output validates, and putting `<LookAt>` back after `<Style>` reproduces `Element … LookAt: This element is not expected`. That verifies the schema order, not that a viewer draws the file. GPX and NMEA output are covered only by this project's own tests |
 
 ## 3. The simulator
 

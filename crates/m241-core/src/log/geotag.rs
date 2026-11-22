@@ -110,7 +110,14 @@ pub struct GeotagOptions {
     /// rather than tagged with a coordinate it cannot support.
     pub max_gap_seconds: u32,
     /// When `true`, [`apply`] writes a sibling `<photo>_original` backup before
-    /// replacing a photo (if that backup does not already exist).
+    /// replacing a photo (unless that backup already exists).
+    ///
+    /// A rewrite replaces the only copy of a photo, and `--dry-run` is not what
+    /// a user runs on the folder they care about, so the default is **`true`**:
+    /// losing an original to a mis-aimed match is not recoverable from the
+    /// rewritten file. The CLI exposes `--no-backup` for a caller who has its own
+    /// copy and does not want the duplicates; a library caller that wants the old
+    /// behaviour sets the field to `false` explicitly.
     ///
     /// The backup is a *suffix* on purpose, so it sits beside the photo where a
     /// user who typed `ls` or opened the folder will see it and can restore it
@@ -152,7 +159,7 @@ impl Default for GeotagOptions {
     fn default() -> Self {
         Self {
             max_gap_seconds: DEFAULT_MAX_GAP_SECONDS,
-            keep_backup: false,
+            keep_backup: true,
             photo_shift_seconds: 0,
             group_distance_meters: None,
             max_photo_edge_pixels: None,
@@ -467,11 +474,7 @@ pub fn group_matched_plans(plans: &mut [GeotagPlan], max_distance_meters: f64) {
     // The matched plans' coordinates, in listing order.
     let positions: Vec<(f64, f64)> = plans
         .iter()
-        .filter_map(|plan| {
-            let point = plan.point?;
-            let (lat, lon) = (point.latitude?, point.longitude?);
-            (lat.is_finite() && lon.is_finite()).then_some((lat, lon))
-        })
+        .filter_map(|plan| plan.point.as_ref().and_then(TrackPoint::position))
         .collect();
 
     let mut sets = DisjointSets::new(positions.len());
@@ -493,10 +496,7 @@ pub fn group_matched_plans(plans: &mut [GeotagPlan], max_distance_meters: f64) {
     let mut indices: Vec<Option<usize>> = Vec::with_capacity(plans.len());
     let mut next_index = 0usize;
     for plan in plans.iter() {
-        let matched = plan
-            .point
-            .and_then(|point| Some((point.latitude?, point.longitude?)))
-            .is_some_and(|(lat, lon)| lat.is_finite() && lon.is_finite());
+        let matched = plan.point.and_then(|point| point.position()).is_some();
         if matched {
             indices.push(Some(next_index));
             next_index += 1;
@@ -574,21 +574,10 @@ impl DisjointSets {
     }
 }
 
-/// Great-circle distance in metres between two WGS84-ish lat/lon points using
-/// the mean Earth radius (`6_371_000` m).
-#[must_use]
-pub(crate) fn haversine_meters(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    const EARTH_RADIUS_M: f64 = 6_371_000.0;
-    let dlat = (lat2 - lat1).to_radians();
-    let dlon = (lon2 - lon1).to_radians();
-    let lat1_rad = lat1.to_radians();
-    let lat2_rad = lat2.to_radians();
-    let sin_dlat = (dlat / 2.0).sin();
-    let sin_dlon = (dlon / 2.0).sin();
-    let a = sin_dlat * sin_dlat + lat1_rad.cos() * lat2_rad.cos() * sin_dlon * sin_dlon;
-    let c = 2.0 * a.sqrt().min(1.0).asin();
-    EARTH_RADIUS_M * c
-}
+// The distance function lives in `crate::types` so the track summary and the
+// photo grouping cannot disagree about how far apart two points are. It is
+// re-exported here because the grouping tests call it by this module's name.
+pub(crate) use crate::types::haversine_meters;
 
 /// Apply every plan that carries a point, and return the photos written.
 ///
@@ -1301,6 +1290,34 @@ mod tests {
         assert_eq!(chosen.gap_seconds, Some(4), "the later point is nearer");
         assert_eq!(chosen.point.expect("a point").utc, Some(SHUTTER + 4));
         assert!(chosen.will_write());
+    }
+
+    #[test]
+    fn the_default_options_keep_a_backup_before_replacing_a_photo() {
+        // A rewrite destroys the only copy of a photo, so the default is the
+        // safe side; `--no-backup` is how the CLI turns it off.
+        let options = GeotagOptions::default();
+        assert!(
+            options.keep_backup,
+            "the default must write a sibling _original backup"
+        );
+
+        let track = track_at(&[SHUTTER]);
+        let dir = TempDir::new("backup-default");
+        let photo = dir.photo("keep.jpg", &photo_taken_at(SHUTTER));
+        let plans = plan(std::slice::from_ref(&photo), &track, &options).expect("plan");
+        assert_eq!(plans.len(), 1);
+        assert!(
+            plans[0].keep_backup,
+            "the plan must carry the option that apply reads"
+        );
+
+        let written = apply(&plans).expect("apply");
+        assert_eq!(written.len(), 1);
+        assert!(
+            dir.0.join("keep.jpg_original").exists(),
+            "the backup must exist after the default apply"
+        );
     }
 
     #[test]
