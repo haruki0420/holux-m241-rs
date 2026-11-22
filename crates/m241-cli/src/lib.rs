@@ -14,7 +14,7 @@
 //!   cal      civil dates, so the offset flags need no date library
 //!   device   ports, info, doctor
 //!   fw       dump, patch and flash
-//!   logcmd   download, info, read, erase, geotag
+//!   logcmd   download, info, read, edit, erase, geotag, kmz
 //!   nmea     repair and proxy
 //! ```
 //!
@@ -283,8 +283,10 @@ pub(crate) fn run_with(
             LogCommand::Info(options) => logcmd::info(&options, session)?,
             LogCommand::Download(options) => logcmd::download(&options, session)?,
             LogCommand::Read(options) => logcmd::read(&options, session)?,
+            LogCommand::Edit(options) => logcmd::edit(&options, session)?,
             LogCommand::Erase(options) => logcmd::erase(&options, session)?,
             LogCommand::Geotag(options) => logcmd::geotag(&options, session)?,
+            LogCommand::Kmz(options) => logcmd::kmz(&options, session)?,
         },
         Command::Nmea { command } => match command {
             NmeaCommand::Repair(options) => nmea::repair(&options, session)?,
