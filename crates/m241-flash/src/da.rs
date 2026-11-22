@@ -1825,6 +1825,14 @@ impl<T: Transport> DownloadAgent<T> {
 
     /// `0xD3`: record `start`..=`end` with count 1.
     fn record_range(&mut self, start: u32, end: u32) -> Result<()> {
+        // The DA banner is followed by four bytes whose origin is not
+        // established. They arrive before the first `0xD6`, and the 2026-11-22
+        // hardware write showed they also arrive before the first `0xD3`: that
+        // run read one as `0xBB` and reported "0xD3 answered 0xBB". The read
+        // path already drains before `0xD6`; the first write command must drain
+        // too, or the stale byte becomes the ACK. `clear_input` is the same
+        // operation in both places.
+        self.transport.clear_input()?;
         let mut frame = Vec::with_capacity(10);
         // §5.3: one count byte, then one pair of big-endian u32 (start, end).
         frame.push(OPCODE_MEM_CMD);
@@ -2930,6 +2938,52 @@ mod tests {
             .expect("read back through the BootROM view");
         assert_eq!(report.start, 0);
         assert_eq!(report.verified, FLASH_WRITE_LENGTH);
+    }
+
+    #[test]
+    fn the_first_d3_drains_the_da_banner_residue() {
+        // The 2026-11-22 hardware write read `0xBB` as the first `0xD3` reply:
+        // the four bytes after the DA banner were still queued. The fake puts
+        // four of them ahead of the ACK; without the drain this fails framing.
+        let backup = stock_image();
+        let image = patched_image();
+        let mut device = FakeDa::with_firmware(&backup);
+        let report = enter_download_agent(&mut device);
+        assert_eq!(report.first().copied(), Some(0xC0), "the DA banner");
+        device.queue_output(&[0xBB; 4]);
+        let mut da = DownloadAgent::new(device);
+        let pending = da
+            .write(Confirmation::granted(), &backup, &image)
+            .expect("the first 0xD3 drains the banner residue");
+        assert_eq!(pending.packets, 1_589);
+        assert_eq!(
+            da.transport_mut().recorded_range(),
+            (0, FLASH_WRITE_END),
+            "0xD3 records the settled range after the drain"
+        );
+    }
+
+    #[test]
+    fn the_first_d3_drains_the_banner_residue_for_a_vendor_write() {
+        let Some(vendor) = vendor_image() else {
+            return;
+        };
+        let backup = stock_image();
+        let token = accept_vendor_image(&PROFILE_V1_13, &vendor).expect("the pinned vendor image");
+        let mut device = FakeDa::with_firmware(&backup);
+        let report = enter_download_agent(&mut device);
+        assert_eq!(report.first().copied(), Some(0xC0), "the DA banner");
+        device.queue_output(&[0xBB; 4]);
+        let mut da = DownloadAgent::new(device);
+        let pending = da
+            .write_vendor(Confirmation::granted(), &backup, token)
+            .expect("write_vendor drains the banner residue before its first 0xD3");
+        assert_eq!(pending.packets, 1_589);
+        assert_eq!(
+            da.transport_mut().recorded_range(),
+            (0, FLASH_WRITE_END),
+            "write_vendor records the settled range after the drain"
+        );
     }
 
     #[test]
