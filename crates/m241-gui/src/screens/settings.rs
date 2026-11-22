@@ -8,6 +8,7 @@
 use egui::{RichText, Ui};
 use m241_core::firmware::PROFILE_V1_13;
 use m241_core::firmware::patch::EFFECTIVE_EPOCH_OFFSET;
+use m241_core::log::CoordFormat;
 
 use crate::screens::common;
 use crate::theme::{self, size, space};
@@ -82,13 +83,25 @@ impl UnitSystem {
 }
 
 /// Application-wide display and motion preferences held on [`crate::App`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppSettings {
     /// Unit system for speed, distance, and altitude.
     pub units: UnitSystem,
     /// When true, rail tab transitions drop to 0 ms and playback steps at half
     /// the rate (500 ms instead of 250 ms).
     pub reduced_motion: bool,
+    /// How a selected point's coordinate is written on the Log screen.
+    pub coord_format: CoordFormat,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            units: UnitSystem::default(),
+            reduced_motion: false,
+            coord_format: CoordFormat::Decimal,
+        }
+    }
 }
 
 impl AppSettings {
@@ -157,6 +170,9 @@ const ROW_LANG: Row = Row {
 /// it under that name (design review, Should 6).
 const ROW_MOTION_LABEL: &str = "動きの低減";
 
+/// The coordinate-format row's label.
+const ROW_COORD_LABEL: &str = "座標形式";
+
 /// The rows DESIGN.md §5 names, in its order (checked in tests).
 ///
 /// 動きの低減 is absent from this list on purpose: unlike the fixed rows it has no
@@ -168,6 +184,13 @@ const FIXED_ROWS: [Row; 5] = [
     ROW_UNITS,
     ROW_THEME,
     ROW_LANG,
+];
+
+/// The three coordinate formats the Log screen can show (ezTour §3.3/§3.6).
+const COORD_FORMATS: [(CoordFormat, &str); 3] = [
+    (CoordFormat::Dms, "度分秒"),
+    (CoordFormat::Decimal, "10進度"),
+    (CoordFormat::Utm, "UTM"),
 ];
 
 /// Draw the screen body. The rail is drawn by the shell, not here.
@@ -232,6 +255,19 @@ pub fn ui(ui: &mut Ui, settings: &mut AppSettings) {
         );
         fixed_row(ui, ROW_THEME);
         fixed_row(ui, ROW_LANG);
+        option_row(
+            ui,
+            ROW_COORD_LABEL,
+            "選択した点と点の一覧の座標表示を切り替えます（UTM は緯度 -80〜84 度のみ）",
+            settings,
+            |ui, settings| {
+                for (format, label) in COORD_FORMATS {
+                    if common::choice_button(ui, label, settings.coord_format == format).clicked() {
+                        settings.coord_format = format;
+                    }
+                }
+            },
+        );
         let motion_note = if settings.reduced_motion {
             "オン（0 ms。タブ切替の移動アニメーションを無効化中）".to_owned()
         } else {
@@ -356,12 +392,14 @@ mod tests {
     #[test]
     fn the_rows_are_the_ones_the_design_names() {
         // DESIGN.md §5 lists the cache's size and location, units, theme, language
-        // and reduced motion. The location row is a token: the Stage 1 review found
+        // and reduced motion; the coordinate format is the ezTour display choice
+        // added with the Log screen's selected-point expansion. The location row is a token: the Stage 1 review found
         // the published build listed the size only, and this test used to pin the
         // five rows without it, so the omission could not fail.
         let labels: Vec<&str> = FIXED_ROWS
             .iter()
             .map(|row| row.label)
+            .chain(std::iter::once(ROW_COORD_LABEL))
             .chain(std::iter::once(ROW_MOTION_LABEL))
             .collect();
         assert_eq!(
@@ -372,6 +410,7 @@ mod tests {
                 "単位",
                 "テーマ",
                 "言語",
+                "座標形式",
                 "動きの低減"
             ]
         );
@@ -446,5 +485,19 @@ mod tests {
         assert!((settings.rail_transition_secs() - 0.15).abs() < f32::EPSILON);
         settings.reduced_motion = true;
         assert!((settings.rail_transition_secs() - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn the_coordinate_format_row_offers_the_three_core_formats() {
+        // The formats are the core's `CoordFormat` variants, not a GUI copy: a
+        // fourth core format is a compile error here rather than a menu that
+        // silently cannot show it.
+        assert_eq!(COORD_FORMATS.len(), 3);
+        let labels: Vec<&str> = COORD_FORMATS
+            .iter()
+            .map(|(_format, label)| *label)
+            .collect();
+        assert_eq!(labels, ["度分秒", "10進度", "UTM"]);
+        assert_eq!(AppSettings::default().coord_format, CoordFormat::Decimal);
     }
 }

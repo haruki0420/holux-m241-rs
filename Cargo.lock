@@ -1974,6 +1974,7 @@ dependencies = [
  "m241-core",
  "m241-flash",
  "png",
+ "serde_json",
 ]
 
 [[package]]

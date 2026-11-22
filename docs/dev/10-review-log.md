@@ -1386,6 +1386,132 @@ Could 9）と可読性（Must 4 / Should 17 / Could 13）の 2 本で、レビ�
 
 未検証（別エージェントが記入する）。
 
+## 2026-11-23 / PR #37 GUI ログ/NMEA 操作の Stage 2 修正（`feat-gui-logops`）
+
+対象: `c571039606e7d0c4f83d140b3598489d84670515`（base `origin/main` = `142750ed`）、
+修正 head `607b77b`。Stage 1 は仕様検収
+（[仕様レビュー](https://github.com/haruki0420/holux-m241-rs/pull/37#issuecomment-7083569806)）と
+可読性（[可読性レビュー](https://github.com/haruki0420/holux-m241-rs/pull/37#issuecomment-7083518741)）の
+2 本を別レビュアーが実施。Stage 2 は別エージェント（`pr37-fixer`）が担当した。変更範囲は
+`crates/m241-gui` と docs（`02-cli.md` / `DESIGN.md` / 本ファイル）のみで、
+`m241-core` / `m241-cli` / `m241-flash` / `Cargo.*` / `tools/` / `screens/connect.rs` /
+`screens/firmware.rs` は未変更。実機ポートは開いていない（ハードウェア検証はしていない）。
+
+### Stage 1 の Must への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| 仕様 M1 | GUI のプロジェクト保存が常に絶対パスで、CLI の「プロジェクト基点相対」契約（`02-cli.md:393-400`）を満たさない | `stored_path` を CLI と同じ規則に置換: cwd で一度解決し、プロジェクト親基準の相対＋`/` 区切りで保存。絶対パスは絶対のまま。`save_project_in` に cwd を明示してプロセス cwd を変えずに往復を試験 | `a_project_in_a_subdirectory_stores_paths_relative_to_its_directory`（`../track.bin` → 読込で元ファイル）、`an_absolute_path_is_stored_absolute_and_read_back_as_the_same_file` |
+| 仕様 M2 | 「読み書き」の JSON に `nmea` / `offset_days` が無い（`02-cli.md:348-352`） | `ReadFacts`（shift と NMEA counts）を `LoadedLog` に持たせ、core `export()` の出力へ CLI の `attach_read_report` と同型に付与。`LogScreen` が読み取り事実を保持し、書き出しバーとプロジェクト読込経由の両方で同じ JSON を書く | `a_json_read_export_carries_the_nmea_counts_and_the_day_shift`、`a_dump_json_export_has_neither_read_report_field`、`the_read_report_is_only_added_to_json`、`the_export_bar_writes_the_read_report_into_json`、`a_project_load_writes_the_read_report_fields_it_stored` |
+| 可読性 M1 | `log.rs:9-22` のモジュール doc が「端末と話さない」「`--tz-offset-minutes` のコントロール無し」「icon 非公開」と実装に反する | doc を実装に合わせて書き直し（吸い出し/中継は端末を開く・未検証、KMZ tz の操作子あり、icon は opt-in、地図はクリック選択のみ） | 目視（`--screenshot` と `M241_GUI_OPS_SCREENSHOTS` の再出力） |
+| 可読性 M2 | 40 フィールドの共有状態が、消去パネルに無いポート欄・上書き欄をエラー文で指示する | `LogOps` をパネル別 struct（Download / Erase / Project / Repair / Proxy / Read）に分割。Download と Erase が各自ポート・上書き・進捗を描く。状態文は `PanelStatus { mode, .. }` で発生元パネルだけが表示 | `the_transfer_panels_draw_the_controls_their_refusals_name`（エラー文が引用するラベルと同じ文字列が両パネルに描かれる）、`a_status_from_another_panel_is_not_drawn` |
+| 可読性 M3 | KMZ icon を理由なく既定 ON にして旧ゲートを外した | core が `icon/` の意味を未確定と記録し CLI の `log kmz` は icon を書かないため、**既定 OFF の opt-in** に戻した。フィールド doc・モジュール doc・ホバー文・DESIGN に理由を記載 | `a_kmz_with_the_icon_option_bundles_an_icon_entry`（既定 OFF を assert し、ON のときだけ `icon/` が出る） |
+
+### Should への対応（1 行ずつ）
+
+| 指摘 | 対応 |
+|---|---|
+| 仕様 S1 `--port auto` の意味が違う | core がポート名しか公開しないため、CLI の USB-ID 判定を名前に写した「USB シリアルらしい名前」フィルタを追加（`/dev/ttyUSB*`・`/dev/ttyACM*`・macOS の `cu.*USB*/SLAB/wchusbserial*`・`COM*`）。0 件/複数件は拒否し全ポートを列挙。USB-ID 判定を core に移すのが最終形である旨を `device.rs` と `02-cli.md` に明記。`auto_only_considers_a_cable_shaped_port` で固定 |
+| 仕様 S2 プロジェクト読込が kmz+NMEA / `photos:null` を受ける | CLI と同じ 2 つの拒否を読込前に追加（`a_kmz_project_is_refused_for_the_same_inputs_the_cli_refuses`） |
+| 仕様 S3 消去パネルに `--force` / `--port` 相当が無い | M2 のパネル分割で消去パネル自身がポート欄と上書き欄を持ち、エラー文が実際に描かれるラベルを引用するよう修正（上記 M2 のテスト） |
+| 仕様 S4 geotag の `--tz-offset-minutes` 相当が無い | **見送り**。GUI の写真ブロックは `photo_shift`（スコープ別の写真時計シフト）を持ち、CLI の「トラックのコピーをカメラ時計へ移す」tz と合成したときの正しい意味（両方が写真時刻側か、片方がトラック側か）をテストで固定できない。誤った合成は静かに写真を誤マッチさせるので、tz 単独の操作子と合成規則のテストを follow-up にする |
+| 仕様 S5 DESIGN.md 未更新（座標形式・空ログ copy・消去パネル） | DESIGN §5 設定行に座標形式、§6 空ログ、§10 に ログ操作コンソール・消去パネル（amber なし）・icon 既定 OFF・相対保存・JSON 契約を追記 |
+| 仕様 S6 標準 `--screenshot` 8 枚に新パネルが写らない | 設計として DESIGN §8 に記録: 標準 8 枚はサンプル軌跡つきの Log 画面で、コンソールは地図の下。空ログ時のみ先頭に出る。パネルのレビューは opt-in `M241_GUI_OPS_SCREENSHOTS` の 6 枚で行う（今回は再出力して目視） |
+| 仕様 S7 中継の `--max-lines` 相当が無い | `ProxyConfig.max_lines` と中継パネルの「最大行数」欄（空欄＝停止まで）を追加し、行ループ内で終了（`a_line_limit_ends_the_relay_after_that_many_lines`） |
+| 可読性 S1 `ops.rs` の責務分割 | パネル別状態＋実行関数の分割（`finish_dump`/`finish_backup`、`load_project` → `refuse_unsupported_project`/`adopt_project`、`proxy_panel` → 4 つの描画関数）、`run_repair` のファイル I/O を `nmea::repair_file` へ移動。**1 ファイル複数モジュールへの物理分割は見送り**: 純移動でレビュー差分が膨らみ、Stage 2 の Must 修正と独立なため |
+| 可読性 S2 長大関数 | 上記の切り出しで `load_project` 113→約 20 行、`proxy_panel` 132→4 関数に分割。`log.rs` の描画関数（写真・export）の分割は Stage 3 の指摘があれば follow-up |
+| 可読性 S3 共通化不足 | テキスト収集テストヘルパを `test_support` に移して 2 モジュールで共有（複製を解消）。ラベル定数（ポート・上書き）はエラー文と描画で共有。ラベル+`TextEdit` の ~11 箇所の helper 化と `write_dump`/`write_text` の統合は follow-up |
+| 可読性 S4 上書きポリシーが 3 通り | **未変更**（download/read は拒否、repair/project は上書き）。ツールの性格（repair は派生出力、project は設定ファイル）が違い、CLI も同様なので、設計意図を DESIGN §10 に 1 行残すに留めた |
+| 可読性 S5 文言を `contains` で機械判定するテスト | 消去は `press_erase` の挙動（armed でのみ拒否文が消去パネルの status になる）を検証。パネル描画テストは色数だけでなく各パネルの action 文言を `screen_texts` で検証。`settings.rs` の座標形式テストの偽のコンパイルエラー主張は未修正（follow-up） |
+| 可読性 S6 実機未検証と読める書き方 | `device.rs` 冒頭に「GUI 経由の吸い出しは実機未検証」を明記。KMZ icon の断定は既定 OFF と 未検証 表示で解消。project の相互運用はパス規則をテストで固定（CLI が書いた固定 JSON の読込テストは follow-up） |
+| 可読性 S7 `pub` が最小でない | `DownloadJob` のフィールドを private にし `purpose()` / `try_recv()` を追加。新規モジュール全体の `pub` → `pub(super)` の一括変更は機械的で本 PR の Must と独立なため follow-up（`unreachable_pub` 相当の lint 導入と併せて） |
+| 可読性 S8 NMEA 修復・暦算の丸ごと複製 | **共有化は見送り**（write scope が `m241-core` を禁止）。`nmea.rs` の module doc に CLI 側ファイル（`m241-cli/src/nmea.rs` / `cal.rs`）との対応と「片方だけ変えるな」、最終形は core に 1 実装であることを明記 |
+
+### Could（記録）
+
+- C1 空ログの扱い（GUI は保存しない / CLI は 0 バイトを書く）と C2 上書き既定（GUI は拒否 / CLI は上書き）は、GUI が安全側である差として `02-cli.md` の GUI 対応表に明記。
+- C3 KMZ icon は Must 5 で既定 OFF に変更（CLI と同じ出力が既定）。
+- C4 proxy の既定 TCP 待受は維持（ループバック限定）。`--bind` 省略＝TCP なしの CLI との差を GUI 対応表に明記し、欄を空にすれば CLI と同じになる。
+- C5 `--utc-offset-days` 相当は「読み書き」の日付補正とプロジェクトの保存値で代替できることを `log.rs` module doc に明記。C6（proxy 開始時の一過性表示）と C7（吸い出し成功時の解析警告）は未対応（follow-up）。
+
+### 追加・更新テスト（実測 `cargo test -p m241-gui` = 176 passed）
+
+- project: `a_project_in_a_subdirectory_stores_paths_relative_to_its_directory`、
+  `an_absolute_path_is_stored_absolute_and_read_back_as_the_same_file`、
+  `a_json_read_export_carries_the_nmea_counts_and_the_day_shift`、
+  `a_dump_json_export_carries_the_position_and_no_input_facts`、
+  `an_unpositioned_track_writes_no_position_object`、
+  `a_gpx_source_is_named_in_the_json_like_the_cli`、
+  `the_read_report_is_only_added_to_json`。
+- ops: `the_transfer_panels_draw_the_controls_their_refusals_name`、
+  `a_status_from_another_panel_is_not_drawn`、
+  `a_kmz_project_is_refused_for_the_same_inputs_the_cli_refuses`、
+  `the_export_bar_writes_the_read_report_into_json`、
+  `a_project_load_writes_the_read_report_fields_it_stored`。
+  既存の `the_erase_action_needs_a_saved_backup_and_the_confirmation` を文言コピー検査から
+  `press_erase` の挙動検査へ変更。
+- device: `auto_only_considers_a_cable_shaped_port`。
+- proxy: `a_line_limit_ends_the_relay_after_that_many_lines`。
+- log: `a_kmz_with_the_icon_option_bundles_an_icon_entry` に既定 OFF の assert を追加。
+
+### ゲート・スクリーンショット
+
+- `M241_VENDOR_IMAGE=<vendor V1.13> TMPDIR=/var/tmp ./tools/check.sh`: 本節を含む head の
+  ツリーで 6/6（fmt / clippy / test / docs / design / safety）。修正コードの commit は `607b77b`。
+- `cargo run -p m241-gui -- --screenshot`: 標準 8 枚を再出力（`.design/firmware-wizard/screenshots/`、
+  gitignore 済み）し、Log 1024/1280 を目視。`M241_GUI_OPS_SCREENSHOTS=/var/tmp/pr37-ops cargo test ...`
+  で 6 パネルを再出力し、消去パネルのポート欄・上書き欄、中継の「最大行数」、KMZ icon が
+  既定 OFF で表示されることを目視。
+- 実機の吸い出し・中継・消去は未検証のまま（GUI から実行していない）。
+
+### main 追従（PR #36 の core/CLI 変更）後の再突き合わせ（2026-11-23）
+
+- main の `5b2ffce`（PR #36）へ `06e4e1d` で merge。競合は本ファイル末尾のみで、
+  PR #37 節と PR #36 節を両方残して解消（`### Stage 3 検証` は両節がそれぞれ持つ）。
+- PR #36 で CLI の `attach_read_report` が `ReadReport` を受け取る形になり、`log read --format json`
+  は `input:"gpx"` / `simplify` / `position` を追加していた。GUI の JSON は `input` と `position`
+  を欠いていたため、GUI 側を新しい CLI に合わせた:
+  - `position`（最初と最後の位置点、decimal 度、`format` / `start` / `end` と
+    `latitude`/`longitude`/`lat`/`lon`）を書き出しバー・読み書きパネル・プロジェクト読込に追加。
+    `TrackPoint::position()` と core の `format_coordinate` を使い、CLI の `position_report` と同じ
+    規則（両端が揃ったときだけ）にした。
+  - 画面の「ログを開く」で GPX を読んだ場合、`log read --gpx` と同じく `"input": "gpx"` を付与。
+  - JSON は CLI と同じく常に `serde_json::Value` で再直列化してから付与する形にした（従来は
+    付与する事実が無いとき core のバイト列をそのまま書いていた）。
+  - `simplify` は GUI に間引きの操作子が無いため対象外（CLI でも `--simplify` 指定時のみ）。
+    `--cache` / `--csv-report` / `--coord-format` も GUI に対応する操作子が無い。`position` は
+    CLI の既定と同じ decimal 固定（Settings の座標形式は表示専用）。
+- 実出力での再突き合わせ（`/var/tmp` の合成 2 点ダンプと、そこから CLI で作った NMEA/GPX。
+  リポジトリ外で破棄）:
+  - dump: `m241 log read --format json` と GUI の読み書き → **file diff なし**
+  - NMEA: `--nmea --utc-offset-days 1` → **file diff なし**
+  - GPX: `--gpx` と GUI の「ログを開く」→ JSON → **file diff なし**
+- 追加テスト: `a_dump_json_export_carries_the_position_and_no_input_facts`、
+  `an_unpositioned_track_writes_no_position_object`、
+  `a_gpx_source_is_named_in_the_json_like_the_cli`。既存の JSON テスト
+  （`the_export_bar_writes_the_read_report_into_json`、
+  `a_project_load_writes_the_read_report_fields_it_stored`）に `position` の assert を追加。
+  旧 `a_dump_json_export_has_neither_read_report_field` は上記の position テストに置き換え。
+- ゲート: 最終 head（本節を含む）で `./tools/check.sh` 6/6、`cargo test -p m241-gui` は
+  lib 178 passed。`git diff origin/main...HEAD` は `crates/m241-gui`（`Cargo.toml` /
+  `Cargo.lock` の `serde_json` 追加を含む）と docs のみ（merge で取り込んだ core/CLI は
+  PR の差分に出ない）。
+- PR #38（`812a0b5`、GUI のファーム書き込み）を merge した。GUI が `m241-flash` をリンクする
+  ようになり「GUI は書き込みクレートをリンクしない」という前提は消えたため、ログ操作コンソールの
+  消去拒否文・module doc・`DESIGN.md` / `02-cli.md` を「GUI はファーム書き込み用に
+  `m241-flash` をリンクするが、この画面からログ消去の経路は呼び出さない（端末のログを消すには
+  ユーザーの明示的な承認が必要）」に更新した。挙動は変えていない。今回の merge は conflict
+  なし（自動マージ）で、PR #37 / #36 / #38 の節をすべて残した。
+
+### Stage 3 検証（検証者記録の代筆）
+
+Stage 3 再検証は head `d14a129`（PR #36 追従後、PR #38 マージ前）で合格:
+`./tools/check.sh` は **6/6 PASS**、`cargo test -p m241-gui` は **226 passed**
+（lib 178 + design_gate 6 + design_invariants 6 + render 36）。GUI と新しい CLI の
+`--format json` を dump / NMEA / GPX の 3 ケースで突き合わせ、**raw 一致**を確認した。
+Stage 3 検証者は worktree 編集禁止のため、この記録のみを修正担当が代筆した
+（検証対象のコード・テストは変更していない）。
+
 ---
 
 ## 2026-11-23 / PR #36 ezTour パリティ core/CLI Stage 2 修正（`feat-parity-core`）
