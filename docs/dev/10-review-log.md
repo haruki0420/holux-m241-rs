@@ -667,3 +667,69 @@ Stage 3（`/tmp/opencode/verify-da-loader-probe.md`）の **V-Must-1** と Shoul
 ### Stage 3 検証
 
 未検証（別エージェントが記入する）。
+
+---
+
+## 2026-11-22 / PR #19 `fix/flash-d3-resync` の Stage 2 修正
+
+対象: `git diff origin/main...ad489d5`（9 ファイル、+715 / −39）。Stage 1 は仕様検収
+（[仕様レビュー](https://github.com/haruki0420/holux-m241-rs/pull/19#issuecomment-7075378104)）と
+可読性（[可読性レビュー](https://github.com/haruki0420/holux-m241-rs/pull/19#issuecomment-7075374592)）を
+別々のレビュアーが並行実施。Stage 2 は別エージェントが担当し、Stage 3 で検証する。
+Stage 1 の 2 レビュアーは `./tools/check.sh` を実行していない（ビルド成果物を避けるため）。
+
+### Stage 1 の Must への対応
+
+| # | 指摘 | 対応 | 固定するテスト |
+|---|---|---|---|
+| 仕様 M1 | `02-cli.md` の `da-restart` 節に実機未検証の注記が無い | 節内に「⚠️ 未検証 on hardware」と `docs/dev/05-verification.md` §2 への参照を追加。出力例も「再起動は確認できない」に更新 | — |
+| 仕様 M2 | 再試行前の再入失敗に「The write itself finished」「`--recover`」の誤案内が付く | `reenter_bootrom` に `Reentry::{ReadBack, BeforeRetry}` を追加し、エラー文を分岐。再試行前は「何も書いていない・`fw dump` で確認」に。`RESTARTED_NOT_RETRIED_NOTE` を新設し `--recover` を出さない | `flash_retry_reentry_failure_does_not_claim_a_write_finished` |
+| 仕様 M3 | `0xD3` 成功・`0xD5` 未送信の境界テストが無い | fake に `failing_write_command()`（`0xD5` ヘッダの送信を失敗させる）を追加し、再試行しないことを固定。`program_started` はヘッダ送信**前**に立つ | `flash_does_not_retry_when_the_0xd5_header_cannot_be_sent`, `a_failed_d5_header_write_still_counts_as_program_started` |
+| 可読性 M1 | `flash` に復旧が 4 段の入れ子で埋まり、`note_write_failure` + `with_note` が 6 箇所重複 | `recover_failed_write` と `WriteAttempt` に切り出し、`write_failure` ヘルパ 1 つに集約。`flash` は「試行 → 復旧/再試行 → 読み戻し」の一直線に | 既存の retry / no-retry テスト一式 |
+| 可読性 M2 | 再同期が残留 `0x5A` を ACK と誤認しうる点の説明が無い | `read_d3_reply` を切り出し、status `0x00` 検査が第二の防御であること、観測残留は `0xBB` 4 バイト、`5A 00` の場合は `0xD5` の最初のパケット前に止まることを rustdoc に記載 | `a_residue_five_a_is_only_accepted_with_the_zero_status` |
+| 可読性 M3 | 「再起動した」と断定する文言（`0xD9` は応答を読まない） | `RESTARTED_*_NOTE` 3 定数と `da_restart` の結果文を「`0xD9` を送った／再起動は確認できない／`fw dump` で確認」に変更。`02-cli.md` も追随 | `da_restart_sends_one_d9_without_reading_a_reply_or_touching_the_control_lines`（期待文字列を更新） |
+
+### Stage 1 の変異テストで生存した 3 件
+
+| # | 生存した変異 | 対応 | 固定するテスト |
+|---|---|---|---|
+| MUT1 | `0xD3` 再同期のスキップ上限の境界が無い | 8 バイトの残留は成功し、9 バイト目は `after skipping 8 non-reply byte(s)` で拒否することを固定 | `the_d3_resync_accepts_eight_bytes_and_refuses_the_ninth` |
+| MUT2 | `0xD3` status 非 0 の分岐が未実行 | fake に `set_d3_status` を追加し、`0xD3 status byte was 0x01` で停止・`0xD5` を送らないことを固定 | `a_non_zero_d3_status_is_a_framing_error_and_nothing_is_written` |
+| MUT3 | `check_layout_of` のピン検査が後段エラーと区別されない | ピンだけ動かしたとき、後段の `write_start != expected_start` ではなくピン固有の文言で失敗することを固定 | `moving_only_the_pinned_start_is_refused_by_the_pin_rule` |
+
+変異の実測: ピン検査の削除、`skipped >= LIMIT` → `>`、status 検査の削除の 3 つを入れ、
+対応するテストがそれぞれ落ちることを確認した（各変異のあと元に戻し `git status` で確認）。
+残り 2 件の生存変異（等価変異・低リスク）は指示どおり対応しない。
+
+### Should への対応
+
+| # | 指摘 | 対応 |
+|---|---|---|
+| 仕様 S1 / 可読性 M2 | 再同期が `0x5A` を含む残留を ACK と誤認しうる | 可読性 M2 と同じ。`5A 01` の残留を拒否するテストを追加し、設計で消せない `5A 00` は rustdoc に残余リスクとして明記（観測残留は `0xBB`） |
+| 仕様 S2 | 再試行前の `verify_device` 省略の根拠が無い | `reload_for_retry` の rustdoc と `02-cli.md` に「`0xD3` はフラッシュを触らないので、`0xD5` 前の失敗はフラッシュを変えていない」と明記 |
+| 仕様 S3 | 再入路のテストが `0xA8` 回数と `opens() > 0` だけ | fake の `$PMTK180` を `pmtk180_requests` として回数化し、再試行の再入で 1 回（2 回失敗のケース）、読み戻し込みで 2 回（成功ケース）を固定 |
+| 仕様 S4 / 可読性 S4 | `with_note` の doc と実装が矛盾 | doc を「`Framing` / `Timeout` / `Rejected` / `Safety` は variant を保ち、それ以外は `State`」に修正 |
+| 仕様 S5 | `02-cli.md` の 🧪 に自動リトライが列挙されていない | 🧪 注記に「自動 `0xD9` と 1 回再試行」「`0xD3` 応答の再同期」を追加 |
+| 仕様 S6 | `D3_RESYNC_LIMIT = 8` の根拠が citation でない | doc に「観測は 4 バイト（`05-verification.md` §1.3）、8 は余裕で protocol 値ではない」と明記 |
+| 可読性 S5 | `range_attempted = false` の dead store | 削除。`program_started = false` は試行開始時のリセットとして残す |
+| 可読性 S6 | `program_started` の「送信前・失敗時も true」の理由が無い | フィールド・accessor・設定箇所に「送信前に立てる。失敗した書き込みは未送信を証明できない」と明記 |
+| 可読性 S7 | モジュール doc のコマンド列挙に `flash` が無い | 列挙と説明に `flash` を追加 |
+| 可読性 S8 | `flash` の rustdoc 手順に自動復旧が無い | 手順 5 として自動復旧を追加し、読み戻しを 6 に繰り下げ |
+| 可読性 S9 | `assert!(ports.opens() > 0)` が主題を検証しない | `assert_eq!(ports.opens(), 1, ...)`（再試行は同じ transport で再入し、ポートを開き直さない）に変更 |
+| 可読性 S10 | `0xD3` 拒否の 2 機構（`refuse_ranges` と `refuse_ranges_remaining`） | カウンタ 1 本に統一し、`usize::MAX` を「ずっと拒否」に |
+
+### Could
+
+- 対応: 11（`write_once` → `WriteAttempt::write`。vendor 時に `image` を使わない旨を doc に記載）、
+  12（エラー文を `non-reply byte(s)` に）、13（`record_range` から `read_d3_reply` を切り出し）、
+  14（冗長な `assert!(chip.restarted())` を削除）。
+- 見送り: 15（fake の `0xD3` アーム分割）はテスト専用 fake の整理で、別途まとめる。
+  Could 2（`12-progress-summary.md` の `da-restart` 注記）と Could 3（拒否メッセージの
+  「keeps whatever ranges…」）は、後者は仕様検収の項目 4（`A5` を「空」と扱わない）が
+  明示を求めている文面でもあるため、現状のまま残す。
+
+### ゲート
+
+`./tools/check.sh` 6/6（`M241_VENDOR_IMAGE` を設定した状態。実機ポートは開かず、
+`m241-core` と `tools/` は未変更）。
+
