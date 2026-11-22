@@ -1,4 +1,5 @@
-//! `m241 fw dump`, `m241 fw patch` and `m241 fw probe-da`.
+//! `m241 fw dump`, `m241 fw patch`, `m241 fw probe-da` and
+//! `m241 fw da-restart`.
 //!
 //! The halves of the repair, deliberately asymmetric. [`dump`] touches the
 //! device and is read-only: it reads the image twice, comparing hashes, so a
@@ -7,7 +8,8 @@
 //! device is a different command. [`probe_da`] loads the DA into the chip's RAM
 //! and reads two candidate addresses through it; it writes no flash either, and
 //! exists because the address `fw flash` refuses on cannot be settled any other
-//! way.
+//! way. [`da_restart`] sends the DA's one-byte `0xD9` to free a unit that a
+//! failed DA phase left in RAM; it also writes no flash.
 //!
 //! # Why the second pass exists
 //!
@@ -30,13 +32,13 @@ use m241_core::protocol::port::Transport;
 use m241_core::{Error, FirmwareProfile, PatchPlan, Result};
 use m241_flash::da::{
     Confirmation, DaLoadId, DaLoader, DownloadAgent, FLASH_WRITE_START, PROBE_ADDRESSES,
-    PROBE_PAGE_SIZE, VECTOR, VENDOR_PER_UNIT_DATA_BYTES, WritePlan, WriteReport,
-    accept_vendor_image, check_da_image, check_image, check_layout, read_candidates, write_plan,
-    write_plan_vendor,
+    PROBE_PAGE_SIZE, PendingWrite, VECTOR, VENDOR_PER_UNIT_DATA_BYTES, VendorImage, WritePlan,
+    WriteReport, accept_vendor_image, check_da_image, check_image, check_layout, read_candidates,
+    write_plan, write_plan_vendor,
 };
 
 use crate::Session;
-use crate::cli::{DumpOptions, FlashOptions, PatchOptions, ProbeDaOptions};
+use crate::cli::{DaRestartOptions, DumpOptions, FlashOptions, PatchOptions, ProbeDaOptions};
 use crate::fileio;
 use crate::link::{self, Opened};
 use crate::output::Console;
@@ -687,15 +689,71 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
     ));
 
     let mut da_session = DownloadAgent::new(rom.into_transport());
-    let written = match vendor {
-        Some(token) => da_session.write_vendor(confirmation, &backup, token),
-        None => da_session.write(confirmation, &backup, &image),
-    };
-    let pending = match written {
+    let pending = match write_once(&mut da_session, confirmation, &backup, &image, vendor) {
         Ok(pending) => pending,
-        Err(err) => {
-            note_write_failure(session.console, &options.backup);
-            return Err(err);
+        Err(first_err) => {
+            let range_attempted = da_session.range_attempted();
+            let program_started = da_session.program_started();
+            if let Err(restart_err) = da_session.restart() {
+                note_write_failure(session.console, &options.backup);
+                return Err(with_note(
+                    first_err,
+                    &format!(
+                        "The automatic 0xD9 restart failed ({restart_err}); the DA may still be \
+                         running in RAM. Retry with --assume-brom or power-cycle, then run \
+                         `m241 fw dump`"
+                    ),
+                ));
+            }
+            if !range_attempted {
+                note_write_failure(session.console, &options.backup);
+                return Err(with_note(first_err, RESTARTED_NO_RETRY_NOTE));
+            }
+            if program_started {
+                note_write_failure(session.console, &options.backup);
+                return Err(with_note(first_err, RESTARTED_PARTIAL_NOTE));
+            }
+
+            session.console.warn(
+                "0xD3 failed before 0xD5; the DA was restarted with 0xD9. Re-entering the \
+                 BootROM, reloading the DA, and retrying the write once",
+            );
+            let transport = match reenter_bootrom(da_session.into_transport(), session) {
+                Ok(transport) => transport,
+                Err(err) => {
+                    note_write_failure(session.console, &options.backup);
+                    return Err(with_note(err, RESTARTED_RETRY_FAILED_NOTE));
+                }
+            };
+            let mut retry_session = match reload_for_retry(transport, confirmation, &da, session) {
+                Ok(session) => session,
+                Err(err) => {
+                    note_write_failure(session.console, &options.backup);
+                    return Err(with_note(err, RESTARTED_RETRY_FAILED_NOTE));
+                }
+            };
+            match write_once(&mut retry_session, confirmation, &backup, &image, vendor) {
+                Ok(pending) => {
+                    da_session = retry_session;
+                    pending
+                }
+                Err(retry_err) => {
+                    let note = if retry_session.program_started() {
+                        RESTARTED_PARTIAL_NOTE
+                    } else {
+                        RESTARTED_RETRY_FAILED_NOTE
+                    };
+                    let note = match retry_session.restart() {
+                        Ok(()) => note.to_owned(),
+                        Err(restart_err) => format!(
+                            "The automatic 0xD9 restart after the retry failed ({restart_err}); \
+                             {note}"
+                        ),
+                    };
+                    note_write_failure(session.console, &options.backup);
+                    return Err(with_note(retry_err, &note));
+                }
+            }
         }
     };
     session.console.note(
@@ -713,6 +771,84 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
     };
 
     print_write_report(options, session.console, &port, &plan, &report)
+}
+
+/// The note appended when the automatic `0xD9` restart succeeded but no write
+/// had started yet.
+const RESTARTED_NO_RETRY_NOTE: &str = concat!(
+    "The unit was restarted with 0xD9; no battery removal is needed. The write did not start, so ",
+    "there is nothing to retry automatically. Run `m241 fw dump` to confirm what it holds",
+);
+
+/// The note appended after `0xD5` started: the range may be partly written.
+const RESTARTED_PARTIAL_NOTE: &str = concat!(
+    "The unit was restarted with 0xD9; no battery removal is needed. The write may have stopped ",
+    "part-way, so it is not retried automatically. Run `m241 fw dump`; if the image is incomplete, ",
+    "restore your backup with `m241 fw flash --recover ... --yes`",
+);
+
+/// The note appended when the one automatic retry failed after a restart.
+const RESTARTED_RETRY_FAILED_NOTE: &str = concat!(
+    "The unit was restarted with 0xD9; no battery removal is needed. The automatic retry also ",
+    "failed; run `m241 fw dump` before deciding whether to retry, and use `--recover` with your ",
+    "backup if the image was partly written",
+);
+
+/// Run one DA write attempt, selecting the strict or vendor path.
+fn write_once<T: Transport>(
+    da: &mut DownloadAgent<T>,
+    confirmation: Confirmation,
+    backup: &[u8],
+    image: &[u8],
+    vendor: Option<VendorImage<'_>>,
+) -> Result<PendingWrite> {
+    match vendor {
+        Some(token) => da.write_vendor(confirmation, backup, token),
+        None => da.write(confirmation, backup, image),
+    }
+}
+
+/// Re-enter the BootROM and reload the DA for the one automatic retry.
+///
+/// Called only after a failed `0xD3` before `0xD5`: the flash was not changed,
+/// the chip has already been restarted with `0xD9`, and the caller has checked
+/// that no partial write is possible. The range is not passed in; both
+/// [`DownloadAgent::write`] and [`write_vendor`] use the same pinned constants.
+fn reload_for_retry(
+    transport: Opened,
+    confirmation: Confirmation,
+    da: &[u8],
+    session: Session<'_>,
+) -> Result<DownloadAgent<Opened>> {
+    let mut rom = MtkBootRom::new(transport);
+    rom.sync()?;
+    session
+        .console
+        .note("BootROM re-entered after the restart; reloading the DA into RAM");
+    let mut loader = DaLoader::new(rom.transport_mut());
+    let _id = loader.load(confirmation, da)?;
+    Ok(DownloadAgent::new(rom.into_transport()))
+}
+
+/// Append `note` to an error without replacing its machine-readable variant.
+fn with_note(err: Error, note: &str) -> Error {
+    match err {
+        Error::Framing { what, offset } => Error::Framing {
+            what: format!("{what}. {note}"),
+            offset,
+        },
+        Error::Timeout { what, timeout } => Error::Timeout {
+            what: format!("{what}. {note}"),
+            timeout,
+        },
+        Error::Rejected { what } => Error::Rejected {
+            what: format!("{what}. {note}"),
+        },
+        Error::Safety { reason } => Error::Safety {
+            reason: format!("{reason}. {note}"),
+        },
+        other => Error::State(format!("{other}. {note}")),
+    }
 }
 
 /// Put the transport back where a BootROM read works, after `0xD9`.
@@ -1195,6 +1331,37 @@ pub fn base_verdict(pages: &[ProbeCandidate]) -> Result<BaseVerdict> {
         [] => Ok(BaseVerdict::Inconclusive(Inconclusive::NoMatch)),
         _ => Ok(BaseVerdict::Inconclusive(Inconclusive::Ambiguous)),
     }
+}
+
+/// `m241 fw da-restart`: send the DA's one-byte `0xD9` restart.
+///
+/// A failed DA phase can leave the Download Agent running in RAM, where the
+/// unit no longer answers the firmware's commands. `0xD9` makes the chip boot
+/// its firmware; the handler resets the chip and never returns, so no reply is
+/// awaited. It neither erases nor programs flash, which is why the command
+/// needs no `--yes`. DTR/RTS are not touched: pulsing them at a running
+/// firmware can leave the unit unresponsive.
+///
+/// The command opens the port at [`DEFAULT_BOOTROM_BAUD`], sends the single
+/// byte through [`DownloadAgent::restart`], flushes, and returns. It reads
+/// nothing and sends no other opcode.
+///
+/// # Errors
+///
+/// * [`Error::Port`] when no plausible port can be opened.
+/// * [`Error::Io`] when the byte cannot be written.
+pub fn da_restart(options: &DaRestartOptions, session: Session<'_>) -> Result<()> {
+    let port = link::resolve(session.links, &options.port)?;
+    let transport = session.links.open(&port, DEFAULT_BOOTROM_BAUD)?;
+    let mut da = DownloadAgent::new(transport);
+    session
+        .console
+        .note(&format!("sending the one-byte 0xD9 restart to {port}"));
+    da.restart()?;
+    session
+        .console
+        .result("DA restart sent; the unit boots its firmware. No flash was written.");
+    Ok(())
 }
 
 /// `m241 fw probe-da`: load the DA, read the two candidate addresses, say which one
@@ -3292,6 +3459,194 @@ mod tests {
     }
 
     #[test]
+    fn flash_retries_once_when_d3_fails_before_d5() {
+        let scratch = crate::testing::Scratch::new("flash-d3-retry");
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let image = flash_image(&PROFILE_V1_13, true);
+        let case = flash_case(&scratch, &image, &backup);
+        let chip = m241_flash::FakeDa::with_firmware(&backup).refusing_next_ranges(1);
+        let links = da_write::DaWritePorts::new(chip);
+        let ports = links.clone();
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.yes = true;
+        options.da = Some(da_file(scratch.path()));
+
+        flash(&options, session).expect("the one retry succeeds");
+        assert!(ports.opens() > 0);
+        let chip = chip.borrow();
+        assert_eq!(
+            chip.recorded_ranges(),
+            &[(0, FLASH_WRITE_END), (0, FLASH_WRITE_END)],
+            "both 0xD3 attempts use the pinned range"
+        );
+        assert!(chip.restarted(), "the failed D3 was followed by 0xD9");
+        assert_eq!(
+            chip.opcodes()
+                .iter()
+                .filter(|opcode| **opcode == 0xA8)
+                .count(),
+            2,
+            "the first attempt loaded the DA once and the retry loaded it again"
+        );
+        assert_eq!(chip.accepted_packets(), 1_589);
+        let stderr = console.stderr();
+        assert!(
+            stderr.contains("0xD3 failed before 0xD5"),
+            "the retry is explained: {stderr}"
+        );
+        assert!(
+            stderr.contains("retrying the write once"),
+            "the retry is bounded to one: {stderr}"
+        );
+    }
+
+    #[test]
+    fn flash_reports_no_battery_removal_after_two_d3_failures() {
+        let scratch = crate::testing::Scratch::new("flash-d3-two-failures");
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let image = flash_image(&PROFILE_V1_13, true);
+        let case = flash_case(&scratch, &image, &backup);
+        let chip = m241_flash::FakeDa::with_firmware(&backup).refusing_next_ranges(2);
+        let links = da_write::DaWritePorts::new(chip);
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.yes = true;
+        options.da = Some(da_file(scratch.path()));
+
+        let err = flash(&options, session).expect_err("both D3 attempts are refused");
+        assert!(matches!(err, Error::Rejected { .. }), "got {err}");
+        let text = format!("{err}");
+        assert!(
+            text.contains("no battery removal is needed"),
+            "the unit was restarted: {text}"
+        );
+        assert!(
+            text.contains("automatic retry also failed"),
+            "the retry is reported as attempted: {text}"
+        );
+        assert!(text.contains("fw dump"), "the check is named: {text}");
+        let chip = chip.borrow();
+        assert_eq!(
+            chip.recorded_ranges(),
+            &[(0, FLASH_WRITE_END), (0, FLASH_WRITE_END)],
+            "no third 0xD3 and no shifted range"
+        );
+        assert!(chip.restarted());
+        assert_eq!(
+            chip.restart_requests(),
+            2,
+            "0xD9 is sent after each failed 0xD3"
+        );
+    }
+
+    #[test]
+    fn flash_does_not_retry_after_d5_has_started() {
+        let scratch = crate::testing::Scratch::new("flash-d5-no-retry");
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let image = flash_image(&PROFILE_V1_13, true);
+        let case = flash_case(&scratch, &image, &backup);
+        let chip = m241_flash::FakeDa::with_firmware(&backup).refusing_packets_from(2, 1);
+        let links = da_write::DaWritePorts::new(chip);
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.yes = true;
+        options.da = Some(da_file(scratch.path()));
+
+        let err = flash(&options, session).expect_err("the third packet is refused");
+        let text = format!("{err}");
+        assert!(
+            text.contains("no battery removal is needed"),
+            "the unit was restarted: {text}"
+        );
+        assert!(
+            text.contains("not retried automatically"),
+            "a partial write is not retried: {text}"
+        );
+        assert!(
+            text.contains("--recover"),
+            "the recovery route is named: {text}"
+        );
+        assert!(text.contains("fw dump"), "the check is named: {text}");
+        let chip = chip.borrow();
+        assert_eq!(
+            chip.recorded_ranges(),
+            &[(0, FLASH_WRITE_END)],
+            "only one 0xD3, with the pinned range"
+        );
+        assert!(chip.restarted(), "0xD9 is still sent after a D5 failure");
+        assert_eq!(
+            chip.restart_requests(),
+            1,
+            "one restart, and no retry after 0xD5 started"
+        );
+    }
+
+    #[test]
+    fn flash_recover_retries_once_when_d3_fails_before_d5() {
+        let scratch = crate::testing::Scratch::new("flash-recover-d3-retry");
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let image = backup.clone();
+        let case = flash_case(&scratch, &image, &backup);
+        let chip = m241_flash::FakeDa::with_firmware(&backup).refusing_next_ranges(1);
+        let links = da_write::DaWritePorts::new(chip);
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.recover = true;
+        options.yes = true;
+        options.da = Some(da_file(scratch.path()));
+
+        flash(&options, session).expect("recovery also gets the one retry");
+        let chip = chip.borrow();
+        assert_eq!(
+            chip.recorded_ranges(),
+            &[(0, FLASH_WRITE_END), (0, FLASH_WRITE_END)]
+        );
+        assert!(chip.restarted());
+    }
+
+    #[test]
+    fn flash_allow_vendor_retries_once_when_d3_fails_before_d5() {
+        let Some(vendor) = vendor_image() else {
+            return;
+        };
+        let backup = vendor_backup(&vendor);
+        let scratch = crate::testing::Scratch::new("flash-vendor-d3-retry");
+        let case = flash_case(&scratch, &vendor, &backup);
+        let chip = m241_flash::FakeDa::with_firmware(&backup).refusing_next_ranges(1);
+        let links = da_write::DaWritePorts::new(chip);
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.allow_vendor = true;
+        options.yes = true;
+        options.da = Some(da_file(scratch.path()));
+
+        flash(&options, session).expect("the vendor path also gets the one retry");
+        let chip = chip.borrow();
+        assert_eq!(
+            chip.recorded_ranges(),
+            &[(0, FLASH_WRITE_END), (0, FLASH_WRITE_END)]
+        );
+        assert!(chip.restarted());
+        assert_eq!(&chip.memory()[..FLASH_WRITE_LENGTH], &vendor[..]);
+    }
+
+    #[test]
     fn flash_writes_through_the_da_and_reports_the_verified_read_back() {
         // The end-to-end path against the write crate's own fake DA: entry,
         // `verify_device`, the RAM load, `0xD3` + `0xD5`, `0xD9`, the BootROM
@@ -3812,6 +4167,44 @@ mod tests {
             console.stderr().contains("no NMEA stream"),
             "the silence route is reported: {}",
             console.stderr()
+        );
+    }
+
+    #[test]
+    fn da_restart_sends_one_d9_without_reading_a_reply_or_touching_the_control_lines() {
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let chip = m241_flash::FakeDa::with_firmware(&backup);
+        let links = da_write::DaWritePorts::new(chip);
+        let chip = links.chip();
+        let before = chip.borrow().memory().to_vec();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        let options = DaRestartOptions {
+            port: String::from("auto"),
+        };
+
+        da_restart(&options, session).expect("the restart byte is written");
+
+        assert_eq!(links.opens(), 1, "one port open");
+        let chip = chip.borrow();
+        assert_eq!(chip.restart_requests(), 1, "exactly one 0xD9");
+        assert!(chip.restarted(), "the fake saw the restart");
+        assert_eq!(chip.read_polls(), 0, "0xD9 has no reply to read");
+        assert!(chip.opcodes().is_empty(), "no 0xD3 / 0xD5 / 0xD6");
+        assert!(chip.recorded_ranges().is_empty(), "no range was recorded");
+        assert!(chip.packets().is_empty(), "no write packet was sent");
+        assert!(
+            chip.control_lines().is_empty(),
+            "DTR/RTS must never be touched"
+        );
+        assert_eq!(chip.bauds(), &[DEFAULT_BOOTROM_BAUD], "opened at 115200");
+        assert_eq!(chip.memory(), before.as_slice(), "flash contents unchanged");
+        assert!(
+            console
+                .stdout()
+                .contains("DA restart sent; the unit boots its firmware. No flash was written."),
+            "the result says what happened: {}",
+            console.stdout()
         );
     }
 }

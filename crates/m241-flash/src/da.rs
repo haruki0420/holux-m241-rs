@@ -605,6 +605,14 @@ pub const PROBE_PAGE_SIZE: usize = 64;
 /// short enough that a wrong cable is reported instead of hammered.
 pub const READ_RETRIES: usize = 3;
 
+/// How many non-`0x5A` / non-`0xA5` bytes may precede the `0xD3` reply.
+///
+/// The 2026-11-22 hardware writes saw four banner-residue bytes, sometimes after
+/// the pre-command `clear_input`. Eight leaves margin without letting a
+/// genuinely desynchronised line be scanned indefinitely; the deadline is the
+/// same [`REPLY_TIMEOUT`] used by every other reply.
+const D3_RESYNC_LIMIT: usize = 8;
+
 /// A call-site confirmation token indicating that `--yes` (or an interactive
 /// confirmation) was supplied for this operation.
 ///
@@ -1374,6 +1382,10 @@ impl PendingWrite {
 pub struct DownloadAgent<T: Transport> {
     transport: T,
     reply_timeout: Duration,
+    /// `true` once the first `0xD3` attempt has started.
+    range_attempted: bool,
+    /// `true` once the `0xD5` header has been sent (or is about to be).
+    program_started: bool,
 }
 
 impl<T: Transport> DownloadAgent<T> {
@@ -1383,6 +1395,8 @@ impl<T: Transport> DownloadAgent<T> {
         Self {
             transport,
             reply_timeout: REPLY_TIMEOUT,
+            range_attempted: false,
+            program_started: false,
         }
     }
 
@@ -1398,6 +1412,25 @@ impl<T: Transport> DownloadAgent<T> {
         &mut self.transport
     }
 
+    /// Whether the first `0xD3` attempt has started.
+    ///
+    /// After a failed write the CLI uses this with [`Self::program_started`] to
+    /// decide whether the failure happened before any `0xD5` byte: only that
+    /// state is safe for the one automatic retry.
+    #[must_use]
+    pub fn range_attempted(&self) -> bool {
+        self.range_attempted
+    }
+
+    /// Whether the `0xD5` header has been sent (or is about to be).
+    ///
+    /// Once this is true a partial flash write is possible, so the CLI restarts
+    /// the unit but does not retry the write automatically.
+    #[must_use]
+    pub fn program_started(&self) -> bool {
+        self.program_started
+    }
+
     /// Take the transport back, for the BootROM read-back.
     #[must_use]
     pub fn into_transport(self) -> T {
@@ -1409,7 +1442,9 @@ impl<T: Transport> DownloadAgent<T> {
     /// `docs/reference/01-da-protocol.md` §4.5 and §8 item 4: the handler jumps
     /// to `0x00101920`, sets the reset registers and never returns. The write
     /// path itself never calls this; [`PendingWrite::verify_written`] does,
-    /// immediately before the read that needs the restart.
+    /// immediately before the read that needs the restart. The CLI also uses it
+    /// after a failed DA phase to leave the chip in a defined restart state
+    /// instead of RAM-resident DA code.
     ///
     /// # Errors
     ///
@@ -1794,6 +1829,8 @@ impl<T: Transport> DownloadAgent<T> {
     /// place that can reach `0xD3` without repeating a check, so it must not
     /// become public.
     fn write_range_accepted(&mut self, start: u32, image: &[u8]) -> Result<PendingWrite> {
+        self.range_attempted = false;
+        self.program_started = false;
         let mut packets = 0usize;
         let mut progress = Progress::NothingWritten;
         let end = range_end(start);
@@ -1801,6 +1838,7 @@ impl<T: Transport> DownloadAgent<T> {
         // stands on its own. Wrapping it in the partial-write paragraph would
         // tell the user the range is "now only partly erased and programmed"
         // when this run did not erase or program a byte.
+        self.range_attempted = true;
         self.record_range(start, end)?;
         let outcome = self.program(image, start, &mut packets, &mut progress);
         if let Err(err) = outcome {
@@ -1827,11 +1865,14 @@ impl<T: Transport> DownloadAgent<T> {
     fn record_range(&mut self, start: u32, end: u32) -> Result<()> {
         // The DA banner is followed by four bytes whose origin is not
         // established. They arrive before the first `0xD6`, and the 2026-11-22
-        // hardware write showed they also arrive before the first `0xD3`: that
-        // run read one as `0xBB` and reported "0xD3 answered 0xBB". The read
-        // path already drains before `0xD6`; the first write command must drain
-        // too, or the stale byte becomes the ACK. `clear_input` is the same
-        // operation in both places.
+        // hardware writes showed they also arrive before the first `0xD3`.
+        // The first fix cleared the input before sending `0xD3`, but the unit
+        // answered `0xBB` again: the residue can arrive **after** that clear.
+        // The acknowledgement is therefore resynchronised: skip non-`0x5A` /
+        // non-`0xA5` bytes up to `D3_RESYNC_LIMIT`, then require the real reply.
+        // The read path does the same job for `0xD6` by clearing before the
+        // command; here the bytes may follow the command, so a clear alone is
+        // not sufficient.
         self.transport.clear_input()?;
         let mut frame = Vec::with_capacity(10);
         // §5.3: one count byte, then one pair of big-endian u32 (start, end).
@@ -1848,7 +1889,24 @@ impl<T: Transport> DownloadAgent<T> {
         //
         // 未検証 the one-byte refusal: `0x0010202C` shows it in the instruction
         // sequence, but no unit was ever made to refuse a `0xD3`.
-        let first = self.read_byte("0xD3 reply")?;
+        let deadline = std::time::Instant::now() + self.reply_timeout;
+        let mut skipped = 0usize;
+        let first = loop {
+            let byte = self.read_byte_before(deadline, "0xD3 reply")?;
+            if byte == ACK || byte == NAK {
+                break byte;
+            }
+            if skipped >= D3_RESYNC_LIMIT {
+                return Err(Error::Framing {
+                    what: format!(
+                        "0xD3 answered 0x{byte:02X} after skipping {skipped} non-ACK byte(s); \
+                         expected 0x5A or 0xA5"
+                    ),
+                    offset: None,
+                });
+            }
+            skipped = skipped.saturating_add(1);
+        };
         if first == NAK {
             return Err(Error::Rejected {
                 what: format!(
@@ -1858,13 +1916,7 @@ impl<T: Transport> DownloadAgent<T> {
                 ),
             });
         }
-        if first != ACK {
-            return Err(Error::Framing {
-                what: format!("0xD3 answered 0x{first:02X}; expected 0x5A or 0xA5"),
-                offset: None,
-            });
-        }
-        let status = self.read_byte("0xD3 status byte")?;
+        let status = self.read_byte_before(deadline, "0xD3 status byte")?;
         if status != MEM_CMD_STATUS_OK {
             return Err(Error::Framing {
                 what: format!("0xD3 status byte was 0x{status:02X}; the only value is 0x00"),
@@ -1882,6 +1934,7 @@ impl<T: Transport> DownloadAgent<T> {
         packets: &mut usize,
         progress: &mut Progress,
     ) -> Result<()> {
+        self.program_started = true;
         self.send_write_header()?;
         self.await_first_erase()?;
         for (index, chunk) in image.chunks(PACKET_SIZE).enumerate() {
@@ -2004,8 +2057,17 @@ impl<T: Transport> DownloadAgent<T> {
     }
 
     fn read_byte(&mut self, what: &str) -> Result<u8> {
-        let mut byte = [0u8; 1];
         let deadline = std::time::Instant::now() + self.reply_timeout;
+        self.read_byte_before(deadline, what)
+    }
+
+    /// Read one byte, but never past `deadline`.
+    ///
+    /// `record_range` uses one deadline for the whole `0xD3` resynchronisation,
+    /// so skipped bytes and the eventual reply share the same `reply_timeout`
+    /// budget instead of each noise byte getting a fresh one.
+    fn read_byte_before(&mut self, deadline: std::time::Instant, what: &str) -> Result<u8> {
+        let mut byte = [0u8; 1];
         loop {
             if self.transport.read(&mut byte)? == 1 {
                 return byte.first().copied().ok_or_else(|| Error::Timeout {
@@ -2983,6 +3045,53 @@ mod tests {
             da.transport_mut().recorded_range(),
             (0, FLASH_WRITE_END),
             "write_vendor records the settled range after the drain"
+        );
+    }
+
+    #[test]
+    fn the_first_d3_resyncs_past_late_banner_residue() {
+        // The second 2026-11-22 run still saw `0xBB`: the four bytes arrived
+        // after the pre-command clear. The fake stores them as a field and
+        // queues them when it receives `0xD3`, so `clear_input` cannot remove
+        // them. The client must skip them and reach the real `5A 00`.
+        let backup = stock_image();
+        let image = patched_image();
+        let mut device = FakeDa::with_firmware(&backup);
+        let report = enter_download_agent(&mut device);
+        assert_eq!(report.first().copied(), Some(0xC0), "the DA banner");
+        device.prefix_next_d3(&[0xBB; 4]);
+        let mut da = DownloadAgent::new(device);
+        let pending = da
+            .write(Confirmation::granted(), &backup, &image)
+            .expect("the first 0xD3 resynchronises past the late residue");
+        assert_eq!(pending.packets, 1_589);
+        assert_eq!(
+            da.transport_mut().recorded_range(),
+            (0, FLASH_WRITE_END),
+            "0xD3 records the settled range after resynchronising"
+        );
+    }
+
+    #[test]
+    fn the_first_d3_resyncs_past_late_banner_residue_for_a_vendor_write() {
+        let Some(vendor) = vendor_image() else {
+            return;
+        };
+        let backup = stock_image();
+        let token = accept_vendor_image(&PROFILE_V1_13, &vendor).expect("the pinned vendor image");
+        let mut device = FakeDa::with_firmware(&backup);
+        let report = enter_download_agent(&mut device);
+        assert_eq!(report.first().copied(), Some(0xC0), "the DA banner");
+        device.prefix_next_d3(&[0xBB; 4]);
+        let mut da = DownloadAgent::new(device);
+        let pending = da
+            .write_vendor(Confirmation::granted(), &backup, token)
+            .expect("write_vendor resynchronises past the late residue");
+        assert_eq!(pending.packets, 1_589);
+        assert_eq!(
+            da.transport_mut().recorded_range(),
+            (0, FLASH_WRITE_END),
+            "write_vendor records the settled range after resynchronising"
         );
     }
 

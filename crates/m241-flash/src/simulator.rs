@@ -235,6 +235,13 @@ pub struct FakeDa {
     /// unit emits any is ⚠️ 未検証 in `docs/dev/05-verification.md`). A retry
     /// must be clean, so the prefix is taken on the first send only.
     page_prefix: Option<Vec<u8>>,
+    /// Bytes the fake puts in front of the next `0xD3` reply, once.
+    ///
+    /// The 2026-11-22 hardware writes saw the four banner bytes arrive **after**
+    /// the client's pre-command clear, as the `0xD3` reply. The prefix is
+    /// stored here, not in `output`, so the client's `clear_input` cannot remove
+    /// it; `dispatch_da_command` queues it when the `0xD3` frame is complete.
+    d3_prefix: Option<Vec<u8>>,
     /// Every opcode the host sent, in order: the BootROM's frames and the DA's.
     opcodes: Vec<u8>,
     /// The two-byte trailer of each packet, as it arrived, parallel to
@@ -242,8 +249,25 @@ pub struct FakeDa {
     trailers: Vec<[u8; 2]>,
     /// Whether a `0xD9` has been seen.
     restarted: bool,
+    /// How many standalone `0xD9` writes the host sent.
+    ///
+    /// Counted at `write_all` level, so a restart sent while the fake is still
+    /// in a `0xD5` packet stage is visible even though the byte is not parsed as
+    /// a command there.
+    restart_requests: usize,
     /// Whether every `0xD3` is refused, as an unmappable range would be.
     refuse_ranges: bool,
+    /// How many upcoming `0xD3` commands to refuse, then accept again.
+    ///
+    /// A count rather than a bool so a test can fail the first attempt and let
+    /// the automatic retry succeed, or fail both attempts.
+    refuse_ranges_remaining: usize,
+    /// Every `0xD3` range the host sent, in order, accepted or refused.
+    ///
+    /// The retry tests use this to prove every attempt used exactly
+    /// `FLASH_WRITE_START` .. `FLASH_WRITE_END`, never a widened or shifted
+    /// range.
+    ranges_recorded: Vec<(u32, u32)>,
     /// Whether the first sector erase of the next `0xD5` fails.
     ///
     /// `0x0010253C`–`0x0010254C`: the DA answers a single `0xA5` there instead
@@ -356,9 +380,13 @@ impl FakeDa {
             bad_jump_counts: 0,
             retries_sent: 0,
             page_prefix: None,
+            d3_prefix: None,
             opcodes: Vec::new(),
             restarted: false,
+            restart_requests: 0,
             refuse_ranges: false,
+            refuse_ranges_remaining: 0,
+            ranges_recorded: Vec::new(),
             fail_first_erase: false,
             erase_failed: false,
             wrote_an_empty_range: false,
@@ -408,6 +436,22 @@ impl FakeDa {
     pub fn refusing_ranges(mut self, refuse: bool) -> Self {
         self.refuse_ranges = refuse;
         self
+    }
+
+    /// Refuse the next `count` `0xD3` commands, then accept again.
+    ///
+    /// A test can fail the first attempt and let the automatic retry succeed
+    /// (`count = 1`), or fail both attempts (`count = 2`).
+    #[must_use]
+    pub fn refusing_next_ranges(mut self, count: usize) -> Self {
+        self.refuse_ranges_remaining = count;
+        self
+    }
+
+    /// Every `0xD3` range the host sent, in order, accepted or refused.
+    #[must_use]
+    pub fn recorded_ranges(&self) -> &[(u32, u32)] {
+        &self.ranges_recorded
     }
 
     /// Stop refusing `0xD3` on a fake that already exists.
@@ -566,6 +610,17 @@ impl FakeDa {
         self.page_prefix = Some(bytes.to_vec());
     }
 
+    /// Put bytes in front of the next `0xD3` reply, once.
+    ///
+    /// The bytes are queued when the complete `0xD3` command arrives, not before
+    /// it, so they survive the client's pre-command `clear_input`. This models
+    /// the 2026-11-22 hardware writes: the four banner bytes arrived after the
+    /// clear and were read as the ACK. The client must resynchronise, not merely
+    /// clear again.
+    pub fn prefix_next_d3(&mut self, bytes: &[u8]) {
+        self.d3_prefix = Some(bytes.to_vec());
+    }
+
     /// Send every `0xD6` page exactly as long as the range's remaining bytes,
     /// not zero-filled to the page length.
     ///
@@ -678,6 +733,12 @@ impl FakeDa {
     #[must_use]
     pub fn restarted(&self) -> bool {
         self.restarted
+    }
+
+    /// How many standalone `0xD9` writes the host sent.
+    #[must_use]
+    pub fn restart_requests(&self) -> usize {
+        self.restart_requests
     }
 
     /// Whether `$PMTK180*3B` handed the restarted chip back to the BootROM.
@@ -1211,17 +1272,27 @@ impl FakeDa {
         let frame = std::mem::take(&mut self.line);
         match opcode {
             OPCODE_MEM_CMD => {
+                // The 2026-11-22 hardware writes saw these bytes after the
+                // client's pre-command clear; queue them as the front of this
+                // reply, before the ACK/refusal.
+                if let Some(prefix) = self.d3_prefix.take() {
+                    self.queue_bytes(&prefix);
+                }
                 let (Some(start), Some(end)) = (be_u32(&frame, 2), be_u32(&frame, 6)) else {
                     self.queue_bytes(&[NAK]);
                     return;
                 };
+                self.ranges_recorded.push((start, end));
+                let refuse = self.refuse_ranges || self.refuse_ranges_remaining > 0;
+                if self.refuse_ranges_remaining > 0 {
+                    self.refuse_ranges_remaining -= 1;
+                }
                 // From the disassembly: `0xD3` records the range and touches no
                 // flash at all -- the handler (`0x00101F98`-`0x00102034`) calls
                 // no flash driver. The erase is in `0xD5`, immediately before
                 // the data is programmed (`docs/reference/01-da-protocol.md`
                 // §4.6).
-                let Some(range) = accepted_da_range(start, end).filter(|_| !self.refuse_ranges)
-                else {
+                let Some(range) = accepted_da_range(start, end).filter(|_| !refuse) else {
                     // ⚠️ 未検証 from the disassembly, not a measurement: a
                     // refusal is a **single** `A5`; the success path's ACK and
                     // status byte are both skipped. A client that always reads
@@ -1439,6 +1510,19 @@ impl Transport for FakeDa {
     }
 
     fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+        // `0xD9` is a one-byte restart command. Recognise it by its frame length
+        // even while the fake is in a `0xD5` packet stage: the real client sends
+        // it after a partial write without sending a full packet first. The
+        // model drops the command stage and boots the firmware, which is what a
+        // restart means here.
+        if buf == [OPCODE_RESTART] {
+            self.restart_requests = self.restart_requests.saturating_add(1);
+            self.restarted = true;
+            self.mode = Mode::Firmware;
+            self.line.clear();
+            self.output.clear();
+            return Ok(());
+        }
         for byte in buf {
             self.consume(*byte);
         }

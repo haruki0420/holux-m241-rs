@@ -113,6 +113,14 @@ m241: error: framing error: 0xD3 answered 0xBB; expected 0x5A or 0xA5
 * The client now clears the input at the start of `record_range`, so both the
   first `0xD3` and `0xD6` drain the banner residue. ⚠️ The fix has **not** been
   re-run on hardware; this row records the failure that motivated it.
+* A second hardware run after that clear-only fix still failed with the same
+  `0xD3 answered 0xBB`. The four bytes can arrive **after** the pre-command
+  clear, so a clear alone is not enough. The reply reader now resynchronises:
+  it skips non-`0x5A` / non-`0xA5` bytes up to 8 within the same reply timeout,
+  then reads the real `5A 00` or `A5`. On a `0xD3` failure before `0xD5`, the
+  CLI also sends `0xD9`, re-enters the BootROM, reloads the DA and retries
+  once; after `0xD5` starts it sends `0xD9` only. ⚠️ Neither the resynchronised
+  read nor the automatic retry has been re-run on a unit.
 
 ## 1a. The Linux log-erase hardware session (2026-11-21)
 
@@ -149,9 +157,11 @@ nothing on this page makes the final head verified.
 | The Rust `fw flash` command on a unit | the 2026-11-15 flash was an earlier manual/v1 run; this Rust client has never opened a port for a write. The write, erase, restart and backup-diff gates are covered only by the simulator |
 | Writing the official V1.13 vendor image (`--allow-vendor`) | the fixed-SHA gate, dry-run warning and fake write/read-back run in the simulator; no unit has been flashed with a vendor image, and the 14-byte per-unit overwrite has not been observed on hardware. The documented vendor/unit diff is 17 bytes: 14 per-unit + 2 WNRO + 1 version marker |
 | The `0xD9` → NMEA probe → `$PMTK180*3B` re-entry and read-back | implemented in the CLI and exercised against the fake only; no unit has been asked to boot its firmware and hand the BootROM back after a write. The 2026-11-15 row records that the unit booted, not that this read-back ran |
+| The automatic `0xD9` restart and one retry after a `0xD3` failure | implemented in the CLI and exercised against the fake only; no unit has run the retry. The retry uses the same `FLASH_WRITE_START` / `FLASH_WRITE_LENGTH`; it never recomputes the range |
+| `m241 fw da-restart` | implemented and exercised against the fake only; no unit has been sent a standalone `0xD9` after a failed DA phase |
 | The 406,620-byte BootROM read split into `DUMP_CHUNK` frames | the frame count and per-frame byte limits are fixed against the fake; no unit has been read at this size through the chunked path. A single 406,620-byte `0xA2` would exceed the five-second deadline at 115,200 8N1 |
 | The DA's `0xD6` read across multiple pages | one page per address was read on 2026-11-21; the advance between pages, the advance after the **last** page of a multi-page read, and any bytes the DA sends between pages are unmeasured (`docs/reference/01-da-protocol.md` §5.5, §7 item 4) |
-| The four bytes after the DA banner | observed 2026-11-21; their origin is not established. They were read as `0xBB` by the first `0xD3` on 2026-11-22 (§1.3). The client now drains them before both `0xD6` and the first `0xD3`; the fix is not yet re-run on hardware |
+| The four bytes after the DA banner | observed 2026-11-21; their origin is not established. They were read as `0xBB` by the first `0xD3` on 2026-11-22 (§1.3). The client now clears the input before `0xD6` and before the first `0xD3`, and resynchronises the `0xD3` reply (skips up to 8 non-ACK bytes); the fix is not yet re-run on hardware |
 | `0xD6`'s page length for arguments other than 64 | only a 64-byte page-length argument was measured (64 data bytes + 2-byte trailer) |
 | `fw probe-da` on stock V1.13 and on a second unit | the 2026-11-21 run read the unit from §1.1, which already carries the WNRO patch (the version marker is patched to V1.14); its first 64 bytes match the vendor V1.13 image's, but no stock unit and no second unit were probed |
 | The `0xA8` jump frame's count word | the protocol page gives it no meaning; the only client that ran the jump on a unit sent `0`, and this crate does too. Whether the BootROM reads the field at all is not established (`docs/dev/03-hardware-facts.md` "DA jump") |

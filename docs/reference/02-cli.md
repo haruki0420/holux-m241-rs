@@ -5,7 +5,7 @@ reads as a map of the device rather than a list of verbs.
 
 ```text
 m241 device  ports | info | doctor
-m241 fw      dump  | patch | flash | probe-da
+m241 fw      dump  | patch | flash | probe-da | da-restart
 m241 log     info  | download | read | erase | geotag
 m241 nmea    repair | proxy
 ```
@@ -152,6 +152,16 @@ the range was written but the read-back could not be reached, or the read-back
 ran and disagreed. None is reported as a success. The backup file is never
 modified.
 
+If the DA phase fails, the CLI leaves the chip in a defined restart state:
+`0xD3` failing before any `0xD5` byte sends `0xD9` (no reply wait), re-enters
+the BootROM through the same NMEA/`$PMTK180` route, reloads the DA, and retries
+the write **once**. Both attempts use only `FLASH_WRITE_START = 0` and
+`FLASH_WRITE_LENGTH = 0x6345C`; the range is not recomputed. If the retry also
+fails, the error says the unit was restarted, so the battery does not need to
+be removed, and names `fw dump`. If `0xD5` has already started, the CLI sends
+`0xD9` but does **not** retry automatically, because the range may be partly
+written; the error names `fw dump` and `--recover` with the user's backup.
+
 Flags: `--backup <FILE>` (required), `--da <FILE>` (required unless
 `--dry-run`), `--port <PORT|auto>`, `--yes`, `--recover` (write the backup back
 over a partial unit; image must equal `--backup`, conflicts with `--dry-run`),
@@ -222,6 +232,31 @@ after the final page of a multi-page read are still unmeasured
 `fw probe-da` was how the DA-side base was settled; it remains a **read-only**
 diagnostic and does not write flash. `fw flash` now uses the settled `0`, but the
 write path itself has not run against a unit.
+
+## `m241 fw da-restart`
+
+Sends the DA's one-byte `0xD9` restart. **Writes no flash.** This is the software
+route back from a unit that a failed DA phase left running the Download Agent in
+RAM, so the battery does not have to be removed.
+
+The command opens `--port <PORT|auto>` at 115200, sends the single byte, and
+flushes. It reads no reply and does not wait for one: the DA's `0xD9` handler
+resets the chip and never returns. It sends no `0xD3` / `0xD4` / `0xD5` / `0xD6`,
+never touches DTR/RTS, and needs no `--yes`, because restarting the chip neither
+erases nor programs flash. On success it prints:
+
+```text
+DA restart sent; the unit boots its firmware. No flash was written.
+```
+
+The unit then boots its firmware. If a later command needs the BootROM, pass
+`--assume-brom` (the chip is silent and listening) or use the normal NMEA probe
+and `$PMTK180*3B` route. `fw flash` uses the same byte automatically when its DA
+phase fails, before it decides whether a retry is safe; this command is for the
+case where that automatic restart could not be sent or the unit was left by an
+earlier run.
+
+Flags: `--port <PORT|auto>` (default `auto`).
 
 ## `m241 log download`
 
