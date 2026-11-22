@@ -76,6 +76,19 @@ impl TrackPoint {
         self.latitude.is_some() && self.longitude.is_some()
     }
 
+    /// The finite position this point carries, when it has one.
+    ///
+    /// A coordinate pair that is present but non-finite (a NaN or infinity
+    /// decoded from a corrupt record) is not a position: writing it would put
+    /// `NaN` into a GPX or KML document no map can draw, and feeding it to a
+    /// distance would poison every later sum. Every writer and statistic uses
+    /// this one predicate, so they cannot disagree about what counts as a place.
+    #[must_use]
+    pub fn position(&self) -> Option<(f64, f64)> {
+        let (lat, lon) = (self.latitude?, self.longitude?);
+        (lat.is_finite() && lon.is_finite()).then_some((lat, lon))
+    }
+
     /// Whether this point is a manual waypoint.
     #[must_use]
     pub fn is_waypoint(&self) -> bool {
@@ -149,6 +162,141 @@ impl LogSummary {
             ended_at: span.map(|(_, end)| end),
         }
     }
+}
+
+/// Aggregate facts about a track, recomputed from its points.
+///
+/// `07-eztour-spec.ja.md` §8 P0-2 lists these facts as a requirement, and §4.2
+/// records that ezTour recomputed them from the point sequence rather than
+/// reading a device total. That is the right model here too: most M-241 records
+/// carry no speed field at all, so a summary built only from fields would
+/// describe the minority of points that have one.
+///
+/// This is a public API the CLI reads today and the GUI will read, so the fields
+/// are additive: a new fact may appear, but an existing field is not renamed or
+/// removed. The struct is produced by [`TrackStats::of`]; the `Default` value
+/// (all zeros and `None`) is an empty track, not a meaningful default to edit.
+///
+/// Precision is mixed on purpose: device values (`max_speed_kmh`, the altitudes)
+/// are `f32` because that is what a record carries, while the recomputed
+/// distance and average are `f64` because they are sums.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TrackStats {
+    /// Points the track holds, including those without a position.
+    pub records: usize,
+    /// Points that carry a position.
+    pub fixes: usize,
+    /// Total great-circle distance between consecutive positioned points, in
+    /// metres.
+    ///
+    /// A pair with a missing or non-finite coordinate contributes nothing: the
+    /// distance across a gap without a fix was not measured, and joining the two
+    /// sides would draw a straight line the unit never travelled. A wrapped log
+    /// is summed in file order, so its one boundary segment is counted across
+    /// the wrap; the size of that error is bounded by the distance between the
+    /// oldest and newest block, which no reading of the dump can tell apart from
+    /// a real move.
+    pub distance_m: f64,
+    /// Time between the first and last timestamp, in whole seconds.
+    ///
+    /// `None` when no point carries a time. The ends come from
+    /// [`Track::time_span`], which takes the first and last timed point in file
+    /// order rather than the minimum and maximum, because the dump is written
+    /// oldest-first.
+    pub duration_seconds: Option<u32>,
+    /// [`TrackStats::distance_m`] divided by [`TrackStats::duration_seconds`],
+    /// in km/h.
+    ///
+    /// Recomputed, as ezTour's average was: a mean of the records' speed fields
+    /// would average only the records that carry one. `None` without a duration
+    /// or when the duration is zero, because a zero divisor would invent a
+    /// speed.
+    pub average_speed_kmh: Option<f64>,
+    /// Largest `speed_kmh` any record carries, when one does.
+    ///
+    /// The device's own value, not a recomputation: differencing positions at a
+    /// one-second cadence amplifies position noise into a speed no vehicle
+    /// reported. `None` when every record was written without the speed field.
+    pub max_speed_kmh: Option<f32>,
+    /// Lowest finite altitude, in metres.
+    pub min_altitude_m: Option<f32>,
+    /// Highest finite altitude, in metres.
+    pub max_altitude_m: Option<f32>,
+}
+
+impl TrackStats {
+    /// Compute the summary from a parsed track.
+    #[must_use]
+    pub fn of(track: &Track) -> Self {
+        let mut distance_m = 0.0;
+        let mut previous: Option<(f64, f64)> = None;
+        for point in &track.points {
+            let position = point.position();
+            if let (Some((lat1, lon1)), Some((lat2, lon2))) = (previous, position) {
+                distance_m += haversine_meters(lat1, lon1, lat2, lon2);
+            }
+            // A point without a position ends the run: the next positioned
+            // point starts a new segment rather than connecting across the gap.
+            previous = position;
+        }
+
+        let duration_seconds = track
+            .time_span()
+            .map(|(start, end)| end.saturating_sub(start));
+        let average_speed_kmh = duration_seconds
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| distance_m / f64::from(seconds) * 3.6);
+        let max_speed_kmh = track
+            .points
+            .iter()
+            .filter_map(|point| point.speed_kmh)
+            .filter(|speed| speed.is_finite())
+            .reduce(f32::max);
+        let mut min_altitude_m: Option<f32> = None;
+        let mut max_altitude_m: Option<f32> = None;
+        for altitude in track
+            .points
+            .iter()
+            .filter_map(|point| point.height_m)
+            .filter(|height| height.is_finite())
+        {
+            min_altitude_m = Some(min_altitude_m.map_or(altitude, |min| min.min(altitude)));
+            max_altitude_m = Some(max_altitude_m.map_or(altitude, |max| max.max(altitude)));
+        }
+
+        Self {
+            records: track.points.len(),
+            fixes: track.fix_count(),
+            distance_m,
+            duration_seconds,
+            average_speed_kmh,
+            max_speed_kmh,
+            min_altitude_m,
+            max_altitude_m,
+        }
+    }
+}
+
+/// Great-circle distance in metres between two WGS84-ish lat/lon points using
+/// the mean Earth radius (`6_371_000` m).
+///
+/// The same function [`crate::log::geotag`] uses for grouping photos, kept here
+/// so a distance is computed one way in the crate. Haversine is accurate to
+/// about 0.5 % against the ellipsoid at track-log scales; that is well inside
+/// what a 4-byte float coordinate and a one-second sampling interval can
+/// resolve, and the summary only displays a distance.
+#[must_use]
+pub(crate) fn haversine_meters(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    const EARTH_RADIUS_M: f64 = 6_371_000.0;
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let lat1_rad = lat1.to_radians();
+    let lat2_rad = lat2.to_radians();
+    let sin_dlat = (dlat / 2.0).sin();
+    let sin_dlon = (dlon / 2.0).sin();
+    let a = sin_dlat * sin_dlat + lat1_rad.cos() * lat2_rad.cos() * sin_dlon * sin_dlon;
+    let c = 2.0 * a.sqrt().min(1.0).asin();
+    EARTH_RADIUS_M * c
 }
 
 /// One byte that a patch would change.
@@ -450,5 +598,110 @@ mod tests {
         };
         assert!(known.is_known_release());
         assert!(!DeviceInfo::default().is_known_release());
+    }
+
+    /// A point with an explicit time, position, height and speed, so a statistics
+    /// test can vary one field at a time.
+    fn stats_point(
+        utc: Option<u32>,
+        latitude: Option<f64>,
+        longitude: Option<f64>,
+        height_m: Option<f32>,
+        speed_kmh: Option<f32>,
+    ) -> TrackPoint {
+        TrackPoint {
+            utc,
+            latitude,
+            longitude,
+            height_m,
+            speed_kmh,
+            rcr: None,
+        }
+    }
+
+    #[test]
+    fn the_track_statistics_sum_the_measured_distance_between_consecutive_points() {
+        // One thousandth of a degree of latitude is 111.19 m on the mean sphere:
+        // small enough that a wrong earth radius or a degrees/radians mix-up is
+        // the only way to miss the band.
+        let track = Track {
+            points: vec![
+                stats_point(Some(1_000), Some(35.0), Some(139.0), Some(10.0), Some(4.0)),
+                stats_point(
+                    Some(1_010),
+                    Some(35.001),
+                    Some(139.0),
+                    Some(12.0),
+                    Some(6.0),
+                ),
+                stats_point(Some(1_020), Some(35.002), Some(139.0), Some(8.0), Some(5.0)),
+            ],
+            damaged_blocks: Vec::new(),
+        };
+        let stats = TrackStats::of(&track);
+        assert_eq!(stats.records, 3);
+        assert_eq!(stats.fixes, 3);
+        assert!(
+            (stats.distance_m - 2.0 * 111.19).abs() < 1.0,
+            "got {} m for two 0.001 degree steps",
+            stats.distance_m
+        );
+        assert_eq!(stats.duration_seconds, Some(20));
+        // 222.4 m in 20 s is 40.0 km/h.
+        let average = stats
+            .average_speed_kmh
+            .expect("a duration gives an average");
+        assert!((average - 40.0).abs() < 0.5, "got {average} km/h");
+        assert_eq!(stats.max_speed_kmh, Some(6.0));
+        assert_eq!(stats.min_altitude_m, Some(8.0));
+        assert_eq!(stats.max_altitude_m, Some(12.0));
+    }
+
+    #[test]
+    fn a_gap_without_a_position_does_not_bridge_the_distance() {
+        // Two identical positions separated by a no-fix record: joining them
+        // across the gap would add a segment the unit never travelled.
+        let track = Track {
+            points: vec![
+                stats_point(Some(1_000), Some(35.0), Some(139.0), None, None),
+                stats_point(Some(1_001), None, None, None, None),
+                stats_point(Some(1_002), Some(35.0), Some(139.0), None, None),
+            ],
+            damaged_blocks: Vec::new(),
+        };
+        let stats = TrackStats::of(&track);
+        assert_eq!(stats.fixes, 2);
+        assert_eq!(stats.distance_m, 0.0, "the gap contributes no distance");
+        assert_eq!(stats.duration_seconds, Some(2));
+        assert_eq!(stats.average_speed_kmh, Some(0.0));
+        assert_eq!(stats.max_speed_kmh, None, "no record carries a speed");
+        assert_eq!(stats.min_altitude_m, None);
+    }
+
+    #[test]
+    fn a_track_without_timestamps_has_no_duration_and_no_average() {
+        let track = Track {
+            points: vec![stats_point(None, Some(35.0), Some(139.0), None, None)],
+            damaged_blocks: Vec::new(),
+        };
+        let stats = TrackStats::of(&track);
+        assert_eq!(stats.duration_seconds, None);
+        assert_eq!(stats.average_speed_kmh, None);
+    }
+
+    #[test]
+    fn a_zero_duration_does_not_produce_an_infinite_average_speed() {
+        // Every point shares one timestamp, so dividing by the duration would
+        // invent a speed; the field is `None` rather than an infinity.
+        let track = Track {
+            points: vec![
+                stats_point(Some(1_000), Some(35.0), Some(139.0), None, None),
+                stats_point(Some(1_000), Some(35.001), Some(139.0), None, None),
+            ],
+            damaged_blocks: Vec::new(),
+        };
+        let stats = TrackStats::of(&track);
+        assert_eq!(stats.duration_seconds, Some(0));
+        assert_eq!(stats.average_speed_kmh, None);
     }
 }

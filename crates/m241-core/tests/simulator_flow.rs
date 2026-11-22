@@ -234,8 +234,9 @@ fn a_log_downloaded_over_pmtk_exports_to_every_format() {
 
     let gpx = export::export(&track, ExportFormat::Gpx);
     // The log stores an `f32`, so the exported digits are the widened `f32`, not
-    // the `f64` the example coordinate is written as.
-    assert!(gpx.contains("<trkpt lat=\"35.68123627\""), "got {gpx}");
+    // the `f64` the example coordinate is written as. The writer emits nine
+    // decimals, ezTour's `%.9f` (spec §2).
+    assert!(gpx.contains("<trkpt lat=\"35.681236267\""), "got {gpx}");
     assert!(
         gpx.contains("<time>2023-11-14T22:13:20Z</time>"),
         "got {gpx}"
@@ -248,10 +249,16 @@ fn a_log_downloaded_over_pmtk_exports_to_every_format() {
     assert_eq!(csv.lines().count(), 3, "header plus two points");
 
     let nmea = export::export(&track, ExportFormat::Nmea);
+    // Each point becomes GGA + GSA + RMC, the set a live unit streams.
+    assert_eq!(nmea.lines().count(), 6, "got {nmea}");
     for line in nmea.lines() {
-        assert!(line.starts_with("$GPRMC,"), "got {line}");
+        assert!(
+            line.starts_with("$GPGGA,")
+                || line.starts_with("$GPGSA,")
+                || line.starts_with("$GPRMC,"),
+            "got {line}"
+        );
     }
-    assert_eq!(nmea.lines().count(), 2);
 
     let json = export::export(&track, ExportFormat::Json);
     assert!(json.contains("\"records\": 2"), "got {json}");

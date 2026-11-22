@@ -26,7 +26,9 @@ use serde_json::Value;
 
 use crate::Session;
 use crate::cal::OffsetSpec;
-use crate::cli::{LogKmzOptions, LogProjectLoadOptions, LogProjectSaveOptions, LogReadOptions};
+use crate::cli::{
+    CoordFormatArg, LogKmzOptions, LogProjectLoadOptions, LogProjectSaveOptions, LogReadOptions,
+};
 use crate::fileio;
 use crate::logcmd;
 
@@ -166,14 +168,22 @@ pub fn load(options: &LogProjectLoadOptions, session: Session<'_>) -> Result<()>
             max_gap: DEFAULT_MAX_GAP_SECONDS,
             utc_offset_days,
             tz_offset_minutes: 0,
+            // A project records no thumbnail setting; a KMZ loaded from a
+            // project is the same archive `log kmz` writes without `--icons`.
+            icons: None,
         };
         return logcmd::kmz(&kmz, session);
     }
     let format = document.format(&options.project)?;
     let read = LogReadOptions {
         nmea: document.input.is_nmea(),
+        gpx: false,
         file: log,
         format,
+        csv_report: false,
+        coord_format: CoordFormatArg::Decimal,
+        simplify: None,
+        cache: None,
         output: Some(output),
         utc_offset_days,
     };

@@ -1,8 +1,9 @@
 //! Pure track-editing operations and multi-step Undo/Redo history.
 //!
-//! Splitting, merging, and point deletion operate on [`Track`] values without
-//! mutating files or touching the device. [`TrackEditor`] wraps a `Vec<Track>`
-//! with an undo/redo stack so UI or CLI layers can compose edits safely.
+//! Splitting, merging, point deletion and stride thinning ([`simplify_track`])
+//! operate on [`Track`] values without mutating files or touching the device.
+//! [`TrackEditor`] wraps a `Vec<Track>` with an undo/redo stack so UI or CLI
+//! layers can compose edits safely.
 
 use std::collections::HashSet;
 
@@ -94,6 +95,46 @@ pub fn delete_points(track: &Track, indices: &[usize]) -> Track {
         .enumerate()
         .filter_map(|(idx, &pt)| (!to_remove.contains(&idx)).then_some(pt))
         .collect();
+    Track {
+        points,
+        damaged_blocks: track.damaged_blocks.clone(),
+    }
+}
+
+/// Return a copy of `track` that keeps one point every `every_nth`, plus the
+/// last point.
+///
+/// This is the point-thinning step ezTour asks about before a GPX upload
+/// (`07-eztour-spec.ja.md` §2, "GPX を簡略化するか"). The specification names the
+/// option but not its rule, so this crate implements the **stride** form — keep
+/// index `0, n, 2n, …` and always the final point — and not a distance
+/// threshold. A stride is deterministic, needs no projection or earth model, and
+/// a caller can predict exactly which points survive; a distance cut keeps points
+/// wherever the vehicle happened to slow down, which makes the output size depend
+/// on traffic rather than on the setting.
+///
+/// Both endpoints survive: a route that starts or ends at a different place is a
+/// different route, and an upload that dropped the last point would draw the
+/// trip short.
+///
+/// `every_nth <= 1`, or a track of two points or fewer, returns the track
+/// unchanged — every point is already kept.
+#[must_use]
+pub fn simplify_track(track: &Track, every_nth: usize) -> Track {
+    if every_nth <= 1 || track.points.len() <= 2 {
+        return track.clone();
+    }
+    let mut points: Vec<TrackPoint> = track.points.iter().step_by(every_nth).copied().collect();
+    // The final point is always kept, even when it is not on the stride: an
+    // upload that dropped the last point would draw the trip short.
+    let last_is_on_stride = track
+        .points
+        .len()
+        .saturating_sub(1)
+        .is_multiple_of(every_nth);
+    if !last_is_on_stride && let Some(point) = track.points.last() {
+        points.push(*point);
+    }
     Track {
         points,
         damaged_blocks: track.damaged_blocks.clone(),
@@ -367,6 +408,55 @@ mod tests {
 
         let unchanged = delete_points(&track, &[99, 100]);
         assert_eq!(unchanged, track);
+    }
+
+    #[test]
+    fn simplify_keeps_every_stride_point_and_always_both_ends() {
+        // 7 points with a stride of 3: indices 0, 3, 6 — and 6 is the last point,
+        // so the "always keep the end" rule adds nothing duplicate.
+        let track = sample_track(7);
+        let simplified = simplify_track(&track, 3);
+        let utcs: Vec<Option<u32>> = simplified.points.iter().map(|p| p.utc).collect();
+        assert_eq!(
+            utcs,
+            vec![
+                Some(1_700_000_000),
+                Some(1_700_000_030),
+                Some(1_700_000_060)
+            ]
+        );
+
+        // 8 points with a stride of 3: 0, 3, 6 plus the last point 7, which the
+        // stride would otherwise drop.
+        let track = sample_track(8);
+        let simplified = simplify_track(&track, 3);
+        let utcs: Vec<Option<u32>> = simplified.points.iter().map(|p| p.utc).collect();
+        assert_eq!(
+            utcs,
+            vec![
+                Some(1_700_000_000),
+                Some(1_700_000_030),
+                Some(1_700_000_060),
+                Some(1_700_000_070)
+            ],
+            "the final point survives even when it is not on the stride"
+        );
+        assert_eq!(
+            simplified.damaged_blocks, track.damaged_blocks,
+            "thinning points does not clean the dump's damaged-block list"
+        );
+    }
+
+    #[test]
+    fn simplify_leaves_a_short_track_and_a_stride_of_one_unchanged() {
+        for (points, stride) in [(0usize, 5usize), (1, 5), (2, 5), (6, 1), (6, 0)] {
+            let track = sample_track(u32::try_from(points).expect("small count"));
+            assert_eq!(
+                simplify_track(&track, stride),
+                track,
+                "{points} points at stride {stride} must not change"
+            );
+        }
     }
 
     #[test]
