@@ -339,6 +339,13 @@ pub struct FakeDa {
     read_polls: usize,
     /// Whether every `clear_input` fails, as a port that went away does.
     clear_input_fails: bool,
+    /// A byte the fake flips when the BootROM next reads its address.
+    ///
+    /// Models a half-word that failed to program: the write reported success,
+    /// the flash holds one wrong byte, and the read-back the client performs is
+    /// the first thing that notices. Applied once, inside the BootROM read, so a
+    /// test can reach the mismatch-then-recover sequence without a second fake.
+    readback_damage: Option<(u32, u8)>,
     /// A line being assembled while the fake's firmware is running.
     firmware_line: Vec<u8>,
     /// Whether this firmware segment has already emitted its one NMEA sentence.
@@ -431,6 +438,7 @@ impl FakeDa {
             read_bytes: 0,
             read_polls: 0,
             clear_input_fails: false,
+            readback_damage: None,
             firmware_line: Vec::new(),
             firmware_served: false,
             nmea_after_restart: true,
@@ -694,6 +702,17 @@ impl FakeDa {
     /// be made to fail exactly there.
     pub fn failing_clear_input(&mut self) {
         self.clear_input_fails = true;
+    }
+
+    /// Flip one flash byte when the write's `0xD9` restart arrives, once.
+    ///
+    /// The index is a DA address, the same view [`Self::damage`] uses. The flip
+    /// happens at the restart, so the write path has already reported every
+    /// packet accepted and the unit comparison before the write still matched;
+    /// what the test reaches is the read-back disagreeing with the image, which
+    /// is the state recovery exists for.
+    pub fn damaging_readback(&mut self, da_address: u32, mask: u8) {
+        self.readback_damage = Some((da_address, mask));
     }
 
     /// The last `0xD6` range as `(start, bytes the fake prepared)`.
@@ -1618,7 +1637,6 @@ impl Transport for FakeDa {
         }
         Ok(self.take_output(buf))
     }
-
     fn write_all(&mut self, buf: &[u8]) -> Result<()> {
         // `0xD9` is a one-byte restart command. Recognise it by its frame length
         // even while the fake is in a `0xD5` packet stage: the real client sends
@@ -1628,6 +1646,13 @@ impl Transport for FakeDa {
         if buf == [OPCODE_RESTART] {
             self.restart_requests = self.restart_requests.saturating_add(1);
             self.restarted = true;
+            // A half-word that failed to program without the DA noticing: the
+            // read-back after this restart is the first thing that can see it.
+            if let Some((target, mask)) = self.readback_damage.take()
+                && let Some(slot) = self.memory.get_mut(target as usize)
+            {
+                *slot ^= mask;
+            }
             self.mode = Mode::Firmware;
             self.packet_checksum_failed = false;
             self.line.clear();

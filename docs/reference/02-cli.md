@@ -40,6 +40,30 @@ the reason appears only on stderr. Findings that are worth a human's attention
 are repeated on stderr as a warning, so `2>&1` and `> report.txt 2> problems.txt`
 each show everything they should.
 
+## GUI との対応
+
+`m241-gui` は主要な操作面として、次の CLI 操作と同じ処理を GUI から実行できる。
+GUI の書き込み系は `m241_flash::flow` の共有セッションを通り、CLI と同じ
+`check_layout` / `check_image` / `verify_device` / 読み戻しを使う。
+
+| GUI の操作 | 同じ CLI | 確認 |
+|---|---|---|
+| 接続画面の「接続して確認」 | `m241 device info` | なし（読み取りのみ） |
+| 接続画面の「診断する」 | `m241 device doctor` | なし（読み取りのみ） |
+| 接続画面の「DA を確認」 | `m241 fw probe-da --yes` | `PROBE` を入力 |
+| 接続画面の「0xD9 を送る」 | `m241 fw da-restart` | `RESTART` を入力 |
+| ファーム画面の「吸い出す」 | `m241 fw dump` | なし（読み取りのみ） |
+| ファーム画面の「書き換えたイメージを保存」 | `m241 fw patch` | なし（PC 内のファイルのみ） |
+| ファーム画面の「書き込む」 | `m241 fw flash ... --yes` | `WRITE` を入力 |
+| ファーム画面の「復旧」 | `m241 fw flash --recover ... --yes` | `WRITE` を入力 |
+| ファーム画面のベンダー書き込み | `m241 fw flash --allow-vendor ... --yes` | `WRITE` を入力 |
+| 書き込み失敗後の「0xD9 再起動」 | `m241 fw da-restart` | `RESTART` を入力 |
+| 書き込み失敗後の「BootROM 再入を確認」 | `m241 fw dump --assume-brom` | なし（同期確認のみ） |
+
+GUI には `--yes` に相当する引数はない。`WRITE` / `PROBE` / `RESTART` は
+ユーザー自身がキーボードで入力するものであり、エージェントが代行してはならない
+（`AGENTS.md` §2.2 / §2.5）。
+
 ## `m241 device ports`
 
 Lists serial ports and flags likely M-241 cables (CP210x, PL2303, FTDI, CH340).

@@ -31,6 +31,8 @@ use egui::{Color32, Context, Pos2, Rect, TextureId, Vec2};
 
 use crate::app::App;
 use crate::screens::Screen;
+use crate::screens::connect::{DaProbeState, DoctorState};
+use crate::screens::firmware::{DumpState, FlashState};
 use crate::theme;
 
 /// An 8-bit RGBA image, top-down, ready for a PNG.
@@ -481,6 +483,163 @@ pub fn write_all(directory: &Path) -> Result<Vec<std::path::PathBuf>, String> {
                 .map_err(|err| format!("{} を書けません: {err}", path.display()))?;
             written.push(path);
         }
+    }
+    // The write step has four layouts a device is needed to produce: running,
+    // read-back verified, and the recovery state after a failure. The review is
+    // of the flow, not of one frame, so they are rendered beside the screens.
+    for (suffix, state, undefined) in [
+        (
+            "write-progress",
+            FlashState::Running {
+                stage: String::from("書き込んでいます"),
+                packets: 400,
+                bytes: 102_400,
+                total: m241_flash::da::FLASH_WRITE_LENGTH,
+            },
+            false,
+        ),
+        (
+            "write-result",
+            FlashState::Succeeded {
+                packets: m241_flash::da::FLASH_WRITE_LENGTH.div_ceil(256),
+                verified: m241_flash::da::FLASH_WRITE_LENGTH,
+            },
+            false,
+        ),
+        (
+            "write-recovery",
+            FlashState::Failed(String::from(
+                "読み戻しがイメージと一致しません（先頭の差分 0x40000）",
+            )),
+            true,
+        ),
+    ] {
+        let mut app = App::default();
+        prepare(&mut app, Screen::Firmware);
+        app.firmware_mut().set_flash_state(state);
+        app.firmware_mut().set_undefined(undefined);
+        app.firmware_mut().set_dump_state(DumpState::Verified {
+            bytes: 406_620,
+            digest: String::from(
+                "32fe52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435",
+            ),
+        });
+        let image = render(&mut app, Screen::Firmware, Vec2::new(1280.0, 800.0));
+        let path = directory.join(format!("firmware-{suffix}-1280x800.png"));
+        let png = image
+            .to_png()
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+        std::fs::write(&path, png)
+            .map_err(|err| format!("{} を書けません: {err}", path.display()))?;
+        written.push(path);
+    }
+    // The Connect screen's three device-side actions need a device to produce
+    // their finished states, so the review image is taken with a sample report.
+    {
+        let mut app = App::default();
+        prepare(&mut app, Screen::Connect);
+        app.connect_mut().set_diagnostics_open(true);
+        app.connect_mut()
+            .set_doctor_state(DoctorState::Done(Box::new(crate::device::DoctorReport {
+                ports: vec![
+                    crate::device::PortFinding {
+                        name: String::from("/dev/ttyUSB0"),
+                        likely: true,
+                    },
+                    crate::device::PortFinding {
+                        name: String::from("/dev/ttyACM0"),
+                        likely: true,
+                    },
+                ],
+                identity: Some(m241_core::DeviceInfo {
+                    release: String::from("B-core_1.20"),
+                    build: String::from("0043"),
+                    model: String::from("01017-00F"),
+                    sdk: None,
+                }),
+                drop_dir: String::from("vendor"),
+                files: vec![crate::device::DropFile {
+                    path: String::from("vendor/DA_v3.8.4.bin"),
+                    size: 14_896,
+                    kind: String::from("DA_v3.8.4.bin（DA）"),
+                }],
+                da_source: Some(String::from("vendor/DA_v3.8.4.bin")),
+                ..crate::device::DoctorReport::default()
+            })));
+        app.connect_mut()
+            .set_da_probe_state(DaProbeState::Done(m241_flash::flow::ProbeDaReport {
+                id: m241_flash::da::DaLoadId {
+                    version: 0x0308,
+                    region: 0x49,
+                    flash_bytes: 0x8_0000,
+                    manufacturer: 0x00C2,
+                    device: 0x22BA,
+                },
+                pages: [
+                    m241_flash::flow::ProbePage {
+                        address: m241_flash::da::PROBE_ADDRESSES[0],
+                        first_bytes: Some(m241_flash::da::VECTOR),
+                        matches_vector: true,
+                        error: None,
+                    },
+                    m241_flash::flow::ProbePage {
+                        address: m241_flash::da::PROBE_ADDRESSES[1],
+                        first_bytes: Some([0xFF, 0xFF, 0xFF, 0xFF]),
+                        matches_vector: false,
+                        error: None,
+                    },
+                ],
+                settled: Some(m241_flash::da::PROBE_ADDRESSES[0]),
+            }));
+        let image = render(&mut app, Screen::Connect, Vec2::new(1280.0, 800.0));
+        let path = directory.join("connect-diagnostics-1280x800.png");
+        let png = image
+            .to_png()
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+        std::fs::write(&path, png)
+            .map_err(|err| format!("{} を書けません: {err}", path.display()))?;
+        written.push(path);
+    }
+    // The DA probe's result needs its own frame: with the full doctor report on
+    // screen it lands below the fold, and a result a reviewer cannot see is not
+    // reviewed.
+    {
+        let mut app = App::default();
+        prepare(&mut app, Screen::Connect);
+        app.connect_mut().set_diagnostics_open(true);
+        app.connect_mut()
+            .set_da_probe_state(DaProbeState::Done(m241_flash::flow::ProbeDaReport {
+                id: m241_flash::da::DaLoadId {
+                    version: 0x0308,
+                    region: 0x49,
+                    flash_bytes: 0x8_0000,
+                    manufacturer: 0x00C2,
+                    device: 0x22BA,
+                },
+                pages: [
+                    m241_flash::flow::ProbePage {
+                        address: m241_flash::da::PROBE_ADDRESSES[0],
+                        first_bytes: Some(m241_flash::da::VECTOR),
+                        matches_vector: true,
+                        error: None,
+                    },
+                    m241_flash::flow::ProbePage {
+                        address: m241_flash::da::PROBE_ADDRESSES[1],
+                        first_bytes: Some([0xFF, 0xFF, 0xFF, 0xFF]),
+                        matches_vector: false,
+                        error: None,
+                    },
+                ],
+                settled: Some(m241_flash::da::PROBE_ADDRESSES[0]),
+            }));
+        let image = render(&mut app, Screen::Connect, Vec2::new(1280.0, 800.0));
+        let path = directory.join("connect-probe-da-1280x800.png");
+        let png = image
+            .to_png()
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+        std::fs::write(&path, png)
+            .map_err(|err| format!("{} を書けません: {err}", path.display()))?;
+        written.push(path);
     }
     Ok(written)
 }

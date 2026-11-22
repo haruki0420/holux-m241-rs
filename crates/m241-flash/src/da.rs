@@ -1892,6 +1892,28 @@ impl<T: Transport> DownloadAgent<T> {
         backup: &[u8],
         image: &[u8],
     ) -> Result<PendingWrite> {
+        self.write_with_progress(confirmation, backup, image, &mut |_, _| {})
+    }
+
+    /// [`Self::write`], reporting every accepted packet to `on_progress`.
+    ///
+    /// `on_progress(packets, bytes)` runs after the DA acknowledges a packet, so
+    /// a GUI can show a packet and byte count while the range is being
+    /// programmed. The callbacks cannot change what is written: the range still
+    /// comes from [`FLASH_WRITE_START`] and the same `check_layout()` /
+    /// `check_image()` calls run before the first `0xD3`, in exactly the order
+    /// [`Self::write`] uses them. `on_progress` is a `FnMut` for reporting only.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write`].
+    pub fn write_with_progress(
+        &mut self,
+        confirmation: Confirmation,
+        backup: &[u8],
+        image: &[u8],
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<PendingWrite> {
         if !confirmation.is_given() {
             return Err(Error::Safety {
                 reason: String::from(
@@ -1900,7 +1922,7 @@ impl<T: Transport> DownloadAgent<T> {
             });
         }
         check_layout()?;
-        self.write_range(backup, FLASH_WRITE_START, image)
+        self.write_range_with_progress(backup, FLASH_WRITE_START, image, on_progress)
     }
 
     /// `0xD3` + `0xD5` for an official vendor image that passed [`accept_vendor_image`].
@@ -1951,19 +1973,31 @@ impl<T: Transport> DownloadAgent<T> {
         self.write_range_accepted(FLASH_WRITE_START, vendor.image())
     }
 
-    /// The write with an explicit start, used by [`Self::write`] and the tests.
+    /// The strict write at an explicit start; test-only.
     ///
     /// Private and **strict**: it runs [`check_image`] against `backup`, which
     /// is `AGENTS.md` §2.3's backup-diff rule. Vendor images do not come through
     /// this function; [`Self::write_vendor`] reaches
     /// [`Self::write_range_accepted`] only with a [`VendorImage`] token.
+    #[cfg(test)]
     fn write_range(&mut self, backup: &[u8], start: u32, image: &[u8]) -> Result<PendingWrite> {
+        self.write_range_with_progress(backup, start, image, &mut |_, _| {})
+    }
+
+    /// [`Self::write_range`] with a progress sink; the tests use the plain form.
+    fn write_range_with_progress(
+        &mut self,
+        backup: &[u8],
+        start: u32,
+        image: &[u8],
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<PendingWrite> {
         // The shipped range is V1.13's ([`check_layout`] refuses any other
         // length), so the profile accepting the image is that one. A V1.12 or
         // V1.14 image cannot arrive here: `check_image` refuses a length that is
         // not the profile's, and the profile is V1.13.
         let accepted = check_image(&PROFILE_V1_13, backup, image)?;
-        self.write_range_accepted(start, accepted.image)
+        self.write_range_accepted_with_progress(start, accepted.image, on_progress)
     }
 
     /// Program an image whose acceptance the caller has already established.
@@ -1973,6 +2007,16 @@ impl<T: Transport> DownloadAgent<T> {
     /// place that can reach `0xD3` without repeating a check, so it must not
     /// become public.
     fn write_range_accepted(&mut self, start: u32, image: &[u8]) -> Result<PendingWrite> {
+        self.write_range_accepted_with_progress(start, image, &mut |_, _| {})
+    }
+
+    /// The one body that reaches `0xD3` and `0xD5`, with a progress sink.
+    fn write_range_accepted_with_progress(
+        &mut self,
+        start: u32,
+        image: &[u8],
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<PendingWrite> {
         self.program_started = false;
         let mut packets = 0usize;
         let mut progress = Progress::NothingWritten;
@@ -1983,7 +2027,7 @@ impl<T: Transport> DownloadAgent<T> {
         // when this run did not erase or program a byte.
         self.range_attempted = true;
         self.record_range(start, end)?;
-        let outcome = self.program(image, start, &mut packets, &mut progress);
+        let outcome = self.program(image, start, &mut packets, &mut progress, on_progress);
         if let Err(err) = outcome {
             let unfinished = PartialWrite {
                 progress,
@@ -2095,6 +2139,7 @@ impl<T: Transport> DownloadAgent<T> {
         start: u32,
         packets: &mut usize,
         progress: &mut Progress,
+        on_progress: &mut dyn FnMut(usize, usize),
     ) -> Result<()> {
         // Set before the header goes out: a write that fails part-way cannot
         // prove that no byte of `0xD5` reached the wire, so this attempt must
@@ -2112,6 +2157,7 @@ impl<T: Transport> DownloadAgent<T> {
                 packet_address(index.saturating_add(1), start)
                     .min(start.saturating_add(FLASH_WRITE_LENGTH as u32)),
             );
+            on_progress(*packets, progress.bytes(start, image.len()));
         }
         self.expect_final_acks()
     }

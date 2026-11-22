@@ -25,13 +25,23 @@ The safety gate (`tools/check_safety.py`) is the other mechanical one, and it is
 what keeps reading and writing apart. `m241-core` reads; `m241-flash` writes.
 The gate fails if a destructive command (`$PMTK182,6`, `0xD3`, `0xD4`, `0xD5`,
 `0xD9`, including byte-literal / `\xNN` escape forms) or a write-shaped
-identifier appears in `m241-core` (`src/` or `tests/`), if `m241-core`'s or
-`m241-gui`'s dependency tree contains `m241-flash`, or if `set_control_lines` is
-named outside the exact BootROM entry/port/simulator paths. A binary built from
+identifier appears in `m241-core` (`src/` or `tests/`), if `m241-core`'s
+dependency tree contains `m241-flash`, or if `set_control_lines` is named
+outside the exact BootROM entry/port/simulator paths. A binary built from
 `m241-core` alone therefore cannot link or call the write/erase routines in
 `m241-flash` — though raw transport and framing primitives (`Port::open`,
 `Transport::write_all`, `pmtk::line`, `Frame`) remain public in `m241-core`
-because `m241-flash` builds on them. See
+because `m241-flash` builds on them.
+
+**The GUI writes too (user decision, 2026-11-23).** `m241-gui` now depends on
+`m241-flash` on purpose: the Firmware screen is the primary operator surface,
+and the user asked for the CLI's write capability there. The gate therefore
+requires the GUI's dependency tree to contain `m241-flash`, requires its write
+actions to call `m241_flash::flow::flash`, and requires the Firmware screen to
+build `Confirmation` only from its own typed word; it also fails if a
+destructive opcode (`0xD3` / `0xD4` / `0xD5` / `0xD9`, `PMTK182,6`) appears in
+the GUI's code. The reverse edge stays forbidden: `m241-core` still must not
+reach the write crate, so a read-only binary cannot erase or program. See
 [`docs/dev/11-safety-review.md`](docs/dev/11-safety-review.md).
 
 **Long commands go in the background.** A first `cargo build` of the GUI pulls
@@ -124,12 +134,16 @@ Rules:
 * the range must be a hard-coded constant, not a value derived from user input;
 * refuse to run if that constant is anything unexpected;
 * verify a known-intact marker before erasing;
-* require an explicit confirmation: type `WRITE` at the prompt, or pass `--yes`;
+* require an explicit confirmation: type `WRITE` at the CLI prompt, type
+  `WRITE` in the GUI's confirmation field, or pass `--yes` to the CLI;
 * the prompt is for the user. An agent must not answer it — not even by driving
-  a PTY — because typing `WRITE` is the user's own acknowledgement, not an
-  approval an agent can supply. The only route an agent may take is `--yes`,
-  and only once the approval §2.5 requires has been obtained (by default the
-  user; when delegated, the independent reviewer);
+  a PTY or clicking the GUI field — because typing `WRITE` is the user's own
+  acknowledgement, not an approval an agent can supply. The GUI has no `--yes`
+  equivalent: its buttons stay disabled until the user types the word, and the
+  action re-checks it so no other call path can skip it. The only route an
+  agent may take is `--yes` in the CLI, and only once the approval §2.5
+  requires has been obtained (by default the user; when delegated, the
+  independent reviewer);
 * an agent may pass `--yes` to `fw flash` **or `fw probe-da`** only when the
   approval §2.5 requires has been obtained. `fw probe-da` loads the DA into RAM
   and jumps to it, so the loaded DA can erase or program flash itself; it is
@@ -169,11 +183,13 @@ check:
 
 See §6.
 
-### 2.5 Who may approve a write-capable run (`fw flash --yes`, `fw flash --recover --yes`, `fw flash --allow-vendor --yes`, `fw probe-da --yes`)
+### 2.5 Who may approve a write-capable run (`fw flash --yes`, `fw flash --recover --yes`, `fw flash --allow-vendor --yes`, `fw probe-da --yes`, and the GUI's write / recovery / vendor / probe-da actions)
 
 By default, passing `--yes` to `fw flash` (**including `--recover` and
 `--allow-vendor`**) or `fw probe-da` requires the
-user's own approval. Subagent approval under this section applies **only** when
+user's own approval. The GUI's equivalents are the same approvals: its
+「書き込む」 / 「復旧」 / vendor write / 「DA を確認」 actions run only after the
+user types `WRITE` or `PROBE`, and no `--yes`-style bypass exists in the GUI. Subagent approval under this section applies **only** when
 the user has explicitly delegated approval for these write-capable runs in that
 session or instruction; any explicit user requirement for prior human approval
 on destructive changes **always** takes precedence and overrides this section.

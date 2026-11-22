@@ -11,6 +11,7 @@
 //! marked 「見本」 on the same screen (PRODUCT.md: unverified is a first-class state,
 //! and invented data is not a state at all).
 
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -19,7 +20,10 @@ use m241_core::protocol::Port;
 use m241_core::protocol::pmtk::{NMEA_BAUD, PmtkClient};
 use m241_core::protocol::port::Transport;
 use m241_core::{DeviceInfo, Error as CoreError, LogSummary};
+use m241_flash::da::Confirmation;
+use m241_flash::flow::ProbeDaReport;
 
+use crate::device::{self, DoctorReport, DropFile, JobEvent, PortFinding};
 use crate::screens::common::{self, Status};
 use crate::theme::{self, metric, size, space};
 
@@ -58,17 +62,96 @@ pub enum ProbeState {
     Failed(ProbeError),
 }
 
+/// What the last `device doctor` run produced.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DoctorState {
+    /// Not run in this session.
+    #[default]
+    Idle,
+    /// Running in the background.
+    Running,
+    /// Finished; a partial report is still a report.
+    Done(Box<DoctorReport>),
+    /// The job itself failed.
+    Failed(String),
+}
+
+/// What the last `fw probe-da` run produced.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DaProbeState {
+    /// Not run in this session.
+    #[default]
+    Idle,
+    /// The DA is being loaded and read.
+    Running,
+    /// Finished.
+    Done(ProbeDaReport),
+    /// Refused or failed; the device's words are kept.
+    Failed(String),
+}
+
+/// Which device job the Connect screen is waiting on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectJob {
+    Doctor,
+    ProbeDa,
+    Restart,
+}
+
+impl ConnectJob {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Doctor => "診断",
+            Self::ProbeDa => "DA の確認",
+            Self::Restart => "再起動",
+        }
+    }
+}
+
 /// The Connect screen's own state.
 ///
 /// Held here rather than in [`crate::App`] so the screen can be tested on its own,
 /// and so a background probe owns only this screen's data.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ConnectScreen {
     ports: Listing,
     selected: Option<String>,
     probe: ProbeState,
     probe_rx: Option<mpsc::Receiver<std::result::Result<DeviceProbe, ProbeError>>>,
     sample: bool,
+    doctor: DoctorState,
+    drop_dir: String,
+    extract_to: String,
+    da_path: String,
+    da_probe: DaProbeState,
+    probe_confirmation: String,
+    restart_confirmation: String,
+    message: Option<(Status, String)>,
+    job: Option<(ConnectJob, mpsc::Receiver<JobEvent>)>,
+    /// Whether the diagnostics block is expanded.
+    diagnostics_open: bool,
+}
+
+impl Default for ConnectScreen {
+    fn default() -> Self {
+        Self {
+            ports: Listing::default(),
+            selected: None,
+            probe: ProbeState::default(),
+            probe_rx: None,
+            sample: false,
+            doctor: DoctorState::default(),
+            drop_dir: String::new(),
+            extract_to: String::new(),
+            da_path: String::from("DA_v3.8.4.bin"),
+            da_probe: DaProbeState::default(),
+            probe_confirmation: String::new(),
+            restart_confirmation: String::new(),
+            message: None,
+            job: None,
+            diagnostics_open: false,
+        }
+    }
 }
 
 /// What the last port enumeration produced.
@@ -88,10 +171,20 @@ enum Listing {
 }
 
 impl ConnectScreen {
+    /// The word that unlocks `fw probe-da`.
+    ///
+    /// Loading the DA and jumping to it is inside AGENTS.md §2.5: the running DA
+    /// can erase and program flash. The CLI requires `--yes`; the GUI requires
+    /// this typed word instead, and only the user may type it.
+    pub const PROBE_CONFIRMATION: &'static str = "PROBE";
+
+    /// The word that unlocks the `0xD9` restart (`fw da-restart`).
+    pub const RESTART_CONFIRMATION: &'static str = "RESTART";
+
     /// Draw the screen body. The rail is drawn by the shell, not here.
     pub fn ui(&mut self, ui: &mut Ui) {
-        if self.poll_probe() {
-            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        if self.poll_probe() || self.poll_job() {
+            ui.ctx().request_repaint_after(Duration::from_millis(80));
         }
 
         // The port actions are the reason this screen exists, so they are pinned
@@ -125,6 +218,9 @@ impl ConnectScreen {
             self.port_panel(ui);
 
             ui.add_space(space::M);
+            self.diagnostics_panel(ui);
+
+            ui.add_space(space::M);
             ui.columns_const::<2, _>(|columns| {
                 let [left, right] = columns;
                 self.device_panel(left);
@@ -134,6 +230,207 @@ impl ConnectScreen {
             ui.add_space(space::M);
             self.next_steps(ui);
         });
+    }
+
+    /// Whether a device job (doctor, probe-da, restart) is running.
+    #[must_use]
+    pub fn busy(&self) -> bool {
+        self.job.is_some()
+    }
+
+    /// The doctor's state, for a caller that has just run it.
+    #[must_use]
+    pub fn doctor_state(&self) -> &DoctorState {
+        &self.doctor
+    }
+
+    /// The DA probe's state.
+    #[must_use]
+    pub fn da_probe_state(&self) -> &DaProbeState {
+        &self.da_probe
+    }
+
+    /// Put the doctor panel in a specific state, for the screenshot run.
+    pub fn set_doctor_state(&mut self, state: DoctorState) {
+        self.doctor = state;
+    }
+
+    /// Put the DA-probe panel in a specific state, for the screenshot run.
+    pub fn set_da_probe_state(&mut self, state: DaProbeState) {
+        self.da_probe = state;
+    }
+
+    /// Expand or collapse the diagnostics block.
+    pub fn set_diagnostics_open(&mut self, open: bool) {
+        self.diagnostics_open = open;
+    }
+
+    /// Start `device doctor` for the selected port and the typed drop directory.
+    ///
+    /// # Errors
+    ///
+    /// A job already running.
+    pub fn start_doctor(&mut self) -> Result<(), String> {
+        if self.job.is_some() {
+            return Err(String::from("別の処理が動いています"));
+        }
+        let job = device::Job::Doctor {
+            port: self.selected.clone(),
+            drop_dir: self.drop_dir.trim().to_owned(),
+            extract_to: self.extract_to.trim().to_owned(),
+        };
+        self.doctor = DoctorState::Running;
+        self.message = Some((Status::Info, String::from("診断しています…")));
+        self.start_job(ConnectJob::Doctor, job);
+        Ok(())
+    }
+
+    /// Start `fw probe-da`. The typed word is checked here, not only by the button.
+    ///
+    /// # Errors
+    ///
+    /// The word missing, no port selected, a missing DA path, or a job running.
+    pub fn start_probe_da(&mut self) -> Result<(), String> {
+        if self.probe_confirmation.trim() != Self::PROBE_CONFIRMATION {
+            return Err(format!(
+                "DA を確認するには {} と入力してください",
+                Self::PROBE_CONFIRMATION
+            ));
+        }
+        if self.job.is_some() {
+            return Err(String::from("別の処理が動いています"));
+        }
+        let Some(port) = self.selected.clone() else {
+            return Err(String::from("ポートを選択してください"));
+        };
+        if self.da_path.trim().is_empty() {
+            return Err(String::from("DA のファイルを指定してください"));
+        }
+        let job = device::Job::ProbeDa {
+            port,
+            da: self.da_path.trim().to_owned(),
+            confirmation: Confirmation::granted(),
+            assume_brom: false,
+        };
+        self.da_probe = DaProbeState::Running;
+        self.message = Some((Status::Info, String::from("DA を RAM に読み込んでいます…")));
+        self.start_job(ConnectJob::ProbeDa, job);
+        Ok(())
+    }
+
+    /// Send the one-byte `0xD9` restart. The typed word is checked here too.
+    ///
+    /// # Errors
+    ///
+    /// The word missing, no port selected, or a job running.
+    pub fn start_restart(&mut self) -> Result<(), String> {
+        if self.restart_confirmation.trim() != Self::RESTART_CONFIRMATION {
+            return Err(format!(
+                "再起動するには {} と入力してください",
+                Self::RESTART_CONFIRMATION
+            ));
+        }
+        if self.job.is_some() {
+            return Err(String::from("別の処理が動いています"));
+        }
+        let Some(port) = self.selected.clone() else {
+            return Err(String::from("ポートを選択してください"));
+        };
+        self.message = Some((Status::Info, String::from("0xD9 を送っています…")));
+        self.start_job(ConnectJob::Restart, device::Job::Restart { port });
+        Ok(())
+    }
+
+    /// Spawn a job and keep its channel.
+    fn start_job(&mut self, kind: ConnectJob, job: device::Job) {
+        self.job = Some((kind, device::start(job)));
+    }
+
+    /// Poll the job channel. Returns `true` while a job is still running.
+    pub fn poll_job(&mut self) -> bool {
+        let Some(kind) = self.job.as_ref().map(|(kind, _)| *kind) else {
+            return false;
+        };
+        let mut finished = false;
+        loop {
+            let received = match self.job.as_ref() {
+                Some((_, rx)) => match rx.try_recv() {
+                    Ok(event) => Some(Ok(event)),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                    Err(mpsc::TryRecvError::Disconnected) => Some(Err(())),
+                },
+                None => None,
+            };
+            match received {
+                Some(Ok(event)) => {
+                    if self.apply_job_event(kind, event) {
+                        finished = true;
+                        break;
+                    }
+                }
+                Some(Err(())) => {
+                    self.fail(kind, String::from("処理が結果を返さずに終了しました"));
+                    finished = true;
+                    break;
+                }
+                None => break,
+            }
+        }
+        if finished {
+            self.job = None;
+        }
+        self.job.is_some()
+    }
+
+    /// Apply one job event. Returns `true` when the job ended.
+    fn apply_job_event(&mut self, kind: ConnectJob, event: JobEvent) -> bool {
+        match event {
+            JobEvent::DoctorDone(report) => {
+                self.doctor = DoctorState::Done(Box::new(report));
+                self.message = Some((Status::Ok, String::from("診断が終わりました")));
+                true
+            }
+            JobEvent::ProbeDone(report) => {
+                let settled = report.settled.map_or_else(
+                    || String::from("判定できません（候補が 0 件または複数一致）"),
+                    |address| format!("0x{address:08X} にイメージがあります"),
+                );
+                self.da_probe = DaProbeState::Done(report);
+                self.message = Some((
+                    Status::Ok,
+                    format!("DA の確認: {settled}。フラッシュは書いていません"),
+                ));
+                true
+            }
+            JobEvent::Restarted => {
+                self.message = Some((
+                    Status::Info,
+                    String::from(
+                        "0xD9 を送りました。応答はないため、再起動を確認するには「接続して確認」か吸い出しを実行してください",
+                    ),
+                ));
+                true
+            }
+            JobEvent::Failed(message) => {
+                self.fail(kind, message);
+                true
+            }
+            JobEvent::Flow(_)
+            | JobEvent::Dumped(_)
+            | JobEvent::WriteDone(_)
+            | JobEvent::RecoverDone(_)
+            | JobEvent::BootRomAnswered => true,
+        }
+    }
+
+    /// Record a failed job in the state the job belongs to.
+    fn fail(&mut self, kind: ConnectJob, message: String) {
+        match kind {
+            ConnectJob::Doctor => self.doctor = DoctorState::Failed(message.clone()),
+            ConnectJob::ProbeDa => self.da_probe = DaProbeState::Failed(message.clone()),
+            ConnectJob::Restart => {}
+        }
+        self.message = Some((Status::Err, format!("{}: {message}", kind.label())));
     }
 
     /// Current probe state, for callers and tests.
@@ -472,6 +769,188 @@ impl ConnectScreen {
         });
     }
 
+    /// The diagnostics block: `device doctor`, `fw probe-da`, `fw da-restart`.
+    ///
+    /// The CLI's three device-side commands, without a terminal. Every control
+    /// says which command it is the same as, so a reader who has only the manual
+    /// can still tell what will happen.
+    fn diagnostics_panel(&mut self, ui: &mut Ui) {
+        // Collapsed by default: the port list and the device panels are the
+        // screen's first answer, and an always-open block pushed them below the
+        // fold at 1280x800. The actions are one click away and the row says
+        // which CLI commands the block holds.
+        let title = "診断・保守（device doctor / fw probe-da / fw da-restart）";
+        if !self.diagnostics_open {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(title).size(size::CAPTION).color(theme::MUTE));
+                if common::secondary_button(ui, "開く", true).clicked() {
+                    self.diagnostics_open = true;
+                }
+            });
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(title).size(size::CAPTION).color(theme::MUTE));
+            if common::secondary_button(ui, "閉じる", true).clicked() {
+                self.diagnostics_open = false;
+            }
+        });
+        ui.add_space(space::S);
+        let doctor = self.doctor.clone();
+        let da_probe = self.da_probe.clone();
+        common::panel(ui, "診断・保守", |ui| {
+            ui.label(
+                RichText::new("ポートの一覧・端末の識別・ベンダーファイルの確認を行います。")
+                    .size(size::UI)
+                    .color(theme::MUTE),
+            );
+            ui.add_space(space::M);
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("配布物の場所")
+                        .size(size::CAPTION)
+                        .color(theme::MUTE),
+                );
+                let _response = ui.add(
+                    egui::TextEdit::singleline(&mut self.drop_dir)
+                        .hint_text("ベンダー配布物のディレクトリ（任意）")
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(ui.available_width() * 0.4),
+                );
+                ui.label(
+                    RichText::new("DA の抽出先")
+                        .size(size::CAPTION)
+                        .color(theme::MUTE),
+                );
+                let _response = ui.add(
+                    egui::TextEdit::singleline(&mut self.extract_to)
+                        .hint_text("空なら抽出しない")
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(ui.available_width() * 0.3),
+                );
+            });
+            ui.add_space(space::S);
+            ui.horizontal(|ui| {
+                if common::secondary_button(ui, "診断する", !self.busy()).clicked()
+                    && let Err(reason) = self.start_doctor()
+                {
+                    self.message = Some((Status::Err, reason));
+                }
+                ui.label(
+                    RichText::new("CLI の m241 device doctor と同じ処理です")
+                        .size(size::CAPTION)
+                        .color(theme::MUTE),
+                );
+            });
+
+            match &doctor {
+                DoctorState::Idle => {
+                    common::status_line(ui, Status::Info, "まだ診断していません");
+                }
+                DoctorState::Running => {
+                    common::status_line(ui, Status::Info, "診断しています…");
+                }
+                DoctorState::Failed(reason) => {
+                    common::status_line(ui, Status::Err, reason);
+                }
+                DoctorState::Done(report) => {
+                    doctor_report(ui, report);
+                }
+            }
+
+            ui.add_space(space::M);
+            ui.label(
+                RichText::new("DA の確認（fw probe-da）")
+                    .size(size::TITLE)
+                    .color(theme::INK),
+            );
+            ui.add_space(space::S);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("DA").size(size::CAPTION).color(theme::MUTE));
+                let _response = ui.add(
+                    egui::TextEdit::singleline(&mut self.da_path)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(ui.available_width() - metric::ACTION_WIDTH - space::L),
+                );
+            });
+            ui.add_space(space::S);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("確認のため {} と入力", Self::PROBE_CONFIRMATION))
+                        .size(size::UI)
+                        .color(theme::INK),
+                );
+                let _response = ui.add_sized(
+                    Vec2::new(metric::ACTION_WIDTH * 1.5, metric::ROW),
+                    egui::TextEdit::singleline(&mut self.probe_confirmation)
+                        .hint_text(Self::PROBE_CONFIRMATION)
+                        .font(egui::TextStyle::Monospace),
+                );
+                let ready = self.probe_confirmation.trim() == Self::PROBE_CONFIRMATION
+                    && self.selected.is_some()
+                    && !self.busy();
+                if common::secondary_button(ui, "DA を確認", ready).clicked()
+                    && let Err(reason) = self.start_probe_da()
+                {
+                    self.message = Some((Status::Err, reason));
+                }
+            });
+            ui.label(
+                RichText::new(
+                    "CLI の m241 fw probe-da --yes と同じ処理です。DA を RAM に載せるだけで、\
+                     フラッシュは書き換えません。",
+                )
+                .size(size::CAPTION)
+                .color(theme::MUTE),
+            );
+            match &da_probe {
+                DaProbeState::Idle => {}
+                DaProbeState::Running => {
+                    common::status_line(ui, Status::Info, "DA を読み込んでいます…");
+                }
+                DaProbeState::Failed(reason) => {
+                    common::status_line(ui, Status::Err, reason);
+                }
+                DaProbeState::Done(report) => da_probe_report(ui, report),
+            }
+
+            ui.add_space(space::M);
+            ui.label(
+                RichText::new("0xD9 再起動（fw da-restart）")
+                    .size(size::TITLE)
+                    .color(theme::INK),
+            );
+            ui.add_space(space::S);
+            ui.horizontal(|ui| {
+                let _response = ui.add_sized(
+                    Vec2::new(metric::ACTION_WIDTH * 1.5, metric::ROW),
+                    egui::TextEdit::singleline(&mut self.restart_confirmation)
+                        .hint_text(Self::RESTART_CONFIRMATION)
+                        .font(egui::TextStyle::Monospace),
+                );
+                let ready = self.restart_confirmation.trim() == Self::RESTART_CONFIRMATION
+                    && self.selected.is_some()
+                    && !self.busy();
+                if common::secondary_button(ui, "0xD9 を送る", ready).clicked()
+                    && let Err(reason) = self.start_restart()
+                {
+                    self.message = Some((Status::Err, reason));
+                }
+                ui.label(
+                    RichText::new("CLI の m241 fw da-restart と同じ処理です（応答はありません）")
+                        .size(size::CAPTION)
+                        .color(theme::MUTE),
+                );
+            });
+
+            if let Some((status, text)) = &self.message {
+                ui.add_space(space::S);
+                common::status_line(ui, *status, text);
+            }
+        });
+    }
+
     fn next_steps(&mut self, ui: &mut Ui) {
         ui.add_space(space::M);
         ui.label(
@@ -599,6 +1078,120 @@ fn probe_error_for(err: CoreError) -> ProbeError {
         ),
     };
     ProbeError { message, hint }
+}
+
+/// Render a `device doctor` report: ports, identity, and the drop scan.
+fn doctor_report(ui: &mut Ui, report: &DoctorReport) {
+    common::status_line(ui, Status::Ok, "診断が終わりました");
+    ui.add_space(space::S);
+    common::figure_row(
+        ui,
+        "ポート",
+        &format!(
+            "{} 件（候補 {} 件）",
+            report.ports.len(),
+            report.ports.iter().filter(|port| port.likely).count()
+        ),
+    );
+    for PortFinding { name, likely } in &report.ports {
+        common::figure_row(
+            ui,
+            " ",
+            &format!("{name}  {}", if *likely { "候補" } else { "—" }),
+        );
+    }
+    match (&report.identity, &report.probe_error) {
+        (Some(identity), _) => {
+            common::figure_row(ui, "ファーム", &identity.release);
+            common::figure_row(ui, "ビルド", &identity.build);
+            common::figure_row(ui, "モデル", &identity.model);
+        }
+        (None, Some(reason)) => {
+            common::status_line(ui, Status::Err, &format!("端末の識別に失敗: {reason}"));
+        }
+        (None, None) => {}
+    }
+    if !report.drop_dir.is_empty() {
+        common::figure_row(ui, "配布物", &format!("{} 件", report.files.len()));
+        for DropFile { path, size, kind } in &report.files {
+            common::figure_row(
+                ui,
+                " ",
+                &format!("{kind}  {}  {}", common::bytes(*size), file_name(path)),
+            );
+        }
+        if let Some(source) = &report.da_source {
+            common::figure_row(ui, "DA", &file_name(source));
+        }
+        if let Some(dest) = &report.extracted_to {
+            common::status_line(ui, Status::Ok, &format!("DA を {dest} に抽出しました"));
+        }
+    }
+    if let Some(reason) = &report.drop_error {
+        common::status_line(ui, Status::Err, reason);
+    }
+}
+
+/// Render a `fw probe-da` report: the DA's report and both candidate pages.
+fn da_probe_report(ui: &mut Ui, report: &ProbeDaReport) {
+    common::status_line(
+        ui,
+        Status::Ok,
+        "DA が応答しました（フラッシュ書き込みなし）",
+    );
+    ui.add_space(space::S);
+    common::figure_row(
+        ui,
+        "DA",
+        &format!(
+            "v{}.{} region 0x{:02X}  {:04X}:{:04X}  {} バイト",
+            report.id.version >> 8,
+            report.id.version & 0xFF,
+            report.id.region,
+            report.id.manufacturer,
+            report.id.device,
+            report.id.flash_bytes
+        ),
+    );
+    for page in &report.pages {
+        let value = match (&page.first_bytes, &page.error) {
+            (Some(first), _) => format!(
+                "0x{:08X}  {}  {}",
+                page.address,
+                hex_bytes(first),
+                if page.matches_vector {
+                    "ベクタ一致"
+                } else {
+                    "不一致"
+                }
+            ),
+            (None, Some(reason)) => format!("0x{:08X}  読めません（{reason}）", page.address),
+            (None, None) => format!("0x{:08X}  読めません", page.address),
+        };
+        common::figure_row(ui, "候補", &value);
+    }
+    let verdict = report.settled.map_or_else(
+        || String::from("判定できません（候補が 0 件または複数一致）"),
+        |address| format!("0x{address:08X} にイメージがあります"),
+    );
+    common::status_line(ui, Status::Info, &verdict);
+}
+
+/// Upper-case hex, space-separated.
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The last path component, for a figure row.
+fn file_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| String::from(path))
 }
 
 /// The device the manual's figure shows, for looking at the layout.
@@ -871,6 +1464,83 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn the_da_probe_refuses_without_its_typed_word() {
+        // Loading the DA and jumping to it can program flash (AGENTS.md §2.5),
+        // so the GUI's equivalent of `--yes` is this typed word and nothing else.
+        let mut screen = screen();
+        screen.selected = Some(String::from("/dev/ttyFake0"));
+        let error = screen
+            .start_probe_da()
+            .expect_err("probe-da must refuse without PROBE");
+        assert!(
+            error.contains("PROBE"),
+            "the refusal does not ask for PROBE: {error}"
+        );
+        assert!(!screen.busy(), "a refused probe started a job");
+    }
+
+    #[test]
+    fn the_restart_refuses_without_its_typed_word() {
+        let mut screen = screen();
+        screen.selected = Some(String::from("/dev/ttyFake0"));
+        let error = screen
+            .start_restart()
+            .expect_err("0xD9 must refuse without RESTART");
+        assert!(
+            error.contains("RESTART"),
+            "the refusal does not ask for RESTART: {error}"
+        );
+        assert!(!screen.busy());
+    }
+
+    #[test]
+    fn a_doctor_report_reaches_the_screen() {
+        let mut screen = screen();
+        let report = DoctorReport {
+            ports: vec![PortFinding {
+                name: String::from("/dev/ttyUSB0"),
+                likely: true,
+            }],
+            drop_dir: String::from("vendor"),
+            files: vec![DropFile {
+                path: String::from("vendor/DA_v3.8.4.bin"),
+                size: 14_896,
+                kind: String::from("DA_v3.8.4.bin（DA）"),
+            }],
+            ..DoctorReport::default()
+        };
+        assert!(screen.apply_job_event(ConnectJob::Doctor, JobEvent::DoctorDone(report.clone())));
+        assert_eq!(screen.doctor_state(), &DoctorState::Done(Box::new(report)));
+        assert!(matches!(screen.message, Some((Status::Ok, _))));
+    }
+
+    #[test]
+    fn a_failed_da_probe_keeps_the_devices_words() {
+        let mut screen = screen();
+        screen.apply_job_event(
+            ConnectJob::ProbeDa,
+            JobEvent::Failed(String::from("the DA report is not the vendor DA")),
+        );
+        let DaProbeState::Failed(reason) = screen.da_probe_state() else {
+            panic!("the probe failure did not reach the screen");
+        };
+        assert!(
+            reason.contains("vendor DA"),
+            "the device's words were lost: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_second_connect_job_is_refused_while_one_runs() {
+        let mut screen = screen();
+        let (_tx, rx) = mpsc::channel();
+        screen.job = Some((ConnectJob::Doctor, rx));
+        assert!(screen.start_doctor().is_err());
+        assert!(screen.start_probe_da().is_err());
+        assert!(screen.start_restart().is_err());
     }
 
     #[test]

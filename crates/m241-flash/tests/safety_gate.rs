@@ -6,6 +6,9 @@
 //! against throwaway workspaces laid out the way the script expects (never
 //! touching the real repository), asserting:
 //!
+//! * the GUI's write route: its manifest and tree must reach `m241-flash`,
+//!   `device.rs` must call `flow::flash(`, and `firmware.rs` must build the
+//!   confirmation from its typed word; a destructive opcode in GUI code fails;
 //! * each forbidden command, escape form, write-shaped identifier, misplaced
 //!   `set_control_lines` reference, reversed dependency, and digest-based image
 //!   acceptance fails and names the violated rule;
@@ -82,6 +85,7 @@ edition = \"2024\"
 
 [dependencies]
 m241-core = { path = \"../m241-core\" }
+m241-flash = { path = \"../m241-flash\" }
 ";
 
 /// The smallest `da.rs` that satisfies both `m241-flash` rules: `check_image`
@@ -154,6 +158,19 @@ impl FakeRepo {
         std::fs::create_dir_all(gui.join("src")).unwrap();
         std::fs::write(gui.join("Cargo.toml"), CLEAN_GUI_TOML).unwrap();
         std::fs::write(gui.join("src").join("lib.rs"), "pub fn ui() {}\n").unwrap();
+        // The GUI write path's two invariants: it goes through the shared
+        // session, and its confirmation comes from the screen's typed word.
+        std::fs::write(
+            gui.join("src").join("device.rs"),
+            "pub fn go() { flow::flash(); }\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(gui.join("src").join("screens")).unwrap();
+        std::fs::write(
+            gui.join("src").join("screens").join("firmware.rs"),
+            "pub const CONFIRMATION: &str = \"WRITE\";\npub fn c() { Confirmation::granted(); }\n",
+        )
+        .unwrap();
 
         let repo = Self { root };
         for (relative, source) in core_files {
@@ -313,7 +330,7 @@ fn compliant_sources_and_valid_exclusions_pass() {
         "the safety gate rejected compliant sources:\n{report}"
     );
     assert!(
-        report.contains("no write path in m241-core or m241-gui"),
+        report.contains("no write path in m241-core"),
         "the gate passed without its expected summary:\n{report}"
     );
 }
@@ -724,8 +741,10 @@ m241-flash = { path = \"../m241-flash\" }
 }
 
 #[test]
-fn gui_depending_on_flash_is_reported() {
-    let repo = FakeRepo::new("gui-dep-flash", &[]);
+fn gui_without_flash_is_reported() {
+    // The GUI writes firmware now, so the missing link is a regression: its
+    // write actions would either be a second implementation or absent.
+    let repo = FakeRepo::new("gui-no-flash", &[]);
     repo.write_manifest(
         "m241-gui",
         "\
@@ -736,21 +755,50 @@ edition = \"2024\"
 
 [dependencies]
 m241-core = { path = \"../m241-core\" }
-
-[dev-dependencies]
-m241-flash = { path = \"../m241-flash\" }
 ",
     );
     let (passed, report) = repo.run();
-    assert!(!passed, "gui dev-dep on flash was accepted:\n{report}");
+    assert!(!passed, "gui without flash was accepted:\n{report}");
     assert!(
         report.contains("crates/m241-gui/Cargo.toml"),
         "gui manifest check did not fire:\n{report}"
     );
     assert!(
-        report.contains("m241-gui's dependency tree contains m241-flash"),
+        report.contains("does not contain m241-flash"),
         "gui cargo tree check did not fire:\n{report}"
     );
+}
+
+#[test]
+fn a_gui_write_that_bypasses_the_shared_session_is_reported() {
+    // A second write implementation in the GUI is the regression this rule
+    // exists for: it would carry its own opcodes and could skip the range gate.
+    let repo = FakeRepo::new("gui-no-flow", &[]);
+    std::fs::write(
+        repo.root
+            .join("crates")
+            .join("m241-gui")
+            .join("src")
+            .join("device.rs"),
+        "pub fn go() { da.write(...); }\n",
+    )
+    .unwrap();
+    repo.assert_reports("no `flow::flash(` call");
+}
+
+#[test]
+fn a_destructive_opcode_in_gui_code_is_reported() {
+    let repo = FakeRepo::new("gui-opcode", &[]);
+    std::fs::write(
+        repo.root
+            .join("crates")
+            .join("m241-gui")
+            .join("src")
+            .join("device.rs"),
+        "pub fn go() { send(OPCODE_RESTART); }\n",
+    )
+    .unwrap();
+    repo.assert_reports("destructive command");
 }
 
 #[test]
