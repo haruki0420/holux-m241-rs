@@ -128,11 +128,10 @@ Before writing it checks, and refuses on any failure:
 3. the user passed `--yes` (there is no typed prompt in this build; `AGENTS.md`
    §2.5 governs who may pass it);
 4. the layout gate accepts the pinned start `0x00000000` and length `406620`;
-5. `--da` names a 14,896-byte vendor `DA_v3.8.4.bin` starting `00 00 A0 E1`.
-   The code checks only the length and those four bytes, and prints the file's
-   full SHA-256. §2.5's approval requires that hash to equal the vendor value;
-   computing it inside `check_da_image` is follow-up **W2a**, so until it lands
-   the approver compares it manually.
+5. `--da` names a 14,896-byte vendor `DA_v3.8.4.bin` starting `00 00 A0 E1`
+   whose **full SHA-256** equals the pinned value in `AGENTS.md` §2.5. The
+   command still prints the file's full SHA-256, and a file with the right
+   length and head but any other digest is refused before a port is opened.
 
 A real run then enters the BootROM, compares the whole backup span with the
 unit's flash (**before any erase**), loads the DA into the chip's RAM, sends
@@ -193,8 +192,10 @@ are never sent, and the DA is gone at the next power-on.
 
 The client sends no destructive opcode, but the DA it jumps to can erase or
 program flash itself. `--yes` is therefore an approval gate, not a formality:
-`AGENTS.md` §2.5 covers this command, requires the `--da` full SHA-256 to match
-the vendor value, and applies the same independent-review rule as `fw flash`.
+`AGENTS.md` §2.5 covers this command, and `check_da_image` refuses any `--da`
+that is not the pinned vendor image — exact length, exact first four bytes and
+the **full SHA-256** — before a port is opened. §2.5 applies the same
+independent-review rule as `fw flash`.
 
 Flags: `--da <FILE>` (the vendor `DA_v3.8.4.bin`, exactly 14,896 bytes starting
 `00 00 A0 E1`; never committed here), `--port <PORT|auto>` (default `auto`),

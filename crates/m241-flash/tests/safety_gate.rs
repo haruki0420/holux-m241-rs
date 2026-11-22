@@ -97,7 +97,7 @@ pub fn all_within(backup: &[u8], image: &[u8]) -> bool {
     backup == image
 }
 
-// W2a may hash the DA file here; only the firmware acceptance is forbidden a digest.
+// The DA check may hash the file; only the firmware acceptance is forbidden a digest.
 pub fn check_da_image(image: &[u8]) -> bool {
     m241_core::firmware::sha256_hex(image).len() == 64
 }

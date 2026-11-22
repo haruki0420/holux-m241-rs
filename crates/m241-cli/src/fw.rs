@@ -36,8 +36,8 @@ use m241_core::{Error, FirmwareProfile, PatchPlan, Result};
 use m241_flash::da::{
     Confirmation, DaLoadId, DaLoader, DownloadAgent, FLASH_WRITE_START, PROBE_ADDRESSES,
     PROBE_PAGE_SIZE, PendingWrite, VECTOR, VENDOR_PER_UNIT_DATA_BYTES, VendorImage, WritePlan,
-    WriteReport, accept_vendor_image, check_da_image, check_image, check_layout, read_candidates,
-    write_plan, write_plan_vendor,
+    WriteReport, accept_vendor_image, check_da_image_against, check_image, check_layout,
+    read_candidates, write_plan, write_plan_vendor,
 };
 
 use crate::Session;
@@ -56,6 +56,29 @@ const EFFECTIVE_EPOCH_HIGH_TOP: usize = EFFECTIVE_EPOCH_OFFSET + 3;
 /// `V1.12` → `V1.14`), derived from each profile's `version_marker` base.
 const V1_13_VERSION_DIGIT: usize = PROFILE_V1_13.version_marker + VERSION_MARKER_LEN - 1;
 const V1_12_VERSION_DIGIT: usize = PROFILE_V1_12.version_marker + VERSION_MARKER_LEN - 1;
+
+/// The DA fingerprint `fw flash` and `fw probe-da` require of `--da`
+/// (`AGENTS.md` §2.5).
+///
+/// A normal build pins the vendor value from `m241_flash::da` — the same digest
+/// `check_da_image_against` compares — so the DA these commands load is only
+/// ever the vendor `DA_v3.8.4.bin`. The tests cannot use that value: the binary
+/// is never committed (`AGENTS.md` §6), and every CLI write test drives the
+/// command with a synthetic 14,896-byte fixture. The test build therefore pins
+/// the fixture's own digest, computed from the bytes the test writes
+/// (`tests::da_fixture_bytes`): the comparison is still the full SHA-256, it
+/// just checks a value a test can produce. Production never takes that path.
+#[cfg(not(test))]
+fn da_sha256() -> &'static str {
+    m241_flash::da::DA_IMAGE_SHA256
+}
+
+#[cfg(test)]
+fn da_sha256() -> &'static str {
+    use std::sync::OnceLock;
+    static DIGEST: OnceLock<String> = OnceLock::new();
+    DIGEST.get_or_init(|| sha256_hex(&tests::da_fixture_bytes()))
+}
 
 /// Read the firmware off the device, twice, and save it once both reads agree.
 ///
@@ -525,8 +548,9 @@ fn plan_document(report: &PatchReport, written: Option<&std::path::Path>) -> ser
 /// A real run does everything decidable without a device first, in this order:
 /// the `--yes` confirmation, [`check_layout`], the driver's own acceptance rule
 /// against the pinned V1.13 range ([`check_image`] or
-/// [`accept_vendor_image`]), and the DA file ([`check_da_image`]). Only then is
-/// a port opened. On the device it:
+/// [`accept_vendor_image`]), and the DA file ([`check_da_image_against`], which
+/// requires the pinned vendor SHA-256). Only then is a port opened. On the
+/// device it:
 ///
 /// 1. enters the BootROM ([`enter_bootrom`]) and syncs;
 /// 2. calls [`DownloadAgent::verify_device`], so a unit that does not hold
@@ -565,7 +589,8 @@ fn plan_document(report: &PatchReport, written: Option<&std::path::Path>) -> ser
 /// * [`Error::Firmware`] when the image is too short to hold a header.
 /// * [`Error::Safety`] when the image is not acceptable ([`write_plan`] /
 ///   [`check_image`] / [`accept_vendor_image`]), when `--yes` was not given,
-///   from [`check_layout`], or from [`check_da_image`] / the device check.
+///   from [`check_layout`], or from [`check_da_image_against`] / the device
+///   check.
 /// * [`Error::Port`] when no plausible port can be opened.
 /// * [`Error::State`] when the BootROM cannot be re-entered after `0xD9`.
 /// * [`Error::Timeout`] / [`Error::Framing`] / [`Error::Rejected`] from the
@@ -645,11 +670,10 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
         )));
     };
     let da = fileio::read(da_path)?;
-    check_da_image(&da)?;
+    check_da_image_against(&da, da_sha256())?;
     session.console.note(&format!(
-        "DA file {} is {} bytes with SHA-256 {}; `check_da_image` checks only the length and \
-         the first four bytes (W2a adds the digest). AGENTS.md §2.5 requires the full hash to \
-         match the vendor value before --yes is approved",
+        "DA file {} is {} bytes with SHA-256 {}; it is the pinned DA_v3.8.4.bin digest \
+         (AGENTS.md §2.5), so the DA may be loaded",
         da_path.display(),
         da.len(),
         sha256_hex(&da)
@@ -687,7 +711,7 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
         );
     }
     let mut loader = DaLoader::new(rom.transport_mut());
-    let id = loader.load(confirmation, &da)?;
+    let id = loader.load_against(confirmation, &da, da_sha256())?;
     session.console.note(&format!(
         "DA v{}.{} answered; programming {} bytes in {} packets",
         id.version >> 8,
@@ -915,7 +939,7 @@ fn reload_for_retry(
         .console
         .note("BootROM re-entered after the restart; reloading the DA into RAM");
     let mut loader = DaLoader::new(rom.transport_mut());
-    let _id = loader.load(confirmation, da)?;
+    let _id = loader.load_against(confirmation, da, da_sha256())?;
     Ok(DownloadAgent::new(rom.into_transport()))
 }
 
@@ -1516,8 +1540,9 @@ pub fn da_restart(options: &DaRestartOptions, session: Session<'_>) -> Result<()
 ///
 /// # Errors
 ///
-/// * [`Error::Safety`] without `--yes`, or for a DA file that is not the DA
-///   (wrong size, wrong first bytes). Both run before a port is opened.
+/// * [`Error::Safety`] without `--yes`, or for a DA file that is not the pinned
+///   DA (wrong size, wrong first bytes, wrong full SHA-256). Both run before a
+///   port is opened.
 /// * [`Error::Io`] when the DA file cannot be read, [`Error::State`] when the
 ///   verdict is asked for addresses other than the two candidates.
 /// * [`Error::Port`] when no plausible port can be opened, [`Error::Timeout`] /
@@ -1528,7 +1553,7 @@ pub fn probe_da(options: &ProbeDaOptions, session: Session<'_>) -> Result<()> {
     // Everything that can be checked without a device is checked first.
     let confirmation = Confirmation::of_probe_command_line(options.yes)?;
     let da = fileio::read(&options.da)?;
-    check_da_image(&da)?;
+    check_da_image_against(&da, da_sha256())?;
 
     let port = link::resolve(session.links, &options.port)?;
     session.console.note(&format!(
@@ -1547,7 +1572,7 @@ pub fn probe_da(options: &ProbeDaOptions, session: Session<'_>) -> Result<()> {
     // The loader borrows the transport from the synced client; the DA
     // conversation then takes it back, so the port has one owner throughout.
     let mut loader = DaLoader::new(rom.transport_mut());
-    let id = loader.load(confirmation, &da)?;
+    let id = loader.load_against(confirmation, &da, da_sha256())?;
     session.console.note(&format!(
         "DA v{}.{} answered (region 0x{:02X}, flash {:04X}:{:04X}, {} bytes); reading",
         id.version >> 8,
@@ -2652,15 +2677,12 @@ mod tests {
     fn probe_da_with_a_valid_da_reaches_the_port_step_and_refuses_without_one() {
         // The DA path itself is exercised against the fake in `m241-flash`; here
         // the point is that the command gets past its own refusals and then
-        // reports the missing port as a port error, not a safety one.
+        // reports the missing port as a port error, not a safety one. The fixture
+        // carries a digest the test build pins (`da_sha256`), so the check is
+        // satisfied here the way the vendor file satisfies the pinned value in a
+        // real run.
         let scratch = Scratch::new("probe-port");
-        let path = scratch.join("DA_v3.8.4.bin");
-        let mut image = vec![0u8; 14_896];
-        image
-            .get_mut(..4)
-            .expect("four bytes")
-            .copy_from_slice(&m241_flash::da::DA_IMAGE_HEAD);
-        fileio::write(&path, &image).expect("write");
+        let path = da_file(scratch.path());
         let links = FakePorts::empty();
         let console = RecordingConsole::default();
         let session = Session::new(&links, &console, &AutoConfirm);
@@ -2669,6 +2691,37 @@ mod tests {
         let err = probe_da(&options, session).expect_err("no port is available");
         assert!(matches!(err, Error::Port { .. }), "got {err}");
         assert_eq!(crate::exit::exit_code_for(&err), 3, "got {err}");
+    }
+
+    #[test]
+    fn probe_da_refuses_a_same_size_da_with_the_right_head_but_a_different_hash() {
+        // Follow-up W2a: length and head used to be the whole gate, so any
+        // 14,896-byte file starting `00 00 A0 E1` would be loaded and jumped to.
+        // This file is exactly that — the fixture with one byte changed — and it
+        // must be refused before the port step.
+        let scratch = Scratch::new("probe-digest");
+        let path = scratch.join("DA_v3.8.4.bin");
+        let mut image = da_fixture_bytes();
+        let last = image.last_mut().expect("a 14,896-byte image");
+        *last ^= 0xFF;
+        fileio::write(&path, &image).expect("write");
+        let links = FakePorts::empty();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        let mut options = probe_options(&path);
+        options.yes = true;
+        let err = probe_da(&options, session).expect_err("a lookalike DA is not loaded");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
+        let text = format!("{err}");
+        assert!(
+            text.contains("SHA-256"),
+            "the refusal names the digest check: {text}"
+        );
+        assert!(
+            console.stderr().is_empty(),
+            "the port step is never reached: {}",
+            console.stderr()
+        );
     }
 
     #[test]
@@ -4208,15 +4261,23 @@ mod tests {
 
     /// The DA file `probe_da` reads: the vendor length and first bytes, with
     /// every other byte distinct so a wrong relay shows up in the read-back.
-    fn da_file(dir: &Path) -> PathBuf {
-        let path = dir.join("DA_v3.8.4.bin");
+    ///
+    /// The bytes are the synthetic DA every CLI write test uses. The vendor
+    /// binary is never committed (`AGENTS.md` §6), so [`da_sha256`] pins this
+    /// fixture's own digest in the test build instead of the vendor value.
+    pub(super) fn da_fixture_bytes() -> Vec<u8> {
         let mut image: Vec<u8> = (0..m241_flash::da::DA_IMAGE_SIZE)
             .map(|index| (index % 251) as u8)
             .collect();
         if let Some(head) = image.get_mut(..m241_flash::da::DA_IMAGE_HEAD.len()) {
             head.copy_from_slice(&m241_flash::da::DA_IMAGE_HEAD);
         }
-        fileio::write(&path, &image).expect("write the DA");
+        image
+    }
+
+    fn da_file(dir: &Path) -> PathBuf {
+        let path = dir.join("DA_v3.8.4.bin");
+        fileio::write(&path, &da_fixture_bytes()).expect("write the DA");
         path
     }
 

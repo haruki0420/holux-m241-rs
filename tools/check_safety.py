@@ -510,8 +510,8 @@ def check_flash_acceptance() -> list[str]:
     strict path has no digest route, and that prose must remain allowed.
 
     The ranges are the `check_image`/`all_within` bodies, not all of `da.rs`:
-    `check_da_image` is the DA file's own length/head check, and follow-up W2a
-    will legitimately add its SHA-256 there.
+    `check_da_image` is the DA file's own check, and its full SHA-256 (added by
+    follow-up W2a) legitimately lives there.
     """
     if not FLASH_DA.is_file():
         return [f"{relative(FLASH_DA)} is missing; cannot verify the image acceptance rule"]
