@@ -90,6 +90,30 @@ flash write : no
   after the final page of a multi-page read, and bytes between pages were not
   exercised.
 
+### 1.3 The first `0xD3` after the DA banner (2026-11-22)
+
+Device: the same retail M-241. Host: Linux, `/dev/ttyUSB0`.
+
+A real `fw flash` attempt reached the write sequence and then stopped at the
+first range command:
+
+```text
+BootROM sync answered; comparing the whole unit with the backup before any erase
+the unit matches the backup; loading the DA into the chip's RAM (no flash write yet)
+DA v3.8 answered; programming 406620 bytes in 1589 packets
+m241: error: framing error: 0xD3 answered 0xBB; expected 0x5A or 0xA5
+```
+
+* **The flash was not changed.** `0xD3` only records a range; the erase is
+  inside `0xD5`, which was never sent (`docs/reference/01-da-protocol.md` §4.1,
+  §5.3).
+* `0xBB` is consistent with one of the **four bytes after the DA banner**
+  recorded in §1.2 being read as the `0xD3` ACK. The previous client drained
+  those bytes before `0xD6`; it did not drain before the first `0xD3`.
+* The client now clears the input at the start of `record_range`, so both the
+  first `0xD3` and `0xD6` drain the banner residue. ⚠️ The fix has **not** been
+  re-run on hardware; this row records the failure that motivated it.
+
 ## 1a. The Linux log-erase hardware session (2026-11-21)
 
 Device: retail Holux M-241 (MT3318) over USB serial (CP210x bridge).
@@ -127,7 +151,7 @@ nothing on this page makes the final head verified.
 | The `0xD9` → NMEA probe → `$PMTK180*3B` re-entry and read-back | implemented in the CLI and exercised against the fake only; no unit has been asked to boot its firmware and hand the BootROM back after a write. The 2026-11-15 row records that the unit booted, not that this read-back ran |
 | The 406,620-byte BootROM read split into `DUMP_CHUNK` frames | the frame count and per-frame byte limits are fixed against the fake; no unit has been read at this size through the chunked path. A single 406,620-byte `0xA2` would exceed the five-second deadline at 115,200 8N1 |
 | The DA's `0xD6` read across multiple pages | one page per address was read on 2026-11-21; the advance between pages, the advance after the **last** page of a multi-page read, and any bytes the DA sends between pages are unmeasured (`docs/reference/01-da-protocol.md` §5.5, §7 item 4) |
-| The four bytes after the DA banner | observed once on 2026-11-21; their origin is not established. The client drains them before `0xD6` |
+| The four bytes after the DA banner | observed 2026-11-21; their origin is not established. They were read as `0xBB` by the first `0xD3` on 2026-11-22 (§1.3). The client now drains them before both `0xD6` and the first `0xD3`; the fix is not yet re-run on hardware |
 | `0xD6`'s page length for arguments other than 64 | only a 64-byte page-length argument was measured (64 data bytes + 2-byte trailer) |
 | `fw probe-da` on stock V1.13 and on a second unit | the 2026-11-21 run read the unit from §1.1, which already carries the WNRO patch (the version marker is patched to V1.14); its first 64 bytes match the vendor V1.13 image's, but no stock unit and no second unit were probed |
 | The `0xA8` jump frame's count word | the protocol page gives it no meaning; the only client that ran the jump on a unit sent `0`, and this crate does too. Whether the BootROM reads the field at all is not established (`docs/dev/03-hardware-facts.md` "DA jump") |
