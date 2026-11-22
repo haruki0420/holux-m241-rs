@@ -217,7 +217,10 @@ pub fn block_title(ui: &mut Ui, title: &str, sample: bool) {
 /// becomes unreadable in monochrome, which is what §3 forbids.
 pub fn status_line(ui: &mut Ui, status: Status, text: &str) {
     let (colour, word) = status.voice();
-    ui.horizontal(|ui| {
+    // `horizontal_wrapped`, not `horizontal`: a refusal names the path it failed
+    // on, and a non-wrapping row let a long one widen the rail instead of
+    // wrapping inside it (the map then lost half its width to the overflow).
+    ui.horizontal_wrapped(|ui| {
         let (rect, _ignored) = ui.allocate_exact_size(Vec2::splat(space::S), Sense::hover());
         ui.painter().rect_filled(rect, theme::RADIUS, colour);
         ui.label(RichText::new(word).size(size::CAPTION).color(colour));
