@@ -1904,3 +1904,100 @@ PSS ではなく RSS のため、`Vec` 予約分やバイナリ・アロケー�
 ### Stage 3
 
 - 未実施。`review-gate` は付けていない（Stage 3 は別エージェントが新しい head SHA で行う）。
+
+---
+
+## 2026-11-23 / PR #43 Tauri v2 GUI の Stage 2 修正（`feat-tauri-p0`）
+
+対象: Stage 1 head `5e25205c7874177dbdedf0948e68e15245c5f438`（base `origin/main` = `db15b2f`）。
+仕様・安全検収（Must 3、追加 Must 5、Should 8）と可読性・デザイン（Must 2、Should 17、Could 12）の
+うち、Must 全件と実害の確認された追加 Must を修正した。修正後の head は push 後に PR へ記録する。
+
+**検証の限界**: 実機・実シリアルポートは一切開いていない。UI の実測はビルド済み `dist` を
+ヘッドレス Chrome（CDP、1280×800）で表示し、`window.__TAURI_INTERNALS__` だけモックしたもの。
+Tauri 実ウィンドウ内の CSP・IME・OS ダイアログ、Windows / macOS は未検証。
+
+### Must への対応
+
+| 指摘 | 対応 | 実装 / テスト |
+|---|---|---|
+| 安全ゲートが `m241-app` を網羅しない | `check_safety.py` に 3 条項を追加: (a) `APP_MAY_LINK_FLASH = False` の間は manifest と `cargo tree` の両方で `m241-flash` を拒否（P3 で定数を True にし、GUI と同じ write-route 条項を足す設計）、(b) `m241-app/src` と `ui/src` に `0xD3`/`0xD4`/`0xD5`/`0xD9`/`PMTK182,6` を拒否、(c) `Port::open` は `src/device.rs::probe` の 1 箇所だけ・`device_info` が呼び手、他の serial コンストラクタは拒否 | 実装 + テスト（`safety_gate.rs` に 4 本追加） |
+| クリーンチェックアウトで 4/6 | `check.sh` に準備段: `ui/dist/index.html` が無ければ `pnpm install --frozen-lockfile && pnpm build`。pnpm 不在/失敗時は `m241-app` を clippy/test から外し `[SKIP] m241-app: …` を 1 行出して 5/6＋skip と報告。AGENTS.md / README.md に前提を明記 | 実装（スクリプト）+ docs |
+| 写真マッチングが §6.1 の 2 規則を落としている | `PhotoOptions`（カメラ時差 分・ログの日数ずれ・許容差・グループ距離）を追加し、`GeotagOptions` の許容差と `geotag::group_matched_plans` でグループ化。写真パネルに「カメラ時差（分）」「ログの日付ずれ（日）」「同じ地点にまとめる距離（m）」を追加（既定 0） | 実装 + テスト 4 本 |
+| 同期コマンドが webview を止める | `open_log` / `load_photos` / `export_log` を `async fn` + `spawn_blocking` に変更（`device_info` と同じ形）。共有文書を `Arc<Mutex<…>>` にして blocking closure が自分の handle を持つ | 実装（Tauri runtime が要るため自動テストは無し。clippy/test/build で確認） |
+| テスト名が検証範囲を偽る | `every_error_variant_has_exactly_one_next_action_line` は 11 バリアント全部を配列で渡す（件数 assert 付き）。`logdoc` の弱いテストは `a_relative_destination_is_refused` に改名し、`assert!(!same.is_empty())` を削除 | テスト |
+| 保存先の symlink で上書き禁止を回避できる | 保存先を `canonicalize`（新規ファイルは親を解決）し、Unix では dev/ino も比較。`../` 表記・symlink・hard link の 3 経路を拒否し、元ファイルのバイト列が変わらないことも assert | 実装 + テスト 3 本 |
+| 開いた直後の fit が follow に打ち消される | 文書を fit した直後の follow を 1 回だけ抑止（`suppressFollowOnceRef`）。`fitBounds` の padding をヘッダ/ツールバー/タイムライン用の非対称値に | 実装 + スクショ実測 |
+| 地図の占有率 53.3% | ヘッダとツールバーを地図上のオーバーレイに変更。1280×800 で地図 **784×800 = 61.25%**、ドック 272px は維持 | 実装 + 実測 |
+| OSM ラスタがフルカラーで軌跡より目立つ | `raster-saturation: -0.7` / `raster-brightness-max: 0.85` / `raster-opacity: 0.9`。平均彩度 0.105→0.051、p90 0.315→0.103 | 実装 + 実測 |
+| UI に開発者向けの痕跡 | DeviceCard の「（P3）」を実態の文に、「10 秒ほど」を「最大 15 秒ほど」に（identity 5s + usage 5s + log_enabled 5s）。常に空のコメントブロックを削除 | 実装 |
+
+補足: 依頼文の「タイムゾーン変換（`--utc-offset-days` 相当）」は、CLI では
+`--utc-offset-days` が**軌跡の時刻**を日単位で動かすフラグで、カメラ側の時差は
+`--tz-offset-minutes` である。仕様 §6.1-2 は「写真のタイムゾーン」を要求しているため、
+カメラ時差（分）とログの日数ずれ（日、`--utc-offset-days` と同じ意味）の両方を実装した。
+
+### ゲートの変異テスト（実際に落ちることの確認）
+
+`/home/kuni/dev/holux-m241-wnro-toolkit/rust` の作業ツリーで一時的に変異を入れ、
+`python3 tools/check_safety.py` が **exit 1** になることを確認してから `git checkout --` で戻した。
+
+| 変異 | ゲートの出力 |
+|---|---|
+| `m241-app/Cargo.toml` に `m241-flash.workspace = true` | manifest 条項と `cargo tree` 条項の 2 件で FAIL（exit 1） |
+| `m241-app/src/lib.rs` に `pub const …: u8 = 0xD5;` と `"$PMTK182,6"` | 2 件の destructive command で FAIL |
+| `ui/src/lib/format.ts` に `0xd5` / `"\xd5"` / `"$PMTK182,6"` | 3 件の frontend 違反で FAIL |
+| `commands.rs` に 2 つ目の `Port::open` | 「opens a serial port in 2 places」で FAIL |
+
+変異を戻した後のゲートは exit 0。同じ 4 種は `crates/m241-flash/tests/safety_gate.rs` の
+fixture テスト 4 本としても固定した。
+
+### Stage 1 Should への対応
+
+| 指摘 | 対応 |
+|---|---|
+| 見本の集計がギャップ込みで誤解を招く | 10 分超の間隔を距離・時間・平均から除外（区間ごとに `TrackStats::of` を合計）。見本は 24:44:30 → **1:44:00**、平均 0.3 → 3.3 km/h。日別行にも同じ規則を適用し、注記を追加 |
+| タブの `aria-controls` が存在しない id を指す | アクティブタブだけに `aria-controls` を付与。実測で非アクティブ 4 つは `null`、アクティブは `targetExists: true` |
+| 地図 canvas が 2 つ目のタブストップで outline が消える | canvas を `tabIndex = -1` + `aria-hidden="true"` にし、`:focus-visible` の輪郭を復活。実測 `tabIndex: -1` / `aria-hidden: true` |
+| ポップアップ/ダイアログにフォーカスが移らない | 点ポップアップは閉じるボタンへ、書き出しは保存先入力へフォーカス。実測 `aria-label=閉じる` / `activeElement.id=export-destination` |
+| CSP が `null`、未使用の `opener:default` | CSP を最小構成に（`self`、IPC schemes、`tile.openstreetmap.org`、`worker-src blob:`）。opener は権限・plugin 初期化・依存を削除。※Tauri 実ウィンドウでの CSP 動作は未検証 |
+| DESIGN.md の「ネットワーク消費者は 1 つ」 | egui の `TileFetcher` と Tauri WebView の 2 消費者として更新。AGENTS.md の同記述も更新 |
+| 写真タイムゾーンを設定画面に出す | Must 3 の写真パネル入力を実装（設定画面は P4 扱い） |
+
+### 見送り
+
+- 1024×640 の地図占有率（新レイアウトでも 52.8%）とドックの折りたたみ: 要求は 1280×800 の 60% 超。
+  狭い幅のレスポンシブは別対応とする。
+- 可読性 S-2（`logdoc.rs` 分割）、S-4（`useLogDocument` のリクエストチケット）、S-5（ESLint）、
+  型スケール 11px の整理、チャート時間軸の日付併記、Connect の地図プレースホルダ、
+  タイル取得失敗の案内、サムネイル帯・回転: Must と独立の構造/文言で、stage 3 の判定後に follow-up。
+- Tauri 実ウィンドウでの CSP・キーボード操作・IME: ヘッドレス Chrome では Tauri の CSP が掛からないため未検証。
+
+### 検証
+
+- `./tools/check.sh`（head `23dc60f`）: **6/6**（fmt / clippy / test / docs / design / safety、120s）。
+- クリーン複製 `/var/tmp/pr43-clean`（`git worktree add --detach`、`ui/dist` を削除、head `23dc60f`）:
+  `check.sh` が `prepare: … running pnpm install + build` → `prepare: built …` を出し **6/6**（90s、test 78.1s）。
+- `cargo test -p m241-app`: **28 passed**。`cargo test -p m241-flash --test safety_gate`: **35 passed**
+  （うち 4 本が新しい `m241-app` 条項）。
+- `pnpm --dir crates/m241-app/ui typecheck` / `build`: 成功。
+- 地図: 変更前 784×696 = 53.29%（自作ビルド、Stage 1 レビューの 53.3% と一致）、
+  変更後 784×800 = **61.25%**（ドック 272px 維持）。
+- ラスタ: 平均彩度 0.105 → 0.051、p90 0.315 → 0.103（地図領域の HSV saturation、PIL で計測）。
+  軌跡の accent `#145f75` は彩度 ~0.83 で、地図の p90 を大きく上回る。
+- fit: スクリーンショット上の軌跡 bbox は (330,120)–(951,729)。fit padding top=120 の内側で、
+  2 セッションとも切れていない。
+- 追加テスト: `a_camera_offset_puts_a_utc_plus_nine_photo_on_the_track`、
+  `a_log_offset_moves_the_track_into_the_photo_clock`、`the_time_tolerance_is_the_geotag_max_gap`、
+  `photos_at_the_same_place_share_a_group_when_grouping_is_on`、
+  `exporting_through_a_dot_dot_path_over_the_source_is_refused`、
+  `exporting_through_a_symlink_to_the_source_is_refused`、
+  `exporting_over_a_hard_link_to_the_source_is_refused`、
+  `the_summary_excludes_the_gap_between_sessions`、
+  `app_linking_the_write_crate_is_reported`、`app_destructive_opcode_is_reported`、
+  `app_frontend_destructive_opcode_is_reported`、`app_second_serial_open_is_reported`。
+- スクリーンショット: `/var/tmp/pr43-shots/after-1280x800.png`（タイル OFF、fit）、
+  `tiles-after-1280x800.png`（タイル ON、彩度）、`before-tiles-1280x800.png`（変更前の比較）、
+  `photo-panel.png`（写真パネルの入力）、`a11y-export.png`。
+- 未検証: 実機、実シリアルポート、Tauri 実ウィンドウ、Windows / macOS、写真フォルダの実データでの
+  カメラ時差の一致（合成 JPEG の mtime でテスト）。`review-gate` は付けていない（Stage 3）。
