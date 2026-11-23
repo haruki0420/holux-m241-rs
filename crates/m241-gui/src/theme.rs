@@ -51,6 +51,12 @@ pub const DATA: Color32 = Color32::from_rgb(0x5F, 0xB3, 0xC4);
 /// desaturated to sit on `ground` and `panel` without competing with the ink
 /// that marks the selection; [`DATA`] is the first entry, so a track less than
 /// ten points long stays in the product's own colour.
+///
+/// The cycle paints on both canvases. On the schematic grid no casing is needed;
+/// on an OSM tile the pale hue would read under 2:1 against land, so
+/// `map_canvas` draws a `ground` disc one hairline wider under every record and
+/// the cycle stays true with a dark edge (design review 2026-11-23, M1). There is
+/// no second `ink` ring: the selection marker is the only filled ink disc.
 pub const TRACK_PALETTE: [Color32; 10] = [
     DATA,
     Color32::from_rgb(0xB4, 0x7E, 0xC8),
@@ -127,25 +133,45 @@ pub mod metric {
     /// Width of a track line, a chart series, or a plotted path.
     pub const TRACK_LINE: f32 = 2.0;
     /// Numbers carried over from the reference implementation's polyline
-    /// (07-eztour-spec §5 「既定の線幅 5 px、不透明度 0.7」).
+    /// (07-eztour-spec §5 「既定の線幅 5 px」) plus the casing the map needs.
+    ///
+    /// The reference draws the line at 70% opacity because its map was a dark
+    /// schematic. This map's default surface is OSM tile (land #F2EFE9, water
+    /// #AAD3DF): `data` alone is only 1.7:1 on land by the WCAG formula, so the
+    /// line is painted at full opacity over a `ground` casing, which gives it a
+    /// dark edge on land and water alike (design review 2026-11-23, M1).
     pub mod track {
         /// Stroke width of the map's track polyline.
         pub const LINE_WIDTH: f32 = 5.0;
-        /// Opacity of the map's track polyline and of the plotted records.
+        /// Stroke width of the casing drawn under the polyline.
+        pub const CASING_WIDTH: f32 = 7.0;
+        /// Opacity of one plotted record's fill.
+        ///
+        /// The line is painted opaque over its casing (see below); the records
+        /// keep the reference implementation's 70% so a dense track does not turn
+        /// into a solid ribbon.
         pub const LINE_OPACITY: f32 = 0.7;
 
-        /// The map's track polyline stroke: the specified width and opacity, in
-        /// the product's data colour.
+        /// The map's track polyline stroke, in the product's data colour.
         ///
         /// `PathStroke` rather than `Stroke` because the map line is a path.
         pub fn line_stroke() -> egui::epaint::PathStroke {
-            egui::epaint::PathStroke::new(
-                LINE_WIDTH,
-                super::super::DATA.gamma_multiply(LINE_OPACITY),
-            )
+            egui::epaint::PathStroke::new(LINE_WIDTH, super::super::DATA)
         }
 
-        /// The fill of one plotted record in the colour cycle.
+        /// The casing under [`line_stroke`]: the same geometry in `ground`.
+        ///
+        /// Drawn first so the polyline keeps a dark edge on the light tile; on
+        /// the offline grid it is invisible, which is harmless.
+        pub fn casing_stroke() -> egui::epaint::PathStroke {
+            egui::epaint::PathStroke::new(CASING_WIDTH, super::super::GROUND)
+        }
+
+        /// The fill of one plotted record, in ezTour's ten-colour cycle.
+        ///
+        /// The hue carries the sequence on the offline grid. On a tile the hue is
+        /// too pale to read, so the caller draws a `ground` disc just under it —
+        /// the cycle stays true and the marker stays visible.
         pub fn record_fill(index: usize) -> egui::Color32 {
             let palette = super::super::TRACK_PALETTE;
             palette
@@ -158,21 +184,35 @@ pub mod metric {
     /// Radius of one plotted point.
     pub const POINT_DOT: f32 = 3.0;
     /// Width of a screen's subordinate rail block (DESIGN.md §5, ログ).
-    pub const RAIL_BLOCK: f32 = 220.0;
-    /// Height of the track canvas.
     ///
-    /// The design's 1280×800 page has to hold the map, the speed chart and the
-    /// selected-point block above the export footer. At 240 the speed chart and
-    /// the selected point both fell below the fold; 160 is the landscape
-    /// proportion DESIGN.md §5 draws, and the page ends where the design ends.
-    pub const PLOT: f32 = 160.0;
+    /// The Log screen's own blocks moved into the drawer (§5), but the Connect
+    /// screen's two panels still split on this figure.
+    pub const RAIL_BLOCK: f32 = 220.0;
+    /// Height of the Log screen's tool row: the only strip above the map.
+    ///
+    /// The map is the page (DESIGN.md §5). This row is one line — the screen's
+    /// title and the sample marker — and every other control is drawn *over* the
+    /// canvas as an overlay plate, so none of them takes height from the map.
+    pub const TOOL_ROW: f32 = 40.0;
+    /// Width of the Log screen's right-hand drawer.
+    ///
+    /// Five tab panels' worth of controls. Below [`NARROW`] of content width the
+    /// drawer lies over the map instead of beside it: 360pt beside a sub-1000pt
+    /// canvas would leave the map a strip rather than the main surface.
+    pub const DRAWER: f32 = 360.0;
     /// Height of the speed chart (a subordinate series, one step under the map).
     pub const CHART: f32 = 80.0;
     /// Minimum width of a dialog's primary action, so two buttons line up.
     pub const ACTION_WIDTH: f32 = 128.0;
-    /// Below this content width the Log screen stacks instead of splitting
-    /// (DESIGN.md §9 leaves the breakpoint open; this is the one it names).
-    pub const NARROW: f32 = 1_100.0;
+    /// Below this content width the Log screen floats the drawer over the canvas
+    /// instead of giving it a column (DESIGN.md §9 leaves the breakpoint open;
+    /// this is the one it names).
+    ///
+    /// The measure is the Log body's width (`ui.max_rect()`), not the window's:
+    /// the rail and the page margin are part of the window, not of this screen.
+    /// 1000pt leaves a 640pt canvas beside the 360pt column, which is the width
+    /// at which the credit still wraps clear of the zoom plate.
+    pub const NARROW: f32 = 1_000.0;
 }
 
 /// The system font provider, shared by every context.
@@ -277,6 +317,12 @@ fn apply(style: &mut egui::Style) {
     visuals.panel_fill = GROUND;
     visuals.window_fill = GROUND;
     visuals.extreme_bg_color = RAIL;
+    // An input field is a raised surface, not a hole: `PANEL` sits one step
+    // above `GROUND`, so a path field reads as an editable box instead of
+    // vanishing into the page (the design direction's "fields must be
+    // distinguishable from headings"). egui paints the TextEdit frame from this
+    // colour, so every screen's inputs take the same step.
+    visuals.text_edit_bg_color = Some(PANEL);
     visuals.faint_bg_color = PANEL;
     visuals.override_text_color = Some(INK);
     visuals.window_stroke = egui::Stroke::new(1.0, RULE);
@@ -414,6 +460,9 @@ mod tests {
                 "{name} is not the token DESIGN.md §3 names"
             );
         }
+        // The ten-colour cycle is still the record fill, but on an OSM tile a
+        // pale hue measures under 2:1 on land, so `map_canvas` puts a `ground`
+        // casing under every record as well (design review 2026-11-23, M1).
         assert_eq!(
             TRACK_PALETTE,
             [
@@ -482,6 +531,17 @@ mod tests {
         apply(&mut style);
         assert_eq!(style.visuals.window_shadow, egui::epaint::Shadow::NONE);
         assert_eq!(style.visuals.popup_shadow, egui::epaint::Shadow::NONE);
+    }
+
+    #[test]
+    fn input_fields_sit_on_the_raised_surface() {
+        // A field has to read as editable rather than as a label. `PANEL` is the
+        // product's one raised surface; the theme used to leave egui's default,
+        // which made a TextEdit a hole slightly darker than the page. Pinning
+        // the token keeps the input/heading distinction from drifting back.
+        let mut style = egui::Style::default();
+        apply(&mut style);
+        assert_eq!(style.visuals.text_edit_bg_color, Some(PANEL));
     }
 
     #[test]

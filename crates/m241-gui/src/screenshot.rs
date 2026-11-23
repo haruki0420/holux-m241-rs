@@ -33,6 +33,7 @@ use crate::app::App;
 use crate::screens::Screen;
 use crate::screens::connect::{DaProbeState, DoctorState};
 use crate::screens::firmware::{DumpState, FlashState};
+use crate::screens::log::LogTab;
 use crate::theme;
 
 /// An 8-bit RGBA image, top-down, ready for a PNG.
@@ -482,11 +483,27 @@ fn write_frame(
 /// The I/O failure, with the path and the reason: a screenshot run that wrote nothing
 /// must not exit 0.
 pub fn write_all(directory: &Path) -> Result<Vec<std::path::PathBuf>, String> {
+    write_all_with(directory, &[(1280.0, 800.0), (1024.0, 640.0)])
+}
+
+/// The body of [`write_all`], with the screen sizes named by the caller.
+///
+/// `write_all` always passes the two documented sizes. The test drives the same
+/// writer at a small size — the software rasteriser is O(pixels × triangles), so
+/// rendering the real set inside the test suite would cost minutes — and counts
+/// the frames it produces, so a drawer loop deleted from here fails a test. The
+/// device-side frames (write states, dump states, Connect's panels) are rendered
+/// at the first size, which keeps the standard set identical to before.
+fn write_all_with(
+    directory: &Path,
+    sizes: &[(f32, f32)],
+) -> Result<Vec<std::path::PathBuf>, String> {
     std::fs::create_dir_all(directory)
         .map_err(|err| format!("{} を作れません: {err}", directory.display()))?;
+    let (base_width, base_height) = sizes.first().copied().unwrap_or((1280.0, 800.0));
 
     let mut written = Vec::new();
-    for (width, height) in [(1280.0, 800.0), (1024.0, 640.0)] {
+    for &(width, height) in sizes {
         for screen in Screen::ALL {
             let mut app = App::default();
             prepare(&mut app, screen);
@@ -540,13 +557,16 @@ pub fn write_all(directory: &Path) -> Result<Vec<std::path::PathBuf>, String> {
                 "32fe52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435",
             ),
         });
-        let name = format!("firmware-{suffix}-1280x800.png");
+        let name = format!(
+            "firmware-{suffix}-{}x{}.png",
+            base_width as u32, base_height as u32
+        );
         written.push(write_frame(
             directory,
             &name,
             &mut app,
             Screen::Firmware,
-            Vec2::new(1280.0, 800.0),
+            Vec2::new(base_width, base_height),
         )?);
     }
     // The two-read dump's intermediate states: the power-cycle prompt between the
@@ -580,13 +600,16 @@ pub fn write_all(directory: &Path) -> Result<Vec<std::path::PathBuf>, String> {
         app.firmware_mut()
             .set_step(crate::screens::firmware::Step::Dump);
         app.firmware_mut().set_dump_state(state);
-        let name = format!("firmware-{suffix}-1280x800.png");
+        let name = format!(
+            "firmware-{suffix}-{}x{}.png",
+            base_width as u32, base_height as u32
+        );
         written.push(write_frame(
             directory,
             &name,
             &mut app,
             Screen::Firmware,
-            Vec2::new(1280.0, 800.0),
+            Vec2::new(base_width, base_height),
         )?);
     }
     // The Connect screen's three device-side actions need a device to produce
@@ -649,10 +672,13 @@ pub fn write_all(directory: &Path) -> Result<Vec<std::path::PathBuf>, String> {
             }));
         written.push(write_frame(
             directory,
-            "connect-diagnostics-1280x800.png",
+            &format!(
+                "connect-diagnostics-{}x{}.png",
+                base_width as u32, base_height as u32
+            ),
             &mut app,
             Screen::Connect,
-            Vec2::new(1280.0, 800.0),
+            Vec2::new(base_width, base_height),
         )?);
     }
     // The DA probe's result needs its own frame: with the full doctor report on
@@ -689,11 +715,39 @@ pub fn write_all(directory: &Path) -> Result<Vec<std::path::PathBuf>, String> {
             }));
         written.push(write_frame(
             directory,
-            "connect-probe-da-1280x800.png",
+            &format!(
+                "connect-probe-da-{}x{}.png",
+                base_width as u32, base_height as u32
+            ),
             &mut app,
             Screen::Connect,
-            Vec2::new(1280.0, 800.0),
+            Vec2::new(base_width, base_height),
         )?);
+    }
+    // The drawer's five tabs are the panels the map hides by default: two images
+    // of the closed drawer would leave four of the five with no rendered frame in
+    // the standard set. The batch above stays the map the review is about; this
+    // one is the panels, at both documented sizes.
+    for &(width, height) in sizes {
+        for (tab, slug) in [
+            (LogTab::Summary, "summary"),
+            (LogTab::Photos, "photos"),
+            (LogTab::Edit, "edit"),
+            (LogTab::Export, "export"),
+            (LogTab::Ops, "ops"),
+        ] {
+            let mut app = App::default();
+            prepare(&mut app, Screen::Log);
+            app.log_mut().open_drawer(tab);
+            let name = format!("log-drawer-{slug}-{}x{}.png", width as u32, height as u32);
+            written.push(write_frame(
+                directory,
+                &name,
+                &mut app,
+                Screen::Log,
+                Vec2::new(width, height),
+            )?);
+        }
     }
     Ok(written)
 }
@@ -708,12 +762,13 @@ fn prepare(app: &mut App, screen: Screen) {
         Screen::Connect => app.connect_mut().show_sample(),
         Screen::Log => {
             app.log_mut().show_sample();
-            // The photo block and the KMZ row are the wiring this artifact is
-            // reviewed for, so the Log frame is taken with sample photos loaded
-            // (no file touched) and the KMZ writer selected. The shift controls
-            // are filled with a sample camera as well: the block carries 「見本」,
-            // and the frame shows the resolved-camera and moved-photo readouts
-            // without reading a JPEG.
+            // The photo block and the KMZ row live in the drawer's 写真 and
+            // 書き出し tabs, which `write_all` renders as their own frames
+            // (`log-drawer-photos-*`, `log-drawer-export-*`). The state is loaded
+            // here so those frames show the wiring resolved: sample photos (no
+            // file touched), a sample camera for the shift block, and the KMZ
+            // writer selected. The closed-drawer images still show the map the
+            // review is about.
             app.log_mut().show_sample_photos();
             app.log_mut().show_sample_photo_shift();
             app.log_mut().set_kmz_export();
@@ -838,7 +893,8 @@ mod tests {
     #[test]
     fn the_documented_sizes_render_the_narrow_layout_too() {
         // DESIGN.md §8 names 1280×800 and 1024×640 as the two sizes the review judges,
-        // and §9 makes the Log screen collapse below 1100pt. The narrow size is
+        // and §9 makes the Log screen float its drawer below `metric::NARROW` (1000pt
+        // of content). The narrow size is
         // rendered here rather than only through `write_all`, so a collapse rule that
         // stops working breaks a test instead of a review.
         for (width, height) in [(1280.0_f32, 800.0_f32), (1024.0, 640.0)] {
@@ -852,5 +908,37 @@ mod tests {
                 "{width}×{height} rendered no text"
             );
         }
+    }
+
+    #[test]
+    fn the_standard_screenshot_set_includes_every_drawer_tab() {
+        // Stage 3: the five drawer frames were added to `write_all`, but nothing
+        // failed if the loop was deleted. Drive the same writer at 320×200 — the
+        // software rasteriser makes the real 1280×800 set too slow for the suite
+        // — and count the frames; a deleted drawer loop lowers the count and drops
+        // the names.
+        let directory =
+            std::env::temp_dir().join(format!("m241-screenshot-set-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let written = write_all_with(&directory, &[(320.0, 200.0)]).expect("the screenshot set");
+        let names: Vec<String> = written
+            .iter()
+            .filter_map(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect();
+        // 4 screens + 3 write states + 2 dump states + 2 Connect frames + 5 drawer tabs.
+        assert_eq!(
+            names.len(),
+            16,
+            "the standard set is missing frames: {names:?}"
+        );
+        for slug in ["summary", "photos", "edit", "export", "ops"] {
+            let expected = format!("log-drawer-{slug}-320x200.png");
+            assert!(
+                names.iter().any(|name| name == &expected),
+                "the {slug} drawer frame is missing from the set: {names:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

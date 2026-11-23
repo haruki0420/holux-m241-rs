@@ -355,13 +355,13 @@ impl LogOps {
                     .color(theme::MUTE),
             );
             ui.add_space(space::S);
-            ui.horizontal_wrapped(|ui| {
-                for mode in OpsMode::ALL {
-                    if common::tool_button(ui, mode.label(), self.mode == mode, true).clicked() {
-                        self.mode = mode;
-                    }
-                }
-            });
+            // Six mode chips do not fit the drawer's 332pt on one row, and a
+            // `horizontal_wrapped` cannot break between them: each chip is a
+            // `ui.scope`, and a scope is placed without a wrap check. Two
+            // explicit rows keep every mode reachable instead of squeezing the
+            // last two into vertical text.
+            ui.horizontal(|ui| self.mode_chips(ui, &OpsMode::ALL[..3]));
+            ui.horizontal(|ui| self.mode_chips(ui, &OpsMode::ALL[3..]));
             ui.add_space(space::S);
             match self.mode {
                 OpsMode::Download => self.download_panel(ui),
@@ -382,6 +382,18 @@ impl LogOps {
         });
         if self.job.is_some() || self.proxy_running() {
             ui.ctx().request_repaint_after(REPAINT_INTERVAL);
+        }
+    }
+
+    /// One row of mode chips, the selected one marked.
+    ///
+    /// Split out so [`Self::ui`] can break the six modes across two rows
+    /// explicitly; a wrapping layout cannot see inside a scoped button.
+    fn mode_chips(&mut self, ui: &mut Ui, modes: &[OpsMode]) {
+        for &mode in modes {
+            if common::tool_button(ui, mode.label(), self.mode == mode, true).clicked() {
+                self.mode = mode;
+            }
         }
     }
 
@@ -567,23 +579,23 @@ impl LogOps {
             self.report_port_list(OpsMode::Download);
         }
         let mut started = false;
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("保存先")
-                    .size(size::CAPTION)
-                    .color(theme::MUTE),
-            );
-            let width = (ui.available_width() - metric::ACTION_WIDTH - space::S).max(120.0);
-            let _response = ui.add_sized(
-                Vec2::new(width, metric::ROW),
-                egui::TextEdit::singleline(&mut self.download.transfer.destination)
-                    .hint_text(RichText::new("m241-log.bin").size(size::CAPTION))
-                    .font(egui::TextStyle::Monospace),
-            );
-            if common::primary_button(ui, "吸い出す", !busy).clicked() {
-                started = true;
-            }
-        });
+        // The destination and the download action stack: the drawer is 332pt,
+        // where a caption, a field and a 128pt button on one line sit exactly on
+        // the clip edge.
+        ui.label(
+            RichText::new("保存先")
+                .size(size::CAPTION)
+                .color(theme::MUTE),
+        );
+        ui.add_sized(
+            Vec2::new(ui.available_width(), metric::ROW),
+            egui::TextEdit::singleline(&mut self.download.transfer.destination)
+                .hint_text(RichText::new("m241-log.bin").size(size::CAPTION))
+                .font(egui::TextStyle::Monospace),
+        );
+        if common::primary_button(ui, "吸い出す", !busy).clicked() {
+            started = true;
+        }
         if started {
             self.start_download(DownloadPurpose::Dump);
         }
@@ -611,23 +623,23 @@ impl LogOps {
             self.report_port_list(OpsMode::Erase);
         }
         let mut started = false;
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("バックアップ先")
-                    .size(size::CAPTION)
-                    .color(theme::MUTE),
-            );
-            let width = (ui.available_width() - metric::ACTION_WIDTH * 1.6 - space::S).max(120.0);
-            let _response = ui.add_sized(
-                Vec2::new(width, metric::ROW),
-                egui::TextEdit::singleline(&mut self.erase.transfer.destination)
-                    .hint_text(RichText::new("m241-log-backup.bin").size(size::CAPTION))
-                    .font(egui::TextStyle::Monospace),
-            );
-            if common::secondary_button(ui, "バックアップを保存", !busy).clicked() {
-                started = true;
-            }
-        });
+        // The destination and the backup action stack: the drawer is 332pt and a
+        // caption, a field and a 205pt button do not share one line there.
+        ui.label(
+            RichText::new("バックアップ先")
+                .size(size::CAPTION)
+                .color(theme::MUTE),
+        );
+        ui.add_sized(
+            Vec2::new(ui.available_width(), metric::ROW),
+            egui::TextEdit::singleline(&mut self.erase.transfer.destination)
+                .hint_text(RichText::new("m241-log-backup.bin").size(size::CAPTION))
+                .font(egui::TextStyle::Monospace),
+        );
+        if common::secondary_button(ui, "バックアップを保存", !busy).clicked() {
+            started = true;
+        }
+
         if started {
             self.start_download(DownloadPurpose::Backup);
         }
@@ -644,26 +656,32 @@ impl LogOps {
                 ),
             );
         }
+        // The consent sentence is a caption above its checkbox: the full
+        // sentence at caption size is wider than the drawer, and a checkbox
+        // does not wrap its label. The control itself stays one word, next to
+        // the sentence it answers.
+        ui.label(
+            RichText::new("バックアップを保存済みで、この端末のログを消すことに同意します")
+                .size(size::CAPTION)
+                .color(theme::MUTE),
+        );
         ui.checkbox(
             &mut self.erase.confirm,
-            RichText::new("バックアップを保存済みで、この端末のログを消すことに同意します")
-                .size(size::CAPTION),
+            RichText::new("同意する").size(size::CAPTION),
         );
         let ready = self.erase.ready();
         let mut pressed = false;
-        ui.horizontal(|ui| {
-            if common::secondary_button(ui, "消去", ready).clicked() {
-                pressed = true;
-            }
-            if !ready {
-                let reason = if self.erase.saved.is_none() {
-                    "先にバックアップを保存してください"
-                } else {
-                    "同意のチェックを入れると「消去」が有効になります"
-                };
-                ui.label(RichText::new(reason).size(size::CAPTION).color(theme::MUTE));
-            }
-        });
+        if common::secondary_button(ui, "消去", ready).clicked() {
+            pressed = true;
+        }
+        if !ready {
+            let reason = if self.erase.saved.is_none() {
+                "先にバックアップを保存してください"
+            } else {
+                "同意のチェックを入れると「消去」が有効になります"
+            };
+            ui.label(RichText::new(reason).size(size::CAPTION).color(theme::MUTE));
+        }
         if pressed {
             self.press_erase();
         }
@@ -737,75 +755,71 @@ impl LogOps {
     }
 
     fn project_panel(&mut self, ui: &mut Ui, screen: &mut LogScreen) {
-        for (label, value, hint, reserve) in [
-            (
-                "プロジェクト",
-                &mut self.project.path,
-                "m241-project.json",
-                metric::ACTION_WIDTH * 3.0,
-            ),
-            ("ログ", &mut self.project.log, "track.bin", 0.0),
-            (
-                "写真",
-                &mut self.project.photos,
-                "写真フォルダ（任意）",
-                0.0,
-            ),
-            ("書き出し先", &mut self.project.output, "track.gpx", 0.0),
-            (
-                "日付補正",
-                &mut self.project.offset,
-                "0（日数）",
-                metric::ACTION_WIDTH,
-            ),
+        // Each row is a caption and a field that fills the drawer: the buttons
+        // moved to their own rows, so no row has to reserve width for one.
+        for (label, value, hint) in [
+            ("プロジェクト", &mut self.project.path, "m241-project.json"),
+            ("ログ", &mut self.project.log, "track.bin"),
+            ("写真", &mut self.project.photos, "写真フォルダ（任意）"),
+            ("書き出し先", &mut self.project.output, "track.gpx"),
+            ("日付補正", &mut self.project.offset, "0（日数）"),
         ] {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(label).size(size::CAPTION).color(theme::MUTE));
-                let width = (ui.available_width() - reserve - space::S).max(120.0);
-                let _response = ui.add_sized(
-                    Vec2::new(width, metric::ROW),
-                    egui::TextEdit::singleline(value)
-                        .hint_text(RichText::new(hint).size(size::CAPTION))
-                        .font(egui::TextStyle::Monospace),
-                );
-            });
+            ui.label(RichText::new(label).size(size::CAPTION).color(theme::MUTE));
+            let _response = ui.add_sized(
+                Vec2::new(ui.available_width(), metric::ROW),
+                egui::TextEdit::singleline(value)
+                    .hint_text(RichText::new(hint).size(size::CAPTION))
+                    .font(egui::TextStyle::Monospace),
+            );
         }
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("形式").size(size::CAPTION).color(theme::MUTE));
-            for format in ExportFormat::ALL {
-                let selected = !self.project.kmz && self.project.format == format;
-                if common::tool_button(ui, &format.extension().to_uppercase(), selected, true)
-                    .clicked()
-                {
-                    self.project.kmz = false;
-                    self.project.format = format;
-                }
+        // The chips take two rows in the drawer (a scope is placed without a
+        // wrap check, so `horizontal_wrapped` cannot break between them), and
+        // the read options and the three actions each get their own line.
+        ui.label(RichText::new("形式").size(size::CAPTION).color(theme::MUTE));
+        ui.horizontal(|ui| {
+            for &format in &ExportFormat::ALL[..3] {
+                self.project_format_chip(ui, format);
+            }
+        });
+        ui.horizontal(|ui| {
+            for &format in &ExportFormat::ALL[3..] {
+                self.project_format_chip(ui, format);
             }
             if common::tool_button(ui, "KMZ", self.project.kmz, true).clicked() {
                 self.project.kmz = true;
             }
-            ui.checkbox(
-                &mut self.project.nmea,
-                RichText::new("NMEA 入力").size(size::CAPTION),
-            );
         });
+        ui.checkbox(
+            &mut self.project.nmea,
+            RichText::new("NMEA 入力").size(size::CAPTION),
+        );
         let mut action = None;
-        ui.horizontal_wrapped(|ui| {
+        ui.horizontal(|ui| {
             if common::secondary_button(ui, "保存", true).clicked() {
                 action = Some(ProjectAction::Save);
             }
             if common::secondary_button(ui, "読込", true).clicked() {
                 action = Some(ProjectAction::Load);
             }
-            if common::secondary_button(ui, "読込んで書き出す", true).clicked() {
-                action = Some(ProjectAction::LoadAndWrite);
-            }
         });
+        if common::secondary_button(ui, "読込んで書き出す", true).clicked() {
+            action = Some(ProjectAction::LoadAndWrite);
+        }
         match action {
             Some(ProjectAction::Save) => self.save_project(),
             Some(ProjectAction::Load) => self.load_project(screen, false),
             Some(ProjectAction::LoadAndWrite) => self.load_project(screen, true),
             None => {}
+        }
+    }
+
+    /// One project output-format chip; KMZ is drawn separately because it is a
+    /// writer choice, not an [`ExportFormat`].
+    fn project_format_chip(&mut self, ui: &mut Ui, format: ExportFormat) {
+        let selected = !self.project.kmz && self.project.format == format;
+        if common::tool_button(ui, &format.extension().to_uppercase(), selected, true).clicked() {
+            self.project.kmz = false;
+            self.project.format = format;
         }
     }
 
@@ -1055,42 +1069,41 @@ impl LogOps {
 
     /// The optional TCP listener and the loopback gate.
     fn proxy_bind_controls(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("TCP 待受")
-                    .size(size::CAPTION)
-                    .color(theme::MUTE),
-            );
-            let width = (ui.available_width() - 220.0).max(120.0);
-            let _response = ui.add_sized(
-                Vec2::new(width, metric::ROW),
-                egui::TextEdit::singleline(&mut self.proxy.bind)
-                    .hint_text(RichText::new("空欄なら TCP なし").size(size::CAPTION))
-                    .font(egui::TextStyle::Monospace),
-            );
-            ui.checkbox(
-                &mut self.proxy.allow_non_loopback,
-                RichText::new("ループバック以外を許可").size(size::CAPTION),
-            );
-        });
+        // Stacked for the drawer: a caption, a field and the loopback checkbox
+        // are wider than 332pt on one line.
+        ui.label(
+            RichText::new("TCP 待受")
+                .size(size::CAPTION)
+                .color(theme::MUTE),
+        );
+        let _response = ui.add_sized(
+            Vec2::new(ui.available_width(), metric::ROW),
+            egui::TextEdit::singleline(&mut self.proxy.bind)
+                .hint_text(RichText::new("空欄なら TCP なし").size(size::CAPTION))
+                .font(egui::TextStyle::Monospace),
+        );
+        ui.checkbox(
+            &mut self.proxy.allow_non_loopback,
+            RichText::new("ループバック以外を許可").size(size::CAPTION),
+        );
     }
 
     /// The date correction, the optional line limit and start/stop.
     fn proxy_run_controls(&mut self, ui: &mut Ui) {
+        // Stacked for the drawer: the offset, the line limit and the two
+        // transport actions do not fit one 332pt row.
+        ui.label(
+            RichText::new("日付補正")
+                .size(size::CAPTION)
+                .color(theme::MUTE),
+        );
+        let _response = ui.add_sized(
+            Vec2::new(ui.available_width(), metric::ROW),
+            egui::TextEdit::singleline(&mut self.proxy.offset)
+                .hint_text(RichText::new("auto または日数").size(size::CAPTION))
+                .font(egui::TextStyle::Monospace),
+        );
         ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("日付補正")
-                    .size(size::CAPTION)
-                    .color(theme::MUTE),
-            );
-            let width =
-                (ui.available_width() - metric::ACTION_WIDTH * 2.0 - space::S - 150.0).max(90.0);
-            let _response = ui.add_sized(
-                Vec2::new(width, metric::ROW),
-                egui::TextEdit::singleline(&mut self.proxy.offset)
-                    .hint_text(RichText::new("auto または日数").size(size::CAPTION))
-                    .font(egui::TextStyle::Monospace),
-            );
             ui.label(
                 RichText::new("最大行数")
                     .size(size::CAPTION)
@@ -1102,7 +1115,9 @@ impl LogOps {
                     .hint_text(RichText::new("無制限").size(size::CAPTION))
                     .font(egui::TextStyle::Monospace),
             );
-            let running = self.proxy_running();
+        });
+        let running = self.proxy_running();
+        ui.horizontal(|ui| {
             if common::primary_button(ui, "開始", !running).clicked() {
                 self.start_proxy();
             }
@@ -1235,33 +1250,45 @@ impl LogOps {
                 );
             });
         }
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("形式").size(size::CAPTION).color(theme::MUTE));
-            for format in ExportFormat::ALL {
-                let selected = self.read.format == format;
-                if common::tool_button(ui, &format.extension().to_uppercase(), selected, true)
-                    .clicked()
-                {
-                    self.read.format = format;
-                }
-            }
-            ui.checkbox(
-                &mut self.read.nmea,
-                RichText::new("NMEA 0183 として読む").size(size::CAPTION),
-            );
-        });
-        let mut started = false;
+        // The format chips take two rows in the drawer, and the read options
+        // and the action each sit on their own line: five scoped chips plus a
+        // checkbox cannot share 332pt (a scope is placed without a wrap check).
+        ui.label(RichText::new("形式").size(size::CAPTION).color(theme::MUTE));
         ui.horizontal(|ui| {
-            ui.checkbox(
-                &mut self.read.force,
-                RichText::new("出力先が存在しても上書きする").size(size::CAPTION),
-            );
-            if common::primary_button(ui, "読み込んで書き出す", true).clicked() {
-                started = true;
+            for &format in &ExportFormat::ALL[..3] {
+                self.read_format_chip(ui, format);
             }
         });
+        ui.horizontal(|ui| {
+            for &format in &ExportFormat::ALL[3..] {
+                self.read_format_chip(ui, format);
+            }
+        });
+        ui.checkbox(
+            &mut self.read.nmea,
+            RichText::new("NMEA 0183 として読む").size(size::CAPTION),
+        );
+        let mut started = false;
+        ui.checkbox(
+            &mut self.read.force,
+            RichText::new("出力先が存在しても上書きする").size(size::CAPTION),
+        );
+        if common::primary_button(ui, "読み込んで書き出す", true).clicked() {
+            started = true;
+        }
         if started {
             self.run_read(screen);
+        }
+    }
+
+    /// One `log read` output-format chip.
+    ///
+    /// A method rather than a loop body so the two drawer rows share the one
+    /// selection rule; the panel has no KMZ writer, so there is no archive chip.
+    fn read_format_chip(&mut self, ui: &mut Ui, format: ExportFormat) {
+        let selected = self.read.format == format;
+        if common::tool_button(ui, &format.extension().to_uppercase(), selected, true).clicked() {
+            self.read.format = format;
         }
     }
 
@@ -1395,7 +1422,11 @@ mod tests {
 
     fn texts_for(mode: OpsMode) -> Vec<String> {
         let mut app = empty_screen(mode);
-        screen_texts(app.log_mut())
+        // The console is a drawer tab (DESIGN.md §5), so the frame under test is
+        // the one with that tab open; the closed drawer draws no panel at all.
+        let log = app.log_mut();
+        log.open_drawer(super::super::LogTab::Ops);
+        screen_texts(log)
     }
 
     fn status_of(ops: &LogOps) -> Option<(OpsMode, Status, &str)> {
@@ -1434,6 +1465,7 @@ mod tests {
         for mode in OpsMode::ALL {
             let mut app = sample_screen();
             app.log_mut().ops.mode = mode;
+            app.log_mut().open_drawer(super::super::LogTab::Ops);
             let image = crate::screenshot::render(&mut app, Screen::Log, Vec2::new(640.0, 400.0));
             assert!(
                 image.contains_colour(theme::INK, 24),
@@ -1455,6 +1487,7 @@ mod tests {
                 let mut empty = crate::App::default();
                 empty.select(Screen::Log);
                 empty.log_mut().ops.mode = mode;
+                empty.log_mut().open_drawer(super::super::LogTab::Ops);
                 let image =
                     crate::screenshot::render(&mut empty, Screen::Log, Vec2::new(1024.0, 640.0));
                 let directory = std::path::Path::new(directory);
@@ -1503,11 +1536,14 @@ mod tests {
     #[test]
     fn a_status_from_another_panel_is_not_drawn() {
         // A repair error under the erase panel reads as an erase error.
+        let tab = super::super::LogTab::Ops;
         let mut app = empty_screen(OpsMode::Erase);
         let mut ops = std::mem::take(&mut app.log_mut().ops);
         ops.set_status(OpsMode::Repair, Status::Err, "修復だけのエラー");
         app.log_mut().ops = ops;
-        let erase_texts = screen_texts(app.log_mut());
+        let log = app.log_mut();
+        log.open_drawer(tab);
+        let erase_texts = screen_texts(log);
         assert!(
             !erase_texts.iter().any(|text| text == "修復だけのエラー"),
             "the erase panel drew another panel's status: {erase_texts:?}"
@@ -1516,7 +1552,9 @@ mod tests {
         let mut ops = std::mem::take(&mut app.log_mut().ops);
         ops.set_status(OpsMode::Repair, Status::Err, "修復だけのエラー");
         app.log_mut().ops = ops;
-        let repair_texts = screen_texts(app.log_mut());
+        let log = app.log_mut();
+        log.open_drawer(tab);
+        let repair_texts = screen_texts(log);
         assert!(
             repair_texts.iter().any(|text| text == "修復だけのエラー"),
             "the repair panel did not draw its own status: {repair_texts:?}"

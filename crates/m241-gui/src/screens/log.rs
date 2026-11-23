@@ -1,15 +1,24 @@
 //! ログ — the Log screen (DESIGN.md §5).
 //!
-//! Three zones, right-aligned figures, ruled tables: the manual's reference page.
-//! The track is painted from the points themselves rather than through a slippy
-//! map, because a tile fetcher needs the network and cannot be exercised headlessly;
-//! the projection is forty lines and is what makes the shape of the trip visible,
-//! which is the job on this screen.
+//! The map is the page. One 40pt tool row (the title and the sample marker), then
+//! the canvas: the log file, the playback strip, the zoom and the drawer toggle
+//! are plates drawn *over* it, and the panels that used to push the map down live
+//! in a right-hand drawer that starts closed. The page does not scroll; the canvas
+//! follows the window, because a map that has to be scrolled to is not the main
+//! surface.
+//!
+//! Background tiles are real OpenStreetMap fetches (`tiles`), so they only happen
+//! from a real window. A sample or headless frame therefore says why it shows no
+//! tiles instead of pretending to load them, and the track is still painted from
+//! the points themselves — the projection is what makes the shape of the trip
+//! visible, which is the job on this screen (DESIGN.md §5, §10).
 //!
 //! # What this module and its submodules do
 //!
-//! The page, the map, the point table, the photo block and the export bar are
-//! here. The submodules own the work behind the controls:
+//! The page (the tool row, the canvas, the selected-point strip), the map, the
+//! drawer's five tabs and the point table are here. The submodules own the work
+//! behind the controls — `drawer` owns the plates drawn over the canvas and the
+//! drawer's column/float geometry:
 //!
 //! * `ops` is the ログ操作 console — the CLI's `log` and `nmea` commands as
 //!   panels. It **does talk to a device**: download and the erase backup call
@@ -46,6 +55,10 @@
 // The write token lives one level down, where this module cannot construct it:
 // see `geotag_gate` for why the privacy below `log.rs` is what closes M2.
 mod geotag_gate;
+// The right-hand drawer and the plates drawn on the map. They own the layout so
+// the overlays are placed against one set of sizes and cannot drift into each
+// other (DESIGN.md §5).
+mod drawer;
 // The three wirings added after the design pass. Each owns its own state and
 // returns the result to this module, so `log.rs` keeps drawing the page and the
 // submodules keep their rules (photo scope, KMZ limits, edit history) in one
@@ -89,6 +102,100 @@ use self::ops::LogOps;
 use self::photo_shift::{PhotoShiftSettings, ScopeKind};
 use self::project::ReadFacts;
 use self::tiles::{MapOptions, MapView};
+
+/// Records the rects the screen allocated, for the layout tests.
+///
+/// "The map fills the content", "the plates do not overlap" and "the drawer opens
+/// on every tab" are layout facts, not paint facts: a shape list cannot say how
+/// tall the canvas was. The screen writes them down as it draws, keyed by thread
+/// like `widgets::rail`'s transition record, because the render tests run in
+/// parallel. Nothing is kept outside a test build.
+mod layout_probe {
+    use egui::Rect;
+
+    /// One frame's geometry, as the screen drew it.
+    #[cfg(test)]
+    #[derive(Debug, Clone)]
+    pub(super) struct Frame {
+        /// The rect the Log screen was handed.
+        pub(super) content: Rect,
+        /// The tool row above the canvas.
+        pub(super) tool: Rect,
+        /// The canvas.
+        pub(super) map: Rect,
+        /// Every plate drawn over the canvas, by name.
+        pub(super) overlays: Vec<(&'static str, Rect)>,
+        /// The drawer, when it is open.
+        pub(super) drawer: Option<Rect>,
+    }
+
+    #[cfg(test)]
+    impl Default for Frame {
+        fn default() -> Self {
+            Self {
+                content: Rect::NOTHING,
+                tool: Rect::NOTHING,
+                map: Rect::NOTHING,
+                overlays: Vec::new(),
+                drawer: None,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    static FRAMES: std::sync::Mutex<std::collections::BTreeMap<String, Frame>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+    #[cfg(test)]
+    fn key() -> String {
+        format!("{:?}", std::thread::current().id())
+    }
+
+    /// The frame this thread drew last, if the Log screen was among the screens.
+    #[cfg(test)]
+    pub(super) fn last() -> Option<Frame> {
+        FRAMES
+            .lock()
+            .ok()
+            .and_then(|frames| frames.get(&key()).cloned())
+    }
+
+    #[cfg(test)]
+    fn with_frame(update: impl FnOnce(&mut Frame)) {
+        if let Ok(mut frames) = FRAMES.lock() {
+            update(frames.entry(key()).or_default());
+        }
+    }
+
+    pub(super) fn begin(_content: Rect) {
+        #[cfg(test)]
+        with_frame(|frame| {
+            frame.content = _content;
+            frame.overlays.clear();
+            frame.drawer = None;
+        });
+    }
+
+    pub(super) fn tool(_rect: Rect) {
+        #[cfg(test)]
+        with_frame(|frame| frame.tool = _rect);
+    }
+
+    pub(super) fn map(_rect: Rect) {
+        #[cfg(test)]
+        with_frame(|frame| frame.map = _rect);
+    }
+
+    pub(super) fn overlay(_name: &'static str, _rect: Rect) {
+        #[cfg(test)]
+        with_frame(|frame| frame.overlays.push((_name, _rect)));
+    }
+
+    pub(super) fn drawer(_rect: Rect) {
+        #[cfg(test)]
+        with_frame(|frame| frame.drawer = Some(_rect));
+    }
+}
 
 /// Rows the point list shows before it scrolls.
 ///
@@ -200,6 +307,50 @@ fn photo_entry(track: &Track, plan: GeotagPlan) -> PhotoEntry {
     PhotoEntry { plan, point_index }
 }
 
+/// A tab in the Log screen's right-hand drawer (DESIGN.md §5).
+///
+/// The drawer holds every panel the map used to push down: 集計 keeps the figures,
+/// the day filter, the speed chart and the point list; 写真, 編集, 書き出し and
+/// ログ操作 keep the blocks they had. These are tabs of one screen, not rail
+/// entries: the rail navigates the product's four screens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LogTab {
+    /// 集計: the day filter, the figures, the speed chart and the point list.
+    #[default]
+    Summary,
+    /// 写真: the folder, the match plan and the clock shift.
+    Photos,
+    /// 編集: split, merge, delete.
+    Edit,
+    /// 書き出し: the format, the destination, the geotag and KMZ options.
+    Export,
+    /// ログ操作: download, backup, erase gates, projects, NMEA repair/relay, read.
+    Ops,
+}
+
+impl LogTab {
+    /// Every tab, in the order the drawer draws them.
+    pub const ALL: [Self; 5] = [
+        Self::Summary,
+        Self::Photos,
+        Self::Edit,
+        Self::Export,
+        Self::Ops,
+    ];
+
+    /// The tab's label.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Summary => "集計",
+            Self::Photos => "写真",
+            Self::Edit => "編集",
+            Self::Export => "書き出し",
+            Self::Ops => "ログ操作",
+        }
+    }
+}
+
 /// The Log screen's own state.
 #[derive(Debug)]
 pub struct LogScreen {
@@ -274,6 +425,15 @@ pub struct LogScreen {
     destination: String,
     outcome: Option<(Status, String)>,
     sample: bool,
+    /// Whether the right-hand drawer is open.
+    ///
+    /// Closed by default: the map is the page, and the drawer is where the
+    /// controls wait (DESIGN.md §5). It opens on the tab that holds what the
+    /// person asked for — the empty state's button opens ログ操作, so download is
+    /// one press away without a panel taking the first screen.
+    drawer_open: bool,
+    /// The tab the open drawer shows.
+    drawer_tab: LogTab,
     /// The CLI-equivalent operations console (download, project, NMEA, read).
     ops: LogOps,
 }
@@ -312,6 +472,8 @@ impl Default for LogScreen {
             destination: String::from("m241-track.gpx"),
             outcome: None,
             sample: false,
+            drawer_open: false,
+            drawer_tab: LogTab::Summary,
             ops: LogOps::default(),
         }
     }
@@ -517,6 +679,18 @@ impl LogScreen {
     #[must_use]
     pub fn load_status(&self) -> Option<&(Status, String)> {
         self.load_status.as_ref()
+    }
+
+    /// Open the right-hand drawer on `tab`.
+    ///
+    /// Public because the render tests and the `--screenshot` drawer frames reach
+    /// a panel without synthesising a click; the toggle on the map is the route a
+    /// person takes. The drawer starts closed (DESIGN.md §5), and the only code
+    /// that closes it is the toggle itself, so there is no `close_drawer` to go
+    /// stale.
+    pub fn open_drawer(&mut self, tab: LogTab) {
+        self.drawer_open = true;
+        self.drawer_tab = tab;
     }
 
     /// Load a log from disk (offline, read-only): `.bin` via [`log::parse_dump`],
@@ -1099,90 +1273,68 @@ impl LogScreen {
     }
 
     /// Draw the screen body with active application settings (units & reduced motion).
+    ///
+    /// The map is the page (DESIGN.md §5): one tool row, then the canvas, with the
+    /// log file, the playback strip and the zoom drawn over it and the rest of the
+    /// controls in a drawer that starts closed. Nothing scrolls — the canvas
+    /// follows the window, because a map that has to be scrolled to is not the
+    /// main surface.
     pub fn ui_with_settings(&mut self, ui: &mut Ui, settings: &AppSettings) {
         self.advance_playback_if_due(ui, settings.reduced_motion);
         self.handle_keyboard(ui);
 
-        if !self.track.points.is_empty() {
-            // The export bar is pinned: it is the reason the screen exists, and at
-            // 1024×640 it used to be the part that fell off the bottom. Omitted
-            // when there is no track yet so the empty state does not offer to
-            // export nothing.
-            common::footer(ui, "m241-log-export", |ui| self.export_bar(ui));
+        let content = ui.max_rect();
+        layout_probe::begin(content);
+        let tool = self.tool_row(ui);
+        layout_probe::tool(tool);
+
+        // A wide *content* area gives the drawer its own column; a narrow one lays
+        // it over the map. The threshold is the Log body's width, not the window's:
+        // DESIGN.md §5/§9 name the content width, and the rail and the page margin
+        // are part of the window, not of this screen.
+        let wide = content.width() >= metric::NARROW;
+        if self.drawer_open && wide {
+            self.drawer_column(ui, settings);
         }
 
-        common::scrolling(ui, "m241-log-body", |ui| {
-            common::heading(
-                ui,
-                "ログ",
-                "吸い出したログや .bin ファイルを地図に描き、写真の時刻と突き合わせて書き出します。",
-            );
-            // Every panel and block on this screen carries 「見本」 in its own
-            // caption when the figures are sample data, so a separate band would
-            // spend height the 1280×800 page needs for the speed chart.
-            ui.add_space(space::L);
+        let available = ui.available_rect_before_wrap();
+        let strip = drawer::strip_height(self.track.points.is_empty());
+        let map_rect = Rect::from_min_size(
+            available.min,
+            Vec2::new(available.width(), (available.height() - strip).max(0.0)),
+        );
+        let strip_rect = Rect::from_min_max(
+            egui::pos2(available.left(), map_rect.bottom()),
+            available.max,
+        );
+        layout_probe::map(map_rect);
+        // `Sense::CLICK` rather than `Sense::click()`: the canvas picks the
+        // nearest point from the pointer's position, so it has nothing to say to
+        // a keyboard and must not become an invisible tab stop (design review
+        // 2026-11-23, M4).
+        let response = ui.allocate_rect(map_rect, Sense::CLICK);
+        let canvas = self.map_canvas(ui, map_rect, &response, settings);
+        ui.allocate_rect(strip_rect, Sense::hover());
+        if strip > 0.0 {
+            self.selection_strip(ui, strip_rect, settings);
+        }
 
-            if self.track.points.is_empty() {
-                // Only the empty screen puts the console first: with no map,
-                // download is the action that fills the page. With a track, the
-                // map is the reason the page exists and keeps the top.
-                self.ops_ui(ui);
-                ui.add_space(space::L);
-                self.empty_state(ui);
-                return;
-            }
-
-            self.file_loader_bar(ui);
-            ui.add_space(space::M);
-
-            // The three-zone layout collapses below 1100pt (DESIGN.md §9). The figure is
-            // a *window* size in the design, and it has to be read as one: the rail and
-            // the content margins have already taken ~216pt by the time this runs, so
-            // measuring the content would collapse the layout at the 1280-wide window
-            // the design calls wide.
-            let window_width = ui.ctx().content_rect().width();
-            let wide = window_width >= metric::NARROW;
-            if wide {
-                ui.horizontal_top(|ui| {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(metric::RAIL_BLOCK, ui.available_height()),
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| self.rail_block(ui, settings),
-                    );
-                    ui.add_space(space::L);
-                    ui.vertical(|ui| {
-                        self.map_panel(ui, settings);
-                        self.speed_panel(ui, settings);
-                        self.selected_panel(ui, settings);
-                        self.ops_panel(ui);
-                    });
-                });
-            } else {
-                self.map_panel(ui, settings);
-                ui.add_space(space::M);
-                ui.horizontal_top(|ui| {
-                    ui.vertical(|ui| self.summary_block(ui, settings));
-                    ui.add_space(space::L);
-                    ui.vertical(|ui| self.selected_panel(ui, settings));
-                });
-                ui.add_space(space::M);
-                self.photo_rail_section(ui);
-                ui.add_space(space::M);
-                self.edit_section(ui);
-                ui.add_space(space::M);
-                self.speed_panel(ui, settings);
-                self.ops_panel(ui);
-            }
-
-            ui.add_space(space::L);
-            self.point_table(ui, settings);
+        // The plates depend on two measurements the canvas produced: the zoom
+        // note adds a row, and a file-load refusal adds the wrapped lines the
+        // plate has to hold. Both are measured before anything is laid out.
+        let file_status_height = self.load_status.as_ref().map_or(0.0, |(status, message)| {
+            let plate_width = (map_rect.width() * 0.55).clamp(280.0, 440.0);
+            drawer::status_height(ui, *status, message, plate_width)
         });
-    }
-
-    /// The operations console below the map on a populated page.
-    fn ops_panel(&mut self, ui: &mut Ui) {
-        ui.add_space(space::L);
-        self.ops_ui(ui);
+        let plates = drawer::Plates::new(map_rect, file_status_height, canvas.note.is_some());
+        let floating = (self.drawer_open && !wide)
+            .then(|| plates.floating(map_rect, self.track.points.is_empty()));
+        self.map_overlays(ui, map_rect, canvas, &plates, floating);
+        if let Some(rect) = floating {
+            self.drawer_plate(ui, rect, settings);
+        }
+        // Last, so the floating drawer cannot bury the only way out of it.
+        self.drawer_toggle(ui, map_rect);
     }
 
     /// Draw the operations console without holding two `&mut` to this screen.
@@ -1253,93 +1405,6 @@ impl LogScreen {
         }
     }
 
-    fn file_loader_bar(&mut self, ui: &mut Ui) {
-        // One compact row rather than a panel: opening another dump is the
-        // screen's secondary action, and the reference-manual page has to keep
-        // the map and the speed chart above the fold at 1280×800.
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("ログファイル")
-                    .size(size::CAPTION)
-                    .color(theme::MUTE),
-            );
-            let _response = ui.add_sized(
-                Vec2::new(
-                    (ui.available_width() - metric::ACTION_WIDTH - space::L).max(120.0),
-                    metric::ROW,
-                ),
-                egui::TextEdit::singleline(&mut self.log_path)
-                    .hint_text(RichText::new("ログファイルのパス").size(size::CAPTION))
-                    .font(egui::TextStyle::Monospace),
-            );
-            if common::primary_button(ui, "ログを開く", true).clicked() {
-                let target = PathBuf::from(self.log_path.trim());
-                let _res = self.load_bin_file(&target);
-            }
-        });
-        if let Some((status, message)) = &self.load_status {
-            common::status_line(ui, *status, message);
-        }
-    }
-
-    /// Empty log: the action that fills it, not a shrug (DESIGN.md §6).
-    fn empty_state(&mut self, ui: &mut Ui) {
-        common::panel(ui, "ログ", |ui| {
-            common::status_line(ui, Status::Info, "まだログがありません");
-            ui.add_space(space::S);
-            ui.label(
-                RichText::new(
-                    "保存済みの .bin / .gpx ログを開くか、端末をつないでからログを吸い出してください。",
-                )
-                .size(size::UI)
-                .color(theme::MUTE),
-            );
-            ui.add_space(space::M);
-            // The action that works today is the screen's one primary control.
-            // The path belongs to the action, so it sits on the same line.
-            ui.horizontal(|ui| {
-                let _response = ui.add_sized(
-                    Vec2::new(
-                        (ui.available_width() - metric::ACTION_WIDTH - space::L).max(120.0),
-                        metric::ROW,
-                    ),
-                    egui::TextEdit::singleline(&mut self.log_path)
-                        .hint_text(RichText::new("ログファイルのパス").size(size::CAPTION))
-                        .font(egui::TextStyle::Monospace),
-                );
-                if common::primary_button(ui, "ログを開く", true).clicked() {
-                    let target = PathBuf::from(self.log_path.trim());
-                    let _res = self.load_bin_file(&target);
-                }
-            });
-            if let Some((status, message)) = &self.load_status {
-                ui.add_space(space::XS);
-                common::status_line(ui, *status, message);
-            }
-            ui.add_space(space::S);
-            ui.label(
-                RichText::new(
-                    "端末から吸い出すときは上の「ログ操作」の「吸い出し」から実行します。",
-                )
-                .size(size::CAPTION)
-                .color(theme::MUTE),
-            );
-        });
-
-        ui.add_space(space::M);
-        ui.checkbox(
-            &mut self.sample,
-            RichText::new("見本のログを表示（実機から読んだ値ではありません）")
-                .size(size::CAPTION)
-                .color(theme::MUTE),
-        );
-        // Only when the toggle is turned on and nothing has been loaded: re-seeding
-        // every frame would throw away the row the user just selected.
-        if self.sample && self.track.points.is_empty() {
-            self.set_track(sample_track(), ParseReport::default());
-        }
-    }
-
     /// The 集計 figures: distance, elapsed and moving time, average and top
     /// speed, and the altitude range.
     ///
@@ -1389,14 +1454,13 @@ impl LogScreen {
         }
     }
 
-    /// The left rail block: days, photos, totals. Subordinate to the tab rail:
-    /// caption headings, 28pt rows, no fill (DESIGN.md §5).
+    /// The day filter, at the top of the 集計 tab.
     ///
-    /// Its three blocks share one left edge because that is how §5's figure draws
-    /// them; the 8px staircase is the tab rail's signature and repeating it here
-    /// would give the screen a second one. DESIGN.md §10 records that the section's
-    /// prose and its figure disagree on this point, and which one the build follows.
-    fn rail_block(&mut self, ui: &mut Ui, settings: &AppSettings) {
+    /// A checked day is drawn; an unchecked one leaves the canvas, the fit and the
+    /// point list together (ezTour §5: the track list selects the track). That is
+    /// what lets a trip covering ten degrees be read one day — and one zoom level
+    /// — at a time, rather than only as a continent-wide outline.
+    fn track_days_block(&mut self, ui: &mut Ui) {
         common::block_title(ui, "トラック", self.sample);
         common::hairline(ui);
         ui.add_space(space::XS);
@@ -1417,19 +1481,6 @@ impl LogScreen {
                 self.close_geotag_confirmation();
             }
         }
-
-        ui.add_space(space::M);
-        self.photo_rail_section(ui);
-
-        // 集計 keeps DESIGN.md §5/§10's position directly after the photo block;
-        // 編集 came last because its fields are tall and would push the figures
-        // below the fold on a 1280×800 window. `S` rather than `M` is what keeps
-        // the 集計 caption inside the rail's viewport at that size.
-        ui.add_space(space::S);
-        self.summary_block(ui, settings);
-
-        ui.add_space(space::M);
-        self.edit_section(ui);
     }
 
     /// 写真 rail block: load a photo folder/file with `geotag::plan` and sync with the track.
@@ -1710,168 +1761,178 @@ impl LogScreen {
         self.relink_photos();
     }
 
-    /// 地図: the track painted over the background tiles, with playback and follow controls.
-    fn map_panel(&mut self, ui: &mut Ui, settings: &AppSettings) {
-        let sample = self.sample;
-        common::sample_panel(ui, "地図", sample, |ui| {
-            let height = metric::PLOT;
-            let (rect, response) =
-                ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
-            let painter = ui.painter_at(rect);
-            painter.rect_filled(rect, theme::RADIUS, theme::RAIL);
+    /// 地図: the canvas. Tiles, the track over them, and the picker.
+    ///
+    /// The map is the product's one light surface (DESIGN.md §5), so everything on
+    /// it carries a `ground` casing: the polyline is 5pt of `data` over a 7pt
+    /// `ground` edge, and each record is a palette hue over a `ground` disc. The
+    /// draw order is the contract — grid, tiles, casing, line, records, start/end,
+    /// photos, selection, and the credit last in `map_overlays` — because a
+    /// marker drawn before its background disappears under it. The OSM credit is
+    /// not drawn here: it is an overlay, so `map_overlays` paints it after the
+    /// plates, and its width comes from the plate layout (design review
+    /// 2026-11-23, M1 and Should 1).
+    fn map_canvas(
+        &mut self,
+        ui: &Ui,
+        rect: Rect,
+        response: &egui::Response,
+        settings: &AppSettings,
+    ) -> drawer::Canvas {
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, theme::RADIUS, theme::RAIL);
 
-            let view = self.sync_fit_zoom(rect);
-            let plotted: Vec<(usize, egui::Pos2)> = self.plotted_points(rect);
-            let mut background = None;
-            let mut attribution = None;
-            if plotted.is_empty() {
-                painter.text(
-                    rect.center(),
-                    Align2::CENTER_CENTER,
-                    "位置のある点がありません",
-                    FontId::proportional(size::UI),
-                    theme::MUTE,
-                );
-            } else {
-                let first_index = plotted.first().map(|(index, _pos)| *index);
-                let last_index = plotted.last().map(|(index, _pos)| *index);
-                // The grid stays underneath the tiles: it is the offline canvas,
-                // and it also fills a tile that has not arrived yet.
-                draw_grid(&painter, rect);
-                let drawn = tiles::draw_map(
-                    ui,
-                    &painter,
-                    view,
-                    &mut self.tiles,
-                    MapOptions {
-                        enabled: settings.map_tiles,
-                        sample,
-                    },
-                );
-                background = Some(drawn.background);
-                // OSM requires the credit where its tiles are shown; a sample,
-                // offline or still-loading frame shows none, so it carries none.
-                if drawn.tiles > 0 {
-                    attribution = Some(tiles::draw_attribution(&painter, rect));
-                }
-                let line: Vec<egui::Pos2> = plotted.iter().map(|(_index, pos)| *pos).collect();
-                if line.len() > 1 {
-                    // The spec's track numbers (07-eztour §5 「幅 5・不透明度 0.7」)
-                    // live in `metric::track`, so this screen names a token rather
-                    // than a number. The single hue is the product's data colour;
-                    // where the ten-colour cycle went is explained with
-                    // `track_palette_colour` and in docs/dev/01-design-decisions.ja.md.
-                    painter.add(egui::Shape::line(line, metric::track::line_stroke()));
-                }
-                for (index, pos) in &plotted {
-                    if self.selected == Some(*index) {
-                        continue;
-                    }
-                    // Every point here has a position by construction, and each
-                    // takes the next colour in the cycle: a long track then reads as
-                    // a sequence rather than as one flat shape.
-                    painter.circle_filled(*pos, metric::POINT_DOT, track_palette_colour(*index));
-                    // Waypoints are the device's own POI button: drawn as a ring
-                    // so they read as a place rather than as another sample.
-                    if self
-                        .track
-                        .points
-                        .get(*index)
-                        .is_some_and(TrackPoint::is_waypoint)
-                    {
-                        painter.circle_stroke(
-                            *pos,
-                            metric::POINT_DOT * 2.0,
-                            Stroke::new(metric::TRACK_LINE, theme::INK),
-                        );
-                    }
-                }
-
-                // 始点 / 終点 (DESIGN.md §5 through ezTour §5): the start is a small
-                // ring, the end a large one, and both are ink. Size and ink are a
-                // deliberate reading of ezTour's `line_start` / `line_end` icons:
-                // the ten-colour palette from `track_palette_colour` is reserved
-                // for the records themselves, so a ring in a palette hue would
-                // read as an eleventh record, and the selected marker (3×, ink,
-                // filled) already says "what you are looking at". The ring radius
-                // is what separates start from end, so keep both off the waypoint
-                // ring's 2× radius (`a_waypoint_is_drawn_as_a_ring`).
-                for (index, radius) in [
-                    (first_index, metric::POINT_DOT * 1.5),
-                    (last_index, metric::POINT_DOT * 2.5),
-                ] {
-                    if let Some(index) = index
-                        && self.selected != Some(index)
-                        && let Some((_, pos)) = plotted.iter().find(|(idx, _)| *idx == index)
-                    {
-                        painter.circle_stroke(
-                            *pos,
-                            radius,
-                            Stroke::new(metric::HAIRLINE, theme::INK),
-                        );
-                    }
-                }
-
-                // Matched photo markers along the track.
-                for (photo_idx, entry) in self.photo_entries.iter().enumerate() {
-                    let Some(pt_idx) = entry.point_index else {
-                        continue;
-                    };
-                    if let Some((_, pos)) = plotted.iter().find(|(idx, _)| *idx == pt_idx) {
-                        let active_photo = self.selected_photo == Some(photo_idx);
-                        let marker_size = if active_photo { space::S } else { space::XS };
-                        let marker_rect = Rect::from_center_size(*pos, Vec2::splat(marker_size));
-                        painter.rect_stroke(
-                            marker_rect,
-                            theme::RADIUS,
-                            Stroke::new(metric::HAIRLINE, theme::INK),
-                            StrokeKind::Outside,
-                        );
-                    }
-                }
-
-                // Selected / active playback marker drawn last so it stays on top.
-                if let Some(selected_idx) = self.selected
-                    && let Some((_, pos)) = plotted.iter().find(|(idx, _)| *idx == selected_idx)
-                {
-                    painter.circle_filled(*pos, metric::POINT_DOT * 2.0, theme::INK);
-                    painter.circle_stroke(
-                        *pos,
-                        metric::POINT_DOT * 3.0,
-                        Stroke::new(metric::HAIRLINE, theme::INK),
-                    );
-                }
-            }
-
-            // One caption, bottom-right: the zoom, and the map's state when the
-            // tiles are not on screen (offline, sample, loading). The
-            // attribution owns the bottom-left corner; `draw_note` lifts this
-            // caption above it when a narrow canvas would make them collide.
-            let follow_label = if self.follow { "追従 " } else { "" };
-            let status_note = background.and_then(|background| background.note());
-            let mode_note = match status_note {
-                Some(extra) => format!("{follow_label}zoom {:.0}（{extra}）", view.zoom),
-                None => format!("{follow_label}zoom {:.0}", view.zoom),
+        let view = self.sync_fit_zoom(rect);
+        let plotted: Vec<(usize, egui::Pos2)> = self.plotted_points(rect);
+        if plotted.is_empty() {
+            painter.text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                "位置のある点がありません",
+                FontId::proportional(size::UI),
+                theme::MUTE,
+            );
+            return drawer::Canvas {
+                tiles: 0,
+                note: None,
             };
-            let _note_rect = tiles::draw_note(&painter, rect, &mode_note, attribution);
-
-            // Clicking the map selects the nearest plotted point: the map is a
-            // picker, not a picture, and a track you cannot ask about is a diagram.
-            if response.clicked()
-                && let Some(pointer) = response.interact_pointer_pos()
-                && let Some((index, _distance)) = plotted
-                    .iter()
-                    .map(|(index, pos)| (*index, pos.distance(pointer)))
-                    .min_by(|left, right| left.1.total_cmp(&right.1))
-            {
-                self.select_point(Some(index));
+        }
+        let first_index = plotted.first().map(|(index, _pos)| *index);
+        let last_index = plotted.last().map(|(index, _pos)| *index);
+        // The grid stays underneath the tiles: it is the offline canvas, and it
+        // also fills a tile that has not arrived yet.
+        draw_grid(&painter, rect);
+        let drawn = tiles::draw_map(
+            ui,
+            &painter,
+            view,
+            &mut self.tiles,
+            MapOptions {
+                enabled: settings.map_tiles,
+                sample: self.sample,
+            },
+        );
+        let line: Vec<egui::Pos2> = plotted.iter().map(|(_index, pos)| *pos).collect();
+        if line.len() > 1 {
+            // 07-eztour §5's 5pt line, in the product's data colour, over the
+            // casing the light surface needs. The numbers live in `metric::track`
+            // so this screen names tokens rather than widths.
+            painter.add(egui::Shape::line(
+                line.clone(),
+                metric::track::casing_stroke(),
+            ));
+            painter.add(egui::Shape::line(line, metric::track::line_stroke()));
+        }
+        for (index, pos) in &plotted {
+            if self.selected == Some(*index) {
+                continue;
             }
+            // A record: a `ground` casing under the cycle's colour. On the offline
+            // grid the palette hue carries the sequence (07-eztour §5); on an OSM
+            // tile those hues measure under 2:1 against land, so the casing is what
+            // keeps the marker visible there (design review 2026-11-23, M1).
+            painter.circle_filled(*pos, metric::POINT_DOT + metric::HAIRLINE, theme::GROUND);
+            painter.circle_filled(*pos, metric::POINT_DOT, metric::track::record_fill(*index));
+            // Waypoints are the device's own POI button: a second, wider ring so
+            // they read as a place rather than as another sample.
+            if self
+                .track
+                .points
+                .get(*index)
+                .is_some_and(TrackPoint::is_waypoint)
+            {
+                painter.circle_stroke(
+                    *pos,
+                    metric::POINT_DOT * 2.0,
+                    Stroke::new(metric::TRACK_LINE, theme::INK),
+                );
+            }
+        }
 
-            ui.add_space(space::S);
-            self.playback_controls(ui);
-        });
+        // 始点 / 終点 (DESIGN.md §5 through ezTour §5): the start is a small ring,
+        // the end a large one. The radius separates them, so keep both off the
+        // waypoint ring's 2× radius (`a_waypoint_is_drawn_as_a_ring`); the `ground`
+        // disc under each ring is what makes the marker visible on a bright tile.
+        for (index, radius) in [
+            (first_index, metric::POINT_DOT * 1.5),
+            (last_index, metric::POINT_DOT * 2.5),
+        ] {
+            if let Some(index) = index
+                && self.selected != Some(index)
+                && let Some((_, pos)) = plotted.iter().find(|(idx, _)| *idx == index)
+            {
+                painter.circle_filled(*pos, radius, theme::GROUND);
+                painter.circle_stroke(*pos, radius, Stroke::new(metric::HAIRLINE, theme::INK));
+            }
+        }
+
+        // Matched photo markers along the track.
+        for (photo_idx, entry) in self.photo_entries.iter().enumerate() {
+            let Some(pt_idx) = entry.point_index else {
+                continue;
+            };
+            if let Some((_, pos)) = plotted.iter().find(|(idx, _)| *idx == pt_idx) {
+                let active_photo = self.selected_photo == Some(photo_idx);
+                let marker_size = if active_photo { space::S } else { space::XS };
+                let marker_rect = Rect::from_center_size(*pos, Vec2::splat(marker_size));
+                painter.rect_filled(marker_rect, theme::RADIUS, theme::GROUND);
+                painter.rect_stroke(
+                    marker_rect,
+                    theme::RADIUS,
+                    Stroke::new(metric::HAIRLINE, theme::INK),
+                    StrokeKind::Outside,
+                );
+            }
+        }
+
+        // Selected / active playback marker drawn last so it stays on top.
+        //
+        // A `ground` halo, then a solid `ink` disc, then a thin `ink` ring one
+        // radius out. The disc is filled rather than stroked so it cannot be
+        // confused with a waypoint's ring — that ring is the only translucent,
+        // stroked circle at twice a record's radius, which is what the render
+        // test counts.
+        if let Some(selected_idx) = self.selected
+            && let Some((_, pos)) = plotted.iter().find(|(idx, _)| *idx == selected_idx)
+        {
+            painter.circle_filled(*pos, metric::POINT_DOT * 3.5, theme::GROUND);
+            painter.circle_filled(*pos, metric::POINT_DOT * 2.0, theme::INK);
+            painter.circle_stroke(
+                *pos,
+                metric::POINT_DOT * 3.0,
+                Stroke::new(metric::HAIRLINE, theme::INK),
+            );
+        }
+
+        // OSM requires the credit where its tiles are shown; a sample, offline or
+        // still-loading frame shows none, so it carries none. The credit itself is
+        // painted by `map_overlays`, after the plates, so the area it may use comes
+        // from the same plate layout as the zoom.
+        let tiles = drawn.tiles;
+
+        // Clicking the map selects the nearest plotted point: the map is a
+        // picker, not a picture, and a track you cannot ask about is a diagram.
+        // The answer is the strip under the canvas, so it is never below a fold.
+        if response.clicked()
+            && let Some(pointer) = response.interact_pointer_pos()
+            && let Some((index, _distance)) = plotted
+                .iter()
+                .map(|(index, pos)| (*index, pos.distance(pointer)))
+                .min_by(|left, right| left.1.total_cmp(&right.1))
+        {
+            self.select_point(Some(index));
+        }
+
+        drawer::Canvas {
+            tiles,
+            note: drawn.background.note(),
+        }
     }
 
+    /// The playback strip drawn over the canvas: the transport, then the timeline.
+    ///
+    /// The zoom owns its own plate; the selected point's figures live in the strip
+    /// under the canvas, so this plate stays two rows tall (DESIGN.md §5).
     fn playback_controls(&mut self, ui: &mut Ui) {
         let len = self.track.points.len();
         if len == 0 {
@@ -1904,13 +1965,6 @@ impl LogScreen {
             if common::tool_button(ui, "追従", follow, true).clicked() {
                 self.set_follow(!follow);
             }
-
-            if common::tool_button(ui, "−", false, true).clicked() {
-                self.set_zoom(self.map_zoom - 1.0);
-            }
-            if common::tool_button(ui, "＋", false, true).clicked() {
-                self.set_zoom(self.map_zoom + 1.0);
-            }
         });
 
         ui.add_space(space::XS);
@@ -1923,22 +1977,31 @@ impl LogScreen {
             let max_idx = len.saturating_sub(1);
             let pos = self.selected.unwrap_or(0).min(max_idx);
             let track_width = (ui.available_width() - 64.0).max(48.0);
+            // `Sense::CLICK | Sense::DRAG`, not `Sense::click_and_drag()`: the
+            // timeline reads the pointer's position, so it is not keyboard
+            // operable and must not be a focusable stop that shows nothing
+            // (design review 2026-11-23, M4).
             let (rect, response) = ui.allocate_exact_size(
                 Vec2::new(track_width, metric::ROW * 0.5),
-                Sense::click_and_drag(),
+                Sense::CLICK | Sense::DRAG,
             );
             let painter = ui.painter_at(rect);
             let y = rect.center().y;
+            // The empty track is `rule` at the line width, not a hairline: a 1pt
+            // rule on `ground` measured about 1:1, which is not a track at all
+            // (design review 2026-11-23, the progress-bar finding).
             painter.hline(
                 rect.x_range(),
                 y,
-                Stroke::new(metric::HAIRLINE, theme::RULE),
+                Stroke::new(metric::TRACK_LINE, theme::RULE),
             );
             if max_idx > 0 {
                 let thumb_x = rect.left() + rect.width() * (pos as f32 / max_idx as f32);
                 let filled =
                     Rect::from_min_max(rect.left_top(), egui::pos2(thumb_x, rect.bottom()));
-                painter.rect_filled(filled, theme::RADIUS, theme::DATA.gamma_multiply(0.35));
+                // Full-opacity `data`: the old 35% tint measured 1.6:1 against
+                // the ground, so the travelled part of the track was invisible.
+                painter.rect_filled(filled, theme::RADIUS, theme::DATA);
                 painter.circle_filled(egui::pos2(thumb_x, y), metric::POINT_DOT, theme::INK);
             }
             // Picking a point is what a click or a drag *means* here: the thumb is
@@ -1988,10 +2051,11 @@ impl LogScreen {
             String::from("速度")
         };
         common::panel_captioned(ui, &title, note.as_deref(), |ui| {
-            let (rect, response) = ui.allocate_exact_size(
-                Vec2::new(ui.available_width(), metric::CHART),
-                Sense::click(),
-            );
+            // `Sense::CLICK`, not `Sense::click()`: picking on the chart needs the
+            // pointer's x, so it has no keyboard mode and must not be a tab stop
+            // that shows no focus ring (design review 2026-11-23, M4).
+            let (rect, response) = ui
+                .allocate_exact_size(Vec2::new(ui.available_width(), metric::CHART), Sense::CLICK);
             let painter = ui.painter_at(rect);
             let Some(maximum) = maximum else {
                 painter.text(
@@ -2063,49 +2127,6 @@ impl LogScreen {
                     .min_by(|a, b| a.1.total_cmp(&b.1))
             {
                 self.select_point(Some(track_idx));
-            }
-        });
-    }
-
-    /// 選択した点: the figures for one record, right-aligned in a ruled block.
-    fn selected_panel(&mut self, ui: &mut Ui, settings: &AppSettings) {
-        let sample = self.sample;
-        common::sample_panel(ui, "選択した点", sample, |ui| {
-            let Some(point) = self.selected.and_then(|index| self.track.points.get(index)) else {
-                common::status_line(ui, Status::Info, "点を選んでください");
-                return;
-            };
-            ui.label(
-                RichText::new(common::utc_stamp(point.utc))
-                    .size(size::UI)
-                    .color(theme::INK)
-                    .monospace(),
-            );
-            ui.add_space(space::XS);
-            ui.label(
-                RichText::new(coordinate_text(point, settings))
-                    .size(size::UI)
-                    .color(theme::INK)
-                    .monospace(),
-            );
-            ui.add_space(space::XS);
-            ui.label(
-                RichText::new(format!(
-                    "標高 {}   速度 {}",
-                    settings.units.format_altitude(point.height_m),
-                    settings.units.format_speed(point.speed_kmh)
-                ))
-                .size(size::CAPTION)
-                .color(theme::MUTE),
-            );
-            if point.is_waypoint() {
-                // The device records a button press as a bit in the record; the
-                // screen says so in words rather than painting a second colour.
-                ui.label(
-                    RichText::new("この点は本体のボタンで付けた目印です")
-                        .size(size::CAPTION)
-                        .color(theme::MUTE),
-                );
             }
         });
     }
@@ -2190,91 +2211,92 @@ impl LogScreen {
         response
     }
 
-    /// The export row: a format, a destination, one button that says what it does.
+    /// The export panel: a format, a destination, one button that says what it does.
+    ///
+    /// The panel is drawn in the 360pt drawer (DESIGN.md §5), not in the
+    /// full-width footer it used to be, so every row is sized for the drawer.
+    /// The six writer chips take two explicit rows: `horizontal_wrapped` cannot
+    /// break between two [`common::tool_button`]s, because each is a `ui.scope`
+    /// and a scope is placed without a wrap check. Left to wrap, the sixth chip
+    /// and the geotag button were pushed past the drawer's clip edge, where egui
+    /// stops painting them — the feature was present in the code and absent from
+    /// the screen.
     fn export_bar(&mut self, ui: &mut Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.label(
-                RichText::new("書き出し")
-                    .size(size::CAPTION)
-                    .color(theme::MUTE),
-            );
-            for format in ExportFormat::ALL {
-                let label = format.extension().to_uppercase();
-                let selected = !self.kmz && self.format == format;
-                if common::tool_button(ui, &label, selected, true)
-                    .on_hover_text(export_format_note(format))
-                    .clicked()
-                {
-                    self.set_export_format(format);
-                }
-            }
+        ui.label(
+            RichText::new("書き出し")
+                .size(size::CAPTION)
+                .color(theme::MUTE),
+        );
+        ui.add_space(space::XS);
+        ui.horizontal(|ui| self.format_chips(ui, &ExportFormat::ALL[..3]));
+        ui.horizontal(|ui| {
+            self.format_chips(ui, &ExportFormat::ALL[3..]);
             // A sixth writer rather than a sixth `ExportFormat`: KMZ bundles the
             // photos too, so it is not a rendering of the track alone.
             if common::tool_button(ui, "KMZ", self.kmz, true).clicked() {
                 self.set_kmz_export();
             }
-
-            let matched = self.matched_photo_count();
-            let photo_button_label = if matched > 0 {
-                format!("写真に位置 ({matched} 枚)")
-            } else {
-                String::from("写真に位置")
-            };
-            if common::secondary_button(ui, &photo_button_label, matched > 0).clicked() {
-                self.open_geotag_confirmation();
-            }
-            if matched == 0 {
-                // Why the button beside it is disabled, next to the button. The
-                // photo block is scrolled away at this point, so a reason that
-                // lives only there is a reason the reader at the footer cannot
-                // see (DESIGN.md §6: a refusal says what the next step is, where
-                // the control is).
-                ui.label(
-                    RichText::new("写真を読み込むと位置を書き込めます")
-                        .size(size::CAPTION)
-                        .color(theme::MUTE),
-                );
-            }
         });
 
-        // The destination and the one export action sit on their own line: a
-        // fixed-width field cannot share a wrapping row with a min-size button
-        // without the button being clipped at the panel edge.
-        ui.horizontal(|ui| {
+        ui.add_space(space::S);
+        let matched = self.matched_photo_count();
+        let photo_button_label = if matched > 0 {
+            format!("写真に位置 ({matched} 枚)")
+        } else {
+            String::from("写真に位置")
+        };
+        if common::secondary_button(ui, &photo_button_label, matched > 0).clicked() {
+            self.open_geotag_confirmation();
+        }
+        if matched == 0 {
+            // Why the button above it is disabled, under the button. The photo
+            // block is in another tab, so a reason that lives only there is a
+            // reason the reader here cannot see (DESIGN.md §6: a refusal says
+            // what the next step is, where the control is).
             ui.label(
-                RichText::new("保存先")
+                RichText::new("写真を読み込むと位置を書き込めます")
                     .size(size::CAPTION)
                     .color(theme::MUTE),
             );
-            let field_width = (ui.available_width() - metric::ACTION_WIDTH - space::S).max(120.0);
-            let _response = ui.add_sized(
-                Vec2::new(field_width, metric::ROW),
-                egui::TextEdit::singleline(&mut self.destination).font(egui::TextStyle::Monospace),
-            );
-            if common::primary_button(ui, "書き出す", true).clicked() {
-                let _res = self.export();
-            }
-        });
+        }
+
+        // The destination and the one export action stack: at the drawer's 332pt
+        // an input field, a caption and a 128pt button do not share a line
+        // without the button being clipped at the panel edge.
+        ui.add_space(space::M);
+        ui.label(
+            RichText::new("保存先")
+                .size(size::CAPTION)
+                .color(theme::MUTE),
+        );
+        let _response = ui.add_sized(
+            Vec2::new(ui.available_width(), metric::ROW),
+            egui::TextEdit::singleline(&mut self.destination).font(egui::TextStyle::Monospace),
+        );
+        ui.add_space(space::S);
+        if common::primary_button(ui, "書き出す", true).clicked() {
+            let _res = self.export();
+        }
 
         // KMZ is the one writer that needs a second input, so its folder and its
         // long-edge limit sit directly under the action that reads them rather
-        // than in the photo block, which is scrolled away at the footer. The row
-        // stays a single line: the matching rule lives with the photo list and
-        // the 未検証 marker rides here, so the pinned strip does not grow tall
-        // enough to cut the speed chart at 1280×800.
+        // than in the photo tab. The rows stack: four controls on one 332pt line
+        // put the last of them past the drawer's clip edge.
         if self.kmz {
-            // Wrapped: the icon and camera-offset controls joined the row, and at
-            // 1024 the last field was clipped at the panel edge.
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("写真").size(size::CAPTION).color(theme::MUTE));
-                let width = (ui.available_width() - 300.0).max(120.0);
-                let _response = ui.add_sized(
-                    Vec2::new(width, metric::ROW),
-                    egui::TextEdit::singleline(&mut self.photo_path)
-                        .hint_text(RichText::new("写真フォルダ").size(size::CAPTION))
-                        .font(egui::TextStyle::Monospace),
-                );
+            ui.add_space(space::M);
+            ui.label(RichText::new("写真").size(size::CAPTION).color(theme::MUTE));
+            let width = ui.available_width();
+            let _response = ui.add_sized(
+                Vec2::new(width, metric::ROW),
+                egui::TextEdit::singleline(&mut self.photo_path)
+                    .hint_text(RichText::new("写真フォルダ").size(size::CAPTION))
+                    .font(egui::TextStyle::Monospace),
+            );
+            ui.add_space(space::XS);
+            ui.horizontal(|ui| {
                 kmz_export::max_edge_field(ui, &mut self.kmz_max_edge);
+            });
+            ui.horizontal(|ui| {
                 ui.checkbox(&mut self.kmz_icons, RichText::new("icon").size(size::CAPTION))
                     .on_hover_text(
                         "写真ごとに長辺 320 px のサムネイルを icon/ に同梱します（既定 OFF。icon/ の仕様は core で未確定のため、CLI と同じ出力を既定にしています）",
@@ -2282,7 +2304,7 @@ impl LogScreen {
                 // Google Earth / `unzip` are not part of this build's checks, so
                 // the writer wears the word DESIGN.md §6 requires rather than
                 // looking like a format that has been opened and judged. The
-                // explanation is on hover: the pinned strip has one row for it.
+                // explanation is on hover.
                 ui.label(
                     RichText::new("未検証")
                         .size(size::CAPTION)
@@ -2346,6 +2368,24 @@ impl LogScreen {
 
         if let Some((status, message)) = &self.outcome {
             common::status_line(ui, *status, message);
+        }
+    }
+
+    /// One row of writer chips, the selected one marked.
+    ///
+    /// Split out so [`Self::export_bar`] can break the six writers across two
+    /// rows explicitly instead of relying on a wrapping layout that cannot see
+    /// inside a scoped button.
+    fn format_chips(&mut self, ui: &mut Ui, formats: &[ExportFormat]) {
+        for &format in formats {
+            let label = format.extension().to_uppercase();
+            let selected = !self.kmz && self.format == format;
+            if common::tool_button(ui, &label, selected, true)
+                .on_hover_text(export_format_note(format))
+                .clicked()
+            {
+                self.set_export_format(format);
+            }
         }
     }
 
@@ -2631,6 +2671,7 @@ impl LogScreen {
             .track
             .points
             .iter()
+            .filter(|point| !self.point_hidden(point))
             .filter_map(|point| Some((point.latitude?, point.longitude?)))
             .collect();
         if points.is_empty() || self.fit_mode {
@@ -2665,16 +2706,19 @@ impl LogScreen {
         )
     }
 
-    /// Every point with a position, as (index, pixel).
+    /// Every point with a position that the day filter leaves visible, as
+    /// (index, pixel).
     ///
     /// Kept as indices rather than as a filtered copy so a click on the map can
-    /// select the *original* row in the table.
+    /// select the *original* row in the table. Hidden days are not projected at
+    /// all: the track list is what chooses the track on the canvas (ezTour §5).
     fn plotted_points(&self, rect: Rect) -> Vec<(usize, egui::Pos2)> {
         let view = self.map_view(rect);
         self.track
             .points
             .iter()
             .enumerate()
+            .filter(|(_index, point)| !self.point_hidden(point))
             .filter_map(|(index, point)| {
                 let latitude = point.latitude?;
                 let longitude = point.longitude?;
@@ -2688,6 +2732,7 @@ impl LogScreen {
             .track
             .points
             .iter()
+            .filter(|point| !self.point_hidden(point))
             .filter_map(|p| Some((p.latitude?, p.longitude?)));
         let Some((first_lat, first_lon)) = iter.next() else {
             return FOLLOW_MIN_ZOOM;
@@ -2807,9 +2852,17 @@ impl LogScreen {
             .points
             .iter()
             .enumerate()
-            .filter(|(_index, point)| !self.hidden_days.contains(&common::utc_date(point.utc)))
+            .filter(|(_index, point)| !self.point_hidden(point))
             .map(|(index, _point)| index)
             .collect()
+    }
+
+    /// Whether the day filter hides this point.
+    ///
+    /// The map asks this for every point three times a frame, so the empty set —
+    /// the usual case — takes a fast path instead of formatting a date per point.
+    fn point_hidden(&self, point: &TrackPoint) -> bool {
+        !self.hidden_days.is_empty() && self.hidden_days.contains(&common::utc_date(point.utc))
     }
 
     fn total_distance_km(&self) -> f64 {
@@ -2928,15 +2981,6 @@ fn draw_grid(painter: &egui::Painter, rect: Rect) {
     }
 }
 
-/// Where the logger had been: the §5 ten-colour cycle over plotted records.
-///
-/// Kept out of `map_panel` so the test can ask "was this index painted in the
-/// palette?" without reaching into a painter. The colour itself is the theme's
-/// record fill, which applies the specified opacity.
-fn track_palette_colour(index: usize) -> egui::Color32 {
-    metric::track::record_fill(index)
-}
-
 /// A plausible trip, for looking at the layout without a device.
 ///
 /// The coordinates are the generic city-centre pair the repository uses as its
@@ -2989,6 +3033,41 @@ mod tests {
                 other => out.push(other),
             }
         }
+    }
+
+    /// The leaf shapes one full shell frame paints at `width`×`height`.
+    ///
+    /// Two passes so the immediate-mode layout settles; the second frame's
+    /// shapes are the ones a person sees. `prepare` fills the screen state the
+    /// test is about.
+    fn shell_shapes(
+        width: f32,
+        height: f32,
+        prepare: impl FnOnce(&mut crate::App),
+    ) -> Vec<egui::Shape> {
+        let context = egui::Context::default();
+        crate::theme::install(&context);
+        let mut app = crate::App::default();
+        app.select(crate::screens::Screen::Log);
+        prepare(&mut app);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(width, height),
+            )),
+            ..egui::RawInput::default()
+        };
+        let mut shapes = Vec::new();
+        for _pass in 0..2 {
+            let output = context.run_ui(input.clone(), |ui| app.draw(ui));
+            shapes = output
+                .shapes
+                .iter()
+                .map(|clipped| clipped.shape.clone())
+                .collect();
+            output.drop_without_applying_deltas();
+        }
+        shapes
     }
 
     #[test]
@@ -3311,13 +3390,14 @@ mod tests {
         path
     }
 
-    /// Every text run the screen tessellated at 1280×800, with its position.
-    fn screen_text_runs(screen: &mut LogScreen) -> Vec<(String, egui::Pos2)> {
-        test_support::screen_text_runs(screen)
+    /// Texts with the drawer open on `tab`, where the panels live.
+    fn screen_texts_on(screen: &mut LogScreen, tab: LogTab) -> Vec<String> {
+        test_support::screen_texts_on(screen, tab)
     }
 
-    fn screen_texts(screen: &mut LogScreen) -> Vec<String> {
-        test_support::screen_texts(screen)
+    /// The same, with positions.
+    fn screen_text_runs_on(screen: &mut LogScreen, tab: LogTab) -> Vec<(String, egui::Pos2)> {
+        test_support::screen_text_runs_on(screen, tab)
     }
 
     #[test]
@@ -4002,26 +4082,77 @@ mod tests {
     }
 
     #[test]
-    fn the_track_uses_the_specified_width_and_opacity() {
-        // 07-eztour-spec §5 「幅 5・不透明度 0.7」: the two numbers are carried over
-        // from the reference implementation, so they are asserted as literal
-        // values rather than by re-reading the constant.
-        assert!((metric::track::LINE_WIDTH - 5.0).abs() < f32::EPSILON);
-        assert!((metric::track::LINE_OPACITY - 0.7).abs() < 0.000_1);
-        // The ten-colour cycle: every record takes one of ten hues, and the
-        // product's data colour is the first of them.
-        assert_eq!(theme::TRACK_PALETTE.len(), 10);
-        assert_eq!(track_palette_colour(0), theme::DATA.gamma_multiply(0.7));
+    fn the_track_is_five_points_of_data_over_a_seven_point_ground_casing() {
+        // 07-eztour-spec §5's 「幅 5」 is read from the shapes that were painted,
+        // not from the constants that produced them: the previous version
+        // compared `line_stroke().color` with `theme::DATA`, which is the same
+        // expression twice, and it would have kept passing if the canvas stopped
+        // drawing the line altogether. The casing and full-opacity rule come from
+        // the light OSM surface (design review 2026-11-23, M1).
+        let shapes = shell_shapes(1280.0, 800.0, |app| app.log_mut().show_sample());
+        let mut flat = Vec::new();
+        flatten(&shapes, &mut flat);
+
+        let tracks: Vec<&egui::epaint::PathShape> = flat
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Path(path) if path.points.len() > 100 => Some(path),
+                _ => None,
+            })
+            .collect();
+        let casing = tracks
+            .iter()
+            .find(|path| (path.stroke.width - 7.0).abs() < f32::EPSILON)
+            .expect("the track casing did not render");
         assert_eq!(
-            track_palette_colour(10),
-            track_palette_colour(0),
-            "the palette does not wrap after ten records"
+            casing.stroke.color,
+            egui::epaint::ColorMode::Solid(theme::GROUND),
+            "the casing under the track is not the ground colour"
         );
-        assert_ne!(
-            track_palette_colour(1),
-            track_palette_colour(0),
-            "the second record repeats the first colour"
+        let line = tracks
+            .iter()
+            .find(|path| (path.stroke.width - 5.0).abs() < f32::EPSILON)
+            .expect("the track polyline did not render");
+        assert_eq!(
+            line.stroke.color,
+            egui::epaint::ColorMode::Solid(theme::DATA),
+            "the track is not the data colour at full opacity"
         );
+        assert!(
+            casing.stroke.width > line.stroke.width,
+            "the casing does not show past the polyline"
+        );
+    }
+
+    #[test]
+    fn the_record_fill_cycles_through_the_ten_colours() {
+        // The render test can only see that at least three hues reached the
+        // canvas: a modulo that stopped cycling, or a palette that lost a
+        // colour, would still leave three. `TRACK_PALETTE`'s own doc says the
+        // sequence is what the records carry, so the cycle is pinned directly.
+        assert_eq!(
+            theme::TRACK_PALETTE.len(),
+            10,
+            "the cycle the reference spec names has ten colours"
+        );
+        assert_eq!(
+            metric::track::record_fill(10),
+            metric::track::record_fill(0),
+            "the eleventh record does not return to the first colour"
+        );
+        assert_eq!(
+            metric::track::record_fill(0),
+            theme::DATA.gamma_multiply(metric::track::LINE_OPACITY),
+            "the first colour is not the product's data colour at the record opacity"
+        );
+        for index in 1..theme::TRACK_PALETTE.len() {
+            assert_ne!(
+                metric::track::record_fill(index),
+                metric::track::record_fill(index - 1),
+                "records {index} and {} share a hue, so the sequence is invisible there",
+                index - 1,
+            );
+        }
     }
 
     #[test]
@@ -4223,7 +4354,7 @@ mod tests {
 
         // Rendered: the list rows and the refusal are both in the frame, so the
         // error is shown where the person can act on it.
-        let texts = screen_texts(&mut screen);
+        let texts = screen_texts_on(&mut screen, LogTab::Photos);
         assert!(
             texts.iter().any(|text| text.contains("a.jpg")),
             "the photo list vanished from the frame: {texts:?}"
@@ -4288,7 +4419,7 @@ mod tests {
         assert_eq!(capture_time(&screen, 1), Some(1_763_000_030));
         assert_eq!(capture_time(&screen, 2), Some(1_763_000_960));
 
-        let texts = screen_texts(&mut screen);
+        let texts = screen_texts_on(&mut screen, LogTab::Photos);
         assert!(
             texts
                 .iter()
@@ -4421,7 +4552,7 @@ mod tests {
         let mut screen = LogScreen::default();
         screen.show_sample();
         screen.show_sample_photos();
-        let runs = screen_text_runs(&mut screen);
+        let runs = screen_text_runs_on(&mut screen, LogTab::Photos);
         // The block title 「写真」 carries a 「見本」 on the same caption row, to
         // its right. Comparing y positions is what ties the marker to this block
         // rather than to the five other sample captions on the screen.
@@ -4531,7 +4662,7 @@ mod tests {
             "a track with speeds reported no moving time"
         );
 
-        let texts = screen_texts(&mut screen);
+        let texts = screen_texts_on(&mut screen, LogTab::Summary);
         for label in ["最高速度", "高度", "移動時間"] {
             assert!(
                 texts.iter().any(|text| text.contains(label)),
@@ -4702,7 +4833,7 @@ mod tests {
     fn the_edit_block_shows_the_track_name_and_colour_as_display_only() {
         let mut screen = sample();
         screen.log_path = String::from("holiday.gpx");
-        let texts = screen_texts(&mut screen);
+        let texts = screen_texts_on(&mut screen, LogTab::Edit);
         assert!(
             texts.iter().any(|text| text.contains("holiday")),
             "the track name is missing: {texts:?}"
@@ -4740,10 +4871,16 @@ mod tests {
 
     /// A raw input that looks like an X11 window to the map gate.
     fn windowed_input() -> egui::RawInput {
+        windowed_input_at(1280.0, 800.0)
+    }
+
+    /// The same, at a chosen size: the geometry tests drive more than the two
+    /// documented windows, and the tile gate does not care which one it is.
+    fn windowed_input_at(width: f32, height: f32) -> egui::RawInput {
         let mut input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                Vec2::new(1280.0, 800.0),
+                Vec2::new(width, height),
             )),
             ..egui::RawInput::default()
         };
@@ -4753,7 +4890,7 @@ mod tests {
                 native_pixels_per_point: Some(1.0),
                 inner_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    Vec2::new(1280.0, 800.0),
+                    Vec2::new(width, height),
                 )),
                 ..egui::ViewportInfo::default()
             },
@@ -4888,5 +5025,380 @@ mod tests {
             screen.map_zoom
         );
         assert!(!screen.fit_mode, "a zoom press must leave fit mode");
+    }
+
+    /// Drive the real shell at `size` and return the Log screen's geometry.
+    ///
+    /// The title bar, the rail and the content margins are part of the rect the
+    /// screen is handed, so the layout promises are measured through
+    /// `App::draw` — handing the screen a rectangle would make them true by
+    /// construction.
+    fn log_frame_at(width: f32, height: f32, tab: Option<LogTab>) -> layout_probe::Frame {
+        log_frame(width, height, tab, true, false)
+    }
+
+    /// The same, with the sample state and the tile fetcher chosen by the caller.
+    ///
+    /// `tiles` gives the frame a window gate and a fake fetcher that answers, so
+    /// the OSM credit is actually painted; without it the canvas is headless and
+    /// the credit is (correctly) absent.
+    fn log_frame(
+        width: f32,
+        height: f32,
+        tab: Option<LogTab>,
+        sample: bool,
+        tiles: bool,
+    ) -> layout_probe::Frame {
+        let context = egui::Context::default();
+        crate::theme::install(&context);
+        let mut app = crate::App::default();
+        app.select(crate::screens::Screen::Log);
+        if sample {
+            // `set_track` rather than `show_sample`: the sample flag suppresses
+            // OSM tiles (a sample frame has no window), and the credit tests need
+            // tiles on the canvas with a track under them.
+            app.log_mut()
+                .set_track(sample_track(), ParseReport::default());
+        }
+        if tiles {
+            app.log_mut()
+                .set_tile_fetcher_for_test(std::sync::Arc::new(CountingTiles));
+        }
+        if let Some(tab) = tab {
+            app.log_mut().open_drawer(tab);
+        }
+        let input = if tiles {
+            windowed_input_at(width, height)
+        } else {
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(width, height),
+                )),
+                ..egui::RawInput::default()
+            }
+        };
+        if tiles {
+            // The fake fetch runs on a worker; the credit only exists on a frame
+            // that painted a tile, so wait for the texture before recording.
+            for _attempt in 0..200 {
+                let output = context.run_ui(input.clone(), |ui| app.draw(ui));
+                output.drop_without_applying_deltas();
+                if app.log_mut().tiles.texture_count() > 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                app.log_mut().tiles.texture_count() > 0,
+                "the fake fetch produced no texture"
+            );
+        }
+        for _pass in 0..2 {
+            let output = context.run_ui(input.clone(), |ui| app.draw(ui));
+            output.drop_without_applying_deltas();
+        }
+        layout_probe::last().expect("the Log screen recorded its layout")
+    }
+
+    /// The rect recorded for the overlay named `name`.
+    fn overlay_rect(frame: &layout_probe::Frame, name: &'static str) -> Rect {
+        frame
+            .overlays
+            .iter()
+            .find(|(overlay, _rect)| *overlay == name)
+            .map(|(_name, rect)| *rect)
+            .unwrap_or_else(|| panic!("no {name} plate was drawn: {:?}", frame.overlays))
+    }
+
+    /// Assert that every recorded overlay is on the canvas and none intersect.
+    fn assert_overlays_apart(frame: &layout_probe::Frame, label: &str) {
+        for (index, (name, rect)) in frame.overlays.iter().enumerate() {
+            assert!(
+                frame.map.contains_rect(*rect),
+                "{name} sits outside the canvas at {label}: {rect:?} not in {:?}",
+                frame.map,
+            );
+            for (other_name, other) in &frame.overlays[index + 1..] {
+                assert!(
+                    !rect.intersects(*other),
+                    "{name} {rect:?} overlaps {other_name} {other:?} at {label}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_map_is_the_page_at_both_documented_sizes() {
+        // DESIGN.md §5: the map is the page, and DESIGN.md §8 names the two sizes
+        // the review judges. The floor is the layout promise the review set: 80%
+        // of the content at 1280×800 and 75% at 1024×640.
+        for (width, height, floor) in [(1280.0, 800.0, 0.80), (1024.0, 640.0, 0.75)] {
+            let frame = log_frame_at(width, height, None);
+            let covered = frame.map.height() / frame.content.height();
+            assert!(
+                covered >= floor,
+                "at {width}×{height} the map covers {:.1}% of the content, below the {:.0}% floor",
+                covered * 100.0,
+                floor * 100.0,
+            );
+            assert!(
+                frame.tool.height() <= 48.0,
+                "the tool row above the map is {}pt tall, over the 48pt limit",
+                frame.tool.height(),
+            );
+            assert!(
+                (frame.map.width() - frame.content.width()).abs() < 1.0,
+                "the map does not use the content width at {width}×{height}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_load_error_wraps_inside_the_file_plate() {
+        // Must 7: the file plate used to cut the refusal to one line and the full
+        // sentence was reachable only by hovering the label — not by keyboard.
+        // The plate now reserves the measured wrapped height and draws every row,
+        // so the whole sentence is on screen.
+        let message = String::from(
+            "/very/long/path/to/a/log/file/that/does/not/exist/on/this/machine.bin \
+             を読めません: そのようなファイルやディレクトリはありません。パスを確認してください。",
+        );
+        let context = egui::Context::default();
+        crate::theme::install(&context);
+        let mut app = crate::App::default();
+        app.select(crate::screens::Screen::Log);
+        app.log_mut()
+            .set_track(sample_track(), ParseReport::default());
+        app.log_mut().load_status = Some((Status::Err, message.clone()));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(1280.0, 800.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let mut laid_out = String::new();
+        let mut rows = 0;
+        for _pass in 0..2 {
+            let output = context.run_ui(input.clone(), |ui| app.draw(ui));
+            let shapes: Vec<egui::Shape> = output
+                .shapes
+                .iter()
+                .map(|clipped| clipped.shape.clone())
+                .collect();
+            let mut flat = Vec::new();
+            flatten(&shapes, &mut flat);
+            laid_out.clear();
+            rows = 0;
+            for shape in &flat {
+                if let egui::Shape::Text(text) = shape
+                    && text.galley.job.text.contains("を読めません")
+                {
+                    laid_out = text.galley.job.text.clone();
+                    rows = text.galley.rows.len();
+                }
+            }
+            output.drop_without_applying_deltas();
+        }
+        assert_eq!(
+            laid_out, message,
+            "the plate laid out only part of the refusal"
+        );
+        assert!(
+            rows >= 2,
+            "the refusal was laid out on {rows} row(s); it is still being cut"
+        );
+        let frame = layout_probe::last().expect("the Log screen recorded its layout");
+        let file = overlay_rect(&frame, "file");
+        assert!(
+            file.height() > metric::ROW + 3.0 * space::S + 16.0,
+            "the file plate did not grow for the wrapped line: {}pt",
+            file.height(),
+        );
+    }
+
+    #[test]
+    fn the_map_plates_do_not_overlap_each_other_or_the_credit() {
+        // The overlays are fixed plates anchored to the canvas corners: a caption
+        // that grew with its text would move one plate into the next. The geometry
+        // is recorded as it is drawn and checked, rather than judged from a
+        // screenshot (DESIGN.md §5, design review 2026-11-23, M1).
+        let context = egui::Context::default();
+        crate::theme::install(&context);
+        // One empty frame so the fonts exist before a bare `Painter` lays out the
+        // credit; the credit's geometry is what has to clear the zoom plate.
+        let font_output = context.run_ui(egui::RawInput::default(), |ui| {
+            let _ = ui.allocate_exact_size(Vec2::splat(1.0), Sense::hover());
+        });
+        font_output.drop_without_applying_deltas();
+
+        for (width, height) in [(1280.0, 800.0), (1024.0, 640.0)] {
+            let frame = log_frame_at(width, height, None);
+            let label = format!("{width}×{height}");
+            assert_overlays_apart(&frame, &label);
+            assert!(
+                frame.overlays.iter().any(|(name, _)| *name == "zoom"),
+                "no zoom plate was drawn at {label}",
+            );
+            let zoom = overlay_rect(&frame, "zoom");
+            // A closed-drawer sample frame draws no OSM tiles, so the credit is
+            // not in the recorded overlays; it is laid out from the plate geometry
+            // that the screen would use on a tiled frame.
+            let plates = super::drawer::Plates::new(frame.map, 0.0, false);
+            let painter =
+                egui::Painter::new(context.clone(), egui::LayerId::background(), frame.map);
+            let credit = tiles::draw_attribution(&painter, plates.credit(frame.map));
+            assert!(
+                !credit.intersects(zoom),
+                "the credit {credit:?} overlaps the zoom plate {zoom:?} at {label}",
+            );
+            assert!(
+                frame.map.contains_rect(credit),
+                "the credit sits outside the canvas at {label}",
+            );
+        }
+    }
+
+    #[test]
+    fn the_credit_and_the_zoom_plate_stay_apart_with_the_drawer_open() {
+        // Stage 1, Must 1: with the drawer open the canvas shrinks, and at a
+        // 1200pt window the credit's 356pt plate ran under the zoom plate (map
+        // width 616, credit right edge 360 from the left, zoom left edge 304).
+        // The credit is now laid out in the canvas left of the zoom plate and
+        // wraps to fit, so the two cannot meet at any width; the drawer's
+        // threshold is the content width, so 1200 floats the drawer and the
+        // narrow column starts at 1000pt of content. 1264 / 1269 bracket the
+        // width where the one-line credit just fits; the gap there is the
+        // smallest on the page, so it is sampled rather than assumed.
+        for width in [1100.0, 1200.0, 1240.0, 1264.0, 1269.0, 1280.0] {
+            let label = format!("{width}×800 with the drawer open");
+            let frame = log_frame(width, 800.0, Some(LogTab::Summary), true, true);
+            let credit = overlay_rect(&frame, "attribution");
+            let zoom = overlay_rect(&frame, "zoom");
+            assert!(
+                !credit.intersects(zoom),
+                "the credit {credit:?} overlaps the zoom plate {zoom:?} at {label}",
+            );
+            assert!(
+                credit.right() + space::M <= zoom.left() + 0.5,
+                "the credit {credit:?} is closer than {}pt to the zoom plate's left edge {:?} at {label}",
+                space::M,
+                zoom.left(),
+            );
+            assert_overlays_apart(&frame, &label);
+
+            // The floating drawer is lifted above the playback and zoom plates,
+            // so opening it does not make the map's own controls unreadable.
+            let drawer = frame.drawer.expect("the drawer was not recorded");
+            if drawer.left() < frame.map.right() - 1.0 {
+                assert!(
+                    !drawer.intersects(zoom),
+                    "the floating drawer {drawer:?} covers the zoom plate {zoom:?} at {label}",
+                );
+                if let Some(playback) = frame
+                    .overlays
+                    .iter()
+                    .find(|(name, _rect)| *name == "playback")
+                    .map(|(_name, rect)| *rect)
+                {
+                    assert!(
+                        !drawer.intersects(playback),
+                        "the floating drawer {drawer:?} covers the playback plate {playback:?} at {label}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_log_keeps_its_plate_clear_of_the_drawer() {
+        // The empty state's plate carries the screen's primary action (ログ操作を
+        // 開く) and the 見本 checkbox. A floating drawer over the canvas used to
+        // cover it; the plate is now centred in the canvas width the drawer
+        // leaves, and the drawer is not drawn over it at any of the widths the
+        // geometry tests visit.
+        for width in [1000.0, 1024.0, 1200.0, 1280.0] {
+            let label = format!("{width}×640 empty log");
+            let frame = log_frame(width, 640.0, Some(LogTab::Ops), false, false);
+            let empty = overlay_rect(&frame, "empty");
+            let drawer = frame.drawer.expect("the drawer was not recorded");
+            assert!(
+                !empty.intersects(drawer),
+                "the empty-state plate {empty:?} sits under the drawer {drawer:?} at {label}",
+            );
+            assert!(
+                frame.map.contains_rect(empty),
+                "the empty-state plate sits outside the canvas at {label}",
+            );
+        }
+    }
+
+    #[test]
+    fn every_drawer_tab_opens_and_draws_its_panel() {
+        // The drawer is where the five panels live (DESIGN.md §5), so "the
+        // feature is still there" means "its tab still renders it".
+        let signatures = [
+            (LogTab::Summary, "距離"),
+            (LogTab::Photos, "フォルダ"),
+            (LogTab::Edit, "トラック名"),
+            (LogTab::Export, "保存先"),
+            (LogTab::Ops, "吸い出し"),
+        ];
+        for (tab, signature) in signatures {
+            let mut screen = sample();
+            let texts = screen_texts_on(&mut screen, tab);
+            assert!(
+                texts.iter().any(|text| text == tab.label()),
+                "the {} tab is not drawn: {texts:?}",
+                tab.label(),
+            );
+            assert!(
+                texts.iter().any(|text| text.contains(signature)),
+                "the {} tab drew no panel ({} missing): {texts:?}",
+                tab.label(),
+                signature,
+            );
+        }
+    }
+
+    #[test]
+    fn the_drawer_is_beside_the_map_when_wide_and_over_it_when_narrow() {
+        // 1024×640 is a supported window (DESIGN.md §8). A 360pt column beside an
+        // 800pt content area would leave the map a strip, so the drawer floats
+        // over it below `NARROW` (DESIGN.md §9).
+        let wide = log_frame_at(1280.0, 800.0, Some(LogTab::Summary));
+        let wide_drawer = wide.drawer.expect("the wide window drew no drawer");
+        assert!(
+            (wide_drawer.width() - metric::DRAWER).abs() < 1.0,
+            "the drawer is {:.1}pt wide, expected {}",
+            wide_drawer.width(),
+            metric::DRAWER,
+        );
+        assert!(
+            wide.map.right() <= wide_drawer.left() + 1.0,
+            "the wide drawer {:?} overlaps the map {:?}",
+            wide_drawer,
+            wide.map,
+        );
+
+        let narrow = log_frame_at(1024.0, 640.0, Some(LogTab::Summary));
+        let narrow_drawer = narrow.drawer.expect("the narrow window drew no drawer");
+        assert!(
+            narrow_drawer.left() < narrow.map.right() - 1.0,
+            "the narrow drawer {:?} does not float over the map {:?}",
+            narrow_drawer,
+            narrow.map,
+        );
+        assert!(
+            (narrow.map.width() - narrow.content.width()).abs() < 1.0,
+            "the floating drawer shrank the map instead of covering it",
+        );
+        assert!(
+            narrow.map.contains_rect(narrow_drawer),
+            "the floating drawer {:?} is not inside the canvas {:?}",
+            narrow_drawer,
+            narrow.map,
+        );
     }
 }

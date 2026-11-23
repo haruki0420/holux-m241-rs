@@ -1728,6 +1728,88 @@ Stage 3 検証者は worktree 編集禁止のため、この記録のみを修�
 - 回帰: `cargo test -p m241-gui` は lib 232 / render 38 / design_gate 6 / design_invariants 6 全合格、`check.sh` 6/6。実ウィンドウは X11 16 枚 / Wayland 4 枚のタイル取得、headless は 0 枚（スクリーンショット 15 枚）。`pub(crate) mod tiles`、帰属条件、実測キャッシュ行はマージ後もテストで固定されている。
 - 1 点だけ main 側テストを変更した: PR #37 の座標形式行とタイル行で設定ページが 800pt を超えてスクロールするようになったため、`render.rs` の reduced-motion 表示テストは 1200pt で描画する。行はスクロールで到達でき、テストの意図（注記が設定値を反映する）は変えていない。
 
+## 2026-11-23 / PR #42 Log の地図主面化 Stage 2 修正（`feat-map-layout`）
+
+- 対象: Stage 1 head `a9635b9`（base `origin/main` = `1cc76f2`）への 2 レビュー、仕様検収 `#issuecomment-7089921477`（Must 1 / Should S1–S6 / Could C1–C3）と可読性 `#issuecomment-7089789165`（Must M1–M5、Should S1–S11）。
+- Stage 2 修正（別エージェント）。変更は `crates/m241-gui`（`screens/log.rs` / `screens/log/drawer.rs` / `screens/log/tiles.rs` / `theme.rs` / `screenshot.rs`）、`tests/render.rs`、`DESIGN.md`、本ファイルのみ。他画面と `m241-core` / `m241-cli` / `m241-flash` は未変更。実機ポートは開いていない。
+- 修正コミット: `81aed83`（コード・DESIGN・テスト）。本節は記録用の後続コミットで追加した。
+
+### Must への対応
+
+| 指摘 | 対応 | 実装 / テスト |
+|---|---|---|
+| 仕様 Must 1: 帰属板とズーム板がドロワー開 × 窓幅 1100〜1255 で交差 | **修正（実装＋テスト）** | 帰属板の配置を `drawer::Plates::credit` に移し、`tiles::draw_attribution` が「ズーム板左端 − 余白」の幅で折り返す。帰属板の右端は常にズーム板の左端より左になり、幅 96pt 未満の極小幅だけズーム板上へ退避する。描画も `map_canvas`（板の外）から `map_overlays`（板と同じ座標系・z-order）へ移した。ドロワー判定は `ctx.content_rect()`（ウィンドウ幅）から `ui.max_rect()`（Log 本文幅）へ変更し、`metric::NARROW` を 1100 → **1000** に（DESIGN §5/§6/§10 も 1000 に更新）。追加テスト `the_credit_and_the_zoom_plate_stay_apart_with_the_drawer_open` が 1100 / 1200 / 1240 / 1280 で fake fetch により帰属を実描画し、記録された帰属板が描かれること・右端 ≤ ズーム左端・全 overlay 非交差・浮遊ドロワーが再生/ズーム板を覆わないことを固定。既存 `the_map_plates_do_not_overlap_each_other_or_the_credit` も credit area を使う形に更新 |
+| 可読性 M1: `--screenshot` がドロワー未追随 | **修正（実装＋doc）** | `screenshot::write_all` に `log-drawer-{summary,photos,edit,export,ops}-{1280x800,1024x640}.png` の 10 枚を追加。`prepare` のコメントを「写真/KMZ はドロワー各フレームで見る」に、`open_drawer` の doc を「render テストと `--screenshot` のドロワー frame が使う」に修正。DESIGN §8 の「nine images」記述も標準セットの説明に書き換え。headless 非通信は維持（`XDG_CACHE_HOME` 空でタイル 0 枚） |
+| 可読性 M2: `theme.rs` の doc が実装と逆（ground 塗り＋ink リング） | **修正（doc）** | 実装は「10 色パレット ×0.7 ＋ ground 下敷き」で、ink リングは選択点だけ。`TRACK_PALETTE` と `metric::track` の doc を実装（両 canvas でパレット、OSM 上は ground 円を下に敷く、ink リングなし）に合わせた。実装は変更していない（旧テストが守っていた巡回は Must 4 で復元） |
+| 可読性 M3: 自己成就テスト＋巡回保証の消失 | **修正（テスト）** | `the_track_is_five_points_of_data_over_a_seven_point_ground_casing` を、`App::draw` の描画 shape（`PathShape` の幅 5/7 と色）から検証する形に変更。旧テストが持っていた巡回は `the_record_fill_cycles_through_the_ten_colours` として復元（`record_fill(10) == record_fill(0)`、隣接色の相違、10 色、先頭が `DATA × 0.7`） |
+| 可読性 M4: 未使用 `pub`（`close_drawer` / `is_drawer_open` / `drawer_tab`） | **修正（実装）** | 3 つを削除。`open_drawer` は render テストと `--screenshot` が使うため pub のまま、doc のみ実態に合わせた |
+| 可読性 M5: エラー 1 行切り詰めと「全文はパネル側」の虚偽 | **修正（実装＋テスト）** | `drawer::status_height` が折り返し後の行高を測り、`Plates` がファイル板をその分だけ高くしてから `common::status_line`（折り返し）で全文を描く。`Label::truncate` と「全文はパネル側」の説明を削除。追加テスト `a_long_load_error_wraps_inside_the_file_plate` が「全文が lay out されること・2 行以上・板が伸びること」を固定 |
+| 仕様の可読性 Must: 選択点マーカーと板 alpha 0.92 の契約が未テスト | **修正（テスト）** | `tests/render.rs` に `the_selected_point_is_a_ground_halo_an_ink_disc_and_a_ring`（halo 3.5× / ink disc 2× / 3× ring が同中心・描画順）と `the_map_plates_are_rail_at_ninety_two_percent`（描画された `RectShape` の fill が `RAIL × 0.92`、1024 では 360pt の浮遊ドロワー板も同値）を追加。実装は `PLATE_ALPHA` を credit と共有する形にしただけ |
+
+### Should / Could への対応
+
+| 指摘 | 対応 |
+|---|---|
+| 仕様 S1 狭幅の浮遊ドロワーがズーム/再生板・空ログの主 CTA を覆う | **修正**。浮遊矩形を `log.rs` から `drawer::Plates::floating` へ移し、ファイル板の下から再生板の上までに制限（再生板が無いときはズーム板の上まで）。空状態板は浮遊ドロワーを除いた幅の中央に置く。追加テスト `an_empty_log_keeps_its_plate_clear_of_the_drawer`（1000 / 1024 / 1200 / 1280） |
+| 仕様 S2 ドロワー開・空ログ・中間幅の幾何テストが無い | **修正**。`the_credit_and_the_zoom_plate_stay_apart_with_the_drawer_open`（1100–1280）と `an_empty_log_keeps_its_plate_clear_of_the_drawer`（1000–1280） |
+| 仕様 S3 再生板が 3 行目を予約して 2 行しか描かない | **修正**。2 行分（測定値 28 + 4 + 30）＋ frame margin に縮め、DESIGN §5 の表も「transport and timeline」に訂正 |
+| 仕様 S4「content width 1100」と実装（ウィンドウ幅）の不一致 | **修正**。実装を content 幅基準（`ui.max_rect()`）にし、閾値 1000 を DESIGN §5/§6/§10 と `metric::NARROW` の doc に反映 |
+| 仕様 S5 選択点・板 alpha の契約が未テスト | **修正**。上記の render テスト 2 本 |
+| 仕様 S6 4/5 タブの実画面が標準スクショに無い | **修正**。ドロワー 5 タブ × 2 サイズの 10 枚を追加（標準セットは 8 + 10 = 18 枚、その他 7 枚と合わせて 25 枚） |
+| 可読性 S1 `drawer.rs` の責務分割 | **一部修正**。浮遊矩形の計算を `Plates` に集約。配置（プレート）とドロワーを別モジュールへ分ける再編は見送り（Must 修正の差分を膨らませないため） |
+| 可読性 S2 `map_canvas` 約 160 行の分割 | **見送り（doc で契約を明記）**。描画順（grid → tiles → casing → line → records → start/end → photos → selection、credit は overlay で最後）が契約であることを関数 doc に書いた。分割は描画順の回帰をレビューしやすくする follow-up |
+| 可読性 S3 未使用 `_settings` | **修正**。`map_overlays` から引数を削除 |
+| 可読性 S4 浮遊矩形が `log.rs` に残り `TOOL_ROW` を別意味で再利用 | **修正**。`Plates::floating` へ移し、「ファイル板の下から始める」意図を doc 化 |
+| 可読性 S5 板 alpha が 0.92 / 0.9 の 2 値 | **修正**。`drawer::PLATE_ALPHA` を `tiles::draw_attribution` と共有 |
+| 可読性 S6 status 行の描画が 2 実装 | **修正**。`status_plate_line` を削除し `common::status_line` に統合（折り返しは共通実装のまま） |
+| 可読性 S7 `labelled_field` ヘルパー、S8 `chunks(3)` | **見送り**。`ops.rs` の 5 か所・4 か所に触れると変更範囲（本 PR の Must）を超えるため |
+| 可読性 S9 テストの穴（タブ列フィット、トグルクリック、空 strip） | **一部修正**。空ログで高さ 0 の選択点 strip を描かないようにし、clip 無視の text 収集に混ざらないようにした。タブ列のクリップ検証とトグルクリックのテストは見送り |
+| 可読性 S10 日フィルタの適用範囲 | **見送り**。図表を日フィルタに追随させるかは仕様判断で、Stage 1 の Must ではない |
+| 可読性 S11 `layout_probe` の本番ビルド混入 | **見送り**。11 か所の `#[cfg(test)]` 化は差分が大きく、Stage 3 の焦点を Must からそらす |
+| 仕様 C2 / 可読性 C2 ログのタイトルが `display` でない | **修正**。実装を `size::DISPLAY`（24）に戻し DESIGN §3 と一致させた |
+| 可読性 C1 `strip_height` の rustdoc、C6 332/328 のコメント | **修正**。doc を返り値に合わせ、内側幅のコメントを「332（列）/ 328（浮遊）」に |
+| その他の Could（`Canvas` 改名、`LINE_OPACITY` 改名、位置引数 bool、空状態板の clamp、描画順/`Sense` の未固定、`LogTab` 三重管理、mutex poisoning） | **見送り**。挙動を変えない改名・分割が中心で、本 Stage 2 の Must 修正とは独立 |
+
+### 追加・更新テスト
+
+- `screens::log::tests::the_credit_and_the_zoom_plate_stay_apart_with_the_drawer_open`（新規、1100 / 1200 / 1240 / 1280、fake fetch）
+- `screens::log::tests::an_empty_log_keeps_its_plate_clear_of_the_drawer`（新規、1000 / 1024 / 1200 / 1280）
+- `screens::log::tests::a_long_load_error_wraps_inside_the_file_plate`（新規）
+- `screens::log::tests::the_record_fill_cycles_through_the_ten_colours`（新規、旧巡回保証の復元）
+- `screens::log::tests::the_track_is_five_points_of_data_over_a_seven_point_ground_casing`（描画 shape ベースに変更）
+- `screens::log::tests::the_map_plates_do_not_overlap_each_other_or_the_credit`（credit area 使用に更新）
+- `tests/render.rs::the_selected_point_is_a_ground_halo_an_ink_disc_and_a_ring`（新規）
+- `tests/render.rs::the_map_plates_are_rail_at_ninety_two_percent`（新規）
+
+### 検証
+
+- `M241_VENDOR_IMAGE=<vendor V1.13> TMPDIR=/var/tmp ./tools/check.sh`: **6/6**（68 秒）。
+- `cargo test -p m241-gui --lib`: **240 passed**。`cargo test -p m241-gui --test render`: **40 passed**。design_invariants 6 / design_gate 6 も合格。
+- `--screenshot`（空の `XDG_CACHE_HOME`）: **25 枚**生成（標準 15 + ドロワー 10）。キャッシュは fontconfig 3 件のみで**タイル 0 枚**、ネットワーク未使用。
+- 目視: 1280×800 / 1024×640 の閉状態とドロワー 5 タブ（summary / photos / edit / export / ops）を確認。1024 の浮遊ドロワーは再生板・ズーム板の上で止まり、覆っていない。1280 の列ドロワーは 5 タブが 1 行に収まる。
+- 帰属とズームの実測（テストが記録した矩形、ウィンドウ座標 pt）:
+
+  | 窓 | 状態 | 本文幅 | map 幅 | 帰属板 | ズーム板左端 | 間隔 |
+  |---|---|---|---|---|---|---|
+  | 1280×800 | 閉 | 1056 | 1056 | x 204.0–560.4（356.4、1 行） | 944.0 | 383.6 |
+  | 1100×800 | 開（浮遊） | 876 | 876 | x 204.0–560.4（1 行） | 764.0 | 203.6 |
+  | 1200×800 | 開（浮遊） | 976 | 976 | x 204.0–560.4（1 行） | 864.0 | 303.6 |
+  | 1240×800 | 開（列） | 1016 | 656 | x 204.0–396.8（192.8、2 行） | 544.0 | 147.2 |
+  | 1264×800 | 開（列） | 1040 | 680 | x 204.0–396.8（192.8、2 行） | 568.0 | 171.2 |
+  | 1269×800 | 開（列） | 1045 | 685 | x 204.0–560.4（1 行） | 573.0 | **12.6** |
+  | 1280×800 | 開（列） | 1056 | 696 | x 204.0–560.4（1 行） | 584.0 | 23.6 |
+
+  Stage 1 が報告した「1200×800・map 幅 616・交差 56.4pt」の状態は、閾値を content 幅 1000 にしたことで 1200 ではドロワーが浮遊（map 976）になり再現しない。列ドロワーになるのは本文 1000pt 以上（窓 1224 以上）で、そこでも帰属板はズーム板の左で折り返す。最小間隔は、1 行の帰属がちょうど収まる境目（1269×800）の 12.6pt（下記 Stage 3 の修正で 8.0pt から拡大）。
+- 目視（タイル入り）: 一時テストで fake fetcher とウィンドウ入力を与え、1280 閉 / 1200 開 / 1240 開 を software rasteriser で PNG に書き、帰属板がズーム板の左で 1 行（1200）／2 行（1240）に折り返すこと、浮遊ドロワーが再生板とズーム板を覆わないことを確認した。確認後に一時テストは削除（working tree は clean）。
+- 未検証: 実機（ポートは開いていない）、実ネットワークでのタイル取得、実ウィンドウでの見た目。スクリーンショットは headless の software rasteriser で、OSM タイルは描かない（クレジットも出ないのが正しい）。
+
+### Stage 3 の軽微指摘と main 追従（2026-11-23）
+
+- Stage 3 は head `01f682a` で合格（mergeable / gate success on `01f682a`）。その後 `origin/main` = `1cc76f2`（PR #41）が先に入ったため `git merge origin/main` で追従した。競合は `docs/dev/10-review-log.md` のみで、本節（PR #42）と PR #41 節の両方を残した。他のファイル（`AGENTS.md` / `CHANGELOG.md` / `Cargo.*` / `README.md` / `m241-cli` / `m241-core` / `docs/reference/02-cli.md` / `docs/dev/05-verification.md` / `docs/dev/12-progress-summary.md`）は main 側の内容をそのまま取り込み、本ブランチからの変更は無い。
+- 軽微 1: 帰属とズームの最小間隔が 1264pt 幅で 8.00pt → `Plates::credit` の右余白を `space::S`（8pt）から `space::M`（12pt）に変更。幾何テストは 1264 / 1269 を追加し、全サンプル幅で「帰属右端 + 12pt ≤ ズーム板左端」を assert。実測は上の表のとおり、1 行の帰属がちょうど収まる 1269×800 で **12.6pt** が最小（1264 は折り返して 2 行、171.2pt）。
+- 軽微 2: ドロワー 10 枚が枚数として検証されていない → `write_all` を `write_all_with(directory, sizes)` に分け、テスト `screenshot::tests::the_standard_screenshot_set_includes_every_drawer_tab` が 320×200 で同じ writer を駆動して 16 枚（4 画面 + 3 write 状態 + 2 dump 状態 + 2 Connect + 5 タブ）を数え、5 タブ名を assert。標準セットの 1280/1024 出力は不変（device 側フレームは最初のサイズで描くため、`write_all` の 2 サイズで従来どおり 1280×800）。
+- 追従後の head で `./tools/check.sh` 6/6。新 head は Stage 3 の再検証対象で、`review-gate` はこのセッションでは付けていない。
+
 ## 2026-11-23 / PR #41 ezTour 形式 Stage 2 修正（`feat-eztour-formats`）
 
 - 対象: Stage 1 head `58696153ad57fb7975a76fc6d98a00fc27061eb9`（base `origin/main` = `e7367dc`）への 2 レビュー。仕様検収 `#issuecomment-7089143300`（Must 3 / Should 3）と可読性 `#issuecomment-7088073677`（Must M1–M5、Should S1–S10）。
