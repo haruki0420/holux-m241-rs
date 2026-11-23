@@ -1734,26 +1734,27 @@ Stage 3 検証者は worktree 編集禁止のため、この記録のみを修�
 - Stage 2 修正（別エージェント）: 変更は `crates/m241-core/src/log/import.rs`、`crates/m241-core/src/log/html.rs`、`crates/m241-core/src/log/report.rs`、`crates/m241-cli/src/cli.rs`、`docs/reference/02-cli.md`、本ファイルのみ。`crates/m241-gui` は別エージェントが編集中のため未変更。実ログ・実座標は追加していない。実機ポートは開いていない。
 - 修正コミット: `8645edc`（コード・docs）。本節は自己参照を避けるため後続の docs コミットに置いた。最終 head は PR #41 のコメントを参照。
 
-### Must への対応
+### Must および同根の Should への対応
+
+仕様検収レビューの Must は **1〜3**（KML の計算量・KMZ のメモリ上限・暗号化 ZIP）、可読性レビューの Must は M1〜M5。下表はその両方と、対応する指摘が無い側の項目を並べる（初版は仕様の Should を Must-4〜7 と誤記していた。Stage 3 の指摘で修正した）。
 
 | 指摘 | 対応 | 種別 |
 |---|---|---|
+| 仕様 Must-1 / 可読性 M5: KML 読み込みが O(n²) | `next_kml_geometry` を 1 パス走査に変更。`<Point>` と `<LineString>` を別々に `from` から EOF まで探さない | 実装変更 + テスト |
 | 仕様 Must-2 / 可読性 M1: 64 MiB 上限が展開後検査でメモリを制限しない | `zip_entry_bytes` の deflate 経路を `Read::take(64 MiB + 1)` に変更し、stored 経路も実体長 `data.len()` を検査。宣言 `uncompressed_size` の早期拒否は残した。`read_to_end` の倍々成長で上限の 2 倍（128 MiB）を確保しないよう、`Vec` は上限 +1 を一度だけ予約する（未使用ページは常駐しない） | 実装変更 |
 | 仕様 Must-3 / 可読性 M2: 暗号化 ZIP を検出しない | 中央ディレクトリ +8 とローカルヘッダ +6 の general-purpose flag bit 0 を読み、どちらかが立てば `KMZ entry … is encrypted, which is not supported` で拒否。旧実装は暗号化フラグ付き有効 deflate を exit 0 でインポートしていた。あわせてエントリ単位の ZIP64 マーカー（サイズ / オフセット = `0xFFFFFFFF`）を ZIP64 として理由付きで拒否 | 実装変更 + テスト |
-| 仕様 Must-1 / 可読性 M5: KML 読み込みが O(n²) | `next_kml_geometry` を 1 パス走査に変更。`<Point>` と `<LineString>` を別々に `from` から EOF まで探さない | 実装変更 + テスト |
-| 仕様 Must-4 / 可読性 M4: ZIP パーサの異常系テスト 0 本 | 6 経路（EOCD 無し・中央ヘッダ署名破損・ローカルヘッダ署名破損・ZIP64・未知メソッド・宣言/実体の上限超過）と暗号化 2 経路（中央 / ローカル）のテストを追加 | テスト追加 |
-| 仕様 Must-5 / 可読性 M3: `impl Default for LogReadOptions` が未使用で doc が偽 | impl を削除。clap の既定（`--utc-offset-days auto`、`--format gpx`、`--coord-format decimal` ほか）を `log_read_defaults_are_the_documented_ones` で固定 | 実装削除 + テスト |
-| 仕様 Must-6 / 可読性 S5: `--help` と docs の不整合 | `--help` を「**imported document**（`--gpx` / `--kml` / `--kmz`）」に更新。`docs/reference/02-cli.md` の "(see below)" に対応する説明（imported document には `auto` を適用しない理由）を Input kinds に復活 | docs 変更 |
-| 仕様 Must-7: HTML/RTF のテストが部分文字列のみ | HTML は出力全体を禁止トークン 16 種（`<script` / `<img` / `<link` / `<iframe` / `<object` / `<embed` / `src=` / `href=` / `http://` / `https://` / `url(` / `javascript:` / `@import` / ` onload=` / ` onerror=` / `xlink:href`）で走査し、閉じタグも確認。RTF は `to_rtf` の出力全体でブレース均衡・ASCII・`\par` 行数を検査 | テスト変更 |
+| 可読性 M3: `impl Default for LogReadOptions` が未使用で doc が偽（仕様レビューに対応指摘なし） | impl を削除。clap の既定（`--utc-offset-days auto`、`--format gpx`、`--coord-format decimal` ほか）を `log_read_defaults_are_the_documented_ones` で固定 | 実装削除 + テスト |
+| 可読性 M4 / 仕様 Should-1: ZIP パーサの異常系テスト 0 本 | 6 経路（EOCD 無し・中央ヘッダ署名破損・ローカルヘッダ署名破損・ZIP64・未知メソッド・宣言/実体の上限超過）と暗号化 2 経路（中央 / ローカル）のテストを追加 | テスト追加 |
+| 可読性 S5 / 仕様 Should-2: `--help` と docs の不整合 | `--help` を「**imported document**（`--gpx` / `--kml` / `--kmz`）」に更新。`docs/reference/02-cli.md` の "(see below)" に対応する説明（imported document には `auto` を適用しない理由）を Input kinds に復活 | docs 変更 |
+| 仕様 Should-3 / Should-4: HTML/RTF のテストが部分文字列のみ | HTML は出力全体を禁止トークン 16 種（`<script` / `<img` / `<link` / `<iframe` / `<object` / `<embed` / `src=` / `href=` / `http://` / `https://` / `url(` / `javascript:` / `@import` / ` onload=` / ` onerror=` / `xlink:href`）で走査し、閉じタグも確認。RTF は `to_rtf` の出力全体でブレース均衡・ASCII・`\par` 行数を検査 | テスト変更 |
 
-### Should への対応
+### その他の Should への対応
+
+仕様 Should-1（ZIP 拒否経路のテスト）・Should-2（`--utc-offset-days` の docs）・Should-3/4（HTML/RTF のテスト強度）は上表に含めた。
 
 | 指摘 | 対応 |
 |---|---|
-| 仕様 Should-1 / 可読性 M4: KMZ 拒否経路のテストが 1 本も無い | Must-4 と同じテストで解消（拒否 6 経路 + 暗号化 2 経路 + 実体上限） |
 | 可読性 S7: CRC 未検証が公開 API の doc に無い | `import_kmz` の rustdoc と `02-cli.md` に「CRC は検証しない。stored エントリの 1 ビット反転は妥当な座標として読まれ得る」を明記 |
-| 仕様 Should-2: `--utc-offset-days` の docs が KML/KMZ を説明しない | Must-6 で解消。`--help` と参照 docs の両方に理由を書いた |
-| 仕様 Should-3 / Should-4: HTML/RTF のテスト強度 | Must-7 で解消 |
 | 可読性 S6: RTF の doc「declares one font」と実装（2 font、`\f1` 未使用）の不一致 | 未使用の `{\f1\fmodern Courier New;}` を削除し、doc と実装を一致させた |
 | 可読性 S3: `import_kml` の doc が「root element」、実装は「どこかの `<kml` 要素」 | doc を「`<kml` 要素」に修正（実装は変えていない） |
 | MHT 未実装（仕様 §2 は HTML / MHT） | `02-cli.md` に「MHT is not implemented」節を追加。仕様の記載、実装が無いこと、レイアウトが仕様に無いことを書いた |
@@ -1778,7 +1779,7 @@ Stage 3 検証者は worktree 編集禁止のため、この記録のみを修�
 - `an_entry_that_declares_more_than_the_limit_is_refused`
 - `an_encrypted_entry_is_refused`
 - `a_local_header_that_says_encrypted_is_refused_even_when_the_central_directory_does_not`
-- `a_doc_kml_that_decompresses_past_the_limit_is_refused_while_reading`（宣言 0・実体 64 MiB + 1）
+- `a_doc_kml_that_decompresses_past_the_limit_is_refused_while_reading`（宣言 0・実体 160 MiB。エラーが報告する長さが `64 MiB + 1` = 67,108,865 で止まることを assert）
 
 `crates/m241-core/src/log/report.rs`:
 
@@ -1809,6 +1810,14 @@ PSS ではなく RSS のため、`Vec` 予約分やバイナリ・アロケー�
 - 変更後に `cargo fmt --all -- --check` と `cargo clippy --all-targets -- -D warnings` が通ることを確認した。
 - 外部ビューア（ブラウザ・Word）での表示確認は未実施。実 ezTour の KML/KMZ/HTML/RTF との比較も未実施（Stage 1 と同じ）。
 - 異常系の一部（切り詰めたデータ、EOCD のコメント長、ローカルヘッダの extra field 長）は単体テストの経路で確認したが、実アーカイバが作る全変種を網羅したわけではない。
+
+### main 追従（PR #40）と Stage 3 の軽微指摘（2026-11-23）
+
+- Stage 3 は head `c0b4c5d` で合格（mergeable / gate success）。その後 docs PR #40 が先に main（`3c97d5b`）へ入ったため `git merge origin/main` で追従した。競合は無く自動マージで、`docs/reference/02-cli.md` は PR #40 の GUI 対応表 2 行と本 PR の `log read` 記述を両方残している。`AGENTS.md` / `CHANGELOG.md` / `README.md` / `docs/dev/05-verification.md` / `docs/dev/12-progress-summary.md` は main 側の内容をそのまま取り込み、本ブランチからの変更は無い。
+- 追従後の head で `./tools/check.sh` 6/6。新 head は Stage 3 の再検証対象で、`review-gate` はこのセッションでは付けていない。
+- Stage 3 の軽微指摘 2 件:
+  1. 上限テストが `take` 除去を検知できない → fixture を実体 160 MiB にし、拒否メッセージが報告するサイズが `64 MiB + 1`（67,108,865）であることを assert する形に変更。`take` を外す変異を入れてテストが `167772160 bytes` で FAILED になることを確認し、変異を戻した。
+  2. 本節の対応表の「仕様 Must-4〜7」が誤り → 仕様レビューの Must は 1〜3。該当行を Should-1 / Should-2 / Should-3・4 に修正し、Must 表の重複行を整理した（上表）。
 
 ### Stage 3
 

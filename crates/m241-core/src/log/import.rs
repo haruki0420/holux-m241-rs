@@ -1778,16 +1778,19 @@ mod tests {
 
     #[test]
     fn a_doc_kml_that_decompresses_past_the_limit_is_refused_while_reading() {
-        // The archive is small (a deflate stream of zeros is ~150 KiB) and its
-        // headers claim `uncompressed_size = 0`, which the old reader believed:
-        // it read 160 MiB into a Vec before checking the length. The cap must
-        // stop the read, not report after it.
+        // The archive is small (a deflate stream of zeros is ~160 KiB), its
+        // headers claim `uncompressed_size = 0`, and it really expands to
+        // 160 MiB — the shape that made the old reader allocate everything
+        // before checking. The reported length is the assertion that matters:
+        // it must be the cap plus the one look-ahead byte, never the 160 MiB
+        // the stream actually holds. Removing `Read::take` makes the message
+        // say 167772160 and this test fails.
         use std::io::Write as _;
 
+        let total = 160 * 1024 * 1024;
         let mut encoder =
             flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
         let block = [0u8; 64 * 1024];
-        let total = MAX_KMZ_DOCUMENT_BYTES as usize + 1;
         let mut written = 0usize;
         while written < total {
             let chunk = (total - written).min(block.len());
@@ -1804,10 +1807,15 @@ mod tests {
         );
         let archive = zip_with_encoded_entry("doc.kml", 8, 0, &stored, 0);
         let err = import_kmz(&archive).expect_err("the reader must stop at the cap");
+        let reported = u64::from(MAX_KMZ_DOCUMENT_BYTES) + 1;
         assert!(
             err.to_string()
-                .contains("larger than the 67108864 byte limit"),
-            "got {err}"
+                .contains(&format!("is {reported} bytes uncompressed")),
+            "the reader did not stop at the cap + 1 look-ahead byte; got {err}"
+        );
+        assert!(
+            !err.to_string().contains(&total.to_string()),
+            "the reader measured the whole 160 MiB stream instead of the cap: {err}"
         );
     }
 
