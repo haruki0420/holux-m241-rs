@@ -71,8 +71,8 @@ export function useDeviceProbe() {
     if (target === "") {
       setState({
         kind: "error",
-        message: "ポートが選ばれていません。",
-        hint: "一覧からポートを選ぶか、ポート名を入力してから「接続して確認」を押してください。",
+        message: "ポートが選ばれていません",
+        hint: "一覧からポートを選ぶか、ポート名を入力してから「端末情報を読む」を押してください",
       });
       return;
     }

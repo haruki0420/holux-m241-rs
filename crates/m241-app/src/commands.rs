@@ -50,7 +50,7 @@ pub async fn device_info(port: String) -> Result<DeviceInfo, String> {
         .map_err(|error| {
             format!(
                 "端末情報の読み取り中に内部エラーが発生しました（{error}）\n\
-                 対処: 少し待ってから「接続して確認」を再実行してください。"
+                 対処: 少し待ってから「端末情報を読む」を再実行してください。"
             )
         })?
         .map_err(|error| describe(&error))
@@ -81,8 +81,7 @@ pub fn describe(error: &CoreError) -> String {
             "この画面は読み取りのみです。表示された理由を確認してください。"
         }
         CoreError::Firmware { .. } | CoreError::Profile { .. } | CoreError::Log { .. } => {
-            "端末の応答が想定と異なります。この画面では書き込みを行いません。\
-             端末を再起動してから再試行してください。"
+            "端末の応答が想定と異なります。端末を再起動してから再試行してください。"
         }
         CoreError::Nmea { .. } => {
             "端末の応答を解釈できませんでした。数秒待ってから再試行してください。"

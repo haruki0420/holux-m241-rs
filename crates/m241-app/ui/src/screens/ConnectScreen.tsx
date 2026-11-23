@@ -1,18 +1,20 @@
 import type { DeviceProbeController } from "../hooks/useDeviceProbe";
 import { DeviceCard } from "./DeviceCard";
+import { MapPanel } from "./MapPanel";
 import { PortCard } from "./PortCard";
 
 export function ConnectScreen({ controller }: { controller: DeviceProbeController }) {
+  const { state } = controller;
+  const stage = state.kind === "connected" ? 2 : state.kind === "probing" ? 1 : 0;
+
   return (
-    <div className="mx-auto flex w-full max-w-[1184px] flex-col gap-6 px-6 py-6">
-      <header>
-        <h1 className="text-title font-semibold text-ink">端末に接続</h1>
-        <p className="mt-2 max-w-[720px] text-ui text-ink-2">
-          M-241 を USB ケーブルでつなぎ、ポートを選んで端末情報を読み取ります。この画面は読み取りのみで、ファームの書き込み・ログの消去・記録の停止は行いません。
-        </p>
+    <div className="flex min-h-0 flex-1 flex-col gap-6 px-8 py-6">
+      <header className="shrink-0">
+        <h1 className="text-xl font-medium text-ink">端末に接続</h1>
+        <p className="mt-1 text-sm text-ink-2">ポートを選んで端末の情報を読み取ります</p>
       </header>
 
-      <div className="grid grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)] gap-6">
+      <div className="grid shrink-0 grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
         <PortCard controller={controller} />
         <DeviceCard
           state={controller.state}
@@ -21,9 +23,7 @@ export function ConnectScreen({ controller }: { controller: DeviceProbeControlle
         />
       </div>
 
-      <p className="text-caption text-ink-3">
-        書き込みを伴う画面は、後のフェーズで明示的な確認とともに追加します。旧 UI はパリティに達するまで残しています。
-      </p>
+      <MapPanel stage={stage} />
     </div>
   );
 }
