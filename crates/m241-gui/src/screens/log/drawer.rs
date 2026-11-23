@@ -147,14 +147,16 @@ impl Plates {
     /// The area the OSM credit is laid out in.
     ///
     /// The credit owns the canvas's bottom-left corner and the zoom plate the
-    /// bottom-right one. The area stops one `space::S` short of the zoom plate so
-    /// the plate `tiles` draws from it (the text plus its `space::XS` margin)
-    /// cannot reach the zoom plate at any canvas width; when the canvas is too
-    /// narrow to wrap the text into (outside the documented sizes) the credit is
-    /// placed above the zoom plate instead, which keeps the two apart vertically.
+    /// bottom-right one. The area stops one `space::M` (12pt) short of the zoom
+    /// plate so the plate `tiles` draws from it (the text plus its `space::XS`
+    /// margin) keeps at least 12pt of canvas between the credit and the zoom
+    /// controls at any canvas width — 8pt read as touching at the width where the
+    /// one-line credit just fits (Stage 3, 1264pt). When the canvas is too narrow
+    /// to wrap the text into (outside the documented sizes) the credit is placed
+    /// above the zoom plate instead, which keeps the two apart vertically.
     pub(super) fn credit(&self, map: Rect) -> Rect {
         let left = map.left() + space::S;
-        let right = self.zoom.left() - space::S;
+        let right = self.zoom.left() - space::M;
         let width = right - left - space::XS;
         if width >= MIN_CREDIT_WIDTH {
             Rect::from_min_max(

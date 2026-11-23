@@ -448,7 +448,8 @@ approximation from a mistake.
   keep fixed heights except the file plate's status line, which is measured
   before the plate is laid out and wraps inside it (a long refusal is readable
   without hovering). The credit is laid out in the canvas left of the zoom plate
-  and wraps to that width, so the two cannot meet.
+  and wraps to that width, so the two cannot meet; the layout keeps at least
+  12pt (`space::M`) between the credit's plate and the zoom plate.
 - The 書き出し panel is laid out for the drawer's 332pt inner width: the six
   writer chips take two explicit rows, and the destination field and 書き出す
   stack instead of sharing a line. `horizontal_wrapped` cannot break between two

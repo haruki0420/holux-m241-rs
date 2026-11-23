@@ -5268,8 +5268,10 @@ mod tests {
         // The credit is now laid out in the canvas left of the zoom plate and
         // wraps to fit, so the two cannot meet at any width; the drawer's
         // threshold is the content width, so 1200 floats the drawer and the
-        // narrow column starts at 1000pt of content.
-        for width in [1100.0, 1200.0, 1240.0, 1280.0] {
+        // narrow column starts at 1000pt of content. 1264 / 1269 bracket the
+        // width where the one-line credit just fits; the gap there is the
+        // smallest on the page, so it is sampled rather than assumed.
+        for width in [1100.0, 1200.0, 1240.0, 1264.0, 1269.0, 1280.0] {
             let label = format!("{width}×800 with the drawer open");
             let frame = log_frame(width, 800.0, Some(LogTab::Summary), true, true);
             let credit = overlay_rect(&frame, "attribution");
@@ -5279,8 +5281,9 @@ mod tests {
                 "the credit {credit:?} overlaps the zoom plate {zoom:?} at {label}",
             );
             assert!(
-                credit.right() <= zoom.left() + 0.5,
-                "the credit {credit:?} reaches past the zoom plate's left edge {:?} at {label}",
+                credit.right() + space::M <= zoom.left() + 0.5,
+                "the credit {credit:?} is closer than {}pt to the zoom plate's left edge {:?} at {label}",
+                space::M,
                 zoom.left(),
             );
             assert_overlays_apart(&frame, &label);
