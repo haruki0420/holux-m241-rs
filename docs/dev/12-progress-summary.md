@@ -135,6 +135,54 @@ GUI の到達点（詳細は §3.4）:
 - 設定画面で地図タイルの ON/OFF（**既定 ON・インターネットが必要**）と、キャッシュの場所・サイズ・消去。
 - 実ウィンドウでの取得は 2026-11-23 に X11（Xwayland）と Wayland で確認した。X11 では 2026-11-21 の実ダンプ 10,942 点の軌跡・タイル・帰属が同時に出ることを確認。**いずれも開発機の表示確認で、M-241 の実機検証ではない**。Wayland の実画面の見た目は未検証。
 
+### 3.5 TODO ロードマップ — 新 Tauri アプリ（`m241-app`）移植と ezTour 未実装機能
+
+2026-11-23 に PR #43（`6b45d54`）で新 Tauri v2 + React アプリ（`crates/m241-app`）の P0〜P2（シェル・Connect 画面・Log 画面、読み取り専用）を `main` へ統合した。以下は今後実装する機能の TODO 一覧。
+
+#### A. 新 Tauri アプリ（`crates/m241-app`）への既存機能移植
+
+- [ ] **P3: ファームウェア画面・書き込み機能**（安全-critical のため 3 分割で実装）
+  - [ ] **PR-P3a（Tier 2）**: `APP_MAY_LINK_FLASH = False` のまま、オフライン Patch（`fw_plan` / `fw_patch` / `fw_sample_plan`）と 3 ステップ骨格 UI
+  - [ ] **PR-P3b（Tier 3）**: `APP_MAY_LINK_FLASH = True`・`tools/check_safety.py` の `check_app_write_route` / `check_app_port_path` 更新（`safety_gate.rs` 変異テスト同時追加）・Rust 側コマンド（IPC で生の確認語 `"WRITE"` / `"PROBE"` / `"RESTART"` を受け取り Rust 側で検証して `Confirmation::granted()` を構築、`tauri::ipc::Channel` で進捗通知）・`FakeDa` シミュレータテスト
+  - [ ] **PR-P3c（Tier 3）**: Step 1（2 回読み吸い出し）・Step 3（通常書き込み / `--recover` / `--allow-vendor`）・琥珀色復旧パネル（`0xD9` 再起動・BootROM 再入・復旧）の UI 配線
+- [ ] **P4: データ取り出し・ジオタグ書き込み・トラック編集**
+  - [ ] デバイスからのログ吸い出し（`log download` 相当）とログ消去の安全案内
+  - [ ] 写真ジオタグ EXIF 書き込み（時刻シフト適用・適用範囲 `all` / `selected` / `by-camera`・`_original` バックアップ・確認ダイアログ）
+  - [ ] トラック編集 UI（分割・結合・点削除・Undo/Redo）
+- [ ] **P5: 設定画面・周辺機能・磨き込み**
+  - [ ] 設定画面（タイル ON/OFF・キャッシュ管理、座標形式切替、表示タイムゾーン、単位切替）
+  - [ ] NMEA 修復・NMEA TCP 中継・プロジェクト保存/読込・`device doctor`
+  - [ ] OS ファイルダイアログ（`tauri-plugin-dialog`、Log・Firmware の両画面で共用）
+  - [ ] PR #43 見送り Should 項目（`useLogDocument` リクエストチケット S-4、`logdoc.rs` 責務分割 S-2、ESLint 導入 S-5、1024×640 レスポンシブ、タイル取得失敗案内、写真サムネイル帯・回転、KMZ 写真タイムゾーン反映、Tauri 実ウィンドウでの CSP・IME 検証）
+
+#### B. ezTour 本来の機能のうちコア・CLI・GUI いずれにも未実装のバックログ
+
+[`07-eztour-spec.ja.md`](07-eztour-spec.ja.md) および公式マニュアルとの突き合わせで確認した未実装項目。
+
+- [ ] **端末のログ記録設定（`Config GPS…` / PMTK182 設定書き込み）**（要実機検証）
+  - 時間間隔（`Log every N seconds`）・距離間隔（`Log every N meters`）
+  - ログモードプリセット（General / Vehicle / Cycling / Hiking）
+  - メモリ満杯時の挙動（`Overwrite` 上書き / `Stop Log` 停止）、デバイスリセット、単位（km / mile）
+- [ ] **POI（地点メモ）の編集と手動追加**
+  - 端末 POI ボタン地点の名前・メモ編集、地図クリックによる手動 POI 追加、種別アイコン選択
+- [ ] **複数トラック管理**
+  - 吸い出し時の取り込むトラック選択、複数トラック同時表示（10 色パレット）、トラックごとの色・線幅カスタマイズ
+- [ ] **写真・メディア体験の拡充**
+  - トラック再生と連動した写真スライドショー、写真コメント編集・回転表示
+  - 非 JPEG（動画 MP4 等）のトラック紐づけのみ（EXIF 非書込）
+- [ ] **トラック編集の地図上操作**
+  - Shift 範囲選択・Ctrl トグル・矩形選択による点選択
+- [ ] **地図ツール**
+  - 地図種別切替（標準 / 衛星 / 地形 / 地理院地図等）、ミニマップ、地名検索、地図スクリーンショット保存
+- [ ] **フォーマット互換・書き出しの細部**
+  - GPX 点間引き（簡略化）オプション、GPX `<wpt>` 読み込み
+  - CSV の `LOCAL DATE` / `LOCAL TIME` 出力（表示タイムゾーン設定と連動）
+  - `kmzMaxPhotoEdgeSize` / `icon/` サムネイル寸法の GUI 指定経路
+- [ ] **接続経路の実機検証**
+  - Bluetooth SPP 経由の接続・読み出し（実機未検証）
+
+※ 意図的に対象外とした項目（228 データム・14 各国グリッド、`.itm` / `.itx` / `.dst` / Yupiteru 形式の直接互換、Google Maps JS API v2/v3・認証サーバ・SNS アップロード・AGPS）は [`07-eztour-spec.ja.md`](07-eztour-spec.ja.md) §7–8 の方針を維持する。
+
 ---
 
 ## 4. 絶対に守る規約
