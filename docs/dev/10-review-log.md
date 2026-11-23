@@ -1727,3 +1727,89 @@ Stage 3 検証者は worktree 編集禁止のため、この記録のみを修�
 - `Cargo.lock`: `ureq` / `image` / `dirs` と `serde_json` を統合。`DESIGN.md`: 地図節と PR #37 の設定/コンソール節の両方を残した。
 - 回帰: `cargo test -p m241-gui` は lib 232 / render 38 / design_gate 6 / design_invariants 6 全合格、`check.sh` 6/6。実ウィンドウは X11 16 枚 / Wayland 4 枚のタイル取得、headless は 0 枚（スクリーンショット 15 枚）。`pub(crate) mod tiles`、帰属条件、実測キャッシュ行はマージ後もテストで固定されている。
 - 1 点だけ main 側テストを変更した: PR #37 の座標形式行とタイル行で設定ページが 800pt を超えてスクロールするようになったため、`render.rs` の reduced-motion 表示テストは 1200pt で描画する。行はスクロールで到達でき、テストの意図（注記が設定値を反映する）は変えていない。
+
+## 2026-11-23 / PR #41 ezTour 形式 Stage 2 修正（`feat-eztour-formats`）
+
+- 対象: Stage 1 head `58696153ad57fb7975a76fc6d98a00fc27061eb9`（base `origin/main` = `e7367dc`）への 2 レビュー。仕様検収 `#issuecomment-7089143300`（Must 3 / Should 3）と可読性 `#issuecomment-7088073677`（Must M1–M5、Should S1–S10）。
+- Stage 2 修正（別エージェント）: 変更は `crates/m241-core/src/log/import.rs`、`crates/m241-core/src/log/html.rs`、`crates/m241-core/src/log/report.rs`、`crates/m241-cli/src/cli.rs`、`docs/reference/02-cli.md`、本ファイルのみ。`crates/m241-gui` は別エージェントが編集中のため未変更。実ログ・実座標は追加していない。実機ポートは開いていない。
+- 修正コミット: `8645edc`（コード・docs）。本節は自己参照を避けるため後続の docs コミットに置いた。最終 head は PR #41 のコメントを参照。
+
+### Must への対応
+
+| 指摘 | 対応 | 種別 |
+|---|---|---|
+| 仕様 Must-2 / 可読性 M1: 64 MiB 上限が展開後検査でメモリを制限しない | `zip_entry_bytes` の deflate 経路を `Read::take(64 MiB + 1)` に変更し、stored 経路も実体長 `data.len()` を検査。宣言 `uncompressed_size` の早期拒否は残した。`read_to_end` の倍々成長で上限の 2 倍（128 MiB）を確保しないよう、`Vec` は上限 +1 を一度だけ予約する（未使用ページは常駐しない） | 実装変更 |
+| 仕様 Must-3 / 可読性 M2: 暗号化 ZIP を検出しない | 中央ディレクトリ +8 とローカルヘッダ +6 の general-purpose flag bit 0 を読み、どちらかが立てば `KMZ entry … is encrypted, which is not supported` で拒否。旧実装は暗号化フラグ付き有効 deflate を exit 0 でインポートしていた。あわせてエントリ単位の ZIP64 マーカー（サイズ / オフセット = `0xFFFFFFFF`）を ZIP64 として理由付きで拒否 | 実装変更 + テスト |
+| 仕様 Must-1 / 可読性 M5: KML 読み込みが O(n²) | `next_kml_geometry` を 1 パス走査に変更。`<Point>` と `<LineString>` を別々に `from` から EOF まで探さない | 実装変更 + テスト |
+| 仕様 Must-4 / 可読性 M4: ZIP パーサの異常系テスト 0 本 | 6 経路（EOCD 無し・中央ヘッダ署名破損・ローカルヘッダ署名破損・ZIP64・未知メソッド・宣言/実体の上限超過）と暗号化 2 経路（中央 / ローカル）のテストを追加 | テスト追加 |
+| 仕様 Must-5 / 可読性 M3: `impl Default for LogReadOptions` が未使用で doc が偽 | impl を削除。clap の既定（`--utc-offset-days auto`、`--format gpx`、`--coord-format decimal` ほか）を `log_read_defaults_are_the_documented_ones` で固定 | 実装削除 + テスト |
+| 仕様 Must-6 / 可読性 S5: `--help` と docs の不整合 | `--help` を「**imported document**（`--gpx` / `--kml` / `--kmz`）」に更新。`docs/reference/02-cli.md` の "(see below)" に対応する説明（imported document には `auto` を適用しない理由）を Input kinds に復活 | docs 変更 |
+| 仕様 Must-7: HTML/RTF のテストが部分文字列のみ | HTML は出力全体を禁止トークン 16 種（`<script` / `<img` / `<link` / `<iframe` / `<object` / `<embed` / `src=` / `href=` / `http://` / `https://` / `url(` / `javascript:` / `@import` / ` onload=` / ` onerror=` / `xlink:href`）で走査し、閉じタグも確認。RTF は `to_rtf` の出力全体でブレース均衡・ASCII・`\par` 行数を検査 | テスト変更 |
+
+### Should への対応
+
+| 指摘 | 対応 |
+|---|---|
+| 仕様 Should-1 / 可読性 M4: KMZ 拒否経路のテストが 1 本も無い | Must-4 と同じテストで解消（拒否 6 経路 + 暗号化 2 経路 + 実体上限） |
+| 可読性 S7: CRC 未検証が公開 API の doc に無い | `import_kmz` の rustdoc と `02-cli.md` に「CRC は検証しない。stored エントリの 1 ビット反転は妥当な座標として読まれ得る」を明記 |
+| 仕様 Should-2: `--utc-offset-days` の docs が KML/KMZ を説明しない | Must-6 で解消。`--help` と参照 docs の両方に理由を書いた |
+| 仕様 Should-3 / Should-4: HTML/RTF のテスト強度 | Must-7 で解消 |
+| 可読性 S6: RTF の doc「declares one font」と実装（2 font、`\f1` 未使用）の不一致 | 未使用の `{\f1\fmodern Courier New;}` を削除し、doc と実装を一致させた |
+| 可読性 S3: `import_kml` の doc が「root element」、実装は「どこかの `<kml` 要素」 | doc を「`<kml` 要素」に修正（実装は変えていない） |
+| MHT 未実装（仕様 §2 は HTML / MHT） | `02-cli.md` に「MHT is not implemented」節を追加。仕様の記載、実装が無いこと、レイアウトが仕様に無いことを書いた |
+| PR 本文の「18 new tests」 | 実数は Stage 1 時点で 20、Stage 2 後で 32（`git diff e7367dc -- '*.rs' | grep -c '^+    #\[test\]'` = 32）。PR 本文の数字は書き換えず、PR コメントで訂正した |
+
+### 見送り
+
+- 可読性 S1（4 値ブール + 手書き conflict を `ArgGroup` へ）、S2（`read()` の分割）、S9（`map_svg` の分割）、S10（`format_duration` の可視性）、Could 群: 挙動を変えない構造整理で、今回の Must 修正とは独立。Stage 3 の判定後に follow-up とする。
+- 可読性 S4（エラー位置がコメント除去後の座標系）、S8（非 UTF-8 の文言が NMEA 向け）: 既存の GPX 経路と同じ挙動で、KML/KMZ 固有の回帰ではない。文言・座標系の変更は別 PR とする。
+- `.dst` と実 ezTour サンプルとの比較: 仕様検収の判定どおり未実装・未検証のまま。捏造しない。
+
+### 追加テスト
+
+`crates/m241-core/src/log/import.rs`:
+
+- `a_point_only_kml_is_read_in_one_pass_not_once_per_point`（10,000 点が 5 秒以内。旧実装は debug 78 秒 / release 7.0 秒）
+- `an_archive_without_an_end_of_central_directory_record_is_refused`
+- `a_central_directory_header_with_a_bad_signature_is_refused`
+- `a_local_file_header_with_a_bad_signature_is_refused`
+- `a_zip64_archive_is_refused`
+- `an_entry_with_an_unknown_compression_method_is_refused`
+- `an_entry_that_declares_more_than_the_limit_is_refused`
+- `an_encrypted_entry_is_refused`
+- `a_local_header_that_says_encrypted_is_refused_even_when_the_central_directory_does_not`
+- `a_doc_kml_that_decompresses_past_the_limit_is_refused_while_reading`（宣言 0・実体 64 MiB + 1）
+
+`crates/m241-core/src/log/report.rs`:
+
+- `the_whole_rtf_document_is_balanced_and_ascii`
+
+`crates/m241-cli/src/cli.rs`:
+
+- `log_read_defaults_are_the_documented_ones`
+
+既存テストの変更: `the_snapshot_has_no_javascript_and_no_remote_reference` を 16 トークンの全体走査に拡張。削除したテストは無い。
+
+### 性能実測
+
+`--release` バイナリで計測。ホストに `/usr/bin/time` が無いため、`getrusage(RUSAGE_CHILDREN).ru_maxrss` を 1 コマンド 1 プロセスで読むラッパーを使った。入力は `/var/tmp/pr41fix/` に合成した Point-only KML（880,112 B / 10,000 点）と、`uncompressed_size = 0` を宣言し実体 160 MiB に膨れる KMZ（163,186 B）。実ログ・実座標は使っていない。
+
+| 計測 | 修正前（`5869615`） | 修正後（`8645edc`） |
+|---|---:|---:|
+| 10,000 点 KML の処理時間 | 7.198 s | **0.011 s** |
+| 160 MiB アーカイブのピーク RSS | 197.1 MiB | **69.1 MiB**（上限 64 MiB） |
+| 暗号化フラグ付き KMZ | exit 0（成功） | **exit 1** `is encrypted, which is not supported` |
+
+PSS ではなく RSS のため、`Vec` 予約分やバイナリ・アロケータの常駐分を含む。上限 64 MiB に対して 69.1 MiB で止まり、実体 160 MiB には比例しない。小さい KMZ（186 B、1 点）は 12.2 MiB、上限内の 10 MiB 展開は 26.8 MiB だった。
+
+### 検証
+
+- `M241_VENDOR_IMAGE=<vendor V1.13> TMPDIR=/var/tmp ./tools/check.sh`: **6/6**（fmt / clippy / test / docs / design / safety）。
+- `cargo test -p m241-core --lib`: 361 passed、`cargo test -p m241-cli --lib`: 281 passed（いずれも Stage 2 の追加テストを含む）。
+- 変更後に `cargo fmt --all -- --check` と `cargo clippy --all-targets -- -D warnings` が通ることを確認した。
+- 外部ビューア（ブラウザ・Word）での表示確認は未実施。実 ezTour の KML/KMZ/HTML/RTF との比較も未実施（Stage 1 と同じ）。
+- 異常系の一部（切り詰めたデータ、EOCD のコメント長、ローカルヘッダの extra field 長）は単体テストの経路で確認したが、実アーカイバが作る全変種を網羅したわけではない。
+
+### Stage 3
+
+- 未実施。`review-gate` は付けていない（Stage 3 は別エージェントが新しい head SHA で行う）。
