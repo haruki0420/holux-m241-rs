@@ -2006,6 +2006,7 @@ dependencies = [
 name = "m241-core"
 version = "1.0.0"
 dependencies = [
+ "flate2",
  "image",
  "serialport",
  "thiserror 2.0.21",
