@@ -27,7 +27,7 @@ pub fn to_rtf(track: &Track) -> String {
     let span = track.time_span();
     let mut out = String::from(
         "{\\rtf1\\ansi\\ansicpg1252\\deff0\n\
-         {\\fonttbl{\\f0\\fswiss Helvetica;}{\\f1\\fmodern Courier New;}}\n\\fs24\n",
+         {\\fonttbl{\\f0\\fswiss Helvetica;}}\n\\fs24\n",
     );
     let _ = writeln!(out, "{{\\b {}}}\\par", escape_rtf(DOCUMENT_NAME));
     out.push_str("\\par\n{\\b Summary}\\par\n");
@@ -219,6 +219,63 @@ mod tests {
         assert!(
             !rtf.contains("18.500"),
             "a missing speed printed as its old value"
+        );
+    }
+
+    #[test]
+    fn the_whole_rtf_document_is_balanced_and_ascii() {
+        // Check the bytes `to_rtf` actually writes, not only `escape_rtf`'s
+        // units: a stray brace in a future row would end the document early and
+        // an unescaped non-ASCII character would depend on the reader's code
+        // page. Three points, one of them missing every optional value.
+        let mut track = sample_track();
+        track.points.push(crate::types::TrackPoint {
+            utc: Some(1_700_000_060),
+            latitude: Some(35.690_000),
+            longitude: Some(139.780_000),
+            height_m: Some(38.0),
+            speed_kmh: Some(20.0),
+            rcr: None,
+        });
+        track.points.push(crate::types::TrackPoint {
+            utc: None,
+            latitude: None,
+            longitude: None,
+            height_m: None,
+            speed_kmh: None,
+            rcr: None,
+        });
+        let rtf = to_rtf(&track);
+
+        let mut depth = 0i32;
+        let mut escaped = false;
+        for character in rtf.chars() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match character {
+                '\\' => escaped = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    assert!(
+                        depth >= 0,
+                        "a closing brace arrived before its opening brace"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0, "the document does not close every group it opens");
+        assert!(
+            rtf.is_ascii(),
+            "RTF must be ASCII; non-ASCII text has to use \\uN? control words"
+        );
+        assert_eq!(
+            rtf.matches("\\par").count(),
+            1 + 2 + 10 + 2 + 1 + 3,
+            "title, summary block, ten summary rows, table heading, header row and three rows"
         );
     }
 }

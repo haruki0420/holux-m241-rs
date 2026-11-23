@@ -364,10 +364,37 @@ mod tests {
     #[test]
     fn the_snapshot_has_no_javascript_and_no_remote_reference() {
         let html = to_html(&sample_track());
-        assert!(!html.contains("<script"), "the snapshot must not script");
-        assert!(!html.contains("http://"), "no remote reference");
-        assert!(!html.contains("https://"), "no remote reference");
-        assert!(!html.contains("onload="), "no inline event handler");
+        // Whole-document scan, not a sample of tags: each entry is something the
+        // page must never grow, whether it arrives through a template edit or a
+        // future value. `src=` / `href=` cover a reference to any scheme, not
+        // only `http`, and `url(` covers CSS.
+        for forbidden in [
+            "<script",
+            "<img",
+            "<link",
+            "<iframe",
+            "<object",
+            "<embed",
+            "src=",
+            "href=",
+            "http://",
+            "https://",
+            "url(",
+            "javascript:",
+            "@import",
+            " onload=",
+            " onerror=",
+            "xlink:href",
+        ] {
+            assert!(
+                !html.contains(forbidden),
+                "the snapshot must not contain {forbidden:?}"
+            );
+        }
+        assert!(
+            html.trim_end().ends_with("</html>"),
+            "the snapshot is not a closed document"
+        );
     }
 
     #[test]

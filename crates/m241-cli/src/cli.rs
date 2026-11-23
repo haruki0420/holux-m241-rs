@@ -889,10 +889,11 @@ pub struct LogReadOptions {
     ///
     /// `auto` is a rule for a raw dump: it shifts a log whose newest record
     /// falls in the window an unpatched unit emits (1999-08-22 to 2019-04-06).
-    /// **It is never applied to `--gpx`**: a GPX from another tool can be
-    /// genuinely historical, so its dates are kept as written and a warning
-    /// names the day count that would shift them. Pass an explicit number to
-    /// shift either input, including a negative one to undo a shift.
+    /// **It is never applied to an imported document** (`--gpx`, `--kml` or
+    /// `--kmz`): another tool's document can be genuinely historical, so its
+    /// dates are kept as written and a warning names the day count that would
+    /// shift them. Pass an explicit number to shift either input, including a
+    /// negative one to undo a shift.
     ///
     /// `allow_hyphen_values` is what makes `--utc-offset-days -7168` a value
     /// rather than an unknown flag: a negative shift is the normal way to undo
@@ -904,31 +905,6 @@ pub struct LogReadOptions {
         default_value = "auto"
     )]
     pub utc_offset_days: OffsetSpec,
-}
-
-impl Default for LogReadOptions {
-    /// The documented defaults: what clap fills in when a flag is omitted.
-    ///
-    /// A test that builds the options by hand starts from the same values, so
-    /// adding a flag does not silently change what the other tests exercise.
-    fn default() -> Self {
-        Self {
-            file: PathBuf::new(),
-            nmea: false,
-            gpx: false,
-            kml: false,
-            kmz: false,
-            format: ExportFormat::Gpx,
-            csv_report: false,
-            html: false,
-            rtf: false,
-            coord_format: CoordFormatArg::Decimal,
-            simplify: None,
-            cache: None,
-            output: None,
-            utc_offset_days: OffsetSpec::Days(0),
-        }
-    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -1234,6 +1210,39 @@ mod tests {
         ] {
             Cli::try_parse_from(&args).unwrap_or_else(|e| panic!("{args:?} failed: {e}"));
         }
+    }
+
+    #[test]
+    fn log_read_defaults_are_the_documented_ones() {
+        // The defaults are what clap fills in, and there is deliberately no
+        // `Default` impl for this struct: one that said `Days(0)` while clap
+        // said `Auto` would make a hand-built test exercise a different command
+        // line from the one a user runs.
+        let cli = Cli::try_parse_from(["m241", "log", "read", "track.bin"]).expect("read defaults");
+        let Command::Log {
+            command: LogCommand::Read(options),
+        } = cli.command
+        else {
+            panic!("expected log read");
+        };
+        assert_eq!(options.file, PathBuf::from("track.bin"));
+        assert!(!options.nmea);
+        assert!(!options.gpx);
+        assert!(!options.kml);
+        assert!(!options.kmz);
+        assert_eq!(options.format, ExportFormat::Gpx);
+        assert!(!options.csv_report);
+        assert!(!options.html);
+        assert!(!options.rtf);
+        assert_eq!(options.coord_format, CoordFormatArg::Decimal);
+        assert_eq!(options.simplify, None);
+        assert_eq!(options.cache, None);
+        assert_eq!(options.output, None);
+        assert!(
+            matches!(options.utc_offset_days, OffsetSpec::Auto),
+            "the documented --utc-offset-days default is `auto`, got {:?}",
+            options.utc_offset_days
+        );
     }
 
     #[test]

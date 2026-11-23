@@ -452,7 +452,20 @@ document with `--kml`'s reader. When `doc.kml` is absent the first `.kml` entry 
 used. Stored and deflated entries are both read (a deflated `doc.kml` is the
 normal case); ZIP64, encryption and other compression methods are refused with
 an error naming the reason, as is a `doc.kml` larger than 64 MiB once
-decompressed. An archive with no `.kml` entry is an error.
+decompressed. The 64 MiB cap is applied to the bytes actually produced, not to
+the size the archive declares: a deflated entry is read through a `take` of the
+cap plus one byte, so a small archive that lies about its uncompressed size
+cannot make the reader allocate past the limit. The entry's CRC is **not**
+verified — a corrupted stored entry can still reach the KML reader with
+plausible-looking coordinates. An archive with no `.kml` entry is an error.
+
+`--utc-offset-days auto` is a rule for **this project's raw dump**, not for an
+imported document. A document written by another tool can be genuinely
+historical — the stale window an unpatched unit emits (1999-08-22 to 2019-04-06)
+covers ordinary 2000s and 2010s trips — so `auto` keeps an imported document's
+(`--gpx`, `--kml`, `--kmz`) dates as written and only warns, naming the explicit
+day count that would shift them. An explicit number, including a negative one,
+is applied to every input.
 
 `.dst` ("Destination File"), which the specification lists as readable
 ([`07-eztour-spec.ja.md`](../dev/07-eztour-spec.ja.md) §2), is **not
@@ -555,6 +568,13 @@ the file works offline and can be archived. The summary is `--csv-report`'s ten
 facts in a table. A track with no positioned point gets the summary and a
 sentence instead of an empty map. `--html` is exclusive with `--format`,
 `--csv-report` and `--rtf`.
+
+**MHT is not implemented.** The specification's §2 lists HTML (`.htm`/`.mht`),
+and its table names "HTML / MHT"; this project writes the HTML file above only,
+and its writer emits one self-contained HTML document rather than an MHT
+multipart container. There is no MHT parser or writer in the tree, and the
+specification records no layout for the container, so the format is left out
+rather than guessed.
 
 `--rtf` writes a printable report: the same ten summary facts and a table of
 every point (index, UTC date and time, latitude, longitude, altitude, speed). Text
