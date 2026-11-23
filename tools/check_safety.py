@@ -17,7 +17,8 @@ write path through the shared session, must build its `WRITE` / `PROBE`
 confirmations where the typed word is checked, and must not carry a destructive
 opcode of its own.
 
-Nine checks, each for a different way the split can rot:
+Twelve checks, each for a different way the split can rot:
+
 
 1. **No destructive command in `m241-core`'s sources or tests.** `$PMTK182,6`
    (erase the log) and the DA opcodes `0xD3` / `0xD4` / `0xD5` / `0xD9` (record
@@ -96,6 +97,25 @@ Nine checks, each for a different way the split can rot:
    `#[cfg(any(test, feature = "simulator"))]`. If the attribute comes off, a
    shipped binary could build a token for any digest, and `AGENTS.md` §2.5's
    "the DA must be the vendor image" would stop being a property of the type.
+10. **`m241-app` has no write crate until P3.** The Tauri application is a
+    read-only binary (Connections read the unit; Log reads saved documents).
+    Its manifest and its resolved `cargo tree` must not contain `m241-flash`
+    while `APP_MAY_LINK_FLASH` is `False`. The constant is the P3 switch: flipping
+    it inverts the clause, and the change that flips it must also add the
+    write-route clauses the GUI has. Without this check, the structural
+    guarantee the read-only app relies on was review-only — a reviewer could add
+    `m241-flash.workspace = true` and `0xD5` and the gate still passed.
+11. **`m241-app` and its frontend carry no destructive command.** The same
+    `0xD3` / `0xD4` / `0xD5` / `0xD9` / `$PMTK182,6` scan runs over
+    `crates/m241-app/src` and `crates/m241-app/ui/src`, with the same two passes
+    (masked source for bare literals, comments stripped for escapes and the
+    PMTK sentence). Prose stays allowed for the same reason as in `m241-core`:
+    the screens say what they do not do.
+12. **One serial port path, and it is the read-only probe.** `Port::open` may
+    appear exactly once in `m241-app/src`, inside `src/device.rs`'s `pub fn
+    probe`, and `commands::device_info` must be the caller. Any other serial
+    constructor (`SerialPort::open`, `serialport::new`) is a second route the
+    gate cannot classify as a read.
 
 A rule enforced only by review is a rule that holds until the reviewer is busy.
 These are mechanical so they hold every commit.
@@ -118,6 +138,31 @@ FLASH = REPO / "crates" / "m241-flash"
 FLASH_DA = FLASH / "src" / "da.rs"
 GUI = REPO / "crates" / "m241-gui"
 GUI_MANIFEST = GUI / "Cargo.toml"
+APP = REPO / "crates" / "m241-app"
+APP_SRC = APP / "src"
+APP_UI_SRC = APP / "ui" / "src"
+APP_MANIFEST = APP / "Cargo.toml"
+
+#: Whether `m241-app` is allowed to link the write crate.
+#:
+#: P0-P2 build a read-only Tauri application: the Log screen reads saved
+#: documents and the Connect screen reads the unit's identity, so the absence of
+#: `m241-flash` from `m241-app` is a structural guarantee that the new binary
+#: cannot erase or program. P3 adds the Firmware screen, and that is when this
+#: constant flips to `True`; the same change must add the write-route clauses the
+#: GUI already has (the shared `flow::flash` session, a typed confirmation owned
+#: by the screen that performs it, and no destructive opcode of its own). The
+#: checks below read this constant rather than hard-coding "must be absent", so a
+#: P3 change cannot make the gate pass by deleting the clause.
+APP_MAY_LINK_FLASH = False
+
+#: Opening a port is the one operation that can reach the device. It is allowed
+#: in exactly one place: `src/device.rs`'s read-only `probe`.
+APP_PORT_OPEN = re.compile(r"\bPort\s*::\s*open\s*\(")
+APP_OTHER_PORT_OPEN = re.compile(
+    r"\b(?:SerialPort\s*::\s*(?:open|open_native)|serialport\s*::\s*(?:open|new)|"
+    r"serialport\s*::\s*TTYPort\s*::\s*open)\s*\("
+)
 
 #: Commands that destroy or rewrite what is on the device. `PMTK182,6` erases
 #: the log; the four DA opcodes record a write range (`0xD3`), erase a range
@@ -877,6 +922,214 @@ def check_gui_write_route() -> list[str]:
     return problems
 
 
+def app_relative(path: Path) -> str:
+    """The path relative to `crates/m241-app`, or the absolute path if outside."""
+    try:
+        return str(path.relative_to(APP)).replace("\\", "/")
+    except ValueError:
+        return str(path)
+
+
+def check_app_dependency() -> list[str]:
+    """`m241-app` must stay structurally read-only until P3.
+
+    The compiler cannot verify this: adding one line to `Cargo.toml` is enough to
+    link the write crate. The two halves are the manifest text (a dependency
+    declared and then optimised out is still a finding) and the resolved tree
+    (a dependency inherited through another crate would not appear in the
+    manifest).
+
+    When P3 flips [`APP_MAY_LINK_FLASH`], the clause inverts: the write crate
+    must be present, and the writer route checks (the same shape as
+    [`check_gui_write_route`]) must be added in the same change. Until then the
+    app is a read-only binary and this check is what says so.
+    """
+    problems = []
+    if not APP_MANIFEST.is_file():
+        return [f"{relative(APP_MANIFEST)} is missing; cannot verify m241-app dependencies"]
+    manifest = APP_MANIFEST.read_text(encoding="utf-8")
+    # The manifest explains in a comment why the write crate is absent, so the
+    # name is matched against code only. A TOML `#` comment cannot declare a
+    # dependency, and treating the prose as a declaration would make the gate
+    # fail on the sentence that documents the rule.
+    manifest_code = "\n".join(
+        line.split("#", 1)[0] for line in manifest.splitlines()
+    )
+    named = "m241-flash" in manifest_code or "m241_flash" in manifest_code
+
+    if APP_MAY_LINK_FLASH:
+        if not named:
+            problems.append(
+                f"{relative(APP_MANIFEST)}: does not name `m241-flash` although "
+                "APP_MAY_LINK_FLASH is True; the write route must go through the shared "
+                "write crate, and the write-route clauses must be added with it"
+            )
+    elif named:
+        problems.append(
+            f"{relative(APP_MANIFEST)}: names `m241-flash` while APP_MAY_LINK_FLASH is "
+            "False; the app is read-only until P3, and the write crate must not be "
+            "linkable from it"
+        )
+
+    tree = cargo_tree("m241-app")
+    if tree is None:
+        problems.append("cargo tree -p m241-app could not be read")
+    elif APP_MAY_LINK_FLASH and "m241-flash" not in tree:
+        problems.append(
+            "m241-app's dependency tree does not contain m241-flash although "
+            "APP_MAY_LINK_FLASH is True"
+        )
+    elif not APP_MAY_LINK_FLASH and "m241-flash" in tree:
+        problems.append(
+            "m241-app's dependency tree contains m241-flash; the read-only binary can "
+            "reach the write path"
+        )
+    return problems
+
+
+def check_app_destructive_code() -> list[str]:
+    """No destructive command may appear in `m241-app`, Rust or frontend.
+
+    The app is a read-only binary, so the same rule the GUI obeys applies to it:
+    `0xD3` / `0xD4` / `0xD5` / `0xD9` and `$PMTK182,6` have no business in code.
+    Prose is exempt because the screens explain what they do *not* do; the scan
+    therefore strips `//` comments and keeps string contents for the escape and
+    PMTK forms, while bare literals are matched against masked source (comments
+    and string contents blanked).
+
+    The frontend is scanned with the same two passes. A webview cannot open a
+    serial port, so a destructive token in the UI is either dead code or a route
+    that bypasses the Rust side — both findings.
+    """
+    problems = []
+    for path in rust_sources(APP_SRC):
+        text = path.read_text(encoding="utf-8")
+        masked = masked_source(text)
+        for number, line in enumerate(masked.splitlines(), start=1):
+            for match in DESTRUCTIVE_SYMBOLS[1].finditer(line):
+                problems.append(
+                    f"{relative(path)}:{number}: destructive command `{match.group(0)}` "
+                    "in m241-app; the app reads and never writes until P3"
+                )
+        for number, line in code_lines(text):
+            for pattern in (DESTRUCTIVE_SYMBOLS[0], DESTRUCTIVE_SYMBOLS[2]):
+                for match in pattern.finditer(line):
+                    problems.append(
+                        f"{relative(path)}:{number}: destructive command "
+                        f"`{match.group(0)}` in m241-app; the app reads and never writes "
+                        "until P3"
+                    )
+
+    ui_root = APP_UI_SRC
+    if not ui_root.is_dir():
+        problems.append(
+            f"{relative(ui_root)} is missing; cannot verify the frontend carries no "
+            "destructive command"
+        )
+        return problems
+    frontend = sorted(
+        path
+        for path in ui_root.rglob("*")
+        if path.is_file() and path.suffix in {".ts", ".tsx"}
+    )
+    for path in frontend:
+        text = path.read_text(encoding="utf-8")
+        masked = masked_source(text)
+        for number, line in enumerate(masked.splitlines(), start=1):
+            for match in DESTRUCTIVE_SYMBOLS[1].finditer(line):
+                problems.append(
+                    f"{relative(path)}:{number}: destructive command `{match.group(0)}` "
+                    "in the frontend; the webview has no serial route"
+                )
+        for number, line in code_lines(text):
+            for pattern in (DESTRUCTIVE_SYMBOLS[0], DESTRUCTIVE_SYMBOLS[2]):
+                for match in pattern.finditer(line):
+                    problems.append(
+                        f"{relative(path)}:{number}: destructive command "
+                        f"`{match.group(0)}` in the frontend; the webview has no serial "
+                        "route"
+                    )
+    return problems
+
+
+def check_app_port_path() -> list[str]:
+    """The app may open a serial port through exactly one read path.
+
+    `device.rs::probe` opens the port, sends `$PMTK605` / `$PMTK182,2,8` /
+    `$PMTK182,2,1` and closes it; `commands::device_info` is its only caller.
+    A second `Port::open` (or a direct `serialport` constructor) is a new route
+    to the device, and the gate cannot tell a read from a write by the call
+    itself — which is why the rule is "one place", not "no writing today".
+    """
+    problems = []
+    occurrences: list[tuple[Path, int]] = []
+    for path in rust_sources(APP_SRC):
+        text = path.read_text(encoding="utf-8")
+        for number, line in enumerate(text.splitlines(), start=1):
+            for _ in APP_PORT_OPEN.finditer(line):
+                occurrences.append((path, number))
+            for match in APP_OTHER_PORT_OPEN.finditer(line):
+                problems.append(
+                    f"{relative(path)}:{number}: `{match.group(0)}` opens a serial port "
+                    "outside the one read path in src/device.rs"
+                )
+
+    expected = APP / "src" / "device.rs"
+    if not occurrences:
+        problems.append(
+            f"{relative(expected)}: no `Port::open(` call; cannot verify the app's one "
+            "read path (if the probe moved, update this check)"
+        )
+        return problems
+    if len(occurrences) > 1:
+        places = ", ".join(f"{relative(path)}:{number}" for path, number in occurrences)
+        problems.append(
+            f"m241-app opens a serial port in {len(occurrences)} places ({places}); "
+            "exactly one read path in src/device.rs is allowed"
+        )
+        return problems
+
+    path, number = occurrences[0]
+    if path != expected:
+        problems.append(
+            f"{relative(path)}:{number}: `Port::open` outside src/device.rs; the one "
+            "serial path must be the read-only probe there"
+        )
+        return problems
+
+    # The single call must sit inside `probe`, not in a helper that another
+    # command could reach with different requests.
+    masked = masked_source(path.read_text(encoding="utf-8"))
+    probe = re.search(r"\bpub\s+fn\s+(probe)\s*\(", masked)
+    if probe is None:
+        problems.append(
+            f"{relative(path)}: no `pub fn probe`; cannot verify the one port open is "
+            "the read path"
+        )
+    else:
+        span = pub_fn_body_span(masked, probe)
+        if isinstance(span, str):
+            problems.append(f"{relative(path)}: {span}")
+        else:
+            _, opening, closing = span
+            open_at = masked.find("Port::open", opening, closing)
+            if open_at < 0:
+                problems.append(
+                    f"{relative(path)}:{number}: `Port::open` is not inside `probe`; the "
+                    "one serial path must be the read-only probe"
+                )
+
+    commands = APP / "src" / "commands.rs"
+    if commands.is_file():
+        text = commands.read_text(encoding="utf-8")
+        if "device::probe(" not in text:
+            problems.append(
+                f"{relative(commands)}: does not call `device::probe(`; the read-only "
+                "port path has no command behind it"
+            )
+    return problems
+
+
 def main() -> int:
     if not CORE_SRC.is_dir():
         print(f"no m241-core sources found at {relative(CORE_SRC)}")
@@ -892,6 +1145,9 @@ def main() -> int:
         + check_write_layout_gate()
         + check_da_digest_gate()
         + check_gui_write_route()
+        + check_app_dependency()
+        + check_app_destructive_code()
+        + check_app_port_path()
     )
     print(
         f"checked {len(files)} m241-core source/test file(s) for destructive commands, "
@@ -909,7 +1165,9 @@ def main() -> int:
         "the strict image path accepts only the backup diff; the vendor gate is a separate "
         "fixed-SHA function; every public writer runs check_layout() first; the DA digest "
         "token has no production constructor but the pinned one; the GUI carries no opcode "
-        "and builds its WRITE / PROBE tokens only in the screens that check the typed word"
+        "and builds its WRITE / PROBE tokens only in the screens that check the typed word; "
+        "m241-app (Rust and frontend) carries no destructive command and opens a port in "
+        "exactly one read path, and its dependency tree has no write crate until P3"
     )
     return 0
 
