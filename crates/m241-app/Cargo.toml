@@ -41,6 +41,14 @@ tauri = { version = "2", features = [] }
 # weight beyond the crate itself.
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
+# Photo thumbnails: decode the operator's JPEG/PNG and re-encode a small JPEG
+# data URL for the webview. `m241-core` already builds the same `image` crate for
+# KMZ reduction, so this adds the PNG decoder to the same dependency, not a new
+# one.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# The data URL's encoding. Tauri's IPC is JSON, so a thumbnail crosses the
+# boundary as text rather than an array of 40,000 numbers.
+base64 = "0.22"
 
 # The workspace denies `unwrap`/`expect`/`panic` so no library aborts on bad
 # input. This crate is a binary whose `main` must terminate the process with a

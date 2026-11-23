@@ -12,8 +12,10 @@
 //! the first line is what went wrong, the second is what to do about it.
 
 use m241_core::Error as CoreError;
+use tauri::State;
 
 use crate::device;
+use crate::logdoc::{self, AppState, ExportOutcome, LoadedLog, LogSummary, PhotoLoad, PointDto};
 
 /// One serial port as the picker displays it.
 pub use crate::device::PortInfo;
@@ -92,6 +94,130 @@ pub fn describe(error: &CoreError) -> String {
         CoreError::Io { .. } => "書き込み先の権限と空き容量を確認してください。",
     };
     format!("{error}\n対処: {hint}")
+}
+
+/// Open a log document and return its summary.
+///
+/// `path` is an absolute path ending in `.bin`, `.gpx`, `.kml` or `.kmz`. The
+/// parsed track stays in [`AppState`]; the point list is fetched separately with
+/// [`log_points`] so this reply stays small for a large dump.
+///
+/// # Errors
+///
+/// The Japanese two-line message from [`logdoc::read`].
+#[tauri::command]
+pub fn open_log(state: State<'_, AppState>, path: String) -> Result<LogSummary, String> {
+    open(&state, logdoc::read(&path)?)
+}
+
+/// Load the built-in sample track.
+///
+/// The sample is the same shape as an opened document, with `source` set to
+/// `sample`, so every other command on this screen works against it unchanged.
+///
+/// # Errors
+///
+/// Only an internal-state failure; the sample itself cannot fail to load.
+#[tauri::command]
+pub fn open_sample(state: State<'_, AppState>) -> Result<LogSummary, String> {
+    open(&state, logdoc::sample_log())
+}
+
+fn open(state: &State<'_, AppState>, loaded: LoadedLog) -> Result<LogSummary, String> {
+    let summary = logdoc::summary(&loaded);
+    let mut guard = state.log.lock().map_err(|_| internal("log"))?;
+    *guard = Some(loaded);
+    Ok(summary)
+}
+
+/// Return the `[from, to)` slice of the loaded track.
+///
+/// `path` must be the `source` the summary reported; it is compared rather than
+/// trusted so a point list cannot be read out of a document the screen did not
+/// open.
+///
+/// # Errors
+///
+/// A Japanese two-line message when no document is loaded, the source differs,
+/// or the range is invalid.
+#[tauri::command]
+pub fn log_points(
+    state: State<'_, AppState>,
+    path: String,
+    from: usize,
+    to: usize,
+) -> Result<Vec<PointDto>, String> {
+    with_log(&state, &path, |loaded| {
+        logdoc::point_slice(loaded, from, to)
+    })
+}
+
+/// Read a folder of photos and match them to the loaded track.
+///
+/// # Errors
+///
+/// A Japanese two-line message from [`logdoc::load_photos`], or when no document
+/// is loaded or the source differs.
+#[tauri::command]
+pub fn load_photos(
+    state: State<'_, AppState>,
+    path: String,
+    directory: String,
+) -> Result<PhotoLoad, String> {
+    let mut guard = state.log.lock().map_err(|_| internal("log"))?;
+    let loaded = guard.as_mut().ok_or_else(no_document)?;
+    if loaded.source != path {
+        return Err(source_changed());
+    }
+    logdoc::load_photos(loaded, &directory)
+}
+
+/// Write the loaded track to `destination` in `format`.
+///
+/// `format` is one of GPX / KML / CSV / NMEA / JSON / KMZ / HTML / RTF.
+/// `destination` is an absolute path; the frontend proposes the source path with
+/// the new extension and lets the operator change it.
+///
+/// # Errors
+///
+/// A Japanese two-line message from [`logdoc::export`], or when no document is
+/// loaded or the source differs.
+#[tauri::command]
+pub fn export_log(
+    state: State<'_, AppState>,
+    path: String,
+    format: String,
+    destination: String,
+) -> Result<ExportOutcome, String> {
+    with_log(&state, &path, |loaded| {
+        logdoc::export(loaded, &format, &destination)
+    })
+}
+
+/// Run `action` against the loaded document named by `source`.
+fn with_log<T>(
+    state: &State<'_, AppState>,
+    source: &str,
+    action: impl FnOnce(&LoadedLog) -> Result<T, String>,
+) -> Result<T, String> {
+    let guard = state.log.lock().map_err(|_| internal("log"))?;
+    let loaded = guard.as_ref().ok_or_else(no_document)?;
+    if loaded.source != source {
+        return Err(source_changed());
+    }
+    action(loaded)
+}
+
+fn no_document() -> String {
+    String::from("ログが読み込まれていません\n対処: ログを開くか、見本で試してください。")
+}
+
+fn source_changed() -> String {
+    String::from("表示中のログと読み込み先が一致しません\n対処: ログを開き直してください。")
+}
+
+fn internal(what: &str) -> String {
+    format!("ログ画面の内部状態を読めませんでした（{what}）\n対処: 画面を開き直してください。")
 }
 
 #[cfg(test)]
