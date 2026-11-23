@@ -682,8 +682,8 @@ pub fn match_photos(loaded: &mut LoadedLog, photos: Vec<LoadedPhoto>, options: &
     // the track (`--utc-offset-days` adds days to it) and the camera offset moves
     // the photo. The constants are seconds per unit, and the comparison itself
     // stays in `i64` so a 7168-day log offset cannot wrap a `u32`.
-    let photo_to_track_shift = i64::from(options.log_offset_days) * 86_400
-        - i64::from(options.camera_offset_minutes) * 60;
+    let photo_to_track_shift =
+        i64::from(options.log_offset_days) * 86_400 - i64::from(options.camera_offset_minutes) * 60;
     let timed: Vec<(usize, i64)> = loaded
         .track
         .points
@@ -790,8 +790,7 @@ fn same_file(left: &Path, right: &Path) -> bool {
     if left == right {
         return true;
     }
-    let (Ok(left_meta), Ok(right_meta)) =
-        (std::fs::metadata(left), std::fs::metadata(right))
+    let (Ok(left_meta), Ok(right_meta)) = (std::fs::metadata(left), std::fs::metadata(right))
     else {
         return false;
     };
@@ -1769,7 +1768,10 @@ mod tests {
         )
         .expect("load without grouping");
         assert!(
-            ungrouped.photos.iter().all(|photo| photo.group_id.is_none()),
+            ungrouped
+                .photos
+                .iter()
+                .all(|photo| photo.group_id.is_none()),
             "grouping is off by default"
         );
         std::fs::remove_dir_all(&directory).ok();
