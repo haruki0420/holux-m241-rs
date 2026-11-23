@@ -33,6 +33,7 @@ use crate::app::App;
 use crate::screens::Screen;
 use crate::screens::connect::{DaProbeState, DoctorState};
 use crate::screens::firmware::{DumpState, FlashState};
+use crate::screens::log::LogTab;
 use crate::theme;
 
 /// An 8-bit RGBA image, top-down, ready for a PNG.
@@ -695,6 +696,31 @@ pub fn write_all(directory: &Path) -> Result<Vec<std::path::PathBuf>, String> {
             Vec2::new(1280.0, 800.0),
         )?);
     }
+    // The drawer's five tabs are the panels the map hides by default: two images
+    // of the closed drawer would leave four of the five with no rendered frame in
+    // the standard set. The batch above stays the map the review is about; this
+    // one is the panels, at both documented sizes.
+    for (width, height) in [(1280.0, 800.0), (1024.0, 640.0)] {
+        for (tab, slug) in [
+            (LogTab::Summary, "summary"),
+            (LogTab::Photos, "photos"),
+            (LogTab::Edit, "edit"),
+            (LogTab::Export, "export"),
+            (LogTab::Ops, "ops"),
+        ] {
+            let mut app = App::default();
+            prepare(&mut app, Screen::Log);
+            app.log_mut().open_drawer(tab);
+            let name = format!("log-drawer-{slug}-{}x{}.png", width as u32, height as u32);
+            written.push(write_frame(
+                directory,
+                &name,
+                &mut app,
+                Screen::Log,
+                Vec2::new(width, height),
+            )?);
+        }
+    }
     Ok(written)
 }
 
@@ -708,12 +734,13 @@ fn prepare(app: &mut App, screen: Screen) {
         Screen::Connect => app.connect_mut().show_sample(),
         Screen::Log => {
             app.log_mut().show_sample();
-            // The photo block and the KMZ row are the wiring this artifact is
-            // reviewed for, so the Log frame is taken with sample photos loaded
-            // (no file touched) and the KMZ writer selected. The shift controls
-            // are filled with a sample camera as well: the block carries 「見本」,
-            // and the frame shows the resolved-camera and moved-photo readouts
-            // without reading a JPEG.
+            // The photo block and the KMZ row live in the drawer's 写真 and
+            // 書き出し tabs, which `write_all` renders as their own frames
+            // (`log-drawer-photos-*`, `log-drawer-export-*`). The state is loaded
+            // here so those frames show the wiring resolved: sample photos (no
+            // file touched), a sample camera for the shift block, and the KMZ
+            // writer selected. The closed-drawer images still show the map the
+            // review is about.
             app.log_mut().show_sample_photos();
             app.log_mut().show_sample_photo_shift();
             app.log_mut().set_kmz_export();
@@ -838,7 +865,8 @@ mod tests {
     #[test]
     fn the_documented_sizes_render_the_narrow_layout_too() {
         // DESIGN.md §8 names 1280×800 and 1024×640 as the two sizes the review judges,
-        // and §9 makes the Log screen collapse below 1100pt. The narrow size is
+        // and §9 makes the Log screen float its drawer below `metric::NARROW` (1000pt
+        // of content). The narrow size is
         // rendered here rather than only through `write_all`, so a collapse rule that
         // stops working breaks a test instead of a review.
         for (width, height) in [(1280.0_f32, 800.0_f32), (1024.0, 640.0)] {

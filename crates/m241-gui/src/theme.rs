@@ -52,10 +52,11 @@ pub const DATA: Color32 = Color32::from_rgb(0x5F, 0xB3, 0xC4);
 /// that marks the selection; [`DATA`] is the first entry, so a track less than
 /// ten points long stays in the product's own colour.
 ///
-/// Only the offline canvas uses them. On an OSM tile the pale hues measure
-/// below 2:1 against land (#F2EFE9), so the map's records switch to the
-/// `ground` fill and `ink` ring described in [`metric::track`]; the cycle is
-/// what the schematic grid was designed around.
+/// The cycle paints on both canvases. On the schematic grid no casing is needed;
+/// on an OSM tile the pale hue would read under 2:1 against land, so
+/// `map_canvas` draws a `ground` disc one hairline wider under every record and
+/// the cycle stays true with a dark edge (design review 2026-11-23, M1). There is
+/// no second `ink` ring: the selection marker is the only filled ink disc.
 pub const TRACK_PALETTE: [Color32; 10] = [
     DATA,
     Color32::from_rgb(0xB4, 0x7E, 0xC8),
@@ -136,9 +137,9 @@ pub mod metric {
     ///
     /// The reference draws the line at 70% opacity because its map was a dark
     /// schematic. This map's default surface is OSM tile (land #F2EFE9, water
-    /// #AAD3DF): `data` alone measures 1.7:1 on land, so the line is painted at
-    /// full opacity over a `ground` casing — 11:1 or better on either surface
-    /// (design review 2026-11-23, M1).
+    /// #AAD3DF): `data` alone is only 1.7:1 on land by the WCAG formula, so the
+    /// line is painted at full opacity over a `ground` casing, which gives it a
+    /// dark edge on land and water alike (design review 2026-11-23, M1).
     pub mod track {
         /// Stroke width of the map's track polyline.
         pub const LINE_WIDTH: f32 = 5.0;
@@ -195,18 +196,23 @@ pub mod metric {
     pub const TOOL_ROW: f32 = 40.0;
     /// Width of the Log screen's right-hand drawer.
     ///
-    /// Five tab panels' worth of controls. On a window narrower than
-    /// [`NARROW`] the drawer lies over the map instead of beside it: 360pt
-    /// beside an 800pt content area would leave the map a strip rather than the
-    /// main surface.
+    /// Five tab panels' worth of controls. Below [`NARROW`] of content width the
+    /// drawer lies over the map instead of beside it: 360pt beside a sub-1000pt
+    /// canvas would leave the map a strip rather than the main surface.
     pub const DRAWER: f32 = 360.0;
     /// Height of the speed chart (a subordinate series, one step under the map).
     pub const CHART: f32 = 80.0;
     /// Minimum width of a dialog's primary action, so two buttons line up.
     pub const ACTION_WIDTH: f32 = 128.0;
-    /// Below this content width the Log screen stacks instead of splitting
-    /// (DESIGN.md §9 leaves the breakpoint open; this is the one it names).
-    pub const NARROW: f32 = 1_100.0;
+    /// Below this content width the Log screen floats the drawer over the canvas
+    /// instead of giving it a column (DESIGN.md §9 leaves the breakpoint open;
+    /// this is the one it names).
+    ///
+    /// The measure is the Log body's width (`ui.max_rect()`), not the window's:
+    /// the rail and the page margin are part of the window, not of this screen.
+    /// 1000pt leaves a 640pt canvas beside the 360pt column, which is the width
+    /// at which the credit still wraps clear of the zoom plate.
+    pub const NARROW: f32 = 1_000.0;
 }
 
 /// The system font provider, shared by every context.

@@ -683,29 +683,14 @@ impl LogScreen {
 
     /// Open the right-hand drawer on `tab`.
     ///
-    /// Public because the render tests and the screenshot review reach a panel
-    /// without synthesising a click; the toggle on the map is the route a person
-    /// takes. The drawer starts closed (DESIGN.md §5).
+    /// Public because the render tests and the `--screenshot` drawer frames reach
+    /// a panel without synthesising a click; the toggle on the map is the route a
+    /// person takes. The drawer starts closed (DESIGN.md §5), and the only code
+    /// that closes it is the toggle itself, so there is no `close_drawer` to go
+    /// stale.
     pub fn open_drawer(&mut self, tab: LogTab) {
         self.drawer_open = true;
         self.drawer_tab = tab;
-    }
-
-    /// Close the drawer.
-    pub fn close_drawer(&mut self) {
-        self.drawer_open = false;
-    }
-
-    /// Whether the drawer is open.
-    #[must_use]
-    pub fn is_drawer_open(&self) -> bool {
-        self.drawer_open
-    }
-
-    /// The tab the open drawer shows.
-    #[must_use]
-    pub fn drawer_tab(&self) -> LogTab {
-        self.drawer_tab
     }
 
     /// Load a log from disk (offline, read-only): `.bin` via [`log::parse_dump`],
@@ -1303,10 +1288,11 @@ impl LogScreen {
         let tool = self.tool_row(ui);
         layout_probe::tool(tool);
 
-        // A wide window gives the drawer its own column. A narrow one lays it over
-        // the map: 360pt beside an 800pt content area would leave the map a strip
-        // (DESIGN.md §9's collapse rule).
-        let wide = ui.ctx().content_rect().width() >= metric::NARROW;
+        // A wide *content* area gives the drawer its own column; a narrow one lays
+        // it over the map. The threshold is the Log body's width, not the window's:
+        // DESIGN.md §5/§9 name the content width, and the rail and the page margin
+        // are part of the window, not of this screen.
+        let wide = content.width() >= metric::NARROW;
         if self.drawer_open && wide {
             self.drawer_column(ui, settings);
         }
@@ -1329,18 +1315,23 @@ impl LogScreen {
         let response = ui.allocate_rect(map_rect, Sense::CLICK);
         let canvas = self.map_canvas(ui, map_rect, &response, settings);
         ui.allocate_rect(strip_rect, Sense::hover());
-        self.selection_strip(ui, strip_rect, settings);
+        if strip > 0.0 {
+            self.selection_strip(ui, strip_rect, settings);
+        }
 
-        self.map_overlays(ui, map_rect, canvas, settings);
-        if self.drawer_open && !wide {
-            let drawer = Rect::from_min_max(
-                egui::pos2(
-                    map_rect.right() - metric::DRAWER - space::M,
-                    map_rect.top() + metric::TOOL_ROW + space::M + space::L,
-                ),
-                egui::pos2(map_rect.right() - space::M, map_rect.bottom() - space::M),
-            );
-            self.drawer_plate(ui, drawer, settings);
+        // The plates depend on two measurements the canvas produced: the zoom
+        // note adds a row, and a file-load refusal adds the wrapped lines the
+        // plate has to hold. Both are measured before anything is laid out.
+        let file_status_height = self.load_status.as_ref().map_or(0.0, |(status, message)| {
+            let plate_width = (map_rect.width() * 0.55).clamp(280.0, 440.0);
+            drawer::status_height(ui, *status, message, plate_width)
+        });
+        let plates = drawer::Plates::new(map_rect, file_status_height, canvas.note.is_some());
+        let floating = (self.drawer_open && !wide)
+            .then(|| plates.floating(map_rect, self.track.points.is_empty()));
+        self.map_overlays(ui, map_rect, canvas, &plates, floating);
+        if let Some(rect) = floating {
+            self.drawer_plate(ui, rect, settings);
         }
         // Last, so the floating drawer cannot bury the only way out of it.
         self.drawer_toggle(ui, map_rect);
@@ -1774,9 +1765,13 @@ impl LogScreen {
     ///
     /// The map is the product's one light surface (DESIGN.md §5), so everything on
     /// it carries a `ground` casing: the polyline is 5pt of `data` over a 7pt
-    /// `ground` edge, each record is `ground`-filled with an `ink` ring, and the
-    /// credit is painted last so a track crossing the corner cannot cover it
-    /// (design review 2026-11-23, M1 and Should 1).
+    /// `ground` edge, and each record is a palette hue over a `ground` disc. The
+    /// draw order is the contract — grid, tiles, casing, line, records, start/end,
+    /// photos, selection, and the credit last in `map_overlays` — because a
+    /// marker drawn before its background disappears under it. The OSM credit is
+    /// not drawn here: it is an overlay, so `map_overlays` paints it after the
+    /// plates, and its width comes from the plate layout (design review
+    /// 2026-11-23, M1 and Should 1).
     fn map_canvas(
         &mut self,
         ui: &Ui,
@@ -1798,7 +1793,7 @@ impl LogScreen {
                 theme::MUTE,
             );
             return drawer::Canvas {
-                attribution: None,
+                tiles: 0,
                 note: None,
             };
         }
@@ -1910,9 +1905,10 @@ impl LogScreen {
         }
 
         // OSM requires the credit where its tiles are shown; a sample, offline or
-        // still-loading frame shows none, so it carries none. Last, so the 11pt
-        // credit is never painted under a track that crosses the corner.
-        let attribution = (drawn.tiles > 0).then(|| tiles::draw_attribution(&painter, rect));
+        // still-loading frame shows none, so it carries none. The credit itself is
+        // painted by `map_overlays`, after the plates, so the area it may use comes
+        // from the same plate layout as the zoom.
+        let tiles = drawn.tiles;
 
         // Clicking the map selects the nearest plotted point: the map is a
         // picker, not a picture, and a track you cannot ask about is a diagram.
@@ -1928,7 +1924,7 @@ impl LogScreen {
         }
 
         drawer::Canvas {
-            attribution,
+            tiles,
             note: drawn.background.note(),
         }
     }
@@ -3039,6 +3035,41 @@ mod tests {
         }
     }
 
+    /// The leaf shapes one full shell frame paints at `width`×`height`.
+    ///
+    /// Two passes so the immediate-mode layout settles; the second frame's
+    /// shapes are the ones a person sees. `prepare` fills the screen state the
+    /// test is about.
+    fn shell_shapes(
+        width: f32,
+        height: f32,
+        prepare: impl FnOnce(&mut crate::App),
+    ) -> Vec<egui::Shape> {
+        let context = egui::Context::default();
+        crate::theme::install(&context);
+        let mut app = crate::App::default();
+        app.select(crate::screens::Screen::Log);
+        prepare(&mut app);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(width, height),
+            )),
+            ..egui::RawInput::default()
+        };
+        let mut shapes = Vec::new();
+        for _pass in 0..2 {
+            let output = context.run_ui(input.clone(), |ui| app.draw(ui));
+            shapes = output
+                .shapes
+                .iter()
+                .map(|clipped| clipped.shape.clone())
+                .collect();
+            output.drop_without_applying_deltas();
+        }
+        shapes
+    }
+
     #[test]
     fn a_point_row_draws_the_focus_ring() {
         // The design review's Must 1 covers the point list as well as the buttons:
@@ -4052,27 +4083,76 @@ mod tests {
 
     #[test]
     fn the_track_is_five_points_of_data_over_a_seven_point_ground_casing() {
-        // 07-eztour-spec §5's 「幅 5」 is carried over, but not its 70% opacity:
-        // on the light OSM surface `data` at 70% measured 1.7:1, so the line is
-        // full opacity over a `ground` casing (design review 2026-11-23, M1).
-        assert!((metric::track::LINE_WIDTH - 5.0).abs() < f32::EPSILON);
-        assert!((metric::track::CASING_WIDTH - 7.0).abs() < f32::EPSILON);
+        // 07-eztour-spec §5's 「幅 5」 is read from the shapes that were painted,
+        // not from the constants that produced them: the previous version
+        // compared `line_stroke().color` with `theme::DATA`, which is the same
+        // expression twice, and it would have kept passing if the canvas stopped
+        // drawing the line altogether. The casing and full-opacity rule come from
+        // the light OSM surface (design review 2026-11-23, M1).
+        let shapes = shell_shapes(1280.0, 800.0, |app| app.log_mut().show_sample());
+        let mut flat = Vec::new();
+        flatten(&shapes, &mut flat);
+
+        let tracks: Vec<&egui::epaint::PathShape> = flat
+            .iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Path(path) if path.points.len() > 100 => Some(path),
+                _ => None,
+            })
+            .collect();
+        let casing = tracks
+            .iter()
+            .find(|path| (path.stroke.width - 7.0).abs() < f32::EPSILON)
+            .expect("the track casing did not render");
         assert_eq!(
-            metric::track::line_stroke().color,
-            egui::epaint::ColorMode::Solid(theme::DATA),
-            "the polyline is not the data colour at full opacity"
-        );
-        assert_eq!(
-            metric::track::casing_stroke().color,
+            casing.stroke.color,
             egui::epaint::ColorMode::Solid(theme::GROUND),
-            "the casing under the polyline is not the ground colour"
+            "the casing under the track is not the ground colour"
         );
-        const {
-            assert!(
-                metric::track::CASING_WIDTH > metric::track::LINE_WIDTH,
-                "the casing does not show past the polyline"
-            )
-        };
+        let line = tracks
+            .iter()
+            .find(|path| (path.stroke.width - 5.0).abs() < f32::EPSILON)
+            .expect("the track polyline did not render");
+        assert_eq!(
+            line.stroke.color,
+            egui::epaint::ColorMode::Solid(theme::DATA),
+            "the track is not the data colour at full opacity"
+        );
+        assert!(
+            casing.stroke.width > line.stroke.width,
+            "the casing does not show past the polyline"
+        );
+    }
+
+    #[test]
+    fn the_record_fill_cycles_through_the_ten_colours() {
+        // The render test can only see that at least three hues reached the
+        // canvas: a modulo that stopped cycling, or a palette that lost a
+        // colour, would still leave three. `TRACK_PALETTE`'s own doc says the
+        // sequence is what the records carry, so the cycle is pinned directly.
+        assert_eq!(
+            theme::TRACK_PALETTE.len(),
+            10,
+            "the cycle the reference spec names has ten colours"
+        );
+        assert_eq!(
+            metric::track::record_fill(10),
+            metric::track::record_fill(0),
+            "the eleventh record does not return to the first colour"
+        );
+        assert_eq!(
+            metric::track::record_fill(0),
+            theme::DATA.gamma_multiply(metric::track::LINE_OPACITY),
+            "the first colour is not the product's data colour at the record opacity"
+        );
+        for index in 1..theme::TRACK_PALETTE.len() {
+            assert_ne!(
+                metric::track::record_fill(index),
+                metric::track::record_fill(index - 1),
+                "records {index} and {} share a hue, so the sequence is invisible there",
+                index - 1,
+            );
+        }
     }
 
     #[test]
@@ -4791,10 +4871,16 @@ mod tests {
 
     /// A raw input that looks like an X11 window to the map gate.
     fn windowed_input() -> egui::RawInput {
+        windowed_input_at(1280.0, 800.0)
+    }
+
+    /// The same, at a chosen size: the geometry tests drive more than the two
+    /// documented windows, and the tile gate does not care which one it is.
+    fn windowed_input_at(width: f32, height: f32) -> egui::RawInput {
         let mut input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                Vec2::new(1280.0, 800.0),
+                Vec2::new(width, height),
             )),
             ..egui::RawInput::default()
         };
@@ -4804,7 +4890,7 @@ mod tests {
                 native_pixels_per_point: Some(1.0),
                 inner_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
-                    Vec2::new(1280.0, 800.0),
+                    Vec2::new(width, height),
                 )),
                 ..egui::ViewportInfo::default()
             },
@@ -4948,26 +5034,98 @@ mod tests {
     /// `App::draw` — handing the screen a rectangle would make them true by
     /// construction.
     fn log_frame_at(width: f32, height: f32, tab: Option<LogTab>) -> layout_probe::Frame {
+        log_frame(width, height, tab, true, false)
+    }
+
+    /// The same, with the sample state and the tile fetcher chosen by the caller.
+    ///
+    /// `tiles` gives the frame a window gate and a fake fetcher that answers, so
+    /// the OSM credit is actually painted; without it the canvas is headless and
+    /// the credit is (correctly) absent.
+    fn log_frame(
+        width: f32,
+        height: f32,
+        tab: Option<LogTab>,
+        sample: bool,
+        tiles: bool,
+    ) -> layout_probe::Frame {
         let context = egui::Context::default();
         crate::theme::install(&context);
         let mut app = crate::App::default();
         app.select(crate::screens::Screen::Log);
-        app.log_mut().show_sample();
+        if sample {
+            // `set_track` rather than `show_sample`: the sample flag suppresses
+            // OSM tiles (a sample frame has no window), and the credit tests need
+            // tiles on the canvas with a track under them.
+            app.log_mut()
+                .set_track(sample_track(), ParseReport::default());
+        }
+        if tiles {
+            app.log_mut()
+                .set_tile_fetcher_for_test(std::sync::Arc::new(CountingTiles));
+        }
         if let Some(tab) = tab {
             app.log_mut().open_drawer(tab);
         }
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                Vec2::new(width, height),
-            )),
-            ..egui::RawInput::default()
+        let input = if tiles {
+            windowed_input_at(width, height)
+        } else {
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(width, height),
+                )),
+                ..egui::RawInput::default()
+            }
         };
+        if tiles {
+            // The fake fetch runs on a worker; the credit only exists on a frame
+            // that painted a tile, so wait for the texture before recording.
+            for _attempt in 0..200 {
+                let output = context.run_ui(input.clone(), |ui| app.draw(ui));
+                output.drop_without_applying_deltas();
+                if app.log_mut().tiles.texture_count() > 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                app.log_mut().tiles.texture_count() > 0,
+                "the fake fetch produced no texture"
+            );
+        }
         for _pass in 0..2 {
             let output = context.run_ui(input.clone(), |ui| app.draw(ui));
             output.drop_without_applying_deltas();
         }
         layout_probe::last().expect("the Log screen recorded its layout")
+    }
+
+    /// The rect recorded for the overlay named `name`.
+    fn overlay_rect(frame: &layout_probe::Frame, name: &'static str) -> Rect {
+        frame
+            .overlays
+            .iter()
+            .find(|(overlay, _rect)| *overlay == name)
+            .map(|(_name, rect)| *rect)
+            .unwrap_or_else(|| panic!("no {name} plate was drawn: {:?}", frame.overlays))
+    }
+
+    /// Assert that every recorded overlay is on the canvas and none intersect.
+    fn assert_overlays_apart(frame: &layout_probe::Frame, label: &str) {
+        for (index, (name, rect)) in frame.overlays.iter().enumerate() {
+            assert!(
+                frame.map.contains_rect(*rect),
+                "{name} sits outside the canvas at {label}: {rect:?} not in {:?}",
+                frame.map,
+            );
+            for (other_name, other) in &frame.overlays[index + 1..] {
+                assert!(
+                    !rect.intersects(*other),
+                    "{name} {rect:?} overlaps {other_name} {other:?} at {label}",
+                );
+            }
+        }
     }
 
     #[test]
@@ -4997,6 +5155,70 @@ mod tests {
     }
 
     #[test]
+    fn a_long_load_error_wraps_inside_the_file_plate() {
+        // Must 7: the file plate used to cut the refusal to one line and the full
+        // sentence was reachable only by hovering the label — not by keyboard.
+        // The plate now reserves the measured wrapped height and draws every row,
+        // so the whole sentence is on screen.
+        let message = String::from(
+            "/very/long/path/to/a/log/file/that/does/not/exist/on/this/machine.bin \
+             を読めません: そのようなファイルやディレクトリはありません。パスを確認してください。",
+        );
+        let context = egui::Context::default();
+        crate::theme::install(&context);
+        let mut app = crate::App::default();
+        app.select(crate::screens::Screen::Log);
+        app.log_mut()
+            .set_track(sample_track(), ParseReport::default());
+        app.log_mut().load_status = Some((Status::Err, message.clone()));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(1280.0, 800.0),
+            )),
+            ..egui::RawInput::default()
+        };
+        let mut laid_out = String::new();
+        let mut rows = 0;
+        for _pass in 0..2 {
+            let output = context.run_ui(input.clone(), |ui| app.draw(ui));
+            let shapes: Vec<egui::Shape> = output
+                .shapes
+                .iter()
+                .map(|clipped| clipped.shape.clone())
+                .collect();
+            let mut flat = Vec::new();
+            flatten(&shapes, &mut flat);
+            laid_out.clear();
+            rows = 0;
+            for shape in &flat {
+                if let egui::Shape::Text(text) = shape
+                    && text.galley.job.text.contains("を読めません")
+                {
+                    laid_out = text.galley.job.text.clone();
+                    rows = text.galley.rows.len();
+                }
+            }
+            output.drop_without_applying_deltas();
+        }
+        assert_eq!(
+            laid_out, message,
+            "the plate laid out only part of the refusal"
+        );
+        assert!(
+            rows >= 2,
+            "the refusal was laid out on {rows} row(s); it is still being cut"
+        );
+        let frame = layout_probe::last().expect("the Log screen recorded its layout");
+        let file = overlay_rect(&frame, "file");
+        assert!(
+            file.height() > metric::ROW + 3.0 * space::S + 16.0,
+            "the file plate did not grow for the wrapped line: {}pt",
+            file.height(),
+        );
+    }
+
+    #[test]
     fn the_map_plates_do_not_overlap_each_other_or_the_credit() {
         // The overlays are fixed plates anchored to the canvas corners: a caption
         // that grew with its text would move one plate into the next. The geometry
@@ -5013,39 +5235,98 @@ mod tests {
 
         for (width, height) in [(1280.0, 800.0), (1024.0, 640.0)] {
             let frame = log_frame_at(width, height, None);
-            for (index, (name, rect)) in frame.overlays.iter().enumerate() {
-                assert!(
-                    frame.map.contains_rect(*rect),
-                    "{name} sits outside the canvas at {width}×{height}: {rect:?} not in {:?}",
-                    frame.map,
-                );
-                for (other_name, other) in &frame.overlays[index + 1..] {
-                    assert!(
-                        !rect.intersects(*other),
-                        "{name} {rect:?} overlaps {other_name} {other:?} at {width}×{height}",
-                    );
-                }
-            }
+            let label = format!("{width}×{height}");
+            assert_overlays_apart(&frame, &label);
             assert!(
                 frame.overlays.iter().any(|(name, _)| *name == "zoom"),
-                "no zoom plate was drawn at {width}×{height}",
+                "no zoom plate was drawn at {label}",
             );
-            let zoom = frame
-                .overlays
-                .iter()
-                .find(|(name, _)| *name == "zoom")
-                .map(|(_, rect)| *rect)
-                .expect("the zoom plate");
+            let zoom = overlay_rect(&frame, "zoom");
+            // A closed-drawer sample frame draws no OSM tiles, so the credit is
+            // not in the recorded overlays; it is laid out from the plate geometry
+            // that the screen would use on a tiled frame.
+            let plates = super::drawer::Plates::new(frame.map, 0.0, false);
             let painter =
                 egui::Painter::new(context.clone(), egui::LayerId::background(), frame.map);
-            let credit = tiles::draw_attribution(&painter, frame.map);
+            let credit = tiles::draw_attribution(&painter, plates.credit(frame.map));
             assert!(
                 !credit.intersects(zoom),
-                "the credit {credit:?} overlaps the zoom plate {zoom:?} at {width}×{height}",
+                "the credit {credit:?} overlaps the zoom plate {zoom:?} at {label}",
             );
             assert!(
                 frame.map.contains_rect(credit),
-                "the credit sits outside the canvas at {width}×{height}",
+                "the credit sits outside the canvas at {label}",
+            );
+        }
+    }
+
+    #[test]
+    fn the_credit_and_the_zoom_plate_stay_apart_with_the_drawer_open() {
+        // Stage 1, Must 1: with the drawer open the canvas shrinks, and at a
+        // 1200pt window the credit's 356pt plate ran under the zoom plate (map
+        // width 616, credit right edge 360 from the left, zoom left edge 304).
+        // The credit is now laid out in the canvas left of the zoom plate and
+        // wraps to fit, so the two cannot meet at any width; the drawer's
+        // threshold is the content width, so 1200 floats the drawer and the
+        // narrow column starts at 1000pt of content.
+        for width in [1100.0, 1200.0, 1240.0, 1280.0] {
+            let label = format!("{width}×800 with the drawer open");
+            let frame = log_frame(width, 800.0, Some(LogTab::Summary), true, true);
+            let credit = overlay_rect(&frame, "attribution");
+            let zoom = overlay_rect(&frame, "zoom");
+            assert!(
+                !credit.intersects(zoom),
+                "the credit {credit:?} overlaps the zoom plate {zoom:?} at {label}",
+            );
+            assert!(
+                credit.right() <= zoom.left() + 0.5,
+                "the credit {credit:?} reaches past the zoom plate's left edge {:?} at {label}",
+                zoom.left(),
+            );
+            assert_overlays_apart(&frame, &label);
+
+            // The floating drawer is lifted above the playback and zoom plates,
+            // so opening it does not make the map's own controls unreadable.
+            let drawer = frame.drawer.expect("the drawer was not recorded");
+            if drawer.left() < frame.map.right() - 1.0 {
+                assert!(
+                    !drawer.intersects(zoom),
+                    "the floating drawer {drawer:?} covers the zoom plate {zoom:?} at {label}",
+                );
+                if let Some(playback) = frame
+                    .overlays
+                    .iter()
+                    .find(|(name, _rect)| *name == "playback")
+                    .map(|(_name, rect)| *rect)
+                {
+                    assert!(
+                        !drawer.intersects(playback),
+                        "the floating drawer {drawer:?} covers the playback plate {playback:?} at {label}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_log_keeps_its_plate_clear_of_the_drawer() {
+        // The empty state's plate carries the screen's primary action (ログ操作を
+        // 開く) and the 見本 checkbox. A floating drawer over the canvas used to
+        // cover it; the plate is now centred in the canvas width the drawer
+        // leaves, and the drawer is not drawn over it at any of the widths the
+        // geometry tests visit.
+        for width in [1000.0, 1024.0, 1200.0, 1280.0] {
+            let label = format!("{width}×640 empty log");
+            let frame = log_frame(width, 640.0, Some(LogTab::Ops), false, false);
+            let empty = overlay_rect(&frame, "empty");
+            let drawer = frame.drawer.expect("the drawer was not recorded");
+            assert!(
+                !empty.intersects(drawer),
+                "the empty-state plate {empty:?} sits under the drawer {drawer:?} at {label}",
+            );
+            assert!(
+                frame.map.contains_rect(empty),
+                "the empty-state plate sits outside the canvas at {label}",
             );
         }
     }

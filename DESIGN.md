@@ -225,21 +225,24 @@ moves when another changes:
 |---|---|---|
 | Log file | top-left | the path, 開く, and the result of the last load |
 | パネル | top-right | the drawer toggle, the only route into the panels |
-| 再生 | bottom-centre | transport, timeline and the playing point |
+| 再生 | bottom-centre | transport and timeline (the selected point's figures are the strip under the canvas) |
 | zoom | bottom-right | `−` / `＋`, the level actually drawn, the map's state note |
 | credit | bottom-left | `© OpenStreetMap contributors`, only when OSM pixels were drawn |
 
 Each plate is `rail` at 0.92 alpha with `ink` text: over OSM's light face that
 composites above 11:1, where bare `mute` measured 2.3:1. The plate rects are
-fixed and computed in one place (`screens::log::drawer`), and a render test
-asserts that no two of them — nor the credit and the zoom plate — intersect.
+computed in one place (`screens::log::drawer`), and a render test asserts that no
+two of them — nor the credit and the zoom plate, with the drawer open at
+1100–1280pt — intersect.
 
 The drawer is a 360pt right column holding five tabs: 集計 (figures, day filter,
 speed chart, point list), 写真, 編集, 書き出し (format chips, destination, geotag,
 KMZ options) and ログ操作 (download, backup, erase gates, projects, NMEA, read).
-Below 1100pt of content width there is no room for a 360pt column beside a
+Below 1000pt of content width there is no room for a 360pt column beside a
 readable map, so the drawer floats over the canvas instead; the map keeps its
 size and the toggle stays the last thing painted, so it always remains reachable.
+The floating drawer is lifted above the playback and zoom plates, so opening it
+does not bury the map's own controls.
 
 A 32pt selected-point strip sits directly under the canvas, not in a panel below
 the fold: the canvas is a picker, and the answer to a click belongs under the
@@ -315,7 +318,7 @@ reduced motion, and the clear-cache action.
 | Empty log | Log | A plate at the canvas centre: 「まだログがありません」, what to open or download, ログ操作を開く (opens that drawer tab) and the 見本 checkbox. The canvas stays the page |
 | Offline map | Log | Schematic grid plus 「地図タイルを取得できません（オフライン）」 on the zoom plate in `ink`, never bare `mute` on a tile; the track still draws |
 | Drawer closed | Log | The default: five plates over the canvas and no panel taking height from it |
-| Drawer open | Log | 360pt column beside the canvas at or above 1100pt content width; below it the drawer floats over the canvas and the toggle stays on top |
+| Drawer open | Log | 360pt column beside the canvas at or above 1000pt content width; below it the drawer floats over the canvas, above the playback and zoom plates, and the toggle stays on top |
 | Unverified feature | Anywhere | The word 未検証 beside it, `mute`, never `danger` |
 | Loading | Any | Skeleton rows in the table, never a centred spinner |
 | Keyboard | All | Every control focusable, focus ring is a 2px `ink` outline inset 1px |
@@ -344,15 +347,15 @@ UI changes:
    staircase verified, amber inventory verified to be exactly one control.
 3. Findings recorded in `docs/dev/10-review-log.md` with Must / Should / Could.
 
-The ログ操作 console is a design decision about the standard set: the two Log
-images carry the sample track with the drawer closed, so the render is the map
-the review is about. The five drawer tabs are reviewed from two other places: a
-unit test (`every_drawer_tab_opens_and_draws_its_panel`) renders each tab and
-asserts that its panel draws its signature control, and the opt-in
+The standard set is the four screens × two sizes, plus the Log drawer: five
+`log-drawer-<tab>-*` images at each size, because the map is the page and four of
+the five panels would otherwise have no rendered frame at all. The two closed
+Log images stay the map the review is about. A unit test
+(`every_drawer_tab_opens_and_draws_its_panel`) still checks each tab draws its
+signature control without paying for a full-size render, and the opt-in
 `M241_GUI_OPS_SCREENSHOTS=<dir>` run (`cargo test -p m241-gui` writes
-`ops-<mode>.png` for each ログ操作 panel, from the empty log at 1024×640). Adding
-standard images with the drawer open would change what the nine images are for;
-the split keeps the standard set to the four screens × two sizes.
+`ops-<mode>.png` for each ログ操作 panel, from the empty log at 1024×640) renders
+the console's own six panels.
 
 Three checks are mechanical and belong in CI, not in a human pass:
 
@@ -428,20 +431,24 @@ approximation from a mistake.
   `log::tests::the_map_is_the_page_at_both_documented_sizes` fails below the
   80% / 75% floors the review set.
 - The drawer is `metric::DRAWER` (360pt) wide and starts closed. It is a column
-  beside the canvas at a content width of `metric::NARROW` (1100pt) or more and
-  floats over the canvas below that, because 360pt beside a sub-800pt canvas
-  would leave the map a strip rather than the page. The same test drives both
+  beside the canvas at a content width of `metric::NARROW` (1000pt) or more and
+  floats over the canvas below that, because 360pt beside a sub-1000pt canvas
+  would leave the map a strip rather than the page. The threshold is the Log
+  body's width (`ui.max_rect()`), not the window's. The same test drives both
   branches at 1280×800 and 1024×640.
 - Nothing on the Log page itself scrolls. The one scrolling region is inside the
   drawer: its selected tab's panel scrolls, so a tall 集計 or 編集 panel never
   moves the map. The selected-point strip is one row directly under the canvas
   and does not grow.
-- The five overlay plates are fixed rects computed in
-  `screens::log::drawer::Plates` and asserted non-overlapping — including the
-  OSM credit against the zoom plate — by
-  `the_map_plates_do_not_overlap_each_other_or_the_credit`. A caption that grew
-  with its text would move one plate into the next, so the plates truncate
-  instead.
+- The overlay plates are computed in `screens::log::drawer::Plates` and asserted
+  non-overlapping — including the OSM credit against the zoom plate with the
+  drawer open at 1100–1280pt — by
+  `the_map_plates_do_not_overlap_each_other_or_the_credit` and
+  `the_credit_and_the_zoom_plate_stay_apart_with_the_drawer_open`. The plates
+  keep fixed heights except the file plate's status line, which is measured
+  before the plate is laid out and wraps inside it (a long refusal is readable
+  without hovering). The credit is laid out in the canvas left of the zoom plate
+  and wraps to that width, so the two cannot meet.
 - The 書き出し panel is laid out for the drawer's 332pt inner width: the six
   writer chips take two explicit rows, and the destination field and 書き出す
   stack instead of sharing a line. `horizontal_wrapped` cannot break between two
@@ -505,10 +512,10 @@ approximation from a mistake.
   canvas whenever at least one OSM tile reached it. A sample, offline or
   still-loading frame draws no OSM pixels and carries no credit, because the
   credit is a statement about where the pixels came from. The attribution sits
-  bottom-left; the zoom note owns the bottom-right and is lifted above the
-  credit when a narrow canvas would make them collide. The schematic grid is
-  still drawn first and is what the offline state shows, so a failed fetch
-  leaves a readable canvas rather than a blank.
+  bottom-left, wrapped into the width the zoom plate leaves; the zoom note owns
+  the bottom-right. The credit is drawn after the plates so it is never under a
+  track. The schematic grid is still drawn first and is what the offline state
+  shows, so a failed fetch leaves a readable canvas rather than a blank.
 - The track and the tiles are projected through one `MapView` (Web Mercator).
   The previous track projection was equirectangular with a `cos(latitude)`
   correction; close, but a road drawn a few pixels off the tile is exactly the

@@ -1157,19 +1157,32 @@ pub(crate) fn draw_map(
 /// white field would fail the contrast the rest of the product holds itself to.
 /// The map draws this after the track and its markers, so a route that crosses
 /// the corner cannot paint over the credit (design review 2026-11-23, Should 1).
-/// Returns the plate so the caller can keep the zoom plate clear of it.
-pub(crate) fn draw_attribution(painter: &Painter, rect: Rect) -> Rect {
+///
+/// `area` is the canvas bottom-left area the caller computed
+/// (`drawer::Plates::credit`): the zoom plate owns the bottom-right corner, so
+/// the credit wraps to the width left of it instead of growing under it. The
+/// text is laid out bottom-aligned in that area, so a two-line credit still sits
+/// on the canvas's bottom edge rather than hanging from an arbitrary top.
+/// Returns the plate it drew, for the layout test.
+pub(crate) fn draw_attribution(painter: &Painter, area: Rect) -> Rect {
     let text = format!("{ATTRIBUTION} · {ATTRIBUTION_URL}");
-    let galley =
-        painter.layout_no_wrap(text, egui::FontId::proportional(size::CAPTION), theme::INK);
-    let text_size = Vec2::new(galley.rect.width(), galley.rect.height());
-    // Bottom-left: the zoom plate owns the bottom-right corner.
-    let origin = Pos2::new(
-        rect.left() + space::S,
-        rect.bottom() - space::S - text_size.y,
+    let galley = painter.layout(
+        text,
+        egui::FontId::proportional(size::CAPTION),
+        theme::INK,
+        area.width(),
     );
+    let text_size = Vec2::new(galley.rect.width(), galley.rect.height());
+    // Bottom-left of the area: the zoom plate owns the bottom-right corner.
+    let origin = Pos2::new(area.left(), area.bottom() - text_size.y);
     let plate = Rect::from_min_size(origin, text_size).expand(space::XS);
-    painter.rect_filled(plate, theme::RADIUS, theme::RAIL.gamma_multiply(0.9));
+    // The same plate the map's other overlays use, so the two alphas cannot
+    // drift apart (design review 2026-11-23, Should S5).
+    painter.rect_filled(
+        plate,
+        theme::RADIUS,
+        theme::RAIL.gamma_multiply(super::drawer::PLATE_ALPHA),
+    );
     painter.galley(origin, galley, theme::INK);
     plate
 }
