@@ -1,545 +1,104 @@
 # Verification: what was measured, and what was not
 
-This page is the only place a claim may move from 未検証 to verified. Every other
-document points here.
-
-`✅` measured on a retail M-241 · `⚠️` not measured on hardware · `🧪` covered by
-the simulator and tests only — see §3 for what that is and is not worth.
+This page is the only authority that may move a claim from 未検証 to verified.
+`✅` measured on a retail M-241 · `⚠️` not measured on hardware · `🧪` simulator and tests only (§3).
 
 ## 1. The hardware sessions
 
-### 1.1 The write and dump (2026-11-15)
+### 1.1 Initial dump and write (2026-11-15, v1 / manual)
 
-Device: `B-core_1.20`, build `0043`, model `01017-00F` (V1.13), MT3318.
-Host: Windows 11, CP210x bridge (VID 10C4 / PID EA60) as a COM port.
+Device: `B-core_1.20`, build `0043`, model `01017-00F` (V1.13), MT3318. Host: Windows 11, CP210x (VID 10C4 / PID EA60).
 
 | Step | Result | Status |
 |---|---|---|
-| `$PMTK705` identity read | returned the strings above | ✅ |
-| BootROM entry via `$PMTK180*3B`, then `0xA0`/`0x0A`/`0x50`/`0x05` | 36 probes before `0x5F` | ✅ |
-| Firmware dump, 406,620 bytes, read twice | SHA-256 identical both passes | ✅ |
-| Header decode | family `HOLUX_M-241`, device `01017-00F`, build 67 | ✅ |
-| WNRO patch | 3 bytes changed: `0x402F6`, `0x402F7`, `0x59C2C` | ✅ |
-| Flash write through the DA | every packet accepted, DA restarted | ✅ |
-| Boot after flash | the logger booted | ✅ |
-| `$GPRMC` after flash | date `151126` = 2026-11-15 | ✅ |
-| Log download | 212,860 bytes, 10,399 records, 0 CRC errors | ✅ |
+| `$PMTK705` identity | returned strings above | ✅ |
+| BootROM entry (`$PMTK180*3B` + sync) | 36 probes before `0x5F` | ✅ |
+| Firmware dump (406,620 B, ×2) | identical SHA-256 both passes | ✅ |
+| Header decode | `HOLUX_M-241`, `01017-00F`, build 67 | ✅ |
+| WNRO patch | 3 bytes changed (`0x402F6`, `0x402F7`, `0x59C2C`) | ✅ |
+| Flash write via DA + boot | all packets accepted, booted; `$GPRMC` date `151126` (2026-11-15) | ✅ |
+| Log download | 212,860 B, 10,399 records, 0 CRC errors | ✅ |
 
-The measured dump's SHA-256 differs per unit because the image contains
-per-unit runtime fields; compare against your own backup, never against a
-figure on this page.
+Dump SHA-256 differs per unit (per-unit runtime fields); compare against your own backup.
 
-A **settlement row** for the DA-side firmware base is the only row that may
-justify emptying `UNRESOLVED_STARTS`. It must contain at least:
+**Settlement row rule** (for emptying `UNRESOLVED_STARTS`): must record exact `fw probe-da` command with resolved `--port`/`--da`, `0xD6` output at both `0` and `0x00200000` (failed read = "not read"), whether first 4 bytes are `18 F0 9F E5`, adopted base & why other excluded, date, and explicit "no flash written". The 2026-11-15 manual flash above is **not** a settlement row.
 
-* the exact `fw probe-da` command line that ran, including the resolved
-  `--port` and the `--da` path;
-* what `0xD6` returned at **both** candidates, `0` and `0x00200000` — a failed
-  read is recorded as "not read", never as a mismatch;
-* whether the first four bytes at the adopted base are `18 F0 9F E5`;
-* the base adopted, and why the other candidate was excluded;
-* the date;
-* an explicit statement that the run wrote no flash (DA load into RAM only).
+### 1.2 DA-side base settlement (2026-11-21)
 
-The `Flash write through the DA … ✅` row above is the earlier manual flash.
-It is **not** a settlement row: it records no `fw probe-da` run and says
-nothing about which base the DA uses, so it cannot justify emptying
-`UNRESOLVED_STARTS`.
-
-### 1.2 The DA-side base read (2026-11-21)
-
-Device: the same retail M-241. Host: Linux, `/dev/ttyUSB0` (USB serial).
-
-Command, after re-entering the BootROM with `--assume-brom`:
+Device: same M-241. Host: Linux `/dev/ttyUSB0`.
 
 ```text
 m241 fw probe-da --da <DA_v3.8.4.bin> --port /dev/ttyUSB0 --yes --assume-brom
-```
-
-Output:
-
-```text
-loading the DA into RAM on /dev/ttyUSB0 (this writes no flash), then reading 64 bytes at 0x00000000 and 0x00200000
-BootROM sync answered; writing the DA into the chip's RAM
-DA v3.8 answered (region 0x49, flash 00C2:22BA, 524288 bytes); reading
 0x00000000  : read, first bytes 18 F0 9F E5 (matches the vector 18 F0 9F E5)  first 16: 18 F0 9F E5 18 F0 9F E5 18 F0 9F E5 18 F0 9F E5
 0x00200000  : read, first bytes 02 02 20 42 (does not match the vector)  first 16: 02 02 20 42 00 00 AA 55 AA 55 AA 55 AA 55
 verdict     : the image is at 0x00000000
 flash write : no
 ```
 
-* **DA-side base: `0x00000000`.** The first four bytes are the firmware vector
-  `18 F0 9F E5`, and the first 64 bytes match the vendor V1.13 image's first 64
-  bytes exactly.
-* **`0x00200000` in the DA's view is not firmware.** It reads `02 02 20 42`,
-  consistent with the unmapped-bus pattern `42 20 02 02` byte-reversed. This is
-  a different address view from the BootROM's: the BootROM reads the firmware
-  vector at `0x00200000`, while the DA reads it at `0`. The same number means
-  different things in the two views.
-* **No flash was written.** The only writes were the BootROM's `0xA1` frames
-  into the DA's RAM at `0x00100800`–`0x0010422F`, and the `0xA8` jump. No
-  `0xD3`, `0xD4`, `0xD5` or `0xD9` was sent.
-* **Manual check in the same session:** one `0xD6` page with a 64-byte
-  page-length argument is **64 data bytes + a 2-byte big-endian checksum** (66
-  bytes total). The trailer of the page read at address `0` was `0x17FF`, equal
-  to the sum of its 64 bytes.
-* The first attempt read four bytes off (trailer `0x7035`, sum `0x1870`); after
-  the drain fix the read succeeded. **Four bytes remained after the banner**;
-  their origin is not established.
-* Only **one page** was read at each address. Multi-page reads, the advance
-  after the final page of a multi-page read, and bytes between pages were not
-  exercised.
+- **Settled DA-side base: `0x00000000`** (first 64 B match vendor V1.13). `0x00200000` reads `02 02 20 42` (unmapped bus; BootROM view differs from DA view).
+- **No flash written** (`0xA1` RAM load to `0x00100800`–`0x0010422F` + `0xA8` jump + `0xD6` read only).
+- **Single-page `0xD6` measured**: `page_len = 64` emitted 64 data bytes + 2-byte BE checksum `0x17FF` (66 B). 4 unexplained bytes remained after the 20-byte banner (drained before `0xD6`). ⚠️ Multi-page reads and post-final-page advance remain unmeasured.
 
-### 1.3 The first `0xD3` after the DA banner (2026-11-22)
+### 1.3 First `0xD3` banner residue (2026-11-22)
 
-Device: the same retail M-241. Host: Linux, `/dev/ttyUSB0`.
+Host: Linux `/dev/ttyUSB0`. Two `fw flash` attempts failed before `0xD5` with `0xD3 answered 0xBB` (flash untouched) because the 4 post-banner bytes can arrive *after* a pre-command clear. Client now resynchronises up to 8 non-`0x5A`/non-`0xA5` bytes and retries once via `0xD9` if failure occurs before `0xD5`. ⚠️ Automatic retry has not been triggered on hardware.
 
-A real `fw flash` attempt reached the write sequence and then stopped at the
-first range command:
+### 1.4 Final `0xD5` packet failure (2026-11-22)
 
-```text
-BootROM sync answered; comparing the whole unit with the backup before any erase
-the unit matches the backup; loading the DA into the chip's RAM (no flash write yet)
-DA v3.8 answered; programming 406620 bytes in 1589 packets
-m241: error: framing error: 0xD3 answered 0xBB; expected 0x5A or 0xA5
-```
+Two runs (`--allow-vendor` and `--recover`) programmed 1,588/1,589 packets (406,528/406,620 B, 99%) and failed on packet 1,588 with `0x01` (expected `0x69`). Cause: client zero-padded the final packet to 256 B + 2 B sum, whereas DA reads only `406620 mod 256 = 92` B + 2 B sum (`01-da-protocol.md` §4.3). ⚠️ Exact meaning of wire byte `0x01` remains unestablished.
 
-* **The flash was not changed.** `0xD3` only records a range; the erase is
-  inside `0xD5`, which was never sent (`docs/reference/01-da-protocol.md` §4.1,
-  §5.3).
-* `0xBB` is consistent with one of the **four bytes after the DA banner**
-  recorded in §1.2 being read as the `0xD3` ACK. The previous client drained
-  those bytes before `0xD6`; it did not drain before the first `0xD3`.
-* The client now clears the input at the start of `record_range`, so both the
-  first `0xD3` and `0xD6` drain the banner residue. ⚠️ The fix has **not** been
-  re-run on hardware; this row records the failure that motivated it.
-* A second hardware run after that clear-only fix still failed with the same
-  `0xD3 answered 0xBB`. The four bytes can arrive **after** the pre-command
-  clear, so a clear alone is not enough. The reply reader now resynchronises:
-  it skips non-`0x5A` / non-`0xA5` bytes up to 8 within the same reply timeout,
-  then reads the real `5A 00` or `A5`. On a `0xD3` failure before `0xD5`, the
-  CLI also sends `0xD9`, re-enters the BootROM, reloads the DA and retries
-  once; after `0xD5` starts it sends `0xD9` only. ⚠️ The automatic retry has
-  not been re-run on a unit. The `0xD3` phase did succeed in the 2026-11-22 runs
-  of §1.4 (they reached the `0xD5` phase), so the `0xBB` failure did not recur;
-  those logs do not record which commit the binary came from, so this page does
-  not promote the resynchronised read to ✅ on their strength alone.
+### 1.5 Completed Rust writes and sessions (2026-11-22 / 2026-11-23)
 
-### 1.4 The final `0xD5` packet (2026-11-22)
-
-Device: the same retail M-241. Host: Linux over USB serial.
-
-Two write attempts — the official V1.13 vendor image (`--allow-vendor`) and the
-recovery write of the unit's own backup (`--recover`) — both reached the write
-sequence and stopped on the last packet:
-
-```text
-DA v3.8 answered; programming 406620 bytes in 1589 packets
-m241: error: framing error: 0xD5 packet 1588 answered 0x01, expected 0x69. packets up to DA address 0x00063400 were programmed (406528 of 406620 bytes, 99%); the range is now only partly erased and programmed.
-```
-
-* **Where it stopped:** 1,588 packets were answered `0x69`, 406,528 of 406,620
-  bytes were programmed, and the failure is packet index 1,588 — the 1,589th and
-  last. The run reached 99%; it did not fail early or on the range command.
-* **What the client sent:** every packet was zero-filled to `PACKET_SIZE`
-  (`0x100`) and the two-byte trailer was the sum of the padded payload. The
-  final packet therefore went out as 256 payload bytes + 2 checksum bytes,
-  where the DA reads only 92 payload bytes + 2 (`0x00102474`,
-  `docs/reference/01-da-protocol.md` §4.3).
-* **Why that cannot pass the packet check:** the DA reads the first 92 bytes as
-  payload and the next two — the client's zero padding — as the trailer, so the
-  sums disagree (§4.4 of the same page). For the 406,620-byte image the
-  remainder is `406620 mod 256 = 92`.
-* **`0x01` is not explained.** §4.4's mismatch path ends in `0xA5` and a
-  restart, but the wire carried `0x01`; which DA status it is, is **not**
-  established. The client reports it as a framing failure and does not retry
-  on it.
-* **The `0xD3` phase succeeded in both runs.** Both reached the `0xD5` phase, so
-  the `0xBB` failure of §1.3 did not recur here; the failure is later, in
-  `0xD5`. Which commit the binary came from is not in these logs, so this does
-  not promote the resynchronised read to ✅.
-* **Both runs ended with a `0xD9` restart**, which has no reply, so the restart
-  is not confirmed by these logs. The flash is partly erased and programmed at
-  this point; the recovery path (`m241 fw dump`, then `fw flash --recover`) is
-  the documented next step.
-* **The fix was re-run on a unit later the same day and completed**; §1.5
-  records the runs, the read-back and the boot. This section is the failure
-  that motivated the change.
-
-### 1.5 The writes that completed (2026-11-22)
-
-Device: the same retail M-241 (`B-core_1.20`, build `0043`, model `01017-00F`,
-flash `00C2:22BA`). Host: Linux, `/dev/m241` (udev symlink to `/dev/ttyUSB0`).
-Binary: `fix/flash-d3-resync` at `b8d91ee` — the client that sends the final
-`0xD5` packet at the DA's receive length (§1.4); that branch is PR #19, merged
-into `main` as `877881c`, and this page records the runs, not the merge. Every
-write below was approved per execution by an independent reviewer
-(`AGENTS.md` §2.5). The two strict writes compared the unit with the backup
-before the DA was loaded (`verify_device`); the **recovery write did not** —
-`--recover` skips that comparison by design, because a partly written unit
-cannot match its backup, and its log says so (`recovery mode: … the whole-unit
-comparison is skipped; checking only the M-241 vector and family markers`).
+Device: same M-241. Host: Linux `/dev/m241` → `/dev/ttyUSB0`. Binary: `fix/flash-d3-resync` (`b8d91ee`, merged to `main` as `877881c`), each write independently approved per `AGENTS.md` §2.5.
 
 | Step | Command | Result | Status |
 |---|---|---|---|
 | identity | `m241 device info` | `B-core_1.20` / `0043` / `01017-00F` / sdk 1.0 | ✅ |
-| dump | `m241 fw dump` | 406,620 bytes, two reads identical, SHA-256 `9f192786…` | ✅ |
-| DA base | `m241 fw probe-da` | DA v3.8, `0x00000000` = `18 F0 9F E5`, `0x00200000` = `02 02 20 42`, `flash write : no` | ✅ |
-| vendor write | `m241 fw flash --allow-vendor` | 1589/1589 packets, 406,620 bytes programmed; read-back differed at `0x5C` (see below) | ⚠️ |
-| recovery write | `m241 fw flash --recover` (the unit's own dump) | 1589 packets, `verified: 406620 bytes read back and identical` | ✅ |
-| patch | `m241 fw patch` on a fresh V1.13 dump | 3 bytes changed (`0x402F6`, `0x402F7`, `0x59C2C`), epoch `935280000`, marker V1.14 | ✅ |
-| patched write | `m241 fw flash --yes` (patched image, backup = the fresh dump) | 1589 packets, `verified: 406620 bytes read back and identical` | ✅ |
-| boot of V1.14 | `m241 device info` + NMEA | `device info` answered; the NMEA default date was `22-08-99` (1999-08-22, the patched epoch `935280000`; unpatched would be `06-01-80`) | ✅ |
+| dump | `m241 fw dump` | 406,620 B, 2 reads identical, SHA-256 `9f192786…` | ✅ |
+| DA base | `m241 fw probe-da` | `0x00000000` = `18 F0 9F E5`, `0x00200000` = `02 02 20 42`, `flash write : no` | ✅ |
+| vendor write | `m241 fw flash --allow-vendor` | 1589/1589 pkts written, booted stock V1.13 (`06-01-80`); read-back differed at `0x5C` (see below) | ⚠️ |
+| recovery write | `m241 fw flash --recover` | 1589 pkts, `verified: 406620 bytes read back and identical` (`verify_device` skipped by design) | ✅ |
+| patch | `m241 fw patch` on fresh dump | 3 bytes (`0x402F6`, `0x402F7`, `0x59C2C`), epoch `935280000`, marker V1.14 | ✅ |
+| patched write | `m241 fw flash --yes` | 1589 pkts, `verified: 406620 bytes read back and identical` | ✅ |
+| boot V1.14 | `device info` + NMEA | answered; default no-fix date `22-08-99` (epoch `935280000`; stock was `06-01-80`) | ✅ |
 
-The raw command output quoted on this page was captured in the session that ran
-the commands and is not committed here: the captures are device transcripts and
-the repository does not take them (`AGENTS.md` §6). The quoted lines are
-verbatim; each is the line the client printed.
+- **Vendor write `0x5C` discrepancy**: firmware restores its 4 per-unit bytes `0x5C`–`0x5F` (`91 1B D4 CF`) on boot, so post-reboot read-back differs from vendor `0xFF` at `0x5C`. The other 10 per-unit bytes (`0xF8`–`0xFD`, `0x63458`–`0x6345B`) held vendor values. Source of restored bytes and read-back policy remain open ([`06-open-questions.md`](06-open-questions.md) §8).
+- **V1.12 refused before port open**: dry runs exited 5 for both normal and `--allow-vendor` (`32fe5269…` pin).
+- **No-fix clock & `nmea proxy` (2026-11-22/23)**: later with no fix (`GGA` quality 0, `RMC` `V`), unit emitted `$GPRMC` date `221126` (2026-11-22) matching host clock; `nmea proxy` relayed to stdout and `tcp://127.0.0.1:10110` (9/9 valid checksums; `--offset-days 1` → `231126`). ⚠️ Live GPS fix date, RTC vs GPS time origin, long TCP runs, multi-client, and non-loopback bind remain 未検証.
+- **Post-write log download (2026-11-22)**: 3,228 B then 3,260 B (no framing errors; GUI read 3,292 B). Offline analysis showed 0 track points — settings journal only (141×16 B + 23×20 B). Re-parsing with PR #34 yields `journal_only: true` (164/166 items) and fixes the 2026-11-21 225,028 B dump to 10,942 points / 0 bad checksums / 248 journal items. ⚠️ Recording track points after flash remains 未検証.
+- **GUI on real unit (2026-11-22, X11)**: Connect screen listed ports and 「接続して確認」 read `B-core_1.20` / `0043` / `01017-00F` / SDK `1.0` and log usage `3,292 B` (有効) ✅. ⚠️ Log open, follow, geotag, KMZ, shift, edit, device download/erase/relay, and GUI firmware write were not exercised on hardware.
+- **GUI Log + OSM tiles on dev host (2026-11-23, NO M-241 attached)**: X11 drew 10,942-point dump + OSM tiles + attribution ✅ (dev host); Wayland cached 8 tiles ✅ (fetch only; appearance 未検証); headless/`--screenshot` fetched 0 tiles 🧪.
 
-* **The write path completed on a unit for the first time.** Both successful
-  runs reached the final packet, were acknowledged, restarted the chip with
-  `0xD9`, re-entered the BootROM through the NMEA / `$PMTK180*3B` route and read
-  the whole 406,620-byte range back; the read-back matched the written image
-  exactly. The fake and the unit tests are no longer the only evidence.
-* **The patched image came from a unit dump, not from the vendor file.**
-  `fw patch` was run on the fresh V1.13 dump, so the patched image carries the
-  unit's current per-unit bytes; the strict write compared it with that dump and
-  only the three patch bytes differ.
-* **The patched firmware boots, and the running firmware carries the patched
-  epoch.** After the strict write the unit was power-cycled by the user and the
-  client answered: `device info` returned `B-core_1.20` / `0043` /
-  `01017-00F`, and the NMEA stream reported the default date `22-08-99`
-  (1999-08-22) — the value the patched constant `935280000` produces when there
-  is no fix. The stock image reported `06-01-80` in the same session, so this is a
-  measured difference between the two images, not a guess from the write.
-* **未検証: the date with a real fix.** With no satellites indoors the unit
-  reported its default time right after the write, not a GPS-derived one; that a
-  live fix now produces today's date has not been observed. Later on 2026-11-22
-  the same unit, still with no fix, reported the current UTC date — see
-  "The no-fix date matches the host clock" below — so the no-fix clock does move
-  past the constant, but how it gets set is not established. Recording a track
-  and reading it back with the WNRO-corrected timestamp is the next step, and it
-  needs sky, not a cable.
+## 1a. Linux log-erase hardware session (2026-11-21)
 
-#### The no-fix date matches the host clock (2026-11-22)
-
-Device: the same retail M-241, running the patched V1.14 image written above.
-Host: Linux, the unit over USB serial. The host clock stood at
-`2026-11-22T15:23:11Z`–`2026-11-22T15:23:22Z` across the captures.
+Device: M-241 over CP210x. Binary: `bf41c2e` (`feat/log-erase-wire`, predates empty-log refusal `ea53d1a` and lost-stop-ACK resume).
 
 | Step | Result | Status |
 |---|---|---|
-| `m241 device info` | `B-core_1.20` / `0043` / `01017-00F` / sdk 1.0 | ✅ |
-| raw NMEA, first sentence of the window | `$GPRMC,152314.586,V,8960.0000,N,00000.0000,E,0.00,0.00,221126,,,N*7E` | ✅ |
-| raw NMEA, the `$GPGGA` of the same second | `$GPGGA,152314.586,8960.0000,N,00000.0000,E,0,0,,137.0,M,13.0,M,,*48` | ✅ |
-| the same stream through `m241 nmea proxy` | `$GPRMC,152322.586,V,…221126,,,N*7B` at host `15:23:22Z`; the proxy applied no offset | ✅ |
-| fix state | `$GPGGA` quality `0`, `0` satellites; `$GPRMC` status `V` | ✅ |
-| date and time against the host | both dates `221126` (2026-11-22); sentence time within a few seconds of the host clock | ✅ |
+| Bare `$PMTK182,6` (pre-fix) | backup 225,028 B saved, failed; log untouched (225,060 B) | ✅ (negative) |
+| `$PMTK182,5` → `$PMTK182,6,1*3E` → `$PMTK182,4` | backup 225,092 B saved, `erased: yes`, exit 0 | ✅ |
+| Post-erase `log download` | 528 B (`0x210`), `records: 0`, `fixes: 0`, exit 0 | ✅ |
+| Empty-log refusal & lost-stop-ACK resume | not re-run on hardware | ⚠️ |
 
-* **Without a fix the unit reports the current UTC date and time.** Eight
-  `$GPRMC` and eight `$GPGGA` sentences were captured between host
-  `15:23:11Z` and `15:23:19Z`; every date field was `221126`, and the time
-  fields ran from `152314.586` to `152321.586`, i.e. with the host clock. A
-  second capture through `m241 nmea proxy` at `15:23:22Z` printed
-  `$GPRMC,152322.586,V,…221126…`. A separate pass about 46 s before the host
-  window above (`$GPRMC,152224.586,…,221126,…`; its `$GPGGA` sentence read
-  `15:22:25Z`, which is the sentence's own time — that pass's host clock was
-  not recorded) agrees.
-* **This is not the constant.** The stock image reported `06-01-80` (its epoch
-  `315964800`) and the patched image reported `22-08-99` (its epoch
-  `935280000`) when the unit was started with no fix (above). Today's `221126`
-  is neither, so the sentence is carrying a clock value, not just the constant.
-* **What is still 未検証.** Whether the clock behind this date is a free-running
-  RTC, a value set by an earlier GPS fix, or something else is not established;
-  the unit was not observed from a known-unset clock to this state, and no
-  unpatched image with a running clock was observed. How much of the correct
-  date comes from the patch and how much from the clock's current value is
-  therefore not separated. The date from a **live fix** remains unobserved, and
-  the source of the time (RTC or GPS time) is not established.
-* The raw capture and the command output were written to a temporary directory
-  outside the repository and are not committed (`AGENTS.md` §6); the sentences
-  above are verbatim.
+## 2. Verification summary (open vs closed)
 
-#### The nmea proxy over TCP (2026-11-22/23)
-
-Device: the same unit. The proxy ran with `--bind` on `127.0.0.1:10110`; the
-client's note line read `relaying repaired NMEA on tcp://127.0.0.1:10110`.
-
-| Step | Result | Status |
-|---|---|---|
-| TCP relay | 9 sentences reached a TCP client at `tcp://127.0.0.1:10110` | ✅ |
-| checksums | 9 of 9 valid after the repair | ✅ |
-| date | `221126` (2026-11-22), the unit's no-fix clock | ✅ |
-| `--offset-days 1` | the date became `231126` | ✅ |
-
-* The TCP path relays the same repaired lines as stdout. The listener refuses a
-  non-loopback address unless `--allow-non-loopback` is passed
-  (`bind_checked_listener` in `crates/m241-cli/src/nmea.rs`).
-* **未検証**: a long-running relay, more than one client at a time, a
-  non-loopback bind, and a stream that carries a real fix. The date above comes
-  from the unit's no-fix clock, not from a fix.
-* The raw capture is not committed (`AGENTS.md` §6).
-
-#### The log read back after the writes (2026-11-22)
-
-Device: the same unit, still recording. The read is
-`m241 log download --port <port> --output <file>`, run twice about ten seconds
-apart; nothing was erased or written.
-
-| Step | Result | Status |
-|---|---|---|
-| first download | 3,228 bytes, no framing error; the parser then in the tree counted 135 "records" | ✅ |
-| second download | 3,260 bytes; the parser then in the tree counted 137 "records" | ✅ |
-| what the bytes are | no track point at all: a settings / state journal (141 × 16-byte entries of `AA`×7 + a type + a `u32` value + `BB`×4, and 23 × 20-byte `HOLUXGR241LOGGER` strings; 141 × 16 + 23 × 20 = 2,716 = 3,228 − `0x200`) | ✅ (offline analysis) |
-| re-parse of both dumps with the parser from PR #34 | 0 points, `journal_only: true`, 164 and 166 journal items (3,228 / 3,260 bytes) | ✅ (offline analysis) |
-| block / record checksums as the 2026-11-22 binary printed them | `1 of 1 blocks failed their header checksum` in both, and every record checksum failed (`bad checksums: 135`, then `137`) | ✅ (what that binary printed; the wording was replaced by PR #34) |
-| log usage through the GUI minutes later | `3,292 B`, recording 「有効」 | ✅ |
-
-* The transport was clean: neither run hit a framing error, and the unit's log
-  usage grew between them (3,228 → 3,260 bytes), so the log was written between
-  the two reads. The GUI then reported `3,292 B`.
-* **The downloads contain no track points.** The block holds the unit's
-  settings / state journal, not position records. The parser that ran that day
-  took a 20-byte record from the block header's mask and read the journal as
-  135 / 137 points, which is why every per-record checksum failed. The same
-  misread reproduces on a log downloaded before the write (2026-11-21, 225,028
-  bytes; 4,481 of 11,088 record checksums failed, and block 1 had none — blocks
-  0, 2 and 3 mix in the journal and lose record sync), so the data does not
-  support "the write damaged the log area".
-* **The parser was fixed in PR #34 (merged, `fix-log-journal`).** It recognises
-  the journal shapes and skips them, so re-parsing the saved 2026-11-22 dumps
-  yields 0 points with `journal_only: true` (164 and 166 journal items), and the
-  2026-11-21 dump yields 10,942 points with 0 record-checksum mismatches and 248
-  journal items — the old 11,088 points included 4,481 fabricated ones. This is
-  an offline re-parse of the saved dumps, not a run of the fixed binary against
-  the unit.
-* **The warning wording the 2026-11-22 binary printed was wrong.** The code has
-  no header checksum: `N of M blocks failed their header checksum` counted the
-  blocks holding record-checksum mismatches. PR #34 replaced it with
-  `N of M blocks contain records whose checksum did not match; those records
-  were skipped`, and a journal-only dump now prints `no track points (settings
-  journal only)`. The new wording is pinned by the CLI tests (🧪); no hardware
-  run has printed it.
-* **The download still cannot be used as evidence of a post-flash timestamp.**
-  The old parser's decoded dates were nonsense and are not used anywhere; with
-  the fixed parser the dumps hold no timestamp at all. Whether the unit records
-  track points after the write — with or without a fix — remains **未検証**.
-* The raw dump is not committed: it is the user's track data (`AGENTS.md` §6).
-
-#### The GUI on a real unit (2026-11-22)
-
-Device: the same unit, running the patched V1.14 image. Host: Linux, X11.
-Binary: `target/debug/m241-gui` built from this working tree; the exact commit
-it was built from was not recorded.
-
-| Step | Result | Status |
-|---|---|---|
-| start the window with the unit attached | the Connect screen listed the host's serial ports and had the unit's port selected by default; its diagnostic line named the CP210x / PL2303 / FTDI / CH340 cable types | ✅ |
-| 「接続して確認」 | 「接続済み（読み取り専用）」; firmware `B-core_1.20`, build `0043`, model `01017-00F`, SDK `1.0`; the capture was cut off at the SDK line, so the 状態 row drawn under it is not in the capture | ✅ |
-| log usage through the same probe | `3,292 B`, recording 「有効」 | ✅ |
-| open a downloaded log in the Log screen | not exercised: its file-path field needs keyboard input, and no keyboard could be injected into the X11 window in this session | ⚠️ |
-| 追従 render on a real track | not exercised (it needs a log loaded in the previous row) | ⚠️ |
-| photo geotag / JPEG write through the GUI | not exercised: needs a real camera JPEG and a photo folder; that path is still covered by synthetic JPEGs only | ⚠️ |
-| KMZ writer, photo clock shift and track editing in the Log screen | not exercised: wired into the Log screen by PR #31, after this session; each needs a log loaded there, the shift and photo write need real camera JPEGs, and a KMZ has not been opened in Google Earth or `unzip` | ⚠️ |
-
-* The connect probe **reads** only: the screen says 読み取り専用, and the probe
-  path never pulses DTR/RTS (`AGENTS.md` §2.1). It opened the port, read
-  `$PMTK705`, then asked the unit for its log usage.
-* The 状態 row is drawn immediately after the SDK line
-  (`crates/m241-gui/src/screens/connect.rs`, `figure_row(ui, "状態", …)`); the
-  capture ends below the SDK line, so the row was not visible in it and this
-  page does not record it as observed. The code would show
-  「既知リリース（日付修正対象）」 for this unit, because `is_known_release()`
-  accepts any release starting `B-core_1.` (`crates/m241-core/src/types.rs`).
-* The usage the GUI showed (`3,292 B`) agrees with the `log download` byte
-  counts of the same minutes (3,228 then 3,260), so the GUI and the CLI read the
-  same log.
-* The button was reached through AT-SPI: the driver resolved the accessible
-  under the clicked point and dispatched its `click` action, and the screen then
-  changed as shown. This records how the screen was driven, not that the GUI is
-  operable by keyboard or screen reader.
-* **Three Log-screen wirings landed after this session (PR #31).** The same
-  screen now writes a KMZ (photo folder and maximum long edge), shifts a
-  photo's clock by days / hours / minutes / seconds with the all-photos /
-  selected / camera scope, and edits the track (split, merge, delete with
-  undo/redo). None of them was exercised against the unit or with real camera
-  photos, and no KMZ output was opened in Google Earth or `unzip`; the screens
-  are covered by the GUI tests only (🧪).
-* The screenshots were taken but are not committed: they show this host's port
-  list (`AGENTS.md` §6).
-* **Later (2026-11-23)** the Log screen was exercised with a saved dump in a real
-  X11 window on the development host, with no unit attached; the track, OSM tiles
-  and attribution drew together. That is display evidence, not a hardware run —
-  see the next subsection. The Log screen's device paths (download, the erase
-  backup, the relay) and the firmware write from the GUI have still not been run
-  against a unit.
-
-#### The GUI's Log screen and map in a real window (2026-11-23, development host)
-
-Host: the development Linux machine — an X11 / Xwayland session and a Wayland
-session. **No M-241 was attached.** This records what the GUI drew from a log
-file on disk, not a hardware session; nothing about the logger is measured here.
-The log is the 225,028-byte dump recorded on 2026-11-21, which parses to the same
-10,942 points as §1.5.
-
-| Step | Result | Status |
-|---|---|---|
-| open the dump in the Log screen, real X11 window | the track of 10,942 points was drawn | ✅ (dev host) |
-| OSM tiles in the same X11 window | raster tiles were fetched over the network and drawn under the track; the attribution `© OpenStreetMap contributors` was visible in the same frame as the tiles and the track | ✅ (dev host) |
-| Wayland real window | tile fetch confirmed: 8 tiles in the on-disk cache | ✅ (fetch only; dev host) |
-| headless / `--screenshot` | no tile fetch; the GUI tests pin this (`a_headless_app_draw_never_starts_a_tile_fetch`) | 🧪 |
-| how the map looks on a Wayland screen | screen capture did not answer in this environment, so the appearance stays 未検証 | ⚠️ |
-
-* **This is development-host evidence, not M-241 verification.** The tiles are
-  fetched by the GUI; the unit is not involved. Do not use these rows to move a
-  hardware claim to ✅.
-* The tile request carries the map area on screen, which follows the track
-  (`PRODUCT.md`, `DISCLAIMER.md`); that is why the README records the network
-  behaviour.
-* The attribution is drawn only when an OSM tile was painted; the sample and the
-  offline frames do not carry it (the GUI tests pin that).
-* The X11 capture is a development-host screenshot and is not committed
-  (`AGENTS.md` §6).
-
-#### The vendor write completes but the read-back differs at `0x5C`
-
-The stock V1.13 vendor image was written 100% (all 1589 packets acknowledged,
-406,620 of 406,620 bytes), and the unit booted it: `device info` answered and
-the NMEA default date was `06-01-80` (epoch `315964800`, unpatched). The
-read-back still failed, at one byte: the unit held `0x91` at `0x5C` where the
-vendor image has `0xFF`.
-
-A fresh dump taken after that boot shows the unit restored exactly `0x5C`–`0x5F`
-to the values of its own earlier dump. Those four bytes are inside the 14 bytes
-of per-unit data the vendor gate warns about, and the booted firmware re-creates
-them. The read-back is taken after a restart and a BootROM re-entry, so a vendor
-write cannot compare equal at those offsets even when the write itself is
-correct.
-
-The other ten per-unit bytes (`0xF8`–`0xFD`, `0x63458`–`0x6345B`) are not
-restored by the firmware: after the vendor write they held the vendor values.
-
-未検証: where the restored four bytes come from (a second copy in the chip, or a
-derivation), and whether the vendor read-back should ignore the
-firmware-managed offsets — a design decision that has not been made. The
-options, their effect on the safety gate and a recommendation are recorded in
-[`06-open-questions.md`](06-open-questions.md) §8; the choice is the user's.
-
-#### V1.12 is refused before a port is opened
-
-Measured, not assumed — two dry runs, so no port was opened:
-
-```text
-$ m241 fw flash <V1.12 image> --backup <406,620-byte dump> --dry-run
-m241: error: refused: the backup is 406620 bytes; profile V1.12 is 406312 bytes
-
-$ m241 fw flash <V1.12 image> --backup <406,620-byte dump> --allow-vendor --dry-run
-m241: error: refused: the vendor gate is pinned to V1.13 (406620 bytes, SHA-256 32fe5269…); profile V1.12 is not that release. V1.12 and other vendor builds are not supported
-```
-
-Both exit 5.
-
-## 1a. The Linux log-erase hardware session (2026-11-21)
-
-Device: retail Holux M-241 (MT3318) over USB serial (CP210x bridge).
-Host: Linux, `m241` built from commit `bf41c2e`, the then-head of
-`feat/log-erase-wire`. That commit is **not** an ancestor of this branch, and no
-binary from this branch's final head has been run on hardware.
-
-The rows below were measured with that binary only. The log-erase work has
-gained changes since: the empty-log refusal (`ea53d1a`) and the lost-stop-ACK
-resume with its tests. **Those changes have not been run on hardware**, so
-nothing on this page makes the final head verified.
-
-| Step | Command / detail | Result | Status |
-|---|---|---|---|
-| Bare `$PMTK182,6` (negative result) | `m241 log erase --port <port> --output <backup> --yes` before fix | backup saved (`225,028` bytes), failed on trailing `$PMTK001,182,4,3*23`; follow-up `m241 log download` showed `225,060` bytes / `7,846` records (log untouched) | ✅ (negative) |
-| Log download & erase (`$PMTK182,5` → `$PMTK182,6,1*3E` → `$PMTK182,4`) | `m241 log erase --port <port> --output <backup> --yes` | backup saved (`225,092` bytes), `erased: yes`, exit `0` | ✅ |
-| Post-erase verification | `m241 log download --port <port> --output <check> --force` | `528` bytes (`0x210`), `records: 0`, `fixes: 0`, exit `0` | ✅ |
-| Final-head re-run (empty-log refusal, lost-stop-ACK resume) | not run: the binary above predates both changes | — | ⚠️ |
-
-## 2. What was never measured
-
-| Claim | Why it is still open |
+| Item | Status / Detail |
 |---|---|
-| The OLED after flashing | never observed; the display was not photographed |
-| The binary log's timestamps after flashing | ⚠️ a post-flash log **was** downloaded on 2026-11-22 (§1.5), but it holds only the settings / state journal and no track point. The parser that ran then read the journal as 20-byte records, so every record checksum failed and the decoded dates were nonsense; PR #34 recognises and skips the journal, and re-parsing the same dumps gives 0 points / journal-only. The download therefore does not verify a timestamp, and whether the unit records track points after the write — with or without a fix — is still 未検証 |
-| The NMEA date from a live GPS fix after patching | ⚠️ with no fix the unit reported the then-current UTC date on 2026-11-22 (§1.5), but that is a clock value, not a fix-derived one; the patched default with a zero clock is `22-08-99` (epoch `935280000`). No fix was available indoors, so a GPS-derived date after patching is still unobserved |
-| The GUI's Log screen with a real log file, and the OSM map in a real window | ✅ dev host 2026-11-23 (§1.5): the saved 2026-11-21 dump (10,942 points) opened in a real X11 window, and the track, OSM tiles and attribution drew together; a Wayland window fetched 8 tiles to the cache. **No M-241 was attached — this is not a hardware verification**, and the Wayland display appearance was not captured (screen capture did not answer) |
-| The GUI's device paths (download, erase backup, relay, firmware write) on a real unit | ⚠️ not exercised. The Connect screen and 「接続して確認」 did run against the unit on 2026-11-22 (§1.5). The GUI's firmware write goes through `m241_flash::flow` with the typed `WRITE` / `PROBE`, but it has **not been run against a unit**; neither have the Log screen's download, erase backup or relay, the follow render, the photo JPEG write, the KMZ writer, the photo clock shift (day / hour / minute / second, all-photos / selected / camera scope) or track editing (split / merge / delete / undo). No KMZ output has been opened in Google Earth or `unzip` |
-| `m241 device doctor` against a unit | the command and its tests exist, but no hardware session in §1 ran the port probe, the drop scan or the DA extraction on a unit |
-| `m241 log geotag` on a real camera JPEG | only synthetic JPEGs are written by the tests; no file from a real camera has been geotagged, and a real camera's IFD0 layout has not been read |
-| `m241 nmea proxy` on a live stream | ✅ stdout relay on 2026-11-22 and TCP `--bind` relay on 2026-11-22/23 (§1.5): 9 sentences over `tcp://127.0.0.1:10110`, checksums valid on 9 of 9, date `221126` = 2026-11-22, and `--offset-days 1` corrected it to `231126`. Long runs, multiple clients, a non-loopback bind and a stream carrying a fix are 未検証 |
-| Linux BootROM / firmware dump & flash with a real logger | ✅ measured 2026-11-22 (§1.5): `fw dump`, `fw probe-da`, three `fw flash` runs and their read-backs all ran on Linux over `/dev/ttyUSB0` |
-| macOS with a real logger | ⚠️ never measured: every hardware session in §1 and §1a was Linux over USB; no macOS host was used and the binary was never launched on a Mac |
-| Bluetooth SPP | all hardware work went over USB |
-| 4 MiB units and GR-245 variants | geometry maths is implemented and unit-tested; no device was available |
-| V1.11 and V1.12 on hardware | no V1.11 image to profile. The V1.12 release was measured as **refused before opening a port** on 2026-11-22 (§1.5), so it was never flashed by this client |
-| The V1.12 patch offsets (`0x402F6`, `0x402F7`, `0x59B18`) | derived from the V1.12 vendor package's layout (`0x59B14` marker, size and SHA-256 in `03-hardware-facts.md`), not from a V1.12 unit; V1.12 was never dumped or flashed here |
-| Any timing figure | nothing in this repository is a stopwatch measurement |
-| The Rust `fw flash` command on a unit | ✅ the 2026-11-15 flash was an earlier manual/v1 run; on 2026-11-22 the Rust client completed two writes and read each written range back identical (§1.5). The write, erase, restart and backup-diff gates are no longer covered by the simulator only |
-| The final `0xD5` packet sent short (92 + 2) | ✅ measured 2026-11-22 (§1.5): the zero-padded final packet failed on hardware (§1.4); the client that sends the remainder plus its sum completed two writes and read both back identical |
-| What `0x01` means in a `0xD5` reply | observed 2026-11-22 (§1.4); the disassembly page explains why a padded final packet cannot pass the checksum, but not which DA status reaches the wire as `0x01` |
-| Writing the official V1.13 vendor image (`--allow-vendor`) | ⚠️ written 2026-11-22 (§1.5): all 1589 packets acknowledged, 406,620 bytes programmed, and the unit booted the stock V1.13 (NMEA default date `06-01-80`). The read-back then differed at `0x5C`, because the booted firmware restores its four per-unit bytes; the 14-byte overwrite was therefore observed, but the read-back gate cannot confirm a vendor write as it stands (the options are in [`06-open-questions.md`](06-open-questions.md) §8) |
-| The firmware restoring per-unit bytes at boot | ✅ observed 2026-11-22 (§1.5): after the vendor write the unit held `91 1B D4 CF` at `0x5C`–`0x5F` — its own earlier values — where the image has `FF`. Where those bytes come from and whether the vendor read-back should skip them are 未検証 |
-| The `0xD9` → NMEA probe → `$PMTK180*3B` re-entry and read-back | ✅ measured 2026-11-22 (§1.5): after both successful writes the client restarted the chip, re-entered the BootROM through the NMEA hand-over and read the whole range back. The 2026-11-15 row recorded that the unit booted, not that this read-back ran |
-| The automatic `0xD9` restart and one retry after a `0xD3` failure | still not exercised on a unit: with the final-packet fix in place no `0xD3` failure occurred, so the restart-and-retry path ran only against the fake. The retry uses the same `FLASH_WRITE_START` / `FLASH_WRITE_LENGTH` and never recomputes the range |
-| `m241 fw da-restart` | ✅ measured once 2026-11-22: after `fw probe-da` left the DA running in RAM, the standalone `0xD9` was sent and the next `device info` answered, so the unit had booted its firmware. The command sends one byte, waits for no reply and never touches DTR/RTS; a unit sitting in the BootROM is not restarted by it (measured the same day) |
-| The 406,620-byte BootROM read split into `DUMP_CHUNK` frames | ✅ measured 2026-11-22 (§1.5): `fw dump` read 406,620 bytes in two independent passes that were identical, and the write read-back read the same range in one pass. A single 406,620-byte `0xA2` would exceed the five-second deadline at 115,200 8N1 |
-| The DA's `0xD6` read across multiple pages | one page per address was read on 2026-11-21; the advance between pages, the advance after the **last** page of a multi-page read, and any bytes the DA sends between pages are unmeasured (`docs/reference/01-da-protocol.md` §5.5, §7 item 4) |
-| The four bytes after the DA banner | origin is still not established. They were read as `0xBB` by the first `0xD3` on 2026-11-22 (§1.3); with the resynchronising read in place, every later run that day reached and passed the `0xD3` phase (§1.5). The client clears the input before `0xD6` and before the first `0xD3` and resynchronises the `0xD3` reply (skips up to 8 non-ACK bytes) |
-| `0xD6`'s page length for arguments other than 64 | only a 64-byte page-length argument was measured (64 data bytes + 2-byte trailer) |
-| `fw probe-da` on stock V1.13 and on a second unit | the 2026-11-21 run read the unit from §1.1, which already carries the WNRO patch (the version marker is patched to V1.14); its first 64 bytes match the vendor V1.13 image's, but no stock unit and no second unit were probed |
-| The `0xA8` jump frame's count word | the protocol page gives it no meaning; the only client that ran the jump on a unit sent `0`, and this crate does too. Whether the BootROM reads the field at all is not established (`docs/dev/03-hardware-facts.md` "DA jump") |
-| New GPX / KML / NMEA exports opened in an external application | ⚠️ not opened in Google Earth, a GPX viewer or an NMEA tool. The **KML 2.0 element order was checked on 2026-11-23** with `xmllint --schema` against a minimal schema that copies KML's `FeatureType` sequence: the current output validates, and putting `<LookAt>` back after `<Style>` reproduces `Element … LookAt: This element is not expected`. That verifies the schema order, not that a viewer draws the file. GPX and NMEA output are covered only by this project's own tests |
+| Rust `fw dump` (chunked), `fw probe-da`, `fw flash` (strict & `--recover`), `0xD5` short final pkt (92+2), `0xD9` → `$PMTK180*3B` read-back, `fw da-restart` (from DA RAM), Linux USB | ✅ Measured 2026-11-21/22 (§1.2, §1.5) |
+| `nmea proxy` stdout & loopback TCP | ✅ 9 sentences valid (§1.5); ⚠️ long runs, multi-client, non-loopback, live fix 未検証 |
+| `--allow-vendor` write & boot | ⚠️ Written & booted stock V1.13, but read-back failed at `0x5C` (firmware restores `0x5C`–`0x5F` ✅) |
+| OLED after flash / post-flash log timestamps / live GPS fix date | ⚠️ 未検証 |
+| GUI device paths (download, erase backup, relay, firmware write), geotag, KMZ, shift, edit | ⚠️ 未検証 on hardware (Connect read-only probe ✅; Log/OSM X11/Wayland dev-host only) |
+| `device doctor` on unit / `log geotag` on real camera JPEG | ⚠️ 未検証 (synthetic JPEGs only) |
+| macOS / Bluetooth SPP / 4 MiB / GR-245 / V1.11 / V1.12 on hardware | ⚠️ 未検証 (V1.12 refused pre-port ✅; V1.12 offsets derived from vendor pkg only) |
+| Automatic `0xD9` + 1 retry on `0xD3` failure / `0xD6` multi-page or non-64 page len / `0xA8` count / `0x01` meaning / 4 post-banner bytes origin / stock V1.13 or 2nd unit `probe-da` | ⚠️ 未検証 (fake or single-page only) |
+| External viewers (Google Earth, `unzip`, GPX/NMEA tools) | ⚠️ 未検証 (KML 2.0 element order checked with `xmllint --schema` on 2026-11-23) |
+| Timing figures | ⚠️ No stopwatch measurements |
 
 ## 3. The simulator
 
-`crates/m241-core` is exercised by a fake device that models the chip's own
-behaviour: echo, the checksums, the 16-bit pair swap, the two read widths, and
-the PMTK command/reply framing. It is not a mock: it drives the real client code
-paths. The Download Agent is no longer modelled there — it belongs to the write
-crate, and its fake lives in `crates/m241-flash/src/simulator.rs`.
-
-**It is not a proof of correctness, and 🧪 never means "verified".**
-
-The reason is a circular reference. The simulator and the client share the same
-functions: the fake swaps 16-bit pairs with the crate's own `swap_pairs`, and the
-client undoes it with the same function. If that function's notion of the byte
-order is wrong, both halves are wrong in the same direction and the round trip
-still passes. The same holds for the checksum, the frame layout and every
-constant that is read from the crate rather than written out twice. A test that
-passes therefore shows the two halves agree; it does not show either half agrees
-with the device.
-
-What the simulator *is* good for is a **regression test**: it catches the
-refactor that quietly changes behaviour, because the behaviour it compares
-against was recorded from a version that was checked another way. That is a real
-job — most of the protocol's costliest bugs were regressions, not first attempts
-— but it is a different job from establishing that the first attempt was right.
-
-Correctness is carried by three things instead:
-
-1. **The citation.** Every protocol constant points at a measurement in
-   [`03-hardware-facts.md`](03-hardware-facts.md) or at a function and
-   instruction range in [`../reference/01-da-protocol.md`](../reference/01-da-protocol.md).
-   A constant that cannot be cited is a guess and is labelled as one.
-2. **The hardware run.** Section 1 is the only place a claim becomes ✅. A
-   command that never ran against a unit stays ⚠️ no matter how green the suite
-   is.
-3. **The review.** [`11-safety-review.md`](11-safety-review.md) fixes the
-   questions a diff is read against, and `tools/check_safety.py` turns the ones
-   that can be mechanical — the read/write crate split — into a gate.
-
-🧪 marks a claim covered only by the simulator and tests. It is weaker than ✅ and
-the documents say so at the point of use, not only here. Treat it as "this is
-pinned, so it will not drift unnoticed", never as "this is known to be right".
+`m241-core` and `m241-flash` (`crates/m241-flash/src/simulator.rs`) include fake devices for **regression pinning** (`🧪`), not proof of hardware correctness (shared helpers like `swap_pairs` can be symmetrically wrong). Correctness rests on: (1) citations to `03-hardware-facts.md` / `01-da-protocol.md`, (2) hardware sessions in §1, and (3) `11-safety-review.md` + `tools/check_safety.py`.
 
 ## 4. How to close a gap
 
-1. Run the flow against a real device.
-2. Record the command, the output, and the date in section 1.
-3. Update the `⚠️` at the point the claim is made.
-
-If you cannot do all three, the claim stays `⚠️`. Writing `✅` for an untested
-platform is a defect, not optimism.
+Run against real hardware → record command, verbatim output and date in §1 → update `⚠️` at the claim site. Never mark `✅` without all three.

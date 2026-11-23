@@ -1,81 +1,33 @@
 # When a write fails
 
-**Stay calm. Most failures are recoverable.**
+**Most failures are recoverable.** The MT3318 BootROM is mask ROM and cannot be erased; power-cycling returns the chip to a state ready to accept a backup flash (except a wrong image or power loss at a fatal moment).
 
-The chip has a **BootROM** in mask ROM: a small program that cannot be erased and
-that runs before the firmware. A failed firmware write damages the firmware; the
-BootROM is still there. Power-cycle, and the chip comes up ready to accept a
-write again.
+## Quick triage
 
-The two exceptions are a wrong image and a power loss at the wrong moment. Either
-can leave the unit unusable even with the BootROM intact.
-
-## First, check the device
-
-| What you see | What it means | What to do |
+| Symptom | Meaning | Action |
 |---|---|---|
-| It boots normally, date still wrong | the write failed, the old firmware is intact | run the flash step again |
-| Nothing on the screen | the write stopped part-way | the recovery steps below |
-| Garbled or partial display | the image is incomplete | the recovery steps below |
-| No port appears in `m241 device ports` | the cable or the driver | replug, try another USB port |
+| Boots normally, date still wrong | Old firmware intact | Re-run flash step |
+| Blank or garbled screen | Partial write | Follow Recovery below |
+| No port in `m241 device ports` | Cable or driver | Replug / try another USB port |
 
-## Recovery
+## Recovery steps
 
-1. **Remove the battery for at least ten seconds.** This is what puts the chip
-   back in BootROM waiting state. A short press of the power button is not the
-   same thing.
-2. Put the battery back, switch on, and reconnect.
-3. Write your own backup back with the explicit recovery mode:
+1. **Remove the battery for ≥10 seconds** (a power-button press is not enough), reinsert, switch on, and reconnect.
+2. Flash your own backup back with `--recover`:
 
    ```bash
    m241 fw flash backup/stock.bin --da vendor/DA_v3.8.4.bin --backup backup/stock.bin --recover --yes
    ```
 
-   `--recover` requires the image to be byte-identical to `--backup` and skips
-   the whole-unit comparison, because a partial write has already changed the
-   unit. It still checks the M-241 vector and family markers and keeps the
-   confirmation, layout and DA gates. This is the only supported path for a
-   partial unit: without `--recover`, `verify_device` refuses a unit that no
-   longer matches the backup. If the vector or family marker is itself damaged,
-   `--recover` refuses rather than writing blind; that state is not recoverable
-   by this build. A successful recovery leaves the unit in the
-   BootROM, so remove the battery for about ten seconds, put it back, and switch
-   it on before using the logger.
-
-4. If it still will not answer, try assuming the chip is already in BootROM:
+   `--recover` requires an image byte-identical to `--backup` and skips `verify_device` while keeping M-241 vector/family checks, layout, and DA gates. (If vector/family markers are damaged, `--recover` refuses.) After success, remove the battery for ~10 seconds and power on.
+3. If the unit does not answer, test BootROM directly:
 
    ```bash
    m241 fw dump --assume-brom -o backup/probe.bin
    ```
 
-5. If that reads, go back to step 3. If nothing answers at all, the BootROM is not
-   running and no software can reach it: remove the battery for thirty seconds,
-   try another USB port, and if it is still silent the unit has a hardware fault.
+   If it reads, return to step 2. If completely silent after a 30-second battery pull and another USB port, the unit has a hardware fault.
 
-## Why this works
+## After recovery & reporting
 
-```
-  chip
-  +---------------------------------------+
-  |  BootROM  (mask ROM, cannot be erased)|  <- always survives
-  +---------------------------------------+
-  |  firmware (rewritable)                |  <- what a failed write damages
-  +---------------------------------------+
-```
-
-Only the lower layer is ever written, so the code that accepts a write is never
-at risk.
-
-## After recovery
-
-`m241 device info` should print the release, build and model. If it does, the
-device is healthy; the date will be wrong again unless you reapply the patch.
-
-## Filing a report
-
-Open an issue with the output of `m241 device doctor` and `m241 fw patch
---dry-run`, plus which step failed and the full error text.
-
-**Do not attach a track log.** It contains your location history. A firmware dump
-has no coordinates but does carry per-unit fields, so send its size and SHA-256
-rather than the file.
+Run `m241 device info` to confirm firmware identity (dates remain unpatched until you re-apply the patch). If filing an issue, include `m241 device doctor` and `m241 fw patch --dry-run` output plus the full error — **never attach track logs or firmware dumps** (share size and SHA-256 only).

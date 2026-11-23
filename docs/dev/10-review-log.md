@@ -1,2003 +1,248 @@
 # レビュー記録
 
-[`09-review-protocol.md`](09-review-protocol.md) の手順で行ったレビューの結果。
-対象・日付・指摘・対応・検証を 1 レビュー 1 節で残す。
-
-同じ指摘が 3 回出たら、レビューではなく仕組み（lint、テスト、テンプレート）で塞ぐ。
+[`09-review-protocol.md`](09-review-protocol.md) に沿ったレビューの要約記録。各ストリームの日付・対象・判定・主な指摘と解消・残件および未検証事項を残す。同じ指摘が 3 回出た場合は、レビューではなく lint・テスト・テンプレートで機械的に防ぐ。
 
 ---
 
-## 2026-11-20 / 土台（`7edfadd` 時点のコード一式）
+## 2026-11-20 / 土台（`7edfadd`）
 
-対象: `crates/` 全体。2 種類のレビューを**互いの結果を見せずに**並行で走らせた。
-
-### 仕様検収 — 不合格
-
-判定の根拠は「仕様が要求する安全ゲートが、機能が無いことだけに依存している」こと。
-
-- `docs/reference/01-da-protocol.md` は仕様書自体が空（逆解析待ち）。実装の `da.rs` が
-  常に失敗を返す点は整合しているが、検収できる仕様が存在しない。
-- `docs/reference/02-cli.md` の終了コード表のうち **5（安全拒否）に対応する分岐が
-  コードに無い**。文書化されたコードに producer が無いのは未文書より悪い。
-- 13 コマンド中 12 が未実装スタブ。`--json` / `--dry-run` / `--yes` / `--backup` /
-  `--require-backup` / `--port` のフラグが clap 定義に無い。
-- 「検出するテスト」として認められなかったもの: 恒等写像でも通る往復テスト、
-  `shapes > 0` だけの描画テスト、`checksum_xor16`（本番呼出元ゼロ）。
-- 仕様外の実装として `types.rs` / `brom.rs` / `frame.rs` / `port.rs` / GUI クレート
-  全体が挙がった（01 は DA、02 は CLI のみを規定しているため）。
-
-### 可読性レビュー — Must 8 件
-
-1. `types.rs:188` — `PatchPlan::apply` が `PatchEdit::before` を読まずに書く。
-   doc の「レビュー済みの計画」と `a_plan_built_for_another_image_is_refused` の
-   テスト名が嘘になる。
-2. `brom.rs:194` — エコー不一致に `offset: 0` を与えており、位置を持たない失敗に
-   偽の座標を表示する。
-3. `error.rs:175` — `Io.path` が `"<unbound>"` で埋まり `i/o on <unbound>: …` が出る。
-4. `types.rs:92` と `:128` — `damaged_blocks` が `Vec<u32>` と `usize` で同名別物。
-5. `theme.rs:7` — 存在しない `tests/design_invariants.rs` を根拠に書いている。
-6. `m241-gui/Cargo.toml:16` — `m241-core` が未使用依存。
-7. `brom.rs:7` — 「実機で確立した定数」と宣言した直後に参照実装由来・別チップ由来の
-   値が混在し、全部が実機検証済みに読める。
-8. `frame.rs:87` — 往復テストが恒等写像でも通る。
-
-Should 10 件、Could 2 件。全文は各修正担当への指示に転記した。
-
-### 対応
-
-修正は**別のエージェントに割り振り**、その修正を**さらに別のエージェントが独立に
-レビューする**三段構成にした（実装 → 修正 → 検証）。理由: 指摘した本人が直すと、
-直したつもりの箇所を同じ思い込みで読み直す。
-
-| 修正ストリーム | 範囲 | 検証ストリーム | 検証の状態 |
-|---|---|---|---|
-| `fix/fix-core` | `crates/m241-core/src/` 全体 | verify-merged → sync-probe-test | 不合格 → **合格**（`33b3838`） |
-| `fix/fix-gui` | `crates/m241-gui/` | verify-merged | 合格 |
-| `fix/fix-cli` | `crates/m241-cli/`（core の `Error::Safety` 追加後） | verify-merged | 合格 |
-| `fix/fix-docs` | `docs/`、`AGENTS.md`、`tools/` | verify-merged | 合格 |
-
-不合格の理由: `fix/fix-core` — Must 2 の引用行（`crates/m241-core/src/protocol/brom.rs` の sync プローブ側 `Framing`）に検出テストが無く、`offset: None` を `Some(0)` に戻す変異が全テストを通過していた（エコー側のテストだけでは引用行を守れない）。
-
-**解消** (`33b3838`, 別エージェント): `a_sync_probe_mismatch_does_not_claim_to_be_at_offset_zero` と `every_probe_byte_that_disagrees_reports_no_position` を追加。変異を入れると 2 件とも落ちることを、修正担当と lead の両方が独立に確認した。コード本体は未変更（テスト追加のみ）。
-
-検証ストリームは、修正ストリームに**参加していない**エージェントが担当する
-（[`09-review-protocol.md`](09-review-protocol.md) の三段構成）。検証担当が読むのは
-指摘リストと修正の差分とテストだけで、修正者の説明は読まない。合格条件は
-「指摘がすべて解消 / 新たな問題を入れていない / `./tools/check.sh` が 6/6」の 3 つ。
-状態は `未検証` → `合格` / `不合格` で更新する。
-
----
+- **対象**: `crates/` 全体（並行レビュー: 仕様検収・可読性）
+- **判定**: 初回 不合格 → 修正 4 ストリーム（`fix/fix-core` / `fix/fix-gui` / `fix/fix-cli` / `fix/fix-docs`）を三段構成で独立検証し、`fix/fix-core` 再検証（`33b3838`）後に全件**合格**
+- **主な指摘と解消**:
+  - 終了コード 5（安全拒否）の producer 欠如 → `Error::Safety` と網羅 match を追加
+  - `PatchPlan::apply` の `before` 未検査、エコー不一致の偽 `offset: 0`（sync プローブ側も `33b3838` でテスト追加）、`Io.path` の `"<unbound>"`、`damaged_blocks` の同名別物、恒等写像でも通る往復テスト、`brom.rs` の定数由来混在を解消
+  - ゲート: `./tools/check.sh` 5/5、`cargo test --workspace` 254 件合格
 
 ## 2026-11-20 / simulator の `0xD3` 修正（`fix/simulator-d3`）
 
-対象: `crates/m241-core/src/protocol/simulator.rs`。ブランチ `fix/simulator-d3`、
-HEAD `a9171fb`、分岐点 `e58c5d3`（main は検証中に `5d6ad74` まで進んだ。
-`git diff main..HEAD` は main 側の `AGENTS.md` 追加分の逆差分を混ぜるので、
-ブランチの実体は `git diff e58c5d3..HEAD` の 1 ファイルである）。
-
-### 指摘の解消
-
-| # | 指摘 | 解消 | 根拠 |
-|---|---|---|---|
-| 1 | `0xD3` は記録だけで消去しない | 解消 | `simulator.rs:662-682`（`erase_range` の呼び出し無し、`da_range` 代入のみ） |
-| 2 | 消去は `0xD5` が書き込み直前に行う | 解消 | `simulator.rs:702-703`（`erase_range` の唯一の呼び出し） |
-| 3 | 応答長が成功 2 バイト / 拒否 1 バイト | 解消 | 成功 `simulator.rs:682`、拒否 `simulator.rs:674` |
-| 4 | 拒否された `0xD3` は以前のレンジを残す | 解消 | 拒否枝が `simulator.rs:666-676` で return し、代入 `:677` に到達しない |
-| 5 | doc コメント「(and erases it)」が誤り | 解消 | `simulator.rs:71-75` が「records the range and nothing else」に修正済み（旧は main の `simulator.rs:51`） |
-
-### 変異テスト（実際にコードを壊して実行し、毎回 `git checkout --` で戻した）
-
-| 変異 | 落ちたテスト | 期待どおり |
-|---|---|---|
-| `0xD3` に消去を戻す | `recording_a_memory_range_leaves_the_flash_untouched`（1 件のみ） | はい |
-| `0xD5` の消去を削除 | `the_write_command_erases_...`、`a_refused_memory_range_keeps_...`（2 件） | はい |
-| `0xD5` の消去を最初のパケット後に移す | `the_write_command_erases_...`、`a_refused_memory_range_keeps_...`、既存の `a_write_packet_is_acknowledged_and_stored`（計 3 件） | はい（順序違反で落ちる） |
-| 拒否応答を `[NAK, STATUS_OK]` | `a_refused_memory_range_is_answered_with_one_nak_byte_and_nothing_else`、`a_refused_memory_range_keeps_the_range_recorded_before_it`（2 件） | はい |
-| 拒否時に `da_range` を上書き | `a_refused_memory_range_keeps_the_range_recorded_before_it` | はい |
-| 消去をバイト単位に | `the_write_command_erases_...`、`a_refused_memory_range_keeps_...`（2 件） | はい |
-| 書き込みオフセットを `saturating_sub(FLASH_BASE)` に戻す | `a_refused_memory_range_keeps_the_range_recorded_before_it` のみ（`simulator.rs:1231` で payload が `0xFF` のまま） | はい（ただし専用テストは無く、付随的に検出） |
-| 参考: 成功応答を 3 バイトに | 4 件（拒否 2 件・パケット 2 件） | はい |
-
-### 副次修正（旧コードの確認）
-
-`git show main:crates/m241-core/src/protocol/simulator.rs` の `simulator.rs:689` は
-`let offset = self.da_cursor.saturating_sub(FLASH_BASE) as usize;` で、`da_cursor` は
-`0xD3` のリニアな `start`。`FLASH_BASE = 0x0020_0000` なのでフラッシュ全域で 0 に飽和し、
-実際に常に 0 番地へ書いていた。主張は正しく、誇張ではない。なお同じ誤りが
-`erase_range`（旧 `:704-705`）にもあり、こちらは書き換えで一緒に直っている。
-
-### 新たに入った問題
-
-なし（コード側）。補足:
-
-- アサーションの削除・弱体化は無い（差分に `-` の assert 行が 1 行も無い）。
-  既存テストの書き換えは 4 つのヘルパー（`download_agent` / `memory_range` /
-  `read_reply` / `write_packet`）への置換のみで、期待値は同じか厳しくなっている
-  （`read_reply` で応答長まで比較するようになった）。テストは 19 → 23 件で削除なし。
-- `FLASH_SECTOR_SIZE = 0x4000` は `simulator.rs:59-69` に「記述子が未解読なので
-  モデル自身の選択」と明記されている。ただし仕様 §6 は記述子の先頭ワードを列挙しており
-  `0x00004000` が 2 回現れる（`docs/reference/01-da-protocol.md:601`）。「cite できない」
-  はやや強いが、値の裏付けが §6 にあること自体は問題ない。
-
-> この DA モデル（`0xD3` / `0xD5` / `0xD9` の状態機械、`erase_range`、パケット会計）は
-> 後に `feat/safety-split` で `crates/m241-flash/src/simulator.rs` へ移設された。
-> `m241-core` は読み取り専用クレートとして DA を一切持たないため、この節が指す行番号は
-> main の時点のものであり、現在の `m241-core/src/protocol/simulator.rs` には存在しない。
-> モデルの内容は移設先で上表の変異テストごと維持されている（`tools/check_safety.py` が
-> `m241-core` に DA が戻らないことを検査する）。
-- `accepted_da_range` の `start > end` 拒否（`simulator.rs:851`）は、仕様 §4.2 の
-  3 条件をそのまま写したものではないが、§4.2 は判定を `FUN_00100A34(start, end-start+1)`
-  と書いており（`docs/reference/01-da-protocol.md:226-227`）、`start > end` なら長さが
-  巨大になって写像範囲チェックで落ちるので、拒否は整合する。
-- `0xD5` は実機の「到達したセクタだけを書く直前に消す」ではなく、レンジ全体を
-  コマンド受理時に先に消す（`simulator.rs:689-696` に意図として明記）。転送が
-  中断した場合のフラッシュ状態は実機と変わるが、テストの対象は正常完了経路なので
-  実害は無い。ただし「when a sector is erased is not visible on the wire」という
-  コメント（`simulator.rs:695-696`）は、途中で止めた場合には当てはまらない。
-- `0xD3` のカウントバイト（複数レンジ）は旧実装から未モデル化のまま
-  （`needed = 10` 固定、`simulator.rs:647`）。今回の指摘の範囲外。
-
-### 仕様書との整合
-
-`docs/reference/01-da-protocol.md` §4.6 は「The second `0x5A` is sent only after that
-erase succeeded (`0x00102560`)」と、消去が 2 つ目の `5A` の**前**だと明記している。
-§5.6 の表でも「erase the sector holding the first range's start」→「erase succeeded →
-`0x5A`」の順。修正後の `simulator.rs:702-705` は消去してから `[ACK, ACK]` を積むので
-一致する（実機は 1 つ目の `5A` を消去前に返すが、フェイクは両方まとめて積むだけで
-ワイヤ上のバイト列は同じ）。
-
-### ゲート
-
-`./tools/check.sh` = **5/5**（fmt / clippy / test / docs / design、25 秒）。
-
-### 判定
-
-**合格**。指摘 5 点はすべてコード上で解消され、追加 4 テストは対応する変異で
-実際に落ち、既存テストの弱体化も無い。
-
----
-
-## 2026-11-20 / 修正 4 本の独立検証（`fix/fix-*`）
-
-対象: 可読性レビューの Must 8 件と仕様検収の指摘に対する 4 本の修正
-（`fix/fix-core` / `fix/fix-gui` / `fix/fix-cli` / `fix/fix-docs`）。
-検証は修正に参加していない担当が行い、読んだのは指摘リスト・差分・テストだけ。
-修正範囲は `git diff b818676..52f023e`（23 ファイル、+1098/−203）。検証中の
-main は `e58c5d3` → `5d6ad74` → `19e07c6` と進んだが、いずれも本節の対象外の
-追加（AGENTS.md の追記、simulator の修正）で、4 本の修正内容は変わっていない。
-
-### A. 可読性 Must 8 件
-
-| # | 指摘 | 解消 | 検出するテスト | 根拠 | 判定 |
-|---|---|---|---|---|---|
-| 1 | `PatchPlan::apply` が `before` を読まない | 解消 | `types::tests::a_plan_whose_before_byte_is_absent_from_the_image_is_refused`（`before` チェックを消す変異で落ちる） | `types.rs:197-225`（判定 `:211`） | 合格 |
-| 2 | エコー不一致に偽の `offset: 0` | 一部 | エコー側は `brom::tests::an_echo_mismatch_does_not_claim_to_be_at_offset_zero` が守る。**sync プローブ側は検出テストが無い** | `brom.rs:312`（エコー）、`brom.rs:266`（sync、テスト無し）。指摘が引く `brom.rs:194` は base の sync プローブ側 | **不合格** |
-| 3 | `Io.path` が `"<unbound>"` | 解消 | `error::tests::a_bare_io_error_prints_no_placeholder_path`（`From<io::Error>` を `Some("<unbound>")` に戻す変異で落ちる） | `error.rs:72-73` / `:113-116` / `:211-225`、テスト `:411` | 合格 |
-| 4 | `damaged_blocks` が同名別物 | 解消 | `types::tests::the_summary_counts_the_damaged_blocks_the_track_listed` | `types.rs:92`（`Vec<u32>`）/ `:131`（`damaged_block_count`）/ `:146` | 合格 |
-| 5 | 存在しない `tests/design_invariants.rs` を根拠に | 解消 | 文言の機械検証は無い。参照先は実在する検査に置換 | `theme.rs:7` が `tools/check_design.py` を指す。`design_gate.rs:200` が `check.sh` への配線を固定 | 合格 |
-| 6 | `m241-gui` の `m241-core` 未使用依存 | 解消 | 専用テスト無し（`clippy -D warnings` が実質の検出） | `52f023e` で依存を削除、その後 `3393eff` で画面が実際に `m241_core::` を使うため再追加（`screens/common.rs:12`、`connect.rs:15`）。HEAD では未使用でない | 合格 |
-| 7 | 「実機で確立した定数」の混在 | 解消 | 文言ポリシーのテストは無し。各定数に由来ラベル | `brom.rs:7-43`（`## Established on hardware` / `## Not established on hardware here`）、各定数 `:63`/`:72`/`:80`/`:89`/`:109`/`:114`/`:120`/`:127`/`:133`/`:141` | 合格 |
-| 8 | `frame.rs` の往復テストが恒等写像でも通る | 解消 | `word_reversal_restores_the_vector_table_from_the_wire`、`word_reversal_of_a_single_dword_is_spelled_out`（恒等写像に変異させると 3 件落ちる） | `frame.rs:37-45`（実装）、テスト `:87`/`:105` | 合格 |
-
-### B. 仕様検収の指摘（終了コード 5 の producer）
-
-| 項目 | 確認方法 | 結果 |
-|---|---|---|
-| 終了コード 5 に producer があるか | `Error::Safety` を追加し、`exit_code_for` に `=> 5`（`main.rs:217`）。`every_documented_exit_code_has_a_producer`（`:448`）、`a_safety_refusal_is_exit_code_five`（`:494`） | 合格 |
-| 網羅 match か（`_ => 1` の温存が無いか） | `Error` に `Probe` variant を追加 → core 側 2 か所を直すと **`main.rs:212` の `exit_code_for` が E0004 でコンパイル失敗** | 合格 |
-| 未実装エラーの文言が利用者向けか | 実バイナリ実行で `fw flash` / `log geotag` が「このビルドでは `m241 fw flash` は未実装です。`m241 --help` で使えるコマンドを確認してください。」（exit 1）。`--help`/`--version` は 0、不正引数は 2 | 合格（`main.rs:177-182`） |
-
-### C. 新たに入った問題
-
-1. **Must 2 の検出漏れ**（上記 A#2）。sync プローブ側の `offset: None` を `Some(0)` に
-   戻す変異が **全 254 テストを通過**する。sync 系テストは
-   `sync_accepts_the_four_documented_replies`（`brom.rs:448`）と
-   `sync_rejects_a_complemented_reply_it_does_not_know`（`:456`）の 2 件だけで、
-   どちらも 2 バイト目以降の不一致（`framing` の分岐）を通らない。
-2. **`--quiet` フラグが指摘外で削除されている**。base `main.rs:44-46` の
-   `quiet: bool` は未使用（`let _ = (cli.quiet, cli.verbose)`）で、docs にも
-   記載が無いため仕様違反ではないが、指摘リストに無い変更。実害は
-   `m241 --quiet …` が exit 2 になること。
-3. `theme.rs:3` は「Two rules」と書くが、`tools/check_design.py` が機械強制する
-   規則は 3 つ（amber の出現位置、角丸トークン、状態色のラベル併記）。
-   軽微な文言のずれ。
-4. 消されたテストは**無い**（`git diff b818676..52f023e --name-status` に `D` 無し、
-   テスト数 58 → 78）。弱められたアサーションも確認範囲では無い。
-   `render.rs` の `shapes > 0` は base から据え置きで、テーマ再適用テストは
-   逆に強化されている（`render.rs:140` が style/text_styles/panel_fill を比較）。
-5. `design_invariants.rs` は base に存在しない（`git cat-file -e
-   b818676:crates/m241-gui/tests/design_invariants.rs` が不成立）。指摘 5 は
-   `52f023e` 時点では「存在しないファイル」→「別ファイル」の置換に留まったが、
-   `3393eff` が実ファイルを追加したため HEAD では解消している。
-
-### D. ゲート
-
-`./tools/check.sh` = **5/5**（HEAD `19e07c6`、fmt / clippy / test / docs / design、
-23〜25 秒）。`cargo test --workspace` は **254 件全緑**。
-
-### E. 変異テスト（すべて `git checkout -- <file>` で戻し、都度 `git status` を確認）
-
-| 変異 | 落ちたテスト | 期待どおり |
-|---|---|---|
-| `reverse_words32` を恒等写像に | `word_reversal_restores_…` ほか frame の 3 件 | はい |
-| `PatchPlan::apply` の `before` チェックを削除 | `a_plan_whose_before_byte_is_absent_…` 1 件 | はい |
-| `Error::Probe` variant を追加 | core 2 か所を直した後 cli 側が E0004（コンパイル失敗） | はい |
-| エコー側 `offset: None` → `Some(0)` | `an_echo_mismatch_does_not_claim_…` 1 件 | はい |
-| **sync プローブ側 `offset: None` → `Some(0)`** | **0 件（全 254 緑）** | **いいえ（検出漏れ）** |
-| `From<io::Error>` の `path` を `Some("<unbound>")` に | `a_bare_io_error_prints_no_placeholder_path` 1 件 | はい |
-| `tools/check_design.py` の `main` を常に 0 に | `design_gate` の 4 件 | はい |
-| `theme.rs` の doc のパスを存在しない名前に | 0 件（docs ゲートは Rust ソース内のパスを見ない） | いいえ（指摘 5 の再発は機械検出されない） |
-
-### 判定
-
-**不合格**（`fix/fix-core`）。Must 8 件のうち 7 件は解消し、それぞれ検出テストが
-変異で実際に落ちることを確認した。残る 1 件（Must 2）はコードは両方の site で
-直っているが、指摘が引用した sync プローブ側に検出テストが無く、退行を止められない。
-`fix/fix-gui` / `fix/fix-cli` / `fix/fix-docs` は合格。
-
----
+- **対象**: `simulator.rs`（`a9171fb`、後に `crates/m241-flash/src/simulator.rs` へ移設）
+- **判定**: **合格**（`check.sh` 5/5）
+- **主な指摘と解消**:
+  - `0xD3` は範囲記録のみで消去せず、`0xD5` が書き込み直前に消去するよう修正
+  - 応答長（成功 2 バイト `5A 00` / 拒否 1 バイト `A5`）、拒否時の既存範囲保持、および `saturating_sub(FLASH_BASE)` のオフセット飽和バグを修正し、変異テストで確認
+- **残件**: `0xD3` の複数レンジ指定は未モデル化
 
 ## 2026-11-21 / 読み取り・書き込みの分離（`feat/safety-split` → `fix/safety-split-v2`）
 
-対象: 読み取り専用クレート `m241-core` と書き込みクレート `m241-flash` の分離および `tools/check_safety.py` ゲート追加。
-
-- **初回検証（`feat/safety-split` `323baa0`、`verify/safety-split` `176e384`）**: **不合格**
-  1. `docs/dev/11-safety-review.md` / `AGENTS.md` / `crates/m241-core/src/protocol/mod.rs` の「コンパイルで保証」「持てない」が、`m241-core` 公開 API（`Frame::to_bytes` + `Transport::write_all` + `Port::open` + `pmtk::line`）で反証された。
-  2. `tools/check.sh` の `safety` 行を削除しても 5/5 緑になる（配線テスト欠如）。
-  3. `crates/m241-flash/src/erase.rs` の消去 ACK 判定が `command == 182` のみに後退し、`$PMTK001,182,5,3` を消去成功として受理。`BackupProof::of_bytes` の doc と実装も矛盾。
-  4. `tools/check_safety.py` の穴（`0xD4`・`\xNN`・`m241-core/tests/`・basename 一致 allowlist・`m241-gui` 依存未検査）と行末コメントの過剰検出。
-  5. `11-safety-review.md` の未実装項目への `✓` / 存在しない `brom.rs` 呼び出し記述、`attempt_flash` docstring ずれ、`crates/m241-cli/src/main.rs` の重複 doc 行、`crates/m241-core/src/lib.rs` の古い記述。
-- **Stage 2 修正（別エージェント、`fix/safety-split-v2` `020ac82`）**: 3 コミット（`2db5ed2`, `fbfa356`, `020ac82`、12 ファイル +731/−115）。
-- **Stage 3 独立検証（三人目、修正者の説明・コミット本文は未読）**:
-
-| # | 指摘 | 解消 | 確認箇所・検出テスト |
-|---|---|---|---|
-| 1 | 過度な「コンパイル時保証」主張 | 解消 | `docs/dev/11-safety-review.md`、`AGENTS.md`、`crates/m241-core/src/protocol/mod.rs` ほかで「書き込み・消去ルーチンを持たない（生トランスポートプリミティブは共有のため公開）」に一貫して限定 |
-| 2 | `check_safety.py` 配線・有効性テスト | 解消 | `crates/m241-flash/tests/safety_gate.rs`（12 テスト）。`tools/check.sh` から `safety` 行削除で `the_safety_gate_is_still_wired_into_check_sh` が失敗することを変異テストで実証 |
-| 3 | `erase.rs` ACK 後退・doc 矛盾 | 解消 | `crates/m241-flash/src/erase.rs` で `$PMTK001,182,6,<status>` の 3 フィールド＋サブコマンド `6` を厳格検証。変異テストで 2 テスト失敗を実証。`BackupProof::of_bytes` doc 整合 |
-| 4 | `check_safety.py` の穴と過剰検出 | 解消 | `0xD4`・`\xNN`・`m241-core/tests/`・完全相対パス allowlist・`m241-gui` 依存検査・文字列認識つき `//` 除去を実装。9 件の変異テストすべて期待どおり（行末コメント `// the erase` は PASS、文字列内 `"//"` 後の違反は FAIL） |
-| 5 | 文書・コード不整合と重複行 | 解消 | `11-safety-review.md` の `✓` / 呼出数、`firmware.rs` の `attempt_flash`、`main.rs` 重複行、`m241-core/src/lib.rs` をすべて修正 |
-
-- **ゲート・テスト**: `./tools/check.sh` = **6/6 PASS**、`cargo test --workspace` = **282 passed / 0 failed**（`feat/safety-split` 268 → +14、削除・弱体化 0 件）。個人情報違反なし。
-- **判定**: **合格**（`main` へマージ）。
-
----
+- **対象**: `m241-core`（読み取り専用）と `m241-flash`（書き込み）の分離、`tools/check_safety.py` 追加
+- **判定**: 初回 不合格 → Stage 2（`020ac82`）→ Stage 3 独立検証 **合格**（`check.sh` 6/6、282 テスト）
+- **主な指摘と解消**:
+  - 「コンパイルで書き込み不能を保証」の過大表現を「書き込み・消去ルーチンを持たない（生トランスポートは共有のため公開）」に限定
+  - `crates/m241-flash/tests/safety_gate.rs` で `check.sh` 配線とゲート有効性を固定
+  - `erase.rs` の ACK 検証を `$PMTK001,182,6,<status>` に厳格化し、`check_safety.py` の検出漏れ（`0xD4`・`\xNN`・`tests/`・`m241-gui` 依存）と行末コメント誤検出を修正
 
 ## 2026-11-21 / EXIF 読み書きとジオタグ（`feat/exif2` → `fix/exif2-review`）
 
-対象: `crates/m241-core/src/log/exif.rs`、`crates/m241-core/src/log/geotag.rs`、`crates/m241-core/src/log/fixture.rs`、`crates/m241-core/src/log/mod.rs`。
-
-- **Stage 1 発見レビュー（`feat/exif2` `57c1560`）**: **不合格**（Must 2 件・Should 9 件）
-  - **Must 1**: `geotag.rs` の `replace_file` が非 Windows でも元ファイル削除フォールバックに入り、さらに `remove_file(path)` 後の再 `rename` 失敗時に唯一残った一時ファイル `&temp` まで削除してしまうデータ消失バグ。
-  - **Must 2**: JPEG EOI マーカのリテラル `0xD9`（`exif.rs` / `fixture.rs`）が `tools/check_safety.py` の破壊的オペコード検査に衝突。
-  - **Should 3〜11**: `TiffReader::ifd` の `offset < 8` 未拒否、`read_gps_time` の時分秒範囲検証とゼロ分母時の `Err(malformed)` 統一、`read_datetime_original` の `u32` 範囲外エラー化（無言 `mtime` フォールバック防止）、負の高度（M6）と `validate_position`（M8）のテスト追加、`geotag.rs` のテスト名・内容整合と重複 `plan()` 削除、`CaptureTime` の `GeotagPlan` 公開、非 APP1 セグメント長超過エラー文言修正、`ByteOrder` の `pub(crate)` 化、未使用 `GeotagOptions::dry_run` 削除と `GeotagPlan::will_write()` 改名。
-- **Stage 2 修正（別エージェント、`fix/exif2-review` `a433142`）**: 4 ファイル変更（+534/−115 行、テスト +8 件追加）。
-- **Stage 3 独立検証（三人目、修正者の説明・コミット本文は未読）**:
-
-| # | 指摘 | 解消 | 確認箇所・検出テスト |
-|---|---|---|---|
-| 1 | `replace_file` データ消失バグ（Must） | 解消 | `crates/m241-core/src/log/geotag.rs` で削除フォールバックを `#[cfg(windows)]` に限定し、`remove_file` 後の再 `rename` 失敗時は `temp` を保持して復旧パスをエラーに含める。3 テスト追加、変異テスト M11 で KILLED |
-| 2 | `0xD9` リテラルの `check_safety.py` 衝突（Must） | 解消 | `JPEG_MARKER_SOI: u8 = 0xD8`、`JPEG_MARKER_EOI: u8 = JPEG_MARKER_SOI + 1` に統一。`log/` 配下の `0xD9` 出現 0 件・`tools/check_safety.py` 通過を確認 |
-| 3〜5 | `offset < 8`・`read_gps_time`・`read_datetime_original`（Should） | 解消 | `crates/m241-core/src/log/exif.rs` で各境界検査とテストを追加。変異テスト M9・M10・M12 すべて KILLED |
-| 6 | 負の高度・`validate_position` テスト（Should） | 解消 | `negative_altitude_round_trips_with_below_sea_level_reference`、`invalid_gps_positions_are_rejected_before_writing` を追加。変異テスト M6・M8 とも KILLED |
-| 7〜11 | テスト整合・`CaptureTime`・エラー文言・可視性・API 整理（Should） | 解消 | `exif.rs` / `geotag.rs` / `mod.rs` で全項目解消を diff とテストで確認 |
-
-- **ゲート・テスト**: `./tools/check.sh`（および `tools/check_safety.py`）全ゲート PASS、`crates/m241-core/src/log/` 内テスト **74 件**（`exif.rs` 15 件 + `geotag.rs` 11 件、削除・弱体化 0 件）。本番コードの `unwrap`/`expect`/`panic!`/`unsafe`/無検証添字 0 件、個人情報違反なし。
-- **判定**: **合格**（`main` へマージ）。
-
----
+- **対象**: `crates/m241-core/src/log/`（`exif.rs`, `geotag.rs`, `fixture.rs`, `mod.rs`）
+- **判定**: 初回 不合格 → Stage 2（`a433142`）→ Stage 3 独立検証 **合格**（`check.sh` 6/6、`log/` 74 テスト）
+- **主な指摘と解消**:
+  - `replace_file` の非 Windows 削除フォールバックおよび再 rename 失敗時の一時ファイル消失バグを修正（`#[cfg(windows)]` 限定・失敗時は一時ファイル保持）
+  - JPEG EOI の `0xD9` リテラル衝突を `JPEG_MARKER_SOI + 1` で回避
+  - IFD offset 境界、時刻範囲検証、`DateTimeOriginal` の範囲外エラー化、負の高度テストを追加
 
 ## 2026-11-21 / GUI 設計レビュー修正（`fix/design-review2` → `fix/design-review2-v2`）
 
-対象: `crates/m241-gui/`（レール段差・固定幅、書き込みボタン可読性、ステップマーカー形状区別、1024×640 スクロール・フッター、見本表示、設定画面 5 行、接続画面見出し・数値右揃え、速度チャート最大値位置）。
-
-- **初回 Stage 3 検証（`fix/design-review2` `0321bef`）**: **不合格**（要修正 3 件・推奨整理 3 件）
-  1. `crates/m241-gui/src/screens/connect.rs` の `log_panel` のみ `common::figure_line`（右揃え）に変更され、隣の `device_panel` が左揃え `egui::Grid` のまま残存（コメントも事実誤認で並列 2 パネルが不揃い）。
-  2. `crates/m241-gui/src/screens/firmware.rs` のステップマーカー塗り／中抜き区別がテストで担保されておらず、`Done` を中抜きに戻す変異テスト M3 が生存。
-  3. `crates/m241-gui/src/screens/settings.rs` の UI 文言に内部仕様書名（`DESIGN.md §9`）が露出。
-  - 推奨整理: 空ログ時の書き出しフッター非表示化（`log.rs`）、見本モード時の `sample_marker` 重複除去とパネル見出しキャプション統一（`firmware.rs`）、左レール固定幅の回帰テスト追加（M5、`app.rs`）。
-- **Stage 2 修正（別エージェント、`fix/design-review2-v2` `1f97b24`）**: 5 ファイル変更（+331/−38 行、テスト +6 件追加）。
-- **Stage 3 独立検証（三人目、修正者の説明・コミット本文は未読）**:
-
-| # | 指摘 | 解消 | 確認箇所・検出テスト |
-|---|---|---|---|
-| 1 | `device_panel` 右揃え統一・コメント修正 | 解消 | `crates/m241-gui/src/screens/connect.rs` で `common::figure_line` に統一。`the_connect_panels_align_their_figures_to_the_right_edge` 追加、変異テスト M1 で FAIL |
-| 2 | `StepMarker` 塗り／中抜き単一ソース化・描画検証 | 解消 | `StepMarker::is_filled` 新設、`the_step_markers_are_told_apart_by_shape_not_only_by_colour` 強化 + `the_firmware_step_row_paints_distinct_circle_primitives` 追加。変異テスト M3a・M3b とも FAIL |
-| 3 | `settings.rs` 内部仕様書名露出の除去 | 解消 | UI 文言から内部参照を除去し `no_row_exposes_internal_document_names` 追加。変異テスト M_S3 で FAIL |
-| 4〜6 | 空ログフッター・見本キャプション・レール固定幅テスト | 解消 | `an_empty_log_omits_the_export_footer_until_a_track_exists`、`the_firmware_sample_renders_one_sample_banner_and_captions_its_panels`、`the_rail_keeps_its_fixed_width_across_every_screen` 追加。変異テスト M_L4・M_F5a・M_F5b・M5 すべて FAIL |
-
-- **ゲート・テスト**: `./tools/check.sh` 全ゲート PASS、`crates/m241-gui/` テスト **93 件**（`main` 79 → `0321bef` 87 → `1f97b24` 93、削除・弱体化 0 件）。本番コードの `unwrap`/`expect`/`panic!`/`unsafe`/無検証添字 0 件、個人情報違反なし。
-- **判定**: **合格**（`main` へマージ）。
-
----
+- **対象**: `crates/m241-gui/`
+- **判定**: 初回 不合格 → Stage 2（`1f97b24`）→ Stage 3 独立検証 **合格**（`check.sh` 6/6、GUI 93 テスト）
+- **主な指摘と解消**:
+  - `connect.rs` の数値パネルを右揃え（`common::figure_line`）に統一
+  - `StepMarker::is_filled` で塗り／中抜きの形状区別をテスト固定し、`settings.rs` から内部仕様書名露出を除去
+  - 空ログフッター非表示、見本バナー整理、左レール固定幅の回帰テストを追加
 
 ## 2026-11-21 / CLI 8 コマンド配線（`feat/cli-wire2` → `fix/cli-wire2-v2`）
 
-対象: `crates/m241-cli/`（`device ports` / `device info`、`fw dump` / `fw patch`、`log info` / `log download` / `log read`、`nmea repair` の 8 コマンド配線）および `docs/reference/02-cli.md`。
+- **対象**: `crates/m241-cli/`（`device ports/info`, `fw dump/patch`, `log info/download/read`, `nmea repair`）および `docs/reference/02-cli.md`
+- **判定**: 初回 不合格 → Stage 2（`9e8bf1c`）→ Stage 3 独立検証 **合格**（`check.sh` 6/6、CLI 108 テスト）
+- **主な指摘と解消**:
+  - `StreamState::Unknown` を `Error::Safety`（exit 5）へ変更、`$GPZDA` の暦妥当性検証、`checked_add`、ヘッダサイズ警告の分離
+  - `log read --utc-offset-days auto` の最新日時判定修正、非フラッシュ `Error::Rejected` の exit 1 分離、`--dry-run` 既パッチ拒否（exit 4）、`--json` テスト追加
 
-- **Stage 1 並行レビュー（`feat/cli-wire2` `ea58d10`、仕様検収＋可読性レビューを互いの結果を見せずに並行実施）**: **不合格**（統合 Must 8 件・Should 13 件；なお未実装 5 コマンド `device doctor`/`fw flash`/`log erase`/`log geotag`/`nmea proxy` は後続ストリーム対象として分離）
-  - **Must 1**: `fw.rs` の `StreamState::Unknown` 拒否（`AGENTS.md` §2.1）が `Error::State`（exit 1）を返しており、かつテストが `without_nmea()`（`Silent`）を渡していたため変異テスト M7 が生存。
-  - **Must 2**: `fw.rs` のヘッダ記載サイズ不一致で `declared != len - 4` でも「expected」と表示。
-  - **Must 3**: `fw.rs` の `BASE_ADDR_FIRMWARE + offset` が無検査加算。
-  - **Must 4**: `nmea.rs` の `repair_zda` に年月日の範囲検証が無く、不正日付を別日付＋有効チェックサムに書き換える。
-  - **Must 5**: `logcmd.rs` の `log read --utc-offset-days auto` で `track_days` が「最新」でなく「末尾」を参照し、stale 自動シフトのテスト欠落で変異テスト M6 が生存。また明示 `7168` 指定時も自動検出注記を表示。
-  - **Must 6**: `exit.rs` が非フラッシュの `Error::Rejected`（`log download` のデバイス拒否等）を一律 exit 6（フラッシュ書込失敗）に写像（`02-cli.md` は exit 1）。
-  - **Must 7**: `fw dump --json`、`log download --json`、`fw patch --json`（適用時）のテスト欠落。
-  - **Must 8**: `fw patch` の epoch 定数異常拒否の CLI テスト欠落、および `--dry-run` が既パッチ済みイメージを拒否せず exit 0 を返す不統一。
-  - **Should 9〜21**: 内部可視性（`pub(crate)`）と `link::open_pmtk` 統一、`logcmd.rs` モジュール doc・rustdoc リンク、ハードウェア offset 定数名、コメント日付、CH340/CH341 統一、非 TTY `Confirm::pause` の安全拒否、書き出し後パース失敗時の保存先明示、`output.rs` JSON 往復と `progress(_, 0)` テスト、`nmea.rs` 変数名、`dump`/`read_once` 分割、`--length 0`/奇数長の exit 2 化、stdin `"-"` / `--assume-brom` / `Silent` / `--port` / `kml` / `nmea` テスト追加、`02-cli.md` フラグ同期。
-- **Stage 2 修正（別エージェント、`fix/cli-wire2-v2` `9e8bf1c`）**: 12 ファイル変更（+1,367/−292 行、CLI テスト 84 → 108 件、+24 件追加）。
-- **Stage 3 独立検証（三人目、修正者の説明・コミット本文は未読）**:
+## 2026-11-21 / ezTour core 修正（`fix/eztour-core`）
 
-| # | 指摘 | 解消 | 確認箇所・検出テスト |
-|---|---|---|---|
-| 1 | `StreamState::Unknown` 安全拒否（exit 5）とテスト | 解消 | `crates/m241-cli/src/fw.rs` で `Error::Safety` を返却、`dump_refuses_unknown_line_state_with_safety_error` 追加。変異テスト M7a・M7b とも FAIL |
-| 2〜3 | ヘッダサイズ警告分離・`checked_add` | 解消 | `report_declared_size` と `checked_add` を実装し単体テスト追加。変異テスト M1 で FAIL |
-| 4 | `$GPZDA` 暦妥当性検証 | 解消 | `cal::is_valid_date` による検証と `a_zda_sentence_with_an_out_of_range_date_is_left_alone` 追加。変異テスト M2 で FAIL |
-| 5 | `log read --utc-offset-days auto` 最新日時・テスト | 解消 | `track_days` を `.max()` に修正し 3 テスト追加。変異テスト M6a・M6b とも FAIL |
-| 6 | デバイス拒否（exit 1）とフラッシュ失敗（exit 6）分離 | 解消 | `CliError::{Core, FlashWriteFailed}` により非フラッシュ `Error::Rejected` を exit 1 に分離しつつ exit 6 の producer を維持。変異テスト M3 で 3 テスト FAIL |
-| 7〜8 | `--json` テスト・epoch 異常拒否・`--dry-run` 既パッチ拒否 | 解消 | `--json` 3 テストと epoch 異常拒否テスト追加、`--dry-run` でも既パッチを exit 4 で拒否。変異テスト M4 で FAIL |
-| 9〜21 | Should 13 項目（可視性・doc・非 TTY・exit 2・追加テスト・仕様同期） | 解消 | 全 13 項目の解消を diff・テスト・`docs/reference/02-cli.md` で確認 |
+- **対象**: `crates/m241-core/src/log/`（8 ファイル）
+- **判定**: Stage 2 修正完了（Must 4 件解消・1 件は事実誤認としてテスト補強のみ）
+- **主な指摘と解消**:
+  - `KmzPhoto::max_edge_pixels` に SOF ヘッダ検査を追加（超過時は無言通過せず拒否；後に `image` クレートで縮小を実装）
+  - 時刻シフト後の自動再マッチング（`plan_with_shift` + `write_datetime_original`）、距離グループ化の union-find 化、`GPSVersionID` 規格外時の `None` 仕様を doc 化
 
-- **ゲート・テスト**: `./tools/check.sh` 全ゲート PASS、`m241-cli` テスト **108 件**（84 → 108、削除・弱体化 0 件）。本番コードの `unwrap`/`expect`/`panic!`/`unsafe`/無検証添字 0 件、個人情報違反なし。
-- **判定**: **合格**（`main` へマージ）。
+## 2026-11-21 / GUI ログ画面と接続（`feat/gui-eztour-live` → `fix/gui-eztour-live-v2`）
 
-## 2026-11-21 / ezTour core の Stage 2 修正（`fix/eztour-core`）
+- **対象**: `crates/m241-gui/` および `docs/dev/01-design-decisions.ja.md`
+- **判定**: Stage 1 不合格 → Stage 2 → Stage 3 不合格（確認トークン回避など 3 変異生存）→ Stage 2 v2 で解消（`check.sh` 6/6、GUI 132 テスト）
+- **主な指摘と解消**:
+  - `GeotagConfirmation` を子モジュール `geotag_gate.rs` へ隔離し、UI クリック経路テストで未確認書込を遮断
+  - 再生終了後の不要 repaint 停止、片側欠損座標の不変条件、rail の reduced motion 配線、始点・終点マーカーをテスト固定
+- **残件・未検証**: スライダーのキーボード/accesskit 操作は未解決。`probe_serial_port`・追従実描画・GUI 経由の実 JPEG 書込は実機未検証
 
-対象: `crates/m241-core/src/log/` の 8 ファイル（coord / edit / exif / export / geotag / import / kmz / mod）。
-`feat/eztour-core` `8c2ed2a` に対する仕様検収・可読性レビューの Must を解消した。
+## 2026-11-21 / DA 書き込み経路の独立検証（`fix/da-write-g` → `fix/da-write-g-v2`）
 
-- **裁定の記録**: 可読性 Must 1（KMZ の CDATA が `]]>` で壊れる）はリードが事実誤認と確認済み。
-  `sanitize_photo_name`（`kmz.rs`）は `]` を `_` に置換するため `]]>` は生成できない。
-  修正は行わず、テスト品質の部分（名前経由で CDATA を閉じられないことを固定するテスト）だけを追加した。
-
-| # | 指摘 | 処置 | 判拠 |
-|---|---|---|---|
-| M1 | KMZ の長辺縮小（`kmzMaxPhotoEdgeSize`）未実装 | **部分的に解消。縮小は未実装のまま明示** | `KmzPhoto::max_edge_pixels` を受ける `jpeg_dimensions`（SOF ヘッダ読取、デコード無し）を追加し、上限超過は `Error::State` で**拒否**（黙って原寸を入れない）。PNG→JPEG に必要なコーデック依存は追加提案のみ。`12-progress-summary.md` §3.2 に明記 |
-| M2 | 時刻シフト後の自動再マッチングが無い | 解消 | `geotag::plan_with_shift`（再計画、dry-run 安全）＋ `exif::write_datetime_original`（`DateTimeOriginal` 書き換え）＋ `apply` が同じリライトで時刻と位置を書く。`FileModified` は昇格させない |
-| M3 | 距離グループ化が推移的でない | 解消 | union-find（path halving）。A-B 10 m / B-C 10 m / A-C 20 m を 1 グループにし、入力順反転でも同じ分割 |
-| M4 | `GPSVersionID` の型・個数不一致が doc 未記載 | 解消 | `GpsTags::version_id` と `read_gps_version` に「型・個数が規格外なら `None`」を明記（`read_coordinate` の慣例に合わせ `Err` にはしない。根拠も doc に記載） |
-
-**仕様検収 Should の処置**: S3/S4（色・`<Point>`）、S30/S31（RMC `V`・GGA 品質 0・RMC→GGA 順）、
-S-d（既定値）、S-f（`KmzPhoto::utc` と EXIF の一致、`CaptureTime` の出自を保持）はテスト／実装で解消。
-S11/S15（タイムゾーン変換・日時分秒の個別シフト・適用範囲）と S21/S22（非 JPEG の紐づけのみ）は
-P1 の範囲外として未実装のまま `12-progress-summary.md` に明記。S-e（GPX 1.1 `<speed>`）は m/s 解釈を doc 化。
-C-c（10 色パレット）は単一トラックなので 1 色のまま、理由を定数 doc に記載。
-
-**可読性 Should の処置**: 4（モジュール doc）、5（`last_bucket` 命名＋日付制約）、6（`hemi` 比較）、
-7（閉じないコメントを `Error::Log` に）、9（色の読み下しと「ezTour 実出力と未照合」）、10（Snyder §8-9、
-`split_track` の複製理由）、11（UTM の範囲 doc）、13（`_original` の命名理由）、14（`civil_from_days` を共用）、
-15（`GeotagPlan::keep_backup` の doc）、16（到達不能分岐を除去）、17（`checked_track` に集約）、
-18（merge の点順序）、19（`gps_entries_for` 削除）、20（`segment_length_for` に集約）、
-21（`crc32_ieee`・`MAX_APP1_PAYLOAD`・`MAX_TIFF_BYTES` を非公開化）、23（`<Point>` と高度既定の doc）、
-25（`min(19)` の理由）、C-a（ノルウェー／スバールバル帯の直接テスト）を解消。
-2（`<wpt>`）と 3（NMEA の落ちた行数）は doc に設計判断を明記して見送り。
-
-**安全ゲートの指摘**: 新規の JPEG サイズ読取が EOI を生の `0xD9` で書いたため `check_safety.py` が
-違反として検出した。`exif::JPEG_MARKER_EOI`（SOI+1）で表すよう修正し、ゲートは一切変更していない。
-
----
-
-## 2026-11-21 / GUI のログ画面と接続（`feat/gui-eztour-live` → `fix/gui-eztour-live`）
-
-対象: `crates/m241-gui/`（`app.rs`, `screens/connect.rs`, `screens/log.rs`, `screens/settings.rs`, `widgets/rail.rs`, `tests/render.rs`）と `docs/dev/01-design-decisions.ja.md`。
-仕様書: `DESIGN.md` §3・§5・§6、`docs/dev/07-eztour-spec.ja.md` §5・§8。実機ポートは開いていない。
-
-- **Stage 1 並行レビュー**（仕様検収＋可読性、互いの結果を見せずに並行実施）: **不合格**。
-  変異 13 件中 7 件が生存（M2 `$PMTK182,5` 送信、M3 確認なしジオタグ、M4 無限再生、M6 スライダー無効化、
-  M7 速度パネル常時メートル、M8 rail transition 無視、M9 rail の 4px を 0）。仕様違反は
-  E5（軌跡が単色・幅 2）、E6（始点／終点マーカー無し）、E4（`fit_all` 後の追従が点を選ばない）。
-- **Stage 2 修正（別エージェント）**: 6 ファイル＋設計記録 1 ファイル。
-- **Stage 3 独立検証（三人目、修正者の説明・コミット本文は未読）**: **不合格**。Must 1 件（N1、下記の v2 節）。テスト数は 82 + 30 + 6 で、Stage 3 の独立変異 15 件（M7a を除く）のうち **12 件検出・3 件生存**（M2・M3・M13/M14 群）。**Stage 2 追記にあった「変異 8 件中 7 件検出」はこの結果と食い違うため撤回する**（M3 は「M4a は生存、M4c は検出」と書かれていたが、独立変異では末尾の `playing = false` 削除 M3 が生存し、M13（`has_position()` を落とす）・M14（`latitude.is_some()` に変える）も生存した。検出できたのは M4b/M4c 相当のみ）。
-  - Must: `GeotagConfirmation(())` が `log.rs` から自由に構築でき、「写真に位置」クリック直後に `apply_geotags(GeotagConfirmation(()))` を足す M2 が全テスト通過（テストが UI 経路を通していなかった）。
-  - Should: M3（末尾の repaint 要求が止まらない）、M13/M14（片方だけ座標を持つ点の不変条件が未テスト）、M11b（`app.rs` の rail 配線が未検証）、E6 始点・終点マーカーが無テスト・コメントが 10 色パレットと矛盾、`01-design-decisions.ja.md` の「10 色はトラックごと」の断定が仕様書より強い。
-
-
-| # | 指摘 | 解消 | 確認箇所・検出テスト |
-|---|---|---|---|
-| 1 | `probe_client` の送信内容が未固定（M2） | 解消 | `probe_client` を crate 内に落とし、`probe_client_sends_only_read_requests` で `$PMTK605` / `$PMTK182,2,8` / `$PMTK182,2,1` の 3 通だけを assert。変異 M2 で FAIL |
-| 2 | ジオタグの確認ゲートが未固定（M3、可読性 Must 1） | 解消 | `GeotagConfirmation` トークン（`confirm_geotag_write` だけが発行）を `apply_geotags` が要求。`asking_to_geotag_changes_no_bytes_until_the_write_is_confirmed` / `confirming_needs_an_open_prompt` を追加。~~変異 M3 で FAIL~~ **Stage 3 の訂正: トークンは `log.rs` 内から構築でき、M2（「写真に位置」直後に書き込む）は生存した。v2 節でトークンを子モジュールへ移し、UI 経路のテストで閉じた** |
-| 3 | 再生の自動前進が未検証（M4） | 解消 | `advance_playback(now, interval)` に時計を引数化し、`playback_only_steps_once_the_interval_has_passed` / `playback_stops_at_the_last_point_and_does_not_run_on` / `reduced_motion_slows_playback_to_the_longer_interval` を追加。M4b・M4c で FAIL |
-| 4 | スライダーの確定が未検証（M6） | 解消 | `egui::Slider` を自前のトラックに置き換え、押下→ドラッグ→解放を実イベントで流す `dragging_the_playback_slider_moves_the_selected_point` を追加。変異 M6 で FAIL |
-| 5 | 軌跡の 10 色・幅 5・不透明度 0.7（E5） | 部分解消＋記録 | 線は幅 5・不透明度 0.7（`theme::metric::track`）、10 色は点の塗りに移した（`theme::TRACK_PALETTE`）。理由は `01-design-decisions.ja.md` §8。`the_track_uses_the_specified_width_and_opacity` / `the_map_track_is_five_points_wide_at_seventy_percent_opacity`。変異 M5 で FAIL |
-| 6 | POI（`rcr=0x0008`）のリング表示が未検証（E7） | 解消 | `the_map_draws_a_poi_ring_at_the_waypoint`（描画プリミティブの半径・色）と `a_waypoint_is_drawn_as_a_ring`。変異 M7 で FAIL |
-| 7 | `set_follow(true)` が点を選ばず追従が止まる（E4） | 解消 | 追従オンで位置付きの点が無ければ先頭点を選ぶ。`following_picks_the_first_point_that_can_be_plotted` / `following_centres_the_map_on_the_selected_point`（投影座標で中心を assert）。変異 M8 で FAIL |
-| 8 | 写真マッチの不変条件・確認件数・`point_index` doc・確認の無効化 | 解消 | `sync_photo_to_selected` と `find_matching_point_index` に不変条件の why、`PhotoEntry::point_index` の doc、確認文はファイル名を列挙（`geotag_targets`）、選択・写真選択・日フィルタ・再読込・トラック差し替えで確認を閉じる（`a_change_that_moves_what_would_be_written_closes_the_prompt`） |
-| D2 | rail の reduced motion 配線が未検証（M8 相当） | 解消 | レールの 4px オフセットを `tab_left_at` / `active_step_out` の純関数に切り出し、`the_selected_tab_steps_out_by_four_points_and_the_others_do_not` を追加 |
-| D4 | rail の 4px 段差が未検証 | 同上 | 同上（4.0 をリテラルで assert） |
-
-- **見送った Should と理由**
-  - 速度パネルの帝国単位の数値突き合わせ（仕様検収 Should 6 / 可読性 31）: `log_screen_renders_playback_follow_mode_and_imperial_units` は `mph` の有無だけを見る。変異 M7 は今回の修正範囲外（`speed_panel` の系列値）なので未解消。
-  - OS の reduced motion を読む（Should 4）: 既定の変更は「これまでより動きが減る／増える」の判断を含むため、修正担当の裁量で既定を変えず保留。
-  - 上書き拒否の TOCTOU（Should 3）、単位切替の不揃い（2）、`pub` 範囲の残り（1）: 実害の判断が必要で、範囲外の `m241-core` か設計判断に属する。
-  - 可読性 Should 11（エラー経路の重複）、27（bounds の 3 重走査）: 挙動を変えない整理で、今回の検証対象外。
-- **ゲート・テスト**: `./tools/check.sh` 6/6 PASS。`crates/m241-gui` テスト **112 件**（`ec06f03` の 93 → 112、+19、削除・弱体化 0 件）。
-- **変異テスト**: Stage 2 の「8 変異を実行し 7 検出／M4a のみ生存」は、Stage 3 の独立変異（15 件、M7a を除く）で **12 検出・3 生存**（M2 確認なしジオタグ、M3 末尾 repaint、M13・M14 `has_position()`）と判明したため**撤回**する。M4a の生存という判断はそのまま（末尾で `playing = false` を消しても選択位置は止まる）。生存 3 件は v2 節で解消。
-- **未検証**: `probe_serial_port` の実機動作、追従の実描画、GUI 経由の実 JPEG 書き込みは 05-verification.md に記録が無く、**未検証**のまま（合格に含めない）。
-
-### Stage 2 v2（別エージェント、`fix/gui-eztour-live-v2`、main `8170c4e` を先にマージ）
-
-変更は `crates/m241-gui/` と `docs/dev/` のみ（`m241-core` / `m241-cli` / `m241-flash` は未変更）。実機ポートは開いていない。
-
-| # | Stage 3 の指摘 | 対応 | 確認箇所・検出テスト・変異 |
-|---|---|---|---|
-| N1（Must） | `GeotagConfirmation` を `log.rs` 内から構築でき、M2（「写真に位置」直後に書き込み）が全テスト通過 | **解消** | トークンを子モジュール `crates/m241-gui/src/screens/log/geotag_gate.rs` へ移し、フィールドを完全私有（`pub(super)` にすると親の `log.rs` に再び開くため不可）に。`apply_geotags` も画面私有に下げた。唯一の入口は `confirm_geotag_write`（「書き込む」ハンドラのみが呼ぶ）。UI 経路テスト `pressing_geotag_writes_nothing_until_the_write_button_is_pressed`（実クリック → プロンプト表示 → バイト不変 → キャンセル → 再度押下 → 「書き込む」で初めて変化）を追加。M2 の主形（`GeotagConfirmation(())`）は**コンパイル不能**、構築子を使う形は UI テストが **FAIL** |
-| N2 | 末尾で `playing = false` を消しても検出されない | **解消（指摘の一部は事実と異なる）** | 末尾の代入自体は `step_next` が既に `playing` を落とすため**もともと冗長**で、削除しても状態は変わらない。実際に有害なのは「`advance_playback_if_due` が終了後も repaint を要求し続ける」形なので、`a_finished_playback_asks_for_no_further_frame`（戻り値）と `a_finished_playback_asks_egui_for_no_further_frame`（`set_repaint_observer` で実フレームの 250/500 ms 要求を数える）を追加。`if true` 変異（終了後も要求する）で **FAIL** |
-| N3 | 片方だけ座標を持つ点のテストが無い | **解消** | `the_matched_index_is_always_a_point_with_both_coordinates`（経時点が半分だけ位置を持つ状態を作り、添字が次の実測点へ移ることを要求）と `a_photo_at_a_half_positioned_point_is_not_a_geotag_target`。M13（`has_position()` を落とす）・M14（`latitude.is_some()`）・M14b（`longitude.is_some()`）で **FAIL**。なお写真単位のテストだけでは検出できない（`m241-core` の `geotag::plan` が先に半端な点を拒否するため）ことが分かり、不変条件が効く関数を直接試す形にした |
-| N4 | スライダーのキーボード変更・accesskit 値が後退 | **見送り** | 理由は下記 |
-| N5 | rail の reduced motion 配線が未検証（M11b） | **解消** | `App::draw` が `rail::rail_transition_secs_for` で求めた値を渡し、`rail_with_transition` が受け取った値を記録する（`#[cfg(test)]`、スレッド単位）。`the_shell_hands_the_reduced_motion_setting_to_the_rail` が実シェルを描いて **0 s / 0.15 s の引数そのもの**を assert。`app.rs` を 0.15 直書きにした M11b で **FAIL**。アニメーション自体も `the_tab_slides_at_the_transition_time_the_caller_passed` が描画位置で測り、M11a・M11c（引数を無視）で **FAIL** |
-| N6 | 始点・終点マーカーが無テスト・コメントが 10 色と矛盾 | **解消（削除せず固定）** | コメントをパレットの実態に合わせ、`the_map_marks_the_start_and_the_end_of_the_track_in_ink`（1.5 倍・2.5 倍のリングが ink で描かれる）を追加。削除 → **FAIL**、amber 化 → **FAIL**（design ゲートも検出）。設計判断は `01-design-decisions.ja.md` §8.1 に記録 |
-| N7 | `01-design-decisions.ja.md` の「10 色はトラックごと」という断定 | **解消** | 仕様書が明記しているのは「既定色は 10 色パレットの巡回」までであると書き直した |
-
-- **見送った Should と理由**
-  - **N4（スライダーのキーボード・accesskit）**: 対象の `playback_controls` は今回まったく変更していない（後退は Stage 2 の変更で入ったもの）。直すには egui の focus と accesskit の値変更を headless で再現する必要があり、テストで固定できない変更は Review の対象外になる。代替経路（`Space`/`←`/`→`、「前の点」「次の点」）は残っているので、必須の「任意位置へ飛ぶ」操作以外は満たす。設計判断として未解決のまま残す。
-  - N1 の追加として、パレットの色が**描画**に現れることを `the_map_track_is_five_points_wide_at_seventy_percent_opacity` に追加した（3 種類以上）。色を 1 色に潰す M9 で **FAIL**。
-- **ゲート・テスト**: `./tools/check.sh` 6/6 PASS。`crates/m241-gui` テスト **132 件**（lib 88 + render 32 + design_gate 6 + design_invariants 6。Stage 2 の 112 → 132、+20、削除・弱体化 0 件）。
-- **変異テスト（v2 で追加）**: M2（コンパイル不能／UI テスト FAIL）、M3 相当（終了後 repaint、FAIL）、M13・M14・M14b（FAIL）、M11a・M11b・M11c（FAIL）、N6a マーカー削除（FAIL）、N6b amber（FAIL）、M9 点の色（FAIL）。**v2 のテストで生き残る変異は 0 件**。ただし末尾の `playing = false` の削除は、`step_next` が同じことをするため**状態に影響しない**（テストでは検出できないが、害もない。冗長な代入として残した）。
-- **実機未検証**: Stage 3 と同じ 3 項目（`probe_serial_port`、追従の実描画、GUI 経由の実 JPEG 書き込み）は未検証。
-
----
-
-## 2026-11-21 / DA 書き込み経路の独立検証 v2（`fix/da-write-g` → `fix/da-write-g-v2`）
-
-対象: `crates/m241-flash/src/da.rs`、`simulator.rs`（+ `lib.rs`、`docs/dev/11-safety-review.md` は前段）。
-main `3f72107` を先にマージ済み。実機ポートは開いていない。`FLASH_WRITE_START = 0` と
-`check_layout` の拒否は維持し、実機書き込みは解禁していない。
-
-- **Stage 1**（仕様検収＋可読性、`af8bb4e..c9105ed`）: **不合格**。Must 7 件・Should 22 件ほか。
-- **Stage 2**（`fix/da-write-g` `142c976`, `aea7923`）: Must と可読性 Must を修正。
-- **Stage 3 独立検証**（三人目、`aea7923`）: **不合格**。理由 4 点 —
-  (1) `the_stream_stays_aligned_after_a_refused_range` が `0xD3` 拒否後の余分な読み（V11）を検出できない、
-  (2) `FakeDa::expected_packets` の `ceil` ルールが V15/V16 で固定されていない、
-  (3) `expected_start` のピンが V4（`0x0020_0000` へ変更）で生存、
-  (4) Stage 1 Should の見送り理由が未記録。
-- **Stage 2 v2**（別エージェント、`fix/da-write-g-v2`、本節）:
-
-| # | Stage 3 の指摘 | 対応 | 確認箇所・検出テスト・変異 |
-|---|---|---|---|
-| 1（Must） | `0xD3` 拒否後に余分な読みがあっても検出できない（V11 生存、実測 5.0 s） | **解消** | `FakeDa` に `read_bytes()` と `read_polls()` を追加（`simulator.rs`）。`read_byte` は 0 バイト読みを期限まで**ポーリング**するため、余分な読みはバイト数では見えない（空バッファは `Ok(0)`）ので、ポーリング回数で固定する。`the_stream_stays_aligned_after_a_refused_range` を「受理→拒否→再受理」の 3 段に書き換え、拒否コマンドが**ちょうど 1 バイト・ちょうど 1 ポーリング**で終わることを assert。フェイク側の性質は `a_refused_memory_range_leaves_nothing_behind_for_the_next_reply` が単独で固定する。変異 V11（`A5` の後に `read_byte`）で **FAIL**（ポーリング 70 万回超／`left: 701925, right: 1`） |
-| 2（Must） | フェイクの `ceil` パケット数ルールがテストで固定されていない（V15/V16 生存） | **解消（1 件は等価と判定）** | 追加: `one_byte_range_with_a_full_size_packet_is_one_packet_not_a_cursor_walk`（範囲 2 バイト・パケット `0x100` → `ceil`=1、余分パケットは `A5` のみで書かれない）、`a_packet_beyond_a_short_range_is_refused_before_it_is_programmed`、`a_packet_past_the_two_packet_count_is_refused`、`a_second_write_command_still_counts_its_own_packets`。**この過程でフェイクの実バグを発見**: `accepted_packets` が `0xD5` ごとにリセットされず、同じフェイクで 2 回目の書き込みが最初のパケットで完了扱いになっていた。`0xD5` 受理時に 0 に戻す修正を入れた。変異 **V15b**（リセット削除）**KILLED**、**旧コード**（`da_cursor > end` かつリセット無し）**KILLED**。**V15 単独**（リセット有り＋`da_cursor > end`）と **V16 単独**（完了前チェック無効化）は**等価変異**として生存（理由は G 節） |
-| 3（Must） | `expected_start` のピンが V4 で生存 | **解消** | `check_layout` のローカル `expected_start`/`expected_length` を `EXPECTED_WRITE_START` / `EXPECTED_WRITE_LENGTH`（private 定数）に名前を付け、本体を `check_layout_of(4 引数)` に分離（**公開 API に範囲引数は増やしていない**）。`the_pinned_start_is_the_shipped_start_and_not_the_other_candidate` が「ピン＝出荷値」と「ピンと違う write start は第 3 段で拒否」を assert。変異 **V4** で **FAIL** |
-| 4（Must） | Stage 1 Should の見送り理由が未記録 | **解消** | 本節 G に記録 |
-
-- **ゲート・テスト**: `./tools/check.sh` **6/6 PASS**。`cargo test -p m241-flash` = **70（lib）+ 12（safety_gate）= 82 passed**（`aea7923` の 75 → 82、+7、削除・弱体化 0 件）。
-- **変異テスト（v2 で実行、すべて HEAD から復元し `git status --porcelain` 空を確認）**:
-
-| ID | 変異 | 結果 | 落ちたテスト |
-|---|---|---|---|
-| V4 | `EXPECTED_WRITE_START` を `0x0020_0000` に | **KILLED** | `the_pinned_start_is_the_shipped_start_and_not_the_other_candidate` |
-| V11 | `0xD3` 拒否 `A5` の後に `read_byte` | **KILLED** | `the_stream_stays_aligned_after_a_refused_range` |
-| V15 | 完了判定を `da_cursor > da_range.1` に（リセット有り） | **等価（生存）** | — |
-| V15b | `0xD5` 時の `accepted_packets = 0` を削除 | **KILLED** | `a_second_write_command_still_counts_its_own_packets` |
-| 旧コード | カーソル判定 ＋ リセット無し | **KILLED** | 同上 |
-| V16 | 完了前の余分パケット拒否を無効化 | **等価（生存）** | — |
-
-### G. 見送った Should と理由（Stage 1 由来）
-
-`09-review-protocol.md`「統合」3（Should は直すか、直さないなら理由を残す）に対する記録。
-括弧内は Stage 1 の文書と番号（可 = 可読性レビュー、仕 = 仕様検収）。
-
-- **等価変異として記録するもの（コードは変更、テストは追加しない）**
-  - **V15（フェイクの完了判定を `da_cursor > end` に戻す）**: パケット長が一定でカーソルが
-    各パケットで `length` ずつ増える限り、`ceil((end - start + 1) / length)` と
-    「カーソルが初めて `end` を超えたパケット数」は**すべての整数入力で一致する**
-    （`start` を 0〜8、`en` を `start`〜`start+19`、`length` ∈ {1..7, 0x10, 0x40, 0x100}
-    の全組合せを機械的に照合して 0 件の差異）。差が出るのは `0xD5` ごとにカーソルだけが
-    0 に戻り、カウントが戻らない場合だけで、それは上の **V15b** として固定した。
-    したがって「フェイクがリセット無しでカーソル判定を使っていた」旧コードは **KILLED**、
-    「リセット有りでカーソル判定」は挙動が同一のため生存でよい。
-  - **V16（完了前の余分パケット拒否 `>= expected_packets` を無効化）**: 最後の正常パケットで
-    `== expected_packets` の枝が `DaStage::Command` へ移るため、次のパケットは
-    パケット段ではなくコマンド段で 1 バイトずつ `A5` になる。拒否の**経路**は変わるが、
-    観測できる結果（`0x69` も `0x5A` も出さない・書かない・受理数が増えない）は同じ。
-    実験で確認: 完了前チェックを無効にした状態で `cargo test -p m241-flash` が全緑（当時の 75 テスト、
-    フラッシュも不変）。両方（完了前チェック＋完了時の段移動）を同時に消す変異は **13 件**を落とす
-    （KILLED）。よって単独では等価。
-- **コードはそのまま、理由のみ記録**
-  - **可読性 2（`record_range` と `program` の ACK 読みを `read_ack_pair` に寄せる）**: 両者的に
-    似て見えるが、`0xD3` は「1 バイト目が `5A` なら 2 バイト目を読む（`A5` なら読まない）」、
-    `0xD5` は「1 バイト目 `5A` の後に `A5` か `5A` かを読む（`0xD5` は必ず 2 バイト）」で、
-    **読みの枚数が違い、その違いが安全性そのもの**。1 つの関数に寄せると、この差を
-    引数で表すことになり、`0xD3` 側の「読まない」が呼び出し側の選択になる。今回 V11 で
-    そこにテストを置いたので、集約は差を隠す方向に働く。見送り。
-  - **可読性 3（`Mode` / `Modelled` の改名・統合）**: 挙動に影響せず、`simulator.rs` の
-    テスト専用 API の語彙変更。Stage 2 の範囲で全テストを書き換える割に、見つけられる
-    誤りが「名前が悪い」以上に無い。別 PR で扱う。
-  - **可読性 4（`set_modelled` のリセット対象の明文化）**: `set_modelled` の doc は
-    「何を捨て、何を残すか」を列挙済み。残る曖昧さは `da_range`/`da_cursor` を**残す**理由で、
-    これは `FakeDa` の doc（「チップの状態を忘れるフェイクは、直前のレンジへ書くバグを隠す」）
-    に書かれている。重複を避けるため追記しない。
-  - **可読性 19（`0xD5` の消去範囲の citation が 3 か所で食い違う）**: `da.rs` のモジュール doc
-    は `0x0010251C`–`0x00102560`（`0xD5` 全体）、定数の doc は `0x0010251C`–`0x00102540`
-    （最初のセクタ消去＋失敗分岐）、`check_layout` の doc は全体、と**範囲が違うのは対象が
-    違うため**。同じ範囲に揃えると、むしろ失敗分岐（`0x0010253C`–`0x0010254C`）の位置が
-    読めなくなる。各所の対象を 1 行で書き分ける案は可読性の向上が小さく、実機未検証の
-    アドレス列を触るリスクの方が大きい。見送り。
-  - **仕 4（情報レポートが `0x22BA` の後に `0x0022`/`0x00BA` を送る）**: Stage 1 の指摘。
-    現在の `da_info_report` は `0x00C2`・`0x22BA`・`0x0000`・`0x0000` を正しく並べており
-    （`the_info_report_is_the_measured_twenty_bytes` が先頭 16 バイトを literal で固定）、
-    分岐点からのバグは Stage 2 で解消済み。追加作業なし。
-  - **仕 5（`0xD3` 単独では消えないことも書く）**: `check_layout` のメッセージは `0xD5` が
-    消すと書いており、`0xD3` が記録だけであることは `simulator.rs` のモジュール doc と
-    `a_refused_memory_range_keeps_the_range_recorded_before_it` が固定している。エラーメッセージに
-    足すと、安全側の警告（0 始まりは危険）が相対化される。見送り。
-- **未検証**: `0xD3` の 1 バイト拒否、`0xD9` 無応答、消去失敗の `0xA5`、ゼロ詰めはいずれも
-  **実機未検証**（命令列のみ）。`docs/dev/05-verification.md` に記録が無い限り動かさない。
-
----
+- **対象**: `crates/m241-flash/src/da.rs`, `simulator.rs`
+- **判定**: Stage 1/3 不合格 → Stage 2 v2 で解消（`check.sh` 6/6、flash 82 テスト）
+- **主な指摘と解消**:
+  - `FakeDa` に `read_bytes()` / `read_polls()` を追加し、`0xD3` 拒否後の余分な読み（V11）を検出
+  - パケット数カウントの `0xD5` ごとのリセット漏れバグを修正、`EXPECTED_WRITE_START` ピンの変異テスト（V4）を追加
+- **未検証**: `0xD3` 1 バイト拒否、`0xD9` 無応答、消去失敗 `0xA5`、ゼロ詰めは命令列のみで実機未検証
 
 ## 2026-11-21 / CLI 非破壊 3 コマンド（`fix/cli-non-destructive`）
 
-対象: `crates/m241-cli/`（`cli.rs` / `device.rs` / `lib.rs` / `logcmd.rs` / `nmea.rs` / `testing.rs`）と
-`docs/reference/02-cli.md`。`device doctor`（環境・ポート・同定・ログ使用量・drop スキャン・DA 抽出）、
-`log geotag`（dry-run / タイムゾーン / シフト / バックアップ）、`nmea proxy`（stdout / TCP、loopback ガード）
-を追加した。`fw flash` / `log erase` はスタブのまま。
-
-- **Stage 1 並行レビュー**（仕様検収＋可読性、互いの結果を見せずに並行実施）: 仕様 Must 2 / Should 8、
-  可読性 Must 4 / Should 16。
-- **Stage 2 修正**（別エージェント、`b82f3ce`）: 上記の Must / Should を解消。
-- **Stage 3 独立検証**（三人目、`b82f3ce`）: **合格**。変異 15/15 検出。Should は 19/20 解消
-  （R13 のみ部分解消で理由を記録）。
-- **Windows CI 修正**（`d1160a1`）: `the_drop_scan_stops_one_level_past_max_drop_depth` が
-  `d4/bound.txt` を文字列で比較しており、Windows の `\` で落ちた。`Path::new(path).ends_with(
-  Path::new("d4").join("bound.txt"))` に変更。差分はテスト 1 箇所のみで、本番コードは不変。
-- **新 head 再レビュー**（`feaaeb6` と `d1160a1`）: **合格**。CLI の 7 ファイルは `b82f3ce` と
-  バイト一致で、main 取り込みは機械的。変異 16/17 検出（未検出は `DA_SIZE_BYTES` の定数自体を
-  書き換える D1b のみ）。
-- **ゲート・テスト**: `./tools/check.sh` 6/6 PASS。`m241-cli` は **131 + 1（`nmea_stdin`）**、
-  テストの削除・弱体化 0 件。`fw flash` / `log erase` がスタブであることは
-  `the_stub_list_records_how_far_the_wiring_got` が固定している。
-- **残した Should / Could（マージを妨げない）**:
-  - N1: 誤サイズ DA のテストが期待値を `DA_SIZE_BYTES + 1` から作っており、定数自体の書き換えでは通る。
-    リテラル 1 回の assert で塞げる。
-  - N2: `--port` 未指定時に probe 行が出ないことの assert が無い。
-  - N3: `shift_timestamp_seconds` の到達不能分岐（前回 N1 の継続）。
-  - N5: `02-cli.md` の geotag 節に「実カメラ JPEG では未検証」の 1 行が無い。
-- **未検証**: 実機の `device doctor` probe、実カメラ JPEG への `log geotag`、Bluetooth SPP の
-  `nmea proxy`。いずれも `05-verification.md` に記録が無い限り未検証のまま。
-- **記録の補完**: 本節は Stage 3 再レビューの N4（本ラウンドの記録が `10-review-log.md` に無い）を
-  埋めるために、マージ後に追記した。
-
+- **対象**: `crates/m241-cli/`（`device doctor`, `log geotag`, `nmea proxy`）および `docs/reference/02-cli.md`
+- **判定**: Stage 1 → Stage 2（`b82f3ce`）→ Stage 3・Windows CI 修正（`d1160a1`）再レビュー **合格**（`check.sh` 6/6、CLI 132 テスト）
+- **主な指摘と解消**: 仕様 Must 2・可読性 Must 4・Should 19/20 を解消、Windows パス区切りテストを修正
+- **未検証**: 実機 `device doctor` probe、実カメラ JPEG への `log geotag`、Bluetooth SPP の `nmea proxy`
 
 ## 2026-11-21 / DA ローダーと `fw probe-da`（`feat/da-loader-probe`）
 
-対象: `git diff 7f520c2..c06bcef`（10 ファイル、+1916 / −13）。DA をチップの RAM へロードする
-`DaLoader`（`0xA1` / `0xAF` / `0xA8`）と、読み出し専用 `0xD6` で DA 側のファームウェア基底
-（`0` と `0x00200000`）を判定する `m241 fw probe-da`。フラッシュへは書き込まない。
-
-- **Stage 1 並行レビュー**（仕様検収＋可読性、互いの結果を見せずに並行実施）: 仕様 Must 3 / Should 7 / Could 6、
-  可読性 Must 5 / Should 12 / Could 7。
-- **Stage 2 修正**（別エージェント）: 下の表のとおり Must 8 件をすべて解消。Should 19 件のうち 15 件を解消し、
-  4 件を見送った（理由を本節末尾に記録）。
-
-### Stage 1 の指摘（抜粋）
-
-| # | 指摘 | 出典 |
-|---|---|---|
-| M1 | `fw probe-da` の判定（先頭 4 バイト = `18 F0 9F E5`）は DA ビューで実測がなく、`da.rs` の「`0xD6` 未検証」と `fw.rs` / `02-cli.md` の断定が同居 | 仕様 Must-1 |
-| M2 | `base_verdict` が「第 1 候補が未読・第 2 候補が一致」で `Settled` を返す（未読を不一致として扱う） | 仕様 Must-2 |
-| M3 | `0xA8` の count が旧実装の `0` でなく `1`。偽 DA もテストも count を見ていない（変異 M1c 未検出） | 仕様 Must-3 |
-| M4 | `load` の doc とモジュール doc が「リセットベクタを検査する」と書くが、`check_da_image` はサイズしか見ない | 可読性 M1 |
-| M5 | `write_image` 末尾の `let _ = clear_input()` が失敗を捨てる理由を書いていない | 可読性 M2 |
-| M6 | `02-cli.md` が「64 バイトを比較」と読み取れる書き方（実際に判定するのは 4 バイト） | 可読性 M3 |
-| M7 | `PROBE_PAGE_SIZE` の「偶数」の理由が `0xD6` に当たらない（チェックサムはバイト和） | 可読性 M4 |
-| M8 | `Confirmation::PROBE_WORD`（`LOAD`）はどこからも入力されないのに、エラー文が入力を促す | 可読性 M5 / 仕様 Should-5 |
-
-**変異（Stage 1 実測）**: M1/M1b/M2–M8・C3–C5 は検出。**M1c（`0xA8` count）、C1（候補を 1 つに減らす）、
-C2（ベクタ比較を 1 バイトに）は未検出**。
-
-### Stage 2 の修正
-
-| # | 処置 | 固定するテスト |
-|---|---|---|
-| M1 | `BaseVerdict` を `Settled` / `Inconclusive(Inconclusive)` に分け、`Inconclusive` を `Unread` / `NoMatch` / `Ambiguous` に分ける。`Unread` は読めた候補を列挙する。CLI と `--json` は候補ごとに「読めた/読めない」「先頭 4 バイト」「一致/不一致」を出す。doc と `02-cli.md` に「DA ビューでは未検証」を明記 | 判定の純関数: `a_candidate_that_was_not_read_blocks_settling_even_when_the_other_matches`。表示（`print_probe_result` を直接呼ぶ。`probe_da` は通らない）: `probe_da_json_document_names_both_candidates_and_says_no_flash_write`, `probe_da_text_result_shows_read_state_first_bytes_and_the_match_for_both`。`probe_da` 本体を通すのは `probe_da_reads_both_candidates_through_the_fake_and_sends_no_write_opcode` |
-| M2 | `Settled` は「2 候補とも読めて、ちょうど片方が一致」のときだけ | 同上 + `the_probe_verdict_settles_only_on_exactly_one_vector_match` |
-| M3 | `0xA8` を `Frame { count: DA_JUMP_COUNT = 0 }` で構築（旧実装と同じ zero）。偽 DA が `count != 0` を数え、テストで固定。`03-hardware-facts.md` と `01-da-protocol.md` §3.2 に根拠と未検証を記載。ロード範囲と BootROM スタックの非重複を区間で固定 | `the_jump_frame_carries_count_zero_and_the_fake_refuses_any_other`, `the_load_range_does_not_touch_the_bootrom_stack` |
-| M4 | 選択肢 (a): `DA_IMAGE_HEAD = [00, 00, A0, E1]`（ベンダー `DA_v3.8.4.bin` の先頭 4 バイト = `mov r0, r0`）を追加し、`check_da_image` がサイズの次に比較。DA バイナリはコミットしない | `the_loader_refuses_an_image_whose_first_bytes_are_not_the_da`, `the_loader_constants_are_pinned_to_the_documents_and_the_read_crate` |
-| M5 | 失敗を捨てず `Result` を返す。理由（ずれた echo は次の `read_back` の 9 バイト echo 比較で `Framing` になる）をコメントに書く。ポーリング抽象は持たないので、1 回の drain 失敗はそのままエラーになる | `a_drain_that_fails_is_reported_instead_of_a_successful_load`（Stage 3 の Should-2 で追加。drain の `Io` が `load` のエラーになり、`0xAF` の読み戻しと `0xA8` に到達しないことを固定）。成功経路は `the_loader_writes_the_whole_image_to_the_da_base_and_starts_it` |
-| M6 | `02-cli.md` を「判定は先頭 4 バイトだけ、残りは表示用」に書き直し、実機ログとして貼れる出力例も追記 | — |
-| M7 | `PROBE_PAGE_SIZE` の doc を「偶数は `0xD6` の要件ではなく、ページ長は DA が受け付けるか未検証」に修正 | — |
-| M8 | `PROBE_WORD` を削除し、`of_probe_command_line` のエラーを `--yes` のみに。`11-safety-review.md` の記述も追随 | `the_loader_refuses_without_a_confirmation_and_sends_nothing`, `probe_da_refuses_without_yes_before_opening_a_port_or_reading_a_file` |
-
-**追加で解消した Should**: C1 / C2 の検出（`the_probe_path_reads_both_candidates_and_nothing_else`、
-`the_probe_verdict_compares_all_four_vector_bytes`）、候補一覧の検証（`base_verdict` が 2 つ以外を拒否）、
-`read_candidates` を `m241-flash` に置いて CLI からアドレスを消した（Should-7 / `11-safety-review.md` の
-「任意アドレスを受け付けない」を実装に合わせた）。
-
-**偽 DA の `0xD6` に見つかった既存の欠陥（本節で修正）**: c06bcef の `send_page` はページの開始位置を
-`read_page × page_len` として範囲の先頭からのオフセットで数え、`begin_read_range` は固定長のページだけを
-用意していたため、**開始アドレスが `0` 以外の読み出しに、要求した範囲と違うバイト列を返していた**
-（`0x100` を読むと `0x00` の内容）。`read_returns_the_window_at_the_address_asked_for` はデータを窓の
-`0x100` に置いていたので、偽 DA 側のずれとテストの前提が同じだけずれて一致していた。範囲全体を
-`start` からコピーし、ページをその中の位置で切り出し、ページ数を §5.5 の `udiv(total+page-1, page)` に
-合わせた。固定するテストは `the_fake_pads_a_partial_page_by_default_and_can_send_it_short`
-（Stage 3 の Should-3 で `a_two_page_read_is_the_same_bytes_however_the_da_pads_the_range` から
-改名・強化した。旧テストは範囲長がページ長の倍数で、名前に反して短いページを作っていなかった。
-`read_range` 自体がページ長の倍数以外を `Error::State` で拒否するため、短いページはクライアントからは
-到達しない。テストが固定するのは偽 DA のページ詰めのモデルのほうで、それをテスト名と本文で明示した）。
-併せて `05-verification.md` に `0xD6` / DA ビューのベクタ / V1.14 個体で probe を走らせていないことを追記した。
-
-**見送った Should と理由**
-
-- Should-2 の「最終ページの advance を送らない」側への寄せ: 送る／送らないは実機でのみ決まる。§5.5 の
-  「Nothing is sent when the range is complete.」は DA の返信についての文であり、host 側の advance を
-  省略してよいとは書いていない。テストとシミュレータは「最終ページ後も 1 バイト送り、DA は何も返さない」
-  で一致させ、未検証点として `05-verification.md` に新設の行で記録した。片方に寄せる根拠が無い。
-- Should-1 の「クライアント側が短いページを受ける」側: `PROBE_PAGE_SIZE` は 64 で固定なので、判定が
-  必要とする最初のページが短くなる経路は無い。範囲全体がページ長の倍数でない場合の最終ページは
-  クライアントが要求しない。偽 DA に `without_page_padding` を足して「ページ長の倍数でない範囲」でも
-  同じバイト列が返ることは固定した。
-- Could-2（`0x7D` 待ちの境界）・Could-3（`PROBE_PAGE_SIZE` を可変にする）は実機の値が要る。片付けず、
-  `05-verification.md` に未検証として残した。
-- Could-5（偽 DA の `0xA1` アドレス未検査）と Could-6（`03-hardware-facts.md` の追記）は解消済み。
-  Could-4（テスト名）は **当時の記録が誤り**。Stage 2 では改名されておらず、
-  `a_da_that_did_not_start_is_a_framing_error_rather_than_a_wait` が `Error::Timeout` を期待したまま
-  残っていた（Stage 3 が指摘）。Stage 3 の Should-6 で
-  `a_silent_port_after_the_jump_is_a_timeout_not_a_framing_error` に改名し、`Framing` 側は
-  `bytes_that_are_not_a_report_end_the_scan_as_a_framing_error` として別に固定した。
-
-**訂正（Stage 3 の Should-1）**
-
-- Stage 2 の報告には「`&[u8]` の `get(24..26)` が `None` を返すので `Vec<u8>` でも同じはず」という
-  主張が混ざっていたが、これは誤り。`Vec<u8>` も `&[u8]` も範囲内なら `get(24..26)` は `Some` を返す。
-  HEAD のコードに `get(24..26)` は無く（`first_bytes` は `page.get(..VECTOR.len()).unwrap_or(page)`）、
-  この誤った前提に基づくコードは残っていない。以下の記述は環境依存の主張なので取り下げる。
-
-### ゲート
-
-`./tools/check.sh` 6/6、`cargo test -p m241-flash -p m241-cli`。Gate の詳細は Stage 3 の節（未検証）。
-
-### Stage 2 v2（Stage 3 の Must / Should への対応）
-
-Stage 3（`/tmp/opencode/verify-da-loader-probe.md`）の **V-Must-1** と Should 1〜6 に対応した。
-
-| # | 処置 | 固定するテスト |
-|---|---|---|
-| V-Must-1 | `m241-cli` のテスト用の偽 DA（`crates/m241-cli/src/testing.rs` の `fake_da` モジュール）を追加し、`probe_da` を**最後まで**駆動する。偽 DA は BootROM の sync、NMEA ストリームと `$PMTK180`、`0xA1` / `0xAF` / `0xA8`、DA のバナー、`0xD6` のページ会話を最小限に模し、受けた opcode・`0xA1` のアドレス・`0xA8` の count・`0xD6` の範囲を記録する | `probe_da_reads_both_candidates_through_the_fake_and_sends_no_write_opcode`, `probe_da_with_the_vector_at_the_first_candidate_settles_on_it`, `probe_da_uses_silence_and_assume_brom_without_touching_the_reset_lines` |
-| Should-1 | 上記「訂正」のとおり、`get(24..26)` の誤った主張を取り下げた | — |
-| Should-2 | 偽 DA に `failing_clear_input()` を足し、drain 失敗が `load` の `Error::Io` になり、読み戻しと jump に到達しないことを固定 | `a_drain_that_fails_is_reported_instead_of_a_successful_load` |
-| Should-3 | 旧テストを改名・強化。短いページは `read_range` からは到達しない（ページ長の倍数以外は `Error::State`）ため、「偽 DA のページ詰めのモデル」を固定するテストだと名前に明記 | `the_fake_pads_a_partial_page_by_default_and_can_send_it_short` |
-| Should-4 | 上の M1 / M2 / M5 の「固定するテスト」列を、実際に通る関数とテスト名に直した | — |
-| Should-5 | `Frame` の doc に「count は型では守れず、`DA_JUMP_COUNT` との一致はテストで固定する」と書いた | `the_jump_frame_carries_count_zero_and_the_fake_refuses_any_other` |
-| Should-6 | テスト名を期待値に合わせて改名し、`Framing` 側は別テストにした | `a_silent_port_after_the_jump_is_a_timeout_not_a_framing_error`, `bytes_that_are_not_a_report_end_the_scan_as_a_framing_error` |
-
-**変異（実測、各変異のあと元に戻して `git status --porcelain` 空を確認）**: M9（`probe_da` に `0xD5`）は
-`probe_da*` の 3 本で検出。M2c（2 候補目を捨てる）は 2 本で検出。`DA_JUMP_COUNT = 1`、ベクタ比較 1 バイト、
-未読 → `Settled`、先頭 4 バイト検査の除去もすべて検出。
-
-### Stage 3 検証
-
-未検証（別エージェントが記入する）。
-
----
-
-## 2026-11-22 / PR #19 `fix/flash-d3-resync` の Stage 2 修正
-
-対象: `git diff origin/main...ad489d5`（9 ファイル、+715 / −39）。Stage 1 は仕様検収
-（[仕様レビュー](https://github.com/haruki0420/holux-m241-rs/pull/19#issuecomment-7075378104)）と
-可読性（[可読性レビュー](https://github.com/haruki0420/holux-m241-rs/pull/19#issuecomment-7075374592)）を
-別々のレビュアーが並行実施。Stage 2 は別エージェントが担当し、Stage 3 で検証する。
-Stage 1 の 2 レビュアーは `./tools/check.sh` を実行していない（ビルド成果物を避けるため）。
-
-### Stage 1 の Must への対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| 仕様 M1 | `02-cli.md` の `da-restart` 節に実機未検証の注記が無い | 節内に「⚠️ 未検証 on hardware」と `docs/dev/05-verification.md` §2 への参照を追加。出力例も「再起動は確認できない」に更新 | — |
-| 仕様 M2 | 再試行前の再入失敗に「The write itself finished」「`--recover`」の誤案内が付く | `reenter_bootrom` に `Reentry::{ReadBack, BeforeRetry}` を追加し、エラー文を分岐。再試行前は「何も書いていない・`fw dump` で確認」に。`RESTARTED_NOT_RETRIED_NOTE` を新設し `--recover` を出さない | `flash_retry_reentry_failure_does_not_claim_a_write_finished` |
-| 仕様 M3 | `0xD3` 成功・`0xD5` 未送信の境界テストが無い | fake に `failing_write_command()`（`0xD5` ヘッダの送信を失敗させる）を追加し、再試行しないことを固定。`program_started` はヘッダ送信**前**に立つ | `flash_does_not_retry_when_the_0xd5_header_cannot_be_sent`, `a_failed_d5_header_write_still_counts_as_program_started` |
-| 可読性 M1 | `flash` に復旧が 4 段の入れ子で埋まり、`note_write_failure` + `with_note` が 6 箇所重複 | `recover_failed_write` と `WriteAttempt` に切り出し、`write_failure` ヘルパ 1 つに集約。`flash` は「試行 → 復旧/再試行 → 読み戻し」の一直線に | 既存の retry / no-retry テスト一式 |
-| 可読性 M2 | 再同期が残留 `0x5A` を ACK と誤認しうる点の説明が無い | `read_d3_reply` を切り出し、status `0x00` 検査が第二の防御であること、観測残留は `0xBB` 4 バイト、`5A 00` の場合は `0xD5` の最初のパケット前に止まることを rustdoc に記載 | `a_residue_five_a_is_only_accepted_with_the_zero_status` |
-| 可読性 M3 | 「再起動した」と断定する文言（`0xD9` は応答を読まない） | `RESTARTED_*_NOTE` 3 定数と `da_restart` の結果文を「`0xD9` を送った／再起動は確認できない／`fw dump` で確認」に変更。`02-cli.md` も追随 | `da_restart_sends_one_d9_without_reading_a_reply_or_touching_the_control_lines`（期待文字列を更新） |
-
-### Stage 1 の変異テストで生存した 3 件
-
-| # | 生存した変異 | 対応 | 固定するテスト |
-|---|---|---|---|
-| MUT1 | `0xD3` 再同期のスキップ上限の境界が無い | 8 バイトの残留は成功し、9 バイト目は `after skipping 8 non-reply byte(s)` で拒否することを固定 | `the_d3_resync_accepts_eight_bytes_and_refuses_the_ninth` |
-| MUT2 | `0xD3` status 非 0 の分岐が未実行 | fake に `set_d3_status` を追加し、`0xD3 status byte was 0x01` で停止・`0xD5` を送らないことを固定 | `a_non_zero_d3_status_is_a_framing_error_and_nothing_is_written` |
-| MUT3 | `check_layout_of` のピン検査が後段エラーと区別されない | ピンだけ動かしたとき、後段の `write_start != expected_start` ではなくピン固有の文言で失敗することを固定 | `moving_only_the_pinned_start_is_refused_by_the_pin_rule` |
-
-変異の実測: ピン検査の削除、`skipped >= LIMIT` → `>`、status 検査の削除の 3 つを入れ、
-対応するテストがそれぞれ落ちることを確認した（各変異のあと元に戻し `git status` で確認）。
-残り 2 件の生存変異（等価変異・低リスク）は指示どおり対応しない。
-
-### Should への対応
-
-| # | 指摘 | 対応 |
-|---|---|---|
-| 仕様 S1 / 可読性 M2 | 再同期が `0x5A` を含む残留を ACK と誤認しうる | 可読性 M2 と同じ。`5A 01` の残留を拒否するテストを追加し、設計で消せない `5A 00` は rustdoc に残余リスクとして明記（観測残留は `0xBB`） |
-| 仕様 S2 | 再試行前の `verify_device` 省略の根拠が無い | `reload_for_retry` の rustdoc と `02-cli.md` に「`0xD3` はフラッシュを触らないので、`0xD5` 前の失敗はフラッシュを変えていない」と明記 |
-| 仕様 S3 | 再入路のテストが `0xA8` 回数と `opens() > 0` だけ | fake の `$PMTK180` を `pmtk180_requests` として回数化し、再試行の再入で 1 回（2 回失敗のケース）、読み戻し込みで 2 回（成功ケース）を固定 |
-| 仕様 S4 / 可読性 S4 | `with_note` の doc と実装が矛盾 | doc を「`Framing` / `Timeout` / `Rejected` / `Safety` は variant を保ち、それ以外は `State`」に修正 |
-| 仕様 S5 | `02-cli.md` の 🧪 に自動リトライが列挙されていない | 🧪 注記に「自動 `0xD9` と 1 回再試行」「`0xD3` 応答の再同期」を追加 |
-| 仕様 S6 | `D3_RESYNC_LIMIT = 8` の根拠が citation でない | doc に「観測は 4 バイト（`05-verification.md` §1.3）、8 は余裕で protocol 値ではない」と明記 |
-| 可読性 S5 | `range_attempted = false` の dead store | 削除。`program_started = false` は試行開始時のリセットとして残す |
-| 可読性 S6 | `program_started` の「送信前・失敗時も true」の理由が無い | フィールド・accessor・設定箇所に「送信前に立てる。失敗した書き込みは未送信を証明できない」と明記 |
-| 可読性 S7 | モジュール doc のコマンド列挙に `flash` が無い | 列挙と説明に `flash` を追加 |
-| 可読性 S8 | `flash` の rustdoc 手順に自動復旧が無い | 手順 5 として自動復旧を追加し、読み戻しを 6 に繰り下げ |
-| 可読性 S9 | `assert!(ports.opens() > 0)` が主題を検証しない | `assert_eq!(ports.opens(), 1, ...)`（再試行は同じ transport で再入し、ポートを開き直さない）に変更 |
-| 可読性 S10 | `0xD3` 拒否の 2 機構（`refuse_ranges` と `refuse_ranges_remaining`） | カウンタ 1 本に統一し、`usize::MAX` を「ずっと拒否」に |
-
-### Could
-
-- 対応: 11（`write_once` → `WriteAttempt::write`。vendor 時に `image` を使わない旨を doc に記載）、
-  12（エラー文を `non-reply byte(s)` に）、13（`record_range` から `read_d3_reply` を切り出し）、
-  14（冗長な `assert!(chip.restarted())` を削除）。
-- 見送り: 15（fake の `0xD3` アーム分割）はテスト専用 fake の整理で、別途まとめる。
-  Could 2（`12-progress-summary.md` の `da-restart` 注記）と Could 3（拒否メッセージの
-  「keeps whatever ranges…」）は、後者は仕様検収の項目 4（`A5` を「空」と扱わない）が
-  明示を求めている文面でもあるため、現状のまま残す。
-
-### ゲート
-
-`./tools/check.sh` 6/6（`M241_VENDOR_IMAGE` を設定した状態。実機ポートは開かず、
-`m241-core` と `tools/` は未変更）。
-
-## 2026-11-22 / PR #20 `feat-log-kmz` の Stage 2 修正
-
-対象: `git diff origin/main...2e7468c`（6 ファイル、+764 / −12）。Stage 1 は仕様検収
-（[仕様レビュー](https://github.com/haruki0420/holux-m241-rs/pull/20#issuecomment-7078584766)）と
-可読性（[可読性レビュー](https://github.com/haruki0420/holux-m241-rs/pull/20#issuecomment-7078580687)）を
-別々のレビュアーが並行実施。Stage 2 は別エージェントが担当し、Stage 3 で検証する。
-変更範囲は `crates/m241-cli` と docs のみ（`m241-core` / `m241-flash` / `m241-gui` /
-`Cargo.*` / `tools/` は未変更）。Stage 1 の 2 レビュアーは `./tools/check.sh` を
-実行していない。
-
-### Stage 1 の Must への対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| 可読性 M1 / 仕様 S1 | `log kmz` の写真スキップ警告が理由を「gap 超過」と断定し、非 JPEG・撮影時刻なし・EXIF 破損でも誤った次の行動を促す | `GeotagPlan::skipped` の理由をそのまま出す。実体化を `materialize_kmz_photos` に切り出し | `kmz_reports_the_planners_reason_for_a_photo_it_leaves_out` |
-| 仕様 M1 | `log kmz` の `--utc-offset-days` がマッチング前に適用されることが無テスト | `apply_utc_offset` を `geotag::plan` の前に置いたまま、WNRO ずれログ＋実時刻の写真が同梱されることを固定 | `kmz_applies_the_utc_offset_before_matching_photos` |
-| 仕様 M2 | `log edit` が入力ダンプを変更しないことが無テスト | 分割・結合の実行前後で入力（分割元と `--merge` 入力）のバイト列が不変であることを固定 | `edit_does_not_modify_the_input_dump` |
-| 仕様 M3 | merge が時刻なしダンプを最後に置く分岐が無テスト | 時刻あり 2 本＋時刻なし 1 本を join し、JSON の `utc` が `[Some, Some, None]` の順になることを固定（`--merge` 2 回指定も同時に固定） | `edit_merge_puts_a_dump_without_timestamps_last` |
-
-### Should への対応
-
-| # | 指摘 | 対応 |
-|---|---|---|
-| 可読性 S1 / 仕様 S3 | `edit` だけが `ParseReport` を捨て、破損ブロックの警告を出さない | `warn_about_damage` を本体ダンプと各 `--merge` 入力で呼ぶ。merge 入力は複数あり得るので警告に path を付ける |
-| 可読性 S2 | `edit` の `# Errors` が `Error::State`・split の `Error::Log`・sibling の `Error::Safety` を網羅しない | rustdoc に 4 種を明記 |
-| 可読性 S3 | delete のエラーが exclusive 表記（`0..N-1`）で、0 点時に「0 番が有効」と読める | `0..=N-1` の inclusive 表記にし、0 点は「the log has no points」 |
-| 可読性 S4 | `edit` が 44 行で抽象度が混在 | `write_edited` に書き込み＋報告を切り出し、`edit` は操作の選択と実行だけに |
-| 可読性 S5 | `kmz` が 38 行で抽象度が混在 | `plan_kmz_photos` と `materialize_kmz_photos` に切り出し、`kmz` は読み込み→計画→実体化→書き出しの一直線に |
-| 可読性 S6 | 「merge が空だから delete」という暗黙推論 | `LogEdit` enum と `requested_edit` で操作を明示。track index `0` は `FIRST_TRACK` に命名 |
-| 可読性 S7 | モジュール doc 冒頭 2 行がコマンド列挙 | 目的文「Convert, edit and bundle a downloaded track log.」を先頭に |
-| 可読性 S8 | CLI の KMZ doc に外部ビューア未検証の注記が無い | `kmz` の rustdoc に「Google Earth と `unzip` は未実行」を明記（`02-cli.md` は既に明記済み） |
-| 可読性 S9 | `--max-photo-edge` のテストが core のメッセージ文字列に依存 | 見送り（下記「見送った Should と理由」） |
-| 仕様 S2 | `log kmz` に `--tz-offset-minutes` が無く、ローカル時刻カメラでマッチしない | kmz に `--tz-offset-minutes`（既定 0）を追加。カメラ時計に移したコピーでマッチし、アーカイブと写真の時刻は UTC に戻す。`02-cli.md` を追随 |
-| 仕様 S4 | split の派生 2 出力目が既存ファイルを無確認で上書き | `fileio::ensure_free` で両半分を書く前に拒否（exit 5）。`02-cli.md` に「先に削除・改名」を明記 |
-| 仕様 S5 | 負のテスト不足（`edit --utc-offset-days` の exit 2、`--split-at 0`・点数 の exit 1、2 操作の exit 2） | `log_edit_requires_exactly_one_operation` を拡張し、`edit_refuses_a_split_that_would_leave_an_empty_half` を追加 |
-| 仕様 S6 | `12-progress-summary.md` が CLI 15 コマンド・`kmzMaxPhotoEdgeSize` CLI 未接続のまま | 17 コマンド、kmz の CLI 経路・`log edit` を追記。テスト件数を実測値に更新 |
-
-### Could
-
-- 対応: 可読性 C1（`count_label` に統合）、C2（`b"photo/".len()`）、C3（`--merge` の
-  help を「フラグを繰り返す」に）、C4（split 2 本目の書き込み失敗時に「1 本目は
-  書かれた」を stderr に）、C5（kmz の `# Errors` に ZIP32 超過の `Error::Log`）、
-  C7（`second_sibling` に固定）、C8（`edit` が `--utc-offset-days` を受け付けないことを
-  テストで固定）。仕様 C1（`-o` 必須の負テスト）、C2（photos 省略時の実行テスト）、
-  C3（上限以内の byte-for-byte を CLI 経由で）、C4（`GeotagOptions.max_photo_edge_pixels`
-  の冗長設定を削除）、C6（merge の doc 表記）、C7（拡張子なしの `-2` 命名を doc に）、
-  C8（2 操作の exit 2 を直接断言）。
-- 見送り: 仕様 C5（写真の二重読み）は `KmzPhoto` が `jpeg_bytes` を呼び出し側から
-  受け取る crate 契約の帰結で、直すには core API の変更が要る（本ラウンドの変更範囲外）。
-
-### 見送った Should と理由
-
-| # | 指摘 | 理由 |
-|---|---|---|
-| 可読性 S9 | `the_photo_edge_limit_reaches_the_kmz_exporter` が core の文言に結合 | 実際に縮小されることは `m241-core` の `kmz` テスト（縮小・再エンコード・上限以内 byte-for-byte）が固定しており、この CLI テストは「`--max-photo-edge` が exporter に届いた」配線だけを固定する正直なテスト。実 JPEG を encode して CLI 側でも縮小を測るには `image` を `m241-cli` の dev-dependency に足す必要があり、`Cargo.lock` の変更が本ラウンドの変更範囲（`crates/m241-cli` と docs）を超える。上限以内の byte-for-byte は CLI 経由のテストを追加済みで、文言依存はこの 1 本に残る。 |
-| 可読性 C6 | core の split メッセージ「must be 1..{len}」 | `m241-core/src/log/edit.rs` の文言で、本ラウンドは `m241-core` の挙動・文言を変えない条件。CLI 側は split の失敗を exit 1 として固定した。 |
-
-### ゲート
-
-`./tools/check.sh` 6/6（`M241_VENDOR_IMAGE` を設定した状態。実機ポートは開かず、
-`m241-core` / `m241-flash` / `m241-gui` / `Cargo.*` / `tools/` は未変更）。
-
-
----
-
-## 2026-11-22 / PR #21 `feat-log-edit` の Stage 2 修正
-
-対象: Stage 1 head `660d9a4`（base `origin/main` = `3202c34`）。Stage 1 は仕様検収
-（[仕様レビュー](https://github.com/haruki0420/holux-m241-rs/pull/21#issuecomment-7078597563)）と
-可読性（[可読性レビュー](https://github.com/haruki0420/holux-m241-rs/pull/21#issuecomment-7078619948)）を
-別々のレビュアーが並行実施した。Stage 2 は別エージェントが担当し、Stage 3 で検証する。
-Stage 2 の差分は本節と同じコミットで、範囲は `crates/m241-core/src/log/` と `docs/` のみ
-（`m241-cli` は別 PR が担当するため触っていない）。
-
-### Stage 1 の Must への対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| 可読性 M1 | モジュール doc の "PhotoTimeShift is the first / PhotoShiftScope the second" が直前の 3 スコープ列挙に係り、`PhotoTimeShift = allPhotos` / `PhotoShiftScope = selPhotos` と誤読させる | 2 入力を名詞で書き分けた。「シフトの大きさ（日/時/分/秒）」と「適用範囲（3 スコープ）」が別の入力であることを明示し、`byCamera` を含む 3 スコープが後者に属すると読める形にした | —（doc のみ） |
-| 可読性 M2 | `CameraModel` の doc は「末尾の NUL/空白だけ除去して byte 比較」だが、実装は `from_utf8_lossy` + `.trim()`。非 UTF-8 の異なる名前が同じ `String` になり、先頭空白も落ちる | **実装を安全側に寄せた**。`str::from_utf8` で厳密に読み、末尾の NUL/空白だけを除去して完全一致で比較する。非 UTF-8 のタグは `None`（不明扱い）とし、lossy 変換による誤同一視をしない。doc も同じ規則に書き換え、`06-open-questions.md` §6 に未確定として記録 | `camera_names_that_are_not_valid_utf8_are_unreadable_not_collapsed`, `leading_whitespace_is_part_of_the_camera_name`, `trailing_nul_and_space_padding_is_trimmed_from_camera_names` |
-| 可読性 M3 | 「a value longer than four bytes lives at an offset from the header, which is the layout cameras use」は実カメラ未検証なのに断定 | 「この walk が受け付ける配置」に弱め、実カメラでの確認は未検証と明記。モジュール doc の「Not verified on camera files」にも IFD0 配置を追加し、`12-progress-summary.md` と `06-open-questions.md` §6 に未検証として記録 | —（doc のみ） |
-
-### 仕様検収の Should への対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| S1 | scoped shift の end-to-end テストが無い（選択写真だけが書き換わることを直接固定していない） | `SelectedPhotos` と `ByCamera` の両スコープで plan → apply し、選択写真の `DateTimeOriginal` がシフト後になり、非選択写真はバイト列も時刻も変わらないことを固定 | `a_scoped_shift_writes_the_clock_into_the_scoped_photos_only` |
-| S2 | icon 経路で「フレームヘッダ不明はバイト列そのまま」の分岐が未テスト | SOF を持たない合成 JPEG で `export_kmz_with_icons` を呼び、`photo/` と `icon/` の両方が元バイト列になることを固定 | `a_photo_with_no_readable_frame_header_keeps_its_bytes_under_icon` |
-| S3 | 新しい未確定点が `06-open-questions.md` に無い（`AGENTS.md` §7 の置き場は 06） | §6（byCamera / selPhotos の一致規則、日=24h、実カメラ IFD0 配置）と §7（`icon/` の寸法・命名・KML 参照、ezTour が実際に置いていたか）を追記 | —（docs） |
-| S4 | 新 API が `log` 直下に再エクスポートされていない | `PhotoTimeShift` / `PhotoShiftScope` / `CameraModel` / `plan_with_time_shift` / `KmzIconOptions` / `export_kmz_with_icons` を `log/mod.rs` に追加（既存 re-export は変更なし） | —（コンパイルで担保） |
-| S5 | 既定 scope = `AllPhotos` のテストも未確定記録も無い | 既定をテストで固定（仕様が既定を規定しない実装判断である旨をテストのコメントに記載） | `the_default_scope_is_every_photo` |
-
-### 可読性レビューの Should への対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| S1 | overflow テストが「写真を読む前に拒否」を名乗りながら、読める写真を渡すだけで順序を検証していない | 存在しないパスを渡し、`Error::Io` ではなく `Error::State` になることを固定。テスト名も `..._before_any_photo_is_read` に改名 | `a_shift_that_overflows_seconds_is_refused_before_any_photo_is_read` |
-| S2 | JPEG セグメント走査が 3 実装目。`0xD0..=JPEG_MARKER_SOI` は `exif.rs` の綴りと違い、SOI の値に暗黙依存 | 推奨どおり `exif` に `pub(crate) exif_tiff_block` を追加し、既存の `find_exif_app1` を再利用。geotag 側の走査を削除し、malformed を `None` に落とす差分だけ呼び出し側で吸収 | 既存の camera テスト一式（`the_camera_model_is_read_from_ifd0_make_and_model_in_both_byte_orders` ほか） |
-| S3 | `ifd0_ascii` が 40 行・4 抽象度で、`try_into().ok()?` の連鎖が TIFF の配置を隠す | `read_u16_at` / `read_u32_at` を追加し、文字列正規化を `camera_string` に分離。IFD エントリの配置をコメントで明示 | camera テスト一式 |
-| S4 | `export_kmz_inner` が 66 行・5 段 | `resolve_photo_names` / `photo_entry_bytes` / `icon_thumbnail_bytes` / `zip_entries` に分割 | kmz テスト一式 |
-| S5 | `thumbnails: Vec<Option<Vec<u8>>>` の暗黙不変条件と `zip` の silent truncation。`None` が「元バイト列」を意味する二重契約 | 格納するバイト列を `Cow<'_, [u8]>` に解決して持ち（`None` の意味を消した）、`zip_entries` の先頭で長さを `debug_assert_eq!` で検査 | kmz テスト一式（`asking_for_icons_writes_one_icon_entry_for_each_photo` ほか） |
-| S6 | `is_zero` はテスト以外に呼び出しが無く、`includes` は本体からのみ呼ばれるのに `pub` | `includes` を private に。`is_zero` は production 呼び出し元が無いため削除し、テストは `PhotoTimeShift::default()` との比較に変更 | `the_day_hour_minute_and_second_fields_add_up_to_one_total` |
-| S7 | ゼロ上限の意味が同じファイル内で逆（`KmzIconOptions` は 0 を拒否、`KmzPhoto` は 0 を「縮小しない」で通す） | 挙動は既存公開 API なので変えず、`KmzPhoto::max_edge_pixels` の doc と共通ヘルパのコメントに「`Some(0)` は制限なし、`KmzIconOptions` の 0 はエラー」を明記 | 既存 `a_photo_with_no_limit_keeps_its_bytes` / `an_icon_limit_of_zero_pixels_is_refused` |
-
-### Could
-
-- 対応: 仕様 C1（`is_zero` 削除）、仕様 C4（M2 と同じ。doc を実装に合わせた）、可読性 C1（エラー文を構造体 Debug の露出から「各値と小さくする案内」に変更）、可読性 C3（容量計算のコメント）、可読性 C5（default の重複主張を 1 つに）、可読性 C7（ezTour との等価性を断定しない参照を追加）。
-- 見送り:
-  - 可読性 C2（`Copy` な設定値の渡し方が値/参照で不揃い）: `KmzIconOptions` を参照で渡すのは `GeotagOptions` と同じ「設定型は参照」の慣習に合わせた判断。CLI 配線前の signature 変更は差分の利得が小さい。
-  - 可読性 C4（テストがエントリ順を固定）: レビュー自身が「害は小さい」としている実装固定テスト。集合比較への書き換えは別途。
-  - 可読性 C6（同じ説明をモジュール doc・関数 doc・`12` で 3 回）: 未確定情報の参照先を 06 に寄せたが、説明の重複自体は残した。
-
-### 却下した指摘
-
-なし（Stage 1 の指摘はすべて事実と一致した）。
-
-### 変異で確認したこと
-
-いずれも変異を入れて対応テストが落ちることを確認し、そのあと元に戻して
-`git status --porcelain` の対象ファイルが元の差分に戻ったことを確認した。
-
-- `camera_string` を `String::from_utf8_lossy(...).trim()` に戻すと
-  `camera_names_that_are_not_valid_utf8_are_unreadable_not_collapsed` と
-  `leading_whitespace_is_part_of_the_camera_name` が落ちる。
-- 末尾の NUL/空白の除去をやめると camera の 4 本
-  （invalid UTF-8 / leading whitespace / trailing padding / inline の short names）が落ちる。
-- `plan_with_time_shift` で shift の検査より先に写真を `read` すると
-  `a_shift_that_overflows_seconds_is_refused_before_any_photo_is_read` が
-  `Io` で落ちる（`State` を期待している）。
-
-### ゲート
-
-`./tools/check.sh` 6/6（`M241_VENDOR_IMAGE` を設定した状態。実機ポートは開いていない）。
-
-### Stage 3 検証
-
-未検証（別エージェントが記入する）。
-
-## 2026-11-22 / PR #23 `feat-geotag-cli` の Stage 2 修正
-
-仕様検収（Must 1 / Should 4 / Could 3）と可読性レビュー（Must 3 / Should 4 / Could 4）への対応。
-変更は `crates/m241-cli` と docs のみで、`m241-core` / `m241-flash` / `m241-gui` は変更していない。
-実機ポートは開いていない。Stage 1 がレビューした head は `fc70ecf`。
-
-### 仕様検収の Must への対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| M1 | スコープ違いの `--photo` / `--camera-*` を警告して無視する挙動（`logcmd.rs:749-763`）にテストが無い | 無視されるフラグを 1 つずつ stderr に出し（下の可読性 S1 で表を grammar に一本化）、`--scope all` + `--photo` と `--scope selected` + camera flags の両方を、警告文と「どちらの選択が勝つか」で固定 | `a_photo_flag_under_the_all_scope_is_reported_and_ignored`, `camera_flags_under_the_selected_scope_are_reported_and_ignored` |
-
-### 可読性 Must への対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| M1 | mtime 由来の撮影時刻では「次の実行に shift 不要」が偽 | rustdoc を「`DateTimeOriginal` を書けた写真では」に限定し、`--shift-*` が非 0 で mtime 由来自動写真があれば「shift は保存されない。次の実行でも同じ `--shift-*` を渡すこと」と stderr で警告。`02-cli.md` にも例外と警告を追記 | `a_shift_of_a_photo_with_only_a_file_time_is_not_written_into_it` |
-| M2 | `--photo` は展開後パスとの完全一致で、外すと無警告の no-op | `--scope selected` で 1 枚も展開後パスに一致しなければ `Error::State`（exit 1）。エラー文は「展開後のパスと比較する（ディレクトリは `<DIR>/<NAME>` を寄与）」と計画パスの実例を示す。`--photo` のヘルプと `02-cli.md` も同じ規則に修正 | `a_photo_selection_that_matches_none_of_the_planned_photos_is_an_error`, `a_selected_scope_can_name_a_photo_contributed_by_a_directory` |
-| M3 | shift 要約は 0 件マッチでも「shift した」と読める | 要約行を `shift: <N> s requested (<scope>)` に変え、要求値であることを明示（実績は per-plan の `capture` と `matched`/`written`）。`selected` の 0 件は M2 でエラーになり、要約も出ない。`by-camera` の 0 件を CLI 側で数えるには core の非公開照合規則（`PhotoShiftScope::includes`）を複製する必要があるため、枚数の表示は見送り、文言と docs で誤読を防ぐ形にした | `a_photo_flag_under_the_all_scope_is_reported_and_ignored`（`requested` 表記） |
-
-### 仕様検収の Should への対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| S1 | mtime フォールバック写真はシフトが永続化されず docs の記述が当てはまらない | 可読性 M1 と同じ対応（docs の例外明記＋警告） | `a_shift_of_a_photo_with_only_a_file_time_is_not_written_into_it` |
-| S2 | `selected` の `<DIR>/<NAME>` 寄与パスの CLI 統合テストが無い | ディレクトリ入力 + `--photo <DIR>/<NAME>` の統合テストを追加 | `a_selected_scope_can_name_a_photo_contributed_by_a_directory` |
-| S3 | `--tz-offset-minutes` と shift の併用 e2e テストが無い | tz=540 + shift=3600 で「照合は tz+shift 後、書込 `DateTimeOriginal` は shift 済みローカル時刻、位置 utc は真 UTC」を固定 | `a_tz_offset_and_a_shift_compose_without_moving_the_written_position_time` |
-| S4 | dry-run の人間向け出力にシフト後 capture 時刻が無い | 人間向け plan 行を `(matched UTC, gap N s, capture <ISO-8601>)` に拡張（書き込み実行も同じ行）。docs も同じ表現に更新 | `a_photo_flag_under_the_all_scope_is_reported_and_ignored` |
-
-### 可読性 Should への対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| S1 | スコープ→フラグ表が grammar と handler で二重化 | `LogGeotagOptions::flags_for_other_scopes()` に一本化し、handler は返り値を 1 行ずつ warn するだけにした（handler 側の表と 15 行の重複を削除） | 上記 2 本の警告テスト |
-| S2 | `--scope` の綴りが 3 箇所（ValueEnum / `label()` / `required_if_eq` リテラル）に複製 | `SCOPE_SELECTED` / `SCOPE_BY_CAMERA` 定数に集約し、`label()` と `required_if_eq` が同じ定数を使う。`label()` が clap の possible value 名と一致することをテストで固定（rename 時に parse 条件が黙って消えるのを防ぐ） | `every_scope_is_spelled_the_same_way_wherever_it_is_written` |
-| S3 | 新テストが「shift して再マッチ」を固定していない | `matched_utc`（と `gap_seconds`）を assert し、全点が同座標の合成トラックでもマッチ先が shift 後であることを固定。selected / by-camera / tz 併用の 3 本を強化 | `a_selected_scope_shift_moves_only_the_named_photos_clock`, `a_by_camera_scope_shift_moves_only_photos_from_that_camera`, `a_photo_flag_under_the_all_scope_is_reported_and_ignored`, `camera_flags_under_the_selected_scope_are_reported_and_ignored` |
-| S4 | `geotag_options()` が clap 既定値の写し | `Cli::try_parse_from` で実際に parse して既定値を取得するヘルパに変更（既定値の定義は `cli.rs` の 1 箇所だけになる） | 既存テスト群の前提（コンパイルと既定値依存テストで担保） |
-
-### Could
-
-- 対応:
-  - C1（テスト用 JPEG ビルダの重複）: `synthetic_jpeg_exif(datetime, camera)` に統合し、
-    `synthetic_jpeg_with_datetime` / `synthetic_jpeg_with_camera` は薄い wrapper にした。
-  - C2（テキスト dry-run の capture 時刻）: 仕様検収 Should 4 と同じ変更。
-  - C3（`--scope` だけ指定して shift 0 は no-op）: `--scope` のヘルプに「shift フラグが操作本体。
-    all-zero shift の `--scope` は何も動かさない」と明記（警告は追加していない）。
-  - C4（語と doc の細部）: `cli.rs` モジュール doc の parse 時ルール列挙を更新、`--photo` のヘルプ 1 行目を
-    「`<PHOTOS>` から選ぶ」に変更、`shift()` / `shift_scope()` を `photo_time_shift()` /
-    `photo_shift_scope()` に改名、`geotag_document` に shift を渡して `total_seconds()` の再計算を削除。
-- 見送り:
-  - C3 の警告化: `selected` の 0 件は仕様検収 M2 でエラーになり、`by-camera` の 0 件を CLI 側で
-    検出するには core の非公開照合規則を複製する必要がある。ヘルプでの明記に留めた。
-  - C4 の `--photo` 改名（`--select-photo` 等）: 引数名は Stage 1 仕様検収で承認済みのため変更しない。
-
-### 却下した指摘
-
-なし（仕様検収・可読性の Must / Should はすべて事実と一致した）。
-
-### 変異で確認したこと
-
-いずれも変異を入れて対応テストが落ちることを確認し、そのあと元に戻して
-`git diff` が変異前と同じ内容に戻ったことを確認した。
-
-- スコープ違いの警告文を変えると
-  `a_photo_flag_under_the_all_scope_is_reported_and_ignored` が落ちる。
-- mtime 由来自動写真の警告条件を偽にすると
-  `a_shift_of_a_photo_with_only_a_file_time_is_not_written_into_it` が落ちる。
-- `plan_with_time_shift` に `PhotoTimeShift::default()` を渡すと
-  `a_selected_scope_shift_moves_only_the_named_photos_clock` と
-  `a_by_camera_scope_shift_moves_only_photos_from_that_camera` が `matched_utc` / `capture_utc` で落ちる。
-- `--photo` 0 件マッチのエラー判定を外すと
-  `a_photo_selection_that_matches_none_of_the_planned_photos_is_an_error` が落ちる。
-
-### ゲート
-
-`./tools/check.sh` 6/6（`M241_VENDOR_IMAGE` を設定した状態。実機ポートは開いていない）。
-
-### Stage 3 検証
-
-未検証（別エージェントが記入する）。
-
----
-
-## 2026-11-22 / W2a DA 全文 SHA-256（PR #24、Stage 1 → Stage 2）
-
-対象: `feat-da-digest`（base `origin/main` = `40efd53`）。Stage 1 は仕様検収
-（Must 0 / Should 3 / Could 4）と可読性（Must 2 / Should 4）の 2 本で、レビューした
-head は `6945728`。この節は Stage 2 の対応記録で、Stage 3 は別エージェントが記入する。
-
-### 対応表（Must）
-
-| 指摘 | 対応 |
-|---|---|
-| 可読性 M1: `check_da_image_against` / `DaLoader::load_against` が生 `&str` を受け取り、rustdoc が pin の差し替えを正当化している。機械ゲートも無い | `DaDigest` トークンに変更。フィールドは private で、通常ビルドの構築子は `DaDigest::vendor()`（= `DA_IMAGE_SHA256`）だけ。テスト用 `DaDigest::for_test_da` は `#[cfg(any(test, feature = "simulator"))]` の下（`FakeDa` と同じ feature 慣習）。CLI の本番 5 箇所は `da_digest()` が返す `DaDigest::vendor()` だけを渡せる。`tools/check_safety.py` に検査 8「`DaDigest::for_test_da` の直前が `#[cfg(any(test, feature = "simulator"))]`」を追加し、`docs/dev/11-safety-review.md` の ✓ 表に追記。`crates/m241-flash/tests/safety_gate.rs` に `a_da_digest_constructor_outside_its_cfg_gate_is_reported` を追加（cfg を外す変異で落ちる） |
-| 可読性 M2: `the_vendor_da_hashes_to_the_pinned_digest_and_loads` が env 無しで無言 skip し、`docs/dev/11-safety-review.md` が 🧪 として引用している | テスト名を `the_vendor_da_matches_the_pinned_digest_and_loads_when_the_vendor_da_is_available` に変更。skip 時に `eprintln!` で理由を出す。`docs/dev/11-safety-review.md` の該当行を「条件付き（CI では未実行）」に変更し、pin 値そのものは CI で走る `the_loader_constants_are_pinned_to_the_documents_and_the_read_crate` がリテラル固定することを明記 |
-
-### 対応表（Should / Could）
-
-| 指摘 | 対応 |
-|---|---|
-| 仕様 S1 / 可読性 S1: pin 値の CI 回帰が無い | `the_loader_constants_are_pinned_to_the_documents_and_the_read_crate` に `DA_IMAGE_SHA256` のリテラル比較と `DaDigest::vendor().sha256()` の比較を追加（CI で常に走る） |
-| 仕様 S2: public な逃げ道（M1 と同じ） | `DaDigest` トークン化で解消（上記） |
-| 仕様 S3: ベンダーファイル無し環境で skip する検証の記録 | `M241_VENDOR_IMAGE` を設定して `./tools/check.sh` を実行し 6/6 を確認（下記「ゲート」）。CI では条件付きテストが skip することを `docs/dev/11-safety-review.md` に明記 |
-| 仕様 C1: `fw flash` 側に「正しい先頭・誤 digest」テストが無い | `flash_refuses_a_same_size_da_with_the_right_head_but_a_different_digest` を追加 |
-| 仕様 C2 / 可読性 S1: `digest::matches` を再利用していない・拒否文が常に「pinned vendor digest」と言い切る | 比較を `m241_core::firmware::digest::matches` に変更。拒否文は期待値が pin 値のときだけ「the pinned DA_v3.8.4.bin digest」、それ以外は「the expected digest」と表示し、次の行動（ベンダーパッケージの `DA_v3.8.4.bin` を使う）を書く |
-| 仕様 C4: `--da` フラグ説明に digest が無い | `docs/reference/02-cli.md` の `fw probe-da` フラグ行に追記 |
-| 可読性 S2: docs が実際は呼ばない `check_da_image` を名指し | `AGENTS.md` §2.5、`docs/reference/02-cli.md`、`docs/dev/11-safety-review.md` を、CLI が `check_da_image_against` / `load_against` に `da_digest()` を渡し、`check_da_image` / `load` は同じ pin 済みチェックである、という記述に更新 |
-| 可読性 S3: fingerprint / digest / hash / SHA-256 の語の揺れ | 概念語を `digest` に統一（`DaDigest`、`da_digest()`、テスト名を `..._wrong_digest` / `..._different_digest` / `..._matches_the_pinned_digest_...` に改名） |
-| 可読性 S4: `cfg(not(test))` の本番分岐がテストで実行されない | `da_digest()` の doc に「この分岐は `cargo test` ではコンパイルされない（テストは `#[cfg(test)]` 側を通る）」と明記し、フィクスチャで通るテスト名に条件（`with_the_test_fixture_da`）を付けた |
-| 可読性 C1: モジュール doc の 4+1 チェックが数えにくい | 「ジャンプ前の 4 チェック + その後 DA 自身が返す 20 バイト report が 5 番目」と明記 |
-| 可読性 C2 / C4: fixture doc の主語が移動後になっていない・2 つの fixture の差が不明 | `da_fixture_bytes` の doc を「書き込む合成 DA」に直し、`m241-flash` の `da_image()` との差（`DA_REPORT_OFFSET` の fake report のみ）を明記 |
-| 可読性 C3: `pub(super)` の理由が無い | `da_fixture_bytes` の doc に「親の `da_digest` が同じバイトをハッシュするため」と明記 |
-| 可読性 C5: `run_against` の doc が実装詳細に読める | `load` の check を切り出したものであり、`DaDigest` トークンにより逃げ道ではない、という主語に書き直した |
-
-### 却下・見送り
-
-- 仕様 C3（`fw probe-da` も DA の SHA-256 を表示する）: `fw probe-da` の標準出力・
-  `--json` 契約と `docs/reference/02-cli.md` の出力節を変える別変更になる。§2.5 の承認
-  成果物はもともと承認者が `--da` のパスから独立に SHA-256 を再計算する運用で、
-  W2a（安全ゲートの強化）の範囲外。別 follow-up 候補として残す。
-- 可読性 C6（`assert_eq!(opcodes(), &[] as &[u8])` を `is_empty()` に）: 新規テストは
-  `is_empty()` にしたが、既存行（旧テスト）はファイル内の既存パターンを揃えるため
-  そのまま。全置換は本 PR の目的（安全ゲート）と無関係な差分を増やす。
-
-### ゲート
-
-`M241_VENDOR_IMAGE=".../M-241 Firmware V1.13 update package/01017-01C ... V1.13_GR-241_HLX.bin" ./tools/check.sh`
-→ 6/6（fmt / clippy / test / docs / design / safety）。実機ポートは開いていない。
-この設定では `M241_VENDOR_IMAGE` の隣の `DA_v3.8.4.bin` が使われ、条件付きの
-実 DA 受理テストも実行される（CI ではベンダーファイルが無いため skip。skip は
-`eprintln!` で出力され、pin 値のリテラル回帰は CI でも走る）。
-
-### Stage 3 検証
-
-未検証（別エージェントが記入する）。
-
----
-
-## 2026-11-22 / 1.0.0 リリース整備（PR #26、Stage 1 → Stage 2）
-
-対象: `feat-release-prep`（base `origin/main` = `b0456df`）。Stage 1 は仕様検収（Must 1 / Should 10 /
-Could 9）と可読性（Must 4 / Should 17 / Could 13）の 2 本で、レビューした head は `65f7d60`。
-この節は Stage 2 の対応記録で、Stage 3 は別エージェントが記入する。`crates/**/*.rs` は変更していない。
-
-### 対応表（Must）
-
-| 指摘 | 対応 |
-|---|---|
-| 仕様 M1: README の「NMEA の日付補正が実機で動いている」に `05-verification.md` の根拠が無い | README の状態節を「実機で動いているのは読み取り系・`fw patch`・`fw flash`」に限定し、`nmea repair` はオフライン処理で実装済み、`nmea proxy` は**実機未検証**と書き分けた。未検証一覧にも `nmea proxy` を追加 |
-| 可読性 M1: `02-fix-the-date.md` / `03-recovery.md` への導線が無い | 「使い方」末尾に 2 本への導線を追加し、ドキュメント表（利用者向け）に 2 行追加 |
-| 可読性 M2: リリース資産名が README と `01-install.md` で不一致 | `01-install.md` の取得節を Release の実アセット名の表に置き換え、`SHA256SUMS.txt` との照合手順も追加 |
-| 可読性 M3: 未作成の Release を既存として記述 | README・`01-install.md`・`12-progress-summary.md`・CHANGELOG に「まだ一度も実行していない／`v1.0.0` タグも Release も未作成」と明記 |
-| 可読性 M4: 個体データの 14 / 4 / 1 バイトの食い違い | README と CHANGELOG に「個体データは 14 バイト（`0x5C`–`0x5F` の 4、`0xF8`–`0xFD` の 6、`0x63458`–`0x6345B` の 4）。起動時にファームが書き戻すのは `0x5C`–`0x5F` の 4 バイトで、実測の読み戻しの差は `0x5C` の 1 バイトだけ」と検算できる形で統一 |
-
-### 対応表（仕様 Should）
-
-| 指摘 | 対応 |
-|---|---|
-| S1: 実機確認は `b8d91ee` 時点で、以後の flash / CLI 変更は未実行 | README 状態節と CHANGELOG 冒頭に明記 |
-| S2: 「767 件」は現 head と不一致 | 実測 **810 件**（m241-core 297 / m241-flash 149 / m241-cli 232 / m241-gui 132、2026-11-22）に更新 |
-| S3: Release workflow 未実行を既存として記述 | 未実行を明記（`workflow_dispatch` の dry-run は見送り。理由は下記） |
-| S4: `v*` は RC・誤タグも拾い、版一致の検査が無い | trigger を `v[0-9]+.[0-9]+.[0-9]+` に絞り、build job にタグと `Cargo.toml` の版一致検査 step を追加（不一致は fail） |
-| S5: 05 §2 に未検証 3 項目が無い | `05-verification.md` §2 に `device doctor` 実 probe / 実カメラ geotag / `nmea proxy` の 3 行を追加し、README の参照先を §2 に変更 |
-| S6: Release に `LICENSE` が無い・署名 / provenance が無い | release job で `LICENSE` を dist に足し、チェックサムと Release アセットに含めた。署名・attestation は見送り（下記） |
-| S7: Linux の glibc / libudev 前提が無い | README と `01-install.md` に「Ubuntu 24.04（glibc 2.39）ビルド、`libudev.so.1` 前提、musl 静的ではない」と明記 |
-| S8: macOS Gatekeeper / Windows SmartScreen の注意が無い | README と `01-install.md` に未署名バイナリの注意と回避手順を追加 |
-| S9: `01-install.md` のアセット名が不一致 | 実アセット名の表・SHA-256 照合・リネーム可を追記（可読性 M2 と同じ変更） |
-| S10: 05 §2 の macOS 行 `same` が曖昧 | `⚠️ never measured: …` に明確化 |
-
-### 対応表（可読性 Should）
-
-| 指摘 | 対応 |
-|---|---|
-| S1: 出典とコマンド列挙が無い | 状態節にコマンド名と `05-verification.md` §1.5 / §1a を併記 |
-| S2: 手法の節に検証状況が混入 | `fw flash` の実機状況を 05 §1.5 への 1 行リンクに置換 |
-| S3: 開発者向け情報の混入・表の混在 | `.gitignore` の説明を削除し、ドキュメント表を「利用者向け」「開発者向け」の 2 表に分割 |
-| S4: `strict 書き込み` が未定義 | 「通常の書き込み（自機バックアップとの差分だけを許す経路）」と初出で定義 |
-| S5: Keep a Changelog 形式が中途半端 | `## [Unreleased]` とリンク定義（`[Unreleased]` / `[1.0.0]`）を追加。`実機で確認したこと` / `既知の制限・未検証` / `注意` を `##` に上げ、変更カテゴリでないと明記。`0.1.0` は非公開開発版と明記 |
-| S6: 見出しの日付と項目の日付が不一致 | 見出しを `2026-11-21〜22` に変更 |
-| S7: Added に実機未検証の inline 表記が無い | GUI・`--allow-vendor`・実カメラ geotag に「実機未検証」「読み戻しは一致しない」を追記 |
-| S8: 内部研究メモの混入 | DA プロトコルの細部を `06-open-questions.md` への参照に置換し、プロトコル命令の説明先を `01-da-protocol.md` に明記。利用者が知るべき制限（タイミング・自動再試行）は残した |
-| S9: テスト件数の根拠が現在時点でない | 810 件・実測日・コマンド・内訳に更新（仕様 S2 と同じ） |
-| S10: `M241_VENDOR_IMAGE` が未説明 | 何のパスか、設定時にどのテストが走るか、未設定・CI では skip されることを 1 行で説明 |
-| S11: 太字の断定と同セルの記述が矛盾 | 該当セルを短い状態行に置き換え、限定（自機バックアップ・パッチ済み）を本文に明記 |
-| S12: 表のセルが長すぎる | `12-progress-summary.md` の該当 4 セルを短縮し、詳細を表直後の「補足」箇条書きへ移動 |
-| S13: job 名が成果物名でない | `build (${{ matrix.os }})` → `build (${{ matrix.platform }})` |
-| S14: Linux 依存インストールの重複 | 見送り（下記） |
-| S15: テスト済みコミットだけを配布することが読み取れない | release workflow の build job に `cargo test --workspace --locked` を追加し、`cargo build --release --locked` に変更 |
-| S16: タグと版の一致が「期待」だけ | 検査 step を追加（仕様 S4）し、`Cargo.toml` の version 行に 1 行コメント |
-| S17: 日本語 README から英語文書へ送っている | リンク先に「（英語）」を付記 |
-
-### 却下・見送り
-
-- **仕様 S3 の `workflow_dispatch` + `--draft` dry-run**: 「未実行」の明記で誤読は解消した。
-  `gh release create` は draft でも Release を作るため、初回前に workflow を走らせる検証経路は
-  本番と同じ副作用を持つ。タグを打たずに検証する手段は別設計（ローカルでの action 実行等）で扱う。
-- **仕様 S6 の署名・provenance**（`actions/attest-build-provenance` / cosign）: OIDC と新規 action
-  の導入、検証手順の文書化が必要でリリース整備の範囲を超える。README に「署名されていない・
-  SHA-256 は転送破損しか検出しない」と明記した。
-- **可読性 S14 の composite action 化**: `ci.yml` の 3 ジョブと `release.yml` の apt 行を 1 つの
-  action に寄せる変更で、PR #26 のスコープ（リリース整備）を超える。`release.yml` には
-  「`ci.yml` と同じ」という根拠コメントが残る。
-
-### ゲート・実測
-
-- `M241_VENDOR_IMAGE=... ./tools/check.sh` → 6/6（fmt / clippy / test / docs / design / safety）。
-  実機ポートは開いていない。
-- `cargo test --workspace --offline -- --list` → 810 件（内訳は仕様 S2 の行）。
-- タグ push・Release 作成・マージ・`review-gate` はしていない（Stage 3 の担当）。
-- workflow は YAML パースと `git diff --check` まで。実行はしていない。
-
-### Stage 3 検証
-
-未検証（別エージェントが記入する）。
-
----
-
-## 2026-11-22 / PR #27 `feat-gui-design` の Stage 2 修正
-
-対象: `crates/m241-gui` と `DESIGN.md` §10。ブランチ `feat-gui-design`、修正前 head
-`bcf829c`、base `origin/main` = `b0456df`。指摘は 3 レビュー:
-仕様検収（issuecomment 7080617175）、可読性（7080524634）、デザインレビュー
-（7080737431）。実機ポートは開いていない。`m241-core` / `m241-flash` /
-`m241-cli` は未変更（`git diff --name-only` で確認）。
-
-### Must の解消
-
-| レビュー | 指摘 | 解消 | 固定するテスト |
-|---|---|---|---|
-| 仕様 §6 | 操作待ちで進捗が 100% に保持されない（`firmware.rs:652-670`） | バーを全状態で描くよう `dump_progress` に一本化し、`WaitingForPowerCycle { total }` は `Some(1.0)` と `406,620 / 406,620 バイト（読み取り完了）` を描く。状態行と命令文はバーの下に残す | `the_waiting_state_holds_the_dump_progress_at_one_hundred_percent`（値）、`waiting_for_the_power_cycle_holds_the_progress_bar_at_one_hundred_percent`（描画されたバーの幅と命令文） |
-| 仕様 §5 | 設定に「地図キャッシュの場所」が無い（`settings.rs:117-121`） | 「地図キャッシュの場所 / —（未使用）」行を追加（タイル非同梱の事実）。`DESIGN.md` §10 に記録 | `the_rows_are_the_ones_the_design_names`（6 行）、`the_settings_screen_names_the_cache_location_and_the_patch_offset`（描画） |
-| 可読性 M1 | `promote_system_face(ctx, "a"/"0", …)` の意味不明な文字列 | `PROPORTIONAL_CLUSTER` / `MONOSPACE_CLUSTER` 定数にし、各 family をその文字で代表させる理由を doc に書いた | コンパイルと既存のフォント描画テスト（`screenshot.rs`） |
-| 可読性 M2 | 「All figures come from `m241-core`」と `0x402F4` 直書きの矛盾 | `patch_offset_value()` が `patch::EFFECTIVE_EPOCH_OFFSET` から組み、バイト数は V1.13 固定である理由をコメント。テストが core の epoch 定数から差分バイト数を再計算して 3 と照合 | `the_colophon_builds_the_patch_offset_from_the_core_constant` |
-| 可読性 M3 | 列挙失敗でも「ポートが見つかりません／ケーブル確認」で同画面の `port_status` と矛盾 | `port_guidance()` を empty と failed で分岐。failed は理由（`ポートを列挙できません: {reason}`）とドライバ/権限の次の手を出す | `an_empty_port_list_asks_for_the_cable_and_the_power`、`a_failed_enumeration_reports_the_reason_instead_of_no_port_found`、`a_readable_port_list_needs_no_guidance` |
-| デザイン Must 1 | 主要ボタン・点一覧でキーボードフォーカスが見えない（明示 `.stroke()` が egui の focus 輪を上書き） | `common::focus_ring` を追加し、primary/secondary/choice/tool/write ボタンと点一覧行が `Response` から 2pt `ink` の inset 矩形を描く。テストはウィジェットに focus を与え、フレームの 2pt INK 矩形を測る | `every_custom_button_draws_the_focus_ring`、`the_write_button_draws_the_focus_ring`、`a_point_row_draws_the_focus_ring`、`the_focus_ring_is_two_points_of_ink`。加えて一時ヘルパで Tab を押したフレームを PNG 化し、レール「接続」と「書き込む」に輪が出ることを目視（ヘルパは確認後に削除） |
-
-### 仕様検収 Should の対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| S1 | ease-out が linear（`rail.rs:145`） | `animate_bool_with_time_and_easing(..., quadratic_out)` に変更。150 ms は据え置き、reduced motion は 0 のまま | `the_tab_eases_out_rather_than_moving_linearly`（遷移 1/3 時点の描画位置で linear の 1pt と区別）。既存の duration テストは 4 フレーム読みに更新 |
-| S2 | `popup_shadow` / `window_shadow` 未無効化 | `apply` で `Shadow::NONE` を両方に設定 | `the_page_has_no_shadow_elevation` |
-| S3 | ログ左カラムの 8px 階段が未実装 | 実装は §5 の図（3 ブロック同一左端）に従い、本文と図の不一致を `DESIGN.md` §10 に記録。`log.rs` のコメントも実装に合わせた | —（記録） |
-| S4 | 1280×800 で「選択した点」「点の一覧」が初期表示に出ない | §10 の「§9 が 1024 で認めている」という誤記を撤回し、両サイズとも本文スクロールで到達すると明記 | —（記録。レイアウトは変更せず） |
-| S5 | OSM タイル未実装と `PRODUCT.md:66` の記述が矛盾 | 本 PR の write scope 外（`PRODUCT.md`）のため未編集。§10 の「タイル取得なし」記録は維持し、対応は別 PR に分離 | — |
-| S6 | `§10` の記述不足 | 残る既定ボタン、点一覧の `PANEL` 選択、DA 未取得、書き込みスタブ、KMZ 未対応、衛星なし、桁区切りなし、body 行高、ローディング、虹色軌跡、矢印削除、コピー表記を追記 | — |
-| S7 | 描画変更を固定するテスト欠如 | パレット 16 進値・タイプ・余白・`RADIUS=2`・行高・影・フォーカス・空ログ文言・地図注記・設定コラムを追加。`write_all` の 8 枚出力テストは 8 回のフルサイズ描画（約 60 秒）を check.sh に足すため見送り、`--screenshot` の実行結果（8 枚）で確認 | 上記各テスト + `an_empty_log_says_there_is_no_log_yet`、`the_log_map_is_labelled_as_a_track_without_map_tiles` |
-
-### 可読性 Should の対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| S1 | `figure_row_compact` が `metric::TABLE_HEADER` を流用 | `metric::ROW_COMPACT: 28` を新設し、写真一覧の行高も同じ定数へ。`TABLE_HEADER` はヘッダ専用に | `the_row_heights_are_the_ones_the_design_names` |
-| S2 | `figure_row_open` の戻り値が未使用 | 戻り値を `()` にし、`_row` / `_da` の束縛を削除。doc も「note は呼び出し側がレイアウトで置く」に修正 | コンパイル |
-| S3 | `table_header` / `table_row` のセル配置と列分率の二重管理 | **見送り**。1 つの `Column` 定義へ寄せる変更は firmware/settings の表全体に及び、Stage 2 の範囲では退行リスクが大きい。ヘッダと本文は各画面の同じ関数内で隣接しており、次 PR の構造改善候補として残す | — |
-| S4 | `primary_button` / `secondary_button` の重複 | `action_button` に共通化し、幅係数と色だけを引数に。`choice_button` に disabled を持たない理由を doc 化 | 既存描画テスト + フォーカス輪テスト |
-| S5 | `connect::next_steps` の手書き罫線行 | 未使用束縛（`_marker` / `_note`）を削除。3 系統（next_steps / step_row / point_row）の共通化は **見送り**（データ形が異なり、`tool_button` 追加後の再設計が必要） | — |
-| S6 | `StepMarker::colour` のテストが無い | `an_unreached_step_marker_is_not_drawn_in_the_hairline_colour` を追加（MUTE 固定・RULE でないこと） | 同左 |
-| S7 | 無効ボタンの理由が画面から消えた | 「写真を読み込むと位置を書き込めます」を「写真に位置」ボタンの隣に戻した | レンダリングで目視（`log-1280x800.png`） |
-| S8 | `再読込` の probing 中無効化に理由が無い | `can_refresh` に名前を付け、列挙と probe の競合を避ける理由コメントを追加 | — |
-| S9 | `common.rs` doc の「three screens」 | 「four screens」と家具（status / panel / ruled table / figure rows / button hierarchy / formatting）に修正 | — |
-| Could C2/C3 | `text_styles` の数値直書き、写真行高の不揃い | `size::*` と `metric::ROW_COMPACT` から組むよう修正 | `the_type_scale_is_the_five_sizes_the_design_names` |
-
-### デザインレビュー Should の対応
-
-| # | 指摘 | 対応 |
-|---|---|---|
-| 2 | 1024×640 で書き込みの前提チェックと拒否メッセージが折り返し下 | `gate_rows` を固定フッター（書き込むの直上）へ移動し、`message` もフッターに表示。1024 の再描画で 3 つの前提が見えることを目視 |
-| 3 | 「次にすること」の `→` が偽アフォーダンス | 矢印を削除し、行き先は右端の注記の言葉で示す。§5 の図との差は §10 に記録 |
-| 4 | ボタン語彙が 4 分裂 | `common::tool_button`（rule outline・28pt・選択は ink outline）を追加し、地図操作と書き出しチップ、KMZ（disabled）を移行。step 1/2 の 参照/吸い出す/開く/保存/コピー は secondary/primary へ。§10 に第 4 クラスとして記録 |
-| 5 | 書体の理由が事実誤認（「ライセンスが無い」） | `DESIGN.md` §10 を「Barlow / Noto Sans JP は SIL OFL 1.1 で同梱可能。本ビルドはバイナリ非同梱の方針で OS フェイスを使う。同梱は将来作業」に修正。ネット取得はしない |
-| 6 | 「視差低減」は reduced motion の誤訳 | 「動きの低減」へ変更（ラベル・見出し・テスト期待値） |
-| 7 | 地図の軌跡が 10 色（`TRACK_PALETTE`）で虹 | コードは変更せず §10 に「線は data 1 色、記録ドットのみ ezTour §5 由来の 10 色。§3 に無い色なので単色化か §3 追記のどちらかを設計判断として残す」と記録 |
-| 8 | 「 — 」連結コピー | UI コピー 6 箇所を括弧・句点へ（`見本（…）` / `未検証（…）` / `未接続（…）` / `未取得（…）` / `オン（0 ms。…）` / `オフ（150 ms。…）`）。render テストの期待値も更新 |
-
-### デザインレビュー Could の扱い
-
-- 影の除去（Could 6）: 対応（仕様 S2 と同じ）。
-- キャレット・スクロールバーのテーマ（Could 6）: **見送り**。egui のスクロールバーは `style.visuals` の複数フィールドにまたがり、今回は craft-floor の影・フォーカスを優先。
-- ローディングのスケルトン行（Could 2）、タイトルバーの断定（Could 3）、ステッパーのラベル対称性（Could 1）、地図の明色面（Could 5）、レビュー画像の状態 variant（Could 7）: **見送り**。いずれも仕様変更・追加実装で、Stage 2 の指摘解消とは独立。§10 のローディング記録と 1280 折り返しの訂正に留めた。
-
-### 却下した指摘
-
-なし。3 レビューの Must はすべて事実と一致した。Should のうち実装を見送ったものは上表の理由のとおり（`PRODUCT.md` は write scope 外、表・罫線行の共通化は構造変更、虹色軌跡は設計判断待ち）。
-
-### 検証
-
-- `M241_VENDOR_IMAGE=… TMPDIR=/var/tmp ./tools/check.sh` **6/6**（fmt / clippy / test / docs / design / safety、41 秒）。
-- `cargo test -p m241-gui`: lib **104** + design_gate **6** + design_invariants **6** + render **36** = **152 passed / 0 failed**。
-- Stage 3 の Minor 対応: §10 の「next-step 行は `→` を残す」と「`→` は無い」の矛盾を、実装（矢印なし）に合わせて前者を削除。点一覧行の focus 輪専用テスト `a_point_row_draws_the_focus_ring` を追加（`point_row` は `Response` を返し、テストが実際に focus を与えて 2pt ink 矩形を測る）。
-- `--screenshot /tmp/m241-gui-after2` で **8 枚**（4 画面 × 1280×800 / 1024×640）を再出力し目視。変更点: 設定のキャッシュ場所行、接続の矢印削除、ファームのフッター内前提 3 行、ログの tool ボタン統一、コピーの括弧化。待機状態（Must 1）は 8 枚に含まれないため、一時テストで待機フレームを PNG 化し、バーが全幅で満ちていることを目視（テストは削除済み）。フォーカスも一時ヘルパで Tab 押下後のフレームを PNG 化し、レール「接続」と「書き込む」に 2pt ink の輪が出ることを目視（ヘルパは削除済み）。
-- スクリーンショットで確認した既知の残り: 1280×800 の設定はキャッシュ場所行の追加で巻末の「修正する位置」が、1024×640 では「動きの低減」と巻末が本文スクロールの下にある（フッターは固定）。行を増やした帰結で、本文スクロールで到達する。
-
----
-
-## 2026-11-22 / PR #28 `feat-p2-compat` の Stage 2 修正
-
-- 対象: `feat-p2-compat`（base `origin/main` = `b0456df`、Stage 1 レビュー head `7474798`）。修正コードの head は `959ab2a`、本節はその次の commit。
-- Stage 1: [仕様検収](https://github.com/haruki0420/holux-m241-rs/pull/28#issuecomment-7080543382) と[可読性](https://github.com/haruki0420/holux-m241-rs/pull/28#issuecomment-7080553810)。実装者はどちらのレビューにも参加していない。
-- 実機は使っていない（3 項目ともオフライン機能）。実機未検証の挙動を検証済みにはしていない。
-- `m241-flash` / `m241-gui` は未変更（今回 CSV ヘッダを変えないため GUI の例外 1 行も不要）。
-
-### 仕様検収 Must への対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| Must 1 | save は入力をそのまま、load は project 親基準で join するため往復が壊れる | `save` が相対パスを project 親基準へ正規化して保存（絶対パスは絶対のまま）。`load` は同じ基準で join。`02-cli.md` も「保存される文字列は常に project 基準」に修正 | `a_project_in_a_subdirectory_round_trips_relative_paths`, `a_relative_path_is_stored_against_the_project_directory` |
-
-### 可読性 Must への対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| M1 | NMEA 全却下でも exit 0 で空 GPX | 非空キャプチャで 1 点も取れなければエラー（`Error::State`、ファイル名と件数、出力なし）。部分的な dropped は `console.warn`。空ファイルは従来どおり 0 点で成功。`02-cli.md` に明記 | `read_nmea_refuses_a_capture_that_yields_no_point`, `read_nmea_refuses_a_file_that_is_not_a_capture`, `read_nmea_converts_a_capture_and_reports_dropped_lines`（warning を追加検証） |
-| M2 | `--nmea` の件数が JSON に無い | `--format json` のオブジェクトに `"nmea": {"imported", "dropped", "ignored"}` を追加（`offset_days` と同じ規約: 事実がある時だけ） | `read_nmea_json_carries_the_line_counts`, `read_json_without_a_shift_carries_no_offset_field`（dump に `nmea` が無いことも固定） |
-| M3 | project の相対パスが save/load で非対称 | Must 1 と同じ（パス基準を 1 つにした） | 同上 |
-| M4 | project が入力種別を記録しない | `"input": "dump" \| "nmea"` を保存し、`project save --nmea` を追加。`load` はその種別で `log read` する。kmz は dump 必須（`--nmea` と排他、kmz project で nmea はエラー） | `a_project_records_the_input_kind_and_load_reads_it_back`, `a_kmz_project_cannot_read_an_nmea_capture`, `log_project_save_and_load_parse_their_documented_arguments` |
-| M5 | project のエラーがパスも version も出さない | すべての refusal が project パスを名指し、version 不一致は「見つけた version と対応 version」を表示。欠落/型違いフィールドは推測せず拒否。serialize エラーの文言も write 失敗と読ませない形に修正 | `a_project_error_names_the_file_and_the_version_it_found`, `every_required_field_is_refused_when_missing_and_the_file_is_named`, `a_project_that_is_not_one_is_refused_not_guessed`, `an_unknown_export_format_in_a_project_is_refused`, `a_kmz_project_without_a_photo_folder_is_refused_on_load` |
-
-`Error::State` のままにした理由: project 専用 variant を足すには
-`crates/m241-core/src/error.rs` の変更が要り、この PR の変更範囲外。代わりに
-メッセージがファイル・version・次の行動を含むようにした（`fileio` の
-「失敗は必ずファイルを名指す」規約に合わせる）。
-
-### 仕様検収 Should への対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| Should 2 | load 挙動のテストが無い | 一覧のほぼ全てをテスト化: 未知 export_format / 読込時 kmz+写真なし / 非ゼロ offset の適用と stderr 告知 / 相対パスの project 基準解決 / save がログを開かない / 既存 project の置換 / photos null / kmz の export_format | `saving_a_project_does_not_open_the_log`, `saving_a_project_replaces_an_existing_file`, `a_project_load_applies_the_stored_day_correction_and_announces_it`, `a_kmz_project_records_the_kmz_export_format_and_photo_folder`, 上記 Must 1 / M4 / M5 の各テスト |
-| Should 3 | dropped/ignored の境界が doc と違う | 種別を checksum より先に読む実装に変更。`$GPGSA` 等は checksum 不正でも `ignored`、`$GPRMC`/`$GPGGA` だけが `dropped`。doc の記述はそのまま正しくなった | `another_sentence_kind_with_a_broken_checksum_is_ignored_not_dropped` |
-| Should 4 | `02-cli.md` の `§1.5` は存在しない | `§1, §8 item 12` に修正 | docs ゲート（節アンカーは `check_docs.py` の対象外なので目視） |
-| Should 5 | doc の JSON 例 `"log": "capture.nmea"` が load 不能 | 入力種別を実装したので例を `"input": "nmea"` として実際に読める形に更新 | `a_project_records_the_input_kind_and_load_reads_it_back` |
-| Should 6 | `utc_offset_days` 欠落を黙って 0 に | 必須フィールドとして拒否（欠落・文字列・範囲外）。doc も「nothing is guessed」と整合 | `every_required_field_is_refused_when_missing_and_the_file_is_named` |
-
-### 可読性 Should の対応（任意対応分）
-
-- S3: `import_nmea` の `# Errors` 節を復活（失敗しない理由を明記）。
-- S4: `utc_date_and_time` を追加し、`to_csv` の文字列手術を削除。`utc_iso` も同じ変換を通す。テスト `the_csv_date_and_time_agree_with_the_iso_rendering`。
-- S5: `TRACK_NUMBER` 定数と、`INDEX` の基点・消えた列（`rcr` / `fix` / `waypoint`）の理由を `to_csv` doc に明記。
-- S6: テストの CSV ヘッダ重複を `CSV_COLUMNS` 参照に縮小（project / logcmd）。`cli.rs` の parse テストは実在する入力名に修正。
-- S7: 実 ezTour 出力との突き合わせは未検証と doc に明記（「互換」と断定しない）。
-- S8: モジュール doc に 8 キー一覧と「`.itm` と相互運用しない」を追記。
-- S9: `load` から文書検証を `ProjectDocument::read` に分離、`read` から NMEA の報告を `report_nmea_import` に分離。
-- S10: project が log / output と同一パスなら `Error::Safety` で拒否。テスト `saving_a_project_over_the_files_it_names_is_refused`。
-- C2 / C3 / C6 / C7 / C8 も併せて修正（`LogProjectLoadOptions.project` の doc、Project サブコマンドの説明、project 定数の可視性、`csv_optional` の doc、`log/mod.rs` の import 行）。
-
-### 見送った指摘と理由
-
-- 可読性 S1（`dropped` を rejected / no_fix に分割）: `02-cli.md` が 3 区分を仕様として定めており、区分の追加はこの修正ラウンドの範囲を超える仕様変更。代わりに「dropped は破損と no-fix の両方を含む」ことを型 doc と全却下エラー文に明記した。
-- 可読性 S2（`NmeaImport` を `NmeaReport` + タプル戻り値へ改名）: 公開 API と既存テスト多数を書き換える変更で、指摘の本質（名前の揃え）に対してリスクが大きい。Stage 3 の判断材料として残す。
-- 可読性 S8 の kmz 成功経路テスト: 写真フォルダと実 JPEG の用意が要り、今回の Must 修正とは独立。拒否経路と `export_format` の保存はテスト済み。
-- 仕様検収 Could 9（未確定事項を `06-open-questions.md` へ登録）: 内容は `12-progress-summary.md` に既にあり、今回はコード修正に集中した。別タスクで台帳へ移す。
-
-### 却下した指摘
-
-なし。Must 6 件（仕様 1 + 可読性 5）はいずれも実装で再現でき、事実と一致した。
-
-### 変異で確認したこと
-
-いずれも変異を入れて対応テストが落ちることを確認し、そのあと元に戻した
-（`git diff` が変異前と同じ内容に戻ったことを確認済み）。
-
-- `stored_path` が入力をそのまま返す（修正前の挙動）に戻すと
-  `a_project_in_a_subdirectory_round_trips_relative_paths` が `"track.bin"` と
-  `"../track.bin"` の不一致で落ちる。
-- `report_nmea_import` の全却下ガードを無効にすると
-  `read_nmea_refuses_a_capture_that_yields_no_point` と
-  `read_nmea_refuses_a_file_that_is_not_a_capture` が落ちる。
-
-### ゲート
-
-`./tools/check.sh` 6/6（`M241_VENDOR_IMAGE` を設定した状態。実機ポートは開いていない）。
-修正コード head `959ab2a` で実行。
-
-### Stage 3 検証
-
-未検証（別エージェントが記入する）。
-
----
-
-## 2026-11-23 / PR #31 `feat-gui-wiring` の Stage 2 修正
-
-- 対象: `feat-gui-wiring`（base `origin/main` = `1b7da2e`、Stage 1 レビュー head `cc3d505`）。修正コードの head は `a8a8fbc`、本節とモジュール doc の追記はその次の commit。
-- Stage 1: [仕様検収](https://github.com/haruki0420/holux-m241-rs/pull/31#issuecomment-7081588691) と[可読性](https://github.com/haruki0420/holux-m241-rs/pull/31#issuecomment-7081553478)。実装者はどちらのレビューにも参加していない。
-- 実機は使っていない（GUI のオフライン配線のみ。実機ポートは開いていない）。Google Earth / `unzip` / 実カメラは未検証のまま。
-- 変更範囲: `crates/m241-gui` と `DESIGN.md` のみ。`m241-core` / `m241-flash` / `m241-cli` / `tools/` は無変更（`check_design.py` も無変更）。
-
-### 仕様検収 Must への対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| Must 1 | 再計画失敗が描画されず、古い OK 表示だけが残り、一覧・コントロールごと消える | 失敗時も `photo_entries` とコントロールを残し、`photo_shift.status` を同じブロックに描画。古い計画には `plan_stale` を立て、`写真に位置` と KMZ の書き出しを拒否。空一覧の経路でも status を描く | `a_failed_replan_keeps_the_list_and_draws_the_reason_beside_the_controls`（一覧・拒否・コントロールが同一フレームに描かれることをテキスト収集で確認） |
-| Must 2 | byCamera の基準カメラが画面に出ず、ハイライト変更で再計画しない。`apply_geotags` と `export_kmz` が別計画 | 基準写真から Make/Model を解決してキャッシュし、`基準カメラ: …（未検証）` を表示。ハイライトが別カメラを指したら再計画（同一カメラならフォルダを読み直さない）。KMZ は画面の計画をそのまま使い、保存先フォルダが一覧と違えば拒否。シフトを arm したままの KMZ は `<TimeStamp>` と EXIF が食い違うため拒否し、先に「写真に位置」を促す | `the_camera_scope_shows_the_base_camera_and_replans_when_it_changes`, `a_kmz_export_refuses_a_folder_the_rail_was_not_loaded_from`, `a_kmz_export_while_a_shift_is_armed_asks_for_the_geotag_write_first` |
-| Must 3 | シフト成功メッセージが範囲と無関係に全書き込み枚を「シフト後の時刻」と言う | 書き込み前に範囲内・範囲外の枚数を数え、`…（シフト: 範囲内 N 枚 / 範囲外 M 枚。シフト値は 0 に戻しました）` と表示。確認プロンプトにも同じ内訳を出す | `a_shift_write_reports_the_in_scope_and_out_of_scope_counts` |
-
-### 可読性 Must への対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| M1 | 写真ブロックだけ `見本` がなく、合成データが実読込に見える | `photo_rail_section` を `common::block_title(ui, "写真", self.sample)` に変更。`show_sample_photos` の status も `見本の写真 N 枚（未読込）` に変更 | `the_photo_block_is_captioned_as_sample`（同じ caption 行の右に `見本` があることを座標で確認） |
-| M2 | byCamera の基準写真が選択変更で更新されず、一覧と KMZ が別計画 | 仕様 Must 2 と同じ修正（再計画の契機・表示・単一計画化） | 同上 |
-| M3 | `relink_photos` が失敗を無言で捨て、編集で削除した点を指す古い計画が残る | 再計画の実装を `replan_photos` 1 本に寄せ、`relink_photos` は失敗時に一覧を破棄して `…。写真を読み込み直してください` を表示。成功可否を返す | `a_track_edit_that_breaks_the_photo_plan_drops_the_stale_list` |
-
-### 仕様検収 Should への対応
-
-| # | 指摘 | 対応 |
-|---|---|---|
-| S1 | KMZ が geotag のシフト／スコープを継承し、`<TimeStamp>` が写真 EXIF と食い違う | 画面の計画をそのまま使い、シフト arm 中の KMZ は拒否。空一覧のときだけ CLI と同じ「シフトなし・全写真」で計画する |
-| S2 | KMZ で同梱しなかった写真の理由が出ない | `kmz_export::skipped_reasons` を追加し、先頭 3 枚のファイル名と理由（撮影時刻が読めない／最も近い点と N 秒差）を成功文言に含める。テスト `a_kmz_export_names_the_first_photos_it_could_not_bundle` |
-| S3 | KMZ と byCamera に `未検証` 表示がない | KMZ 行に `未検証`（hover に Google Earth / unzip 未確認）、byCamera の rule に `（未検証）` を表示 |
-| S4 | `DESIGN.md` §10 の「KMZ 未対応」が実装と矛盾 | §10 を「KMZ チップは第六の writer。Google Earth / unzip 未検証のため `未検証`」に更新。rail のブロック順も 4 ブロック（トラック / 写真 / 集計 / 編集）に修正 |
-| S5 | KMZ 選択時に速度チャートが footer で切れる | footer の KMZ 入力を 1 行（写真・最大長辺・未検証）に畳み、5 分ルールは写真ブロックの status に移した。1280×800 でチャート下端 632px・footer 罫線 647px を実測 |
-| S6 | 編集 UI が両サイズで fold 下、スクショにも写らない | 集計を §5 の 3 番目に戻し、編集を最後にした。集計の図と編集 UI はスクロールで到達する（DESIGN §10 に追記）。**スクショにスクロール状態を足すのは今回の範囲外**（レンダラにスクロール引数がない） |
-| S7 | 写真ブロックが `見本` なしで合成の「一致」を表示 | 可読性 M1 と同じ |
-| S8 | `utc_offset_days` 未配線の帰結が画面に出ない | **見送り**。Connect 画面に既に「ファームの日付が 19.6 年ずれています」があり、Log の rail に警告行を足すと本 PR で直した fold を再び悪化させる。Log の module doc に「未補正ダンプは CLI で補正」と明記した |
-| S9 | `scope=選択` で 0 枚のとき無言 no-op | 非ゼロシフトでチェック 0 枚なら `時計を動かす写真がありません。一覧で写真をチェックしてください` を返す |
-| S10 | 仕様項目のテスト未整備 | Must の成功経路（byCamera・シフト枚数・relink 失敗・KMZ 拒否／理由）を追加。単一分割の正経路、redo、範囲分割 2 手 Undo、削除境界の内容、シフト書き込み後リセットのテストは **Stage 3 の候補として残す**（Must 修正と独立） |
-| S11 | PR 本文「Honest limits, also in the module docs」が事実と違う | `photo_shift.rs` / `kmz_export.rs` / `log.rs` の module doc に、カメラ規則・再計画コスト・tz 補正なし・map ドラッグなし・icon 未公開を追記 |
-
-### 可読性 Should への対応
-
-| # | 指摘 | 対応 |
-|---|---|---|
-| S1 | `log.rs` の肥大化と 20 行超関数 | 見送り。Stage 2 は指摘の解消を優先し、`photo_rail_section` / `export_bar` の分割は Stage 3 のリファクタ候補として残す |
-| S2 | `kmz: bool` と `format` の二重状態、拡張子の不整合 | 拡張子の不整合は export 時に拒否（`.kmz` 以外なら保存先を直す文言）。`Writer` 1 列挙への統合は screenshot setter とテストに波及するため Stage 3 候補 |
-| S3 | 再計画が 2 実装 | `replan_photos` 1 本に統合。`relink_photos` は「編集後は失敗時に一覧を捨てる」方針だけを持つ薄い関数にした |
-| S4 | `PhotoEntry` 構築の 4 重複 | `photo_entry(track, plan)` に集約（サンプル・読込・再計画・relink） |
-| S5 | 0 始まりと 1 始まりの混在 | 編集 UI の表示・入力・確認文を 1 始まりに統一（内部 index は parse 時に変換）。テスト `an_edge_split_that_would_leave_an_empty_half_is_refused` を 1 始まりに更新 |
-| S6 | 実装と矛盾するコメント | `load_photos_from_path` の fallback 記述、`# Errors`、`photo_shift` のフォールバック説明を実装に合わせた |
-| S7 | 再計画失敗時に `photo_shift.selected` が残る | 一覧を残す方針に変わったため、失敗時も選択は一覧と整合する。relink 失敗時（一覧を捨てる経路）は `selected` も clear |
-| S8 | UI スレッドで全 JPEG を再読 | 値の変更ごとではなく「確定（drag release / focus loss）」で再計画。カメラ解決は基準カメラが変わったときだけフォルダを読み、同一カメラの選択変更では基準写真 1 枚だけ読む。確定時の全 JPEG 再読は残る（core の planner がパスを取るため） |
-| S9 | CLI 等価性コメントの過大主張 | `kmz_export.rs` の doc を「CLI の簡略版（1 パス・dotfile 除外・gap 300 固定・tz 補正なし）」に書き直した |
-| S10 | 語彙の不一致と rustdoc の言語 | `photo_shift.rs` の rustdoc を英語に統一。`ScopeKind` と core の `PhotoShiftScope` の併存は、core の enum が同名のまま GUI 側の変換を消す変更がテストに波及するため Stage 3 候補 |
-| S11 | エラー文言に「次」がない | `parse_max_edge`、編集の分割／削除エラーに例と次の一手を追加。core エラーは `Error::hint()` を後ろに付ける `edit_error` を通す |
-
-### Could の扱い
-
-- C1（ドラッグ中の再計画）は可読性 S8 として対応。C2（シフト合計 overflow の到達不能分岐）は残す（UI の範囲 ±999 では到達しないが、外から shift を設定する将来の経路で使う）。C3 / C4 / C5 / C6 は見送り（仕様判断または範囲外）。
-- 可読性 Could の `fail` 改名、`max_edge_field` などの改名、キャプション共通化、`pub` 最小化は Stage 3 候補。
-
-### 却下した指摘
-
-なし。Must 6 件（仕様 3 + 可読性 3）はいずれも実装で再現でき、事実と一致した。Should の見送りは上表の理由による。
-
-### 検証
-
-- `M241_VENDOR_IMAGE=… TMPDIR=/var/tmp ./tools/check.sh` **6/6**（fmt / clippy / test / docs / design / safety、43 秒）。実機ポートは開いていない。
-- `cargo test -p m241-gui`: lib **121** + design_gate **6** + design_invariants **6** + render **36** = **169 passed / 0 failed**（Stage 1 時点 162 から +7）。
-- `--screenshot /tmp/m241-gui-wiring2` で **8 枚**（4 画面 × 1280×800 / 1024×640）を再出力し目視。1280×800 の Log で、写真ブロックの `見本`、`見本の写真 2 枚（未読込）`、`基準カメラ: HOLUX M-241（未検証）`、`合計 900 秒: 範囲内 2 枚 / 範囲外 0 枚`、KMZ 行の `未検証`、速度チャートが footer に切られないこと（チャート下端 632px / footer 罫線 647px）を確認。1024×640 の Log で KMZ 行が 1 行に収まり、`未検証` が欠けないことを確認。Connect / Firmware / Settings は変化なし。
-- Must 1（再計画失敗）は固定状態のスクショに無いため、一時テストで失敗フレームを PNG 化して目視（一覧・コントロール・拒否文が同一画面に出て、rail 幅が広がらず map が縮まないことを確認）。一時テストは削除済み。
-- 未検証: Google Earth / `unzip`、実写真、実カメラでの byCamera 一致、実機。
-
-### Stage 3 検証
-
-未検証（別エージェントが記入する）。
-
----
-
-## 2026-11-23 / PR #34 ログの設定ジャーナル Stage 2 修正（`fix-log-journal`）
-
-- 対象: PR #34（base `origin/main` = `7dda90f`、Stage 1 レビュー head `e683f00`）。修正コードの head は `bd65a07`、本節はその次の commit。
-- Stage 1: [仕様検収](https://github.com/haruki0420/holux-m241-rs/pull/34#issuecomment-7082342578) と[可読性](https://github.com/haruki0420/holux-m241-rs/pull/34#issuecomment-7082341031)。実装者はどちらのレビューにも参加していない。
-- 実機ポートは開いていない。実ファイル（2026-11-21 の 225,028 B、2026-11-22 の 3,228 / 3,260 B）は読み取りのみで、リポジトリには入れていない。
-
-### Must への対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| 仕様 M-1 | journal type を「3, 4, 7 / type 2 未観測」と誤記 | 実測（2026-11-21: type 3 ×68 / 4 ×68 / 7 ×75 / 6 ×2 / 2 ×1、names 34、items 248）に修正。type 2 は file offset `0x220` に値 `0x8800_003D`（直後の 20 B レコード・blocks 1–3 の header mask と同値）で 1 回観測、と事実を分離。parser が適用しない理由も明記 | docs ゲート、`a_stale_sixteen_byte_mask_still_reads_twenty_byte_records`（type 2 を含む fixture） |
-| 仕様 S-1 / 可読性 M3 | mask 20 B / データ 16 B で block 全損 + 「cut short」誤診断 | `record::decode_with_length` を追加し、検出長に収まるフィールドだけで decode。「境界=データ・意味=mask」の不変条件を module doc に明記。decode 失敗は truncated ではなく damage として歩を進める。CLI の truncated 文言も「バイトが尽きた」に変更 | `a_stale_twenty_byte_mask_still_reads_sixteen_byte_records`（core）、`a_twenty_byte_mask_over_a_sixteen_byte_record_drops_the_speed_field`（record）、`a_stale_mask_is_warned_about_and_does_not_lose_the_records`（CLI） |
-| 仕様 S-2 / 可読性 M4 | 再同期が 2 連続 checksum で偶然一致（ランダム 50 本中 4 本が点を出力） | 受理条件を名前付き定数化: 宣言長 = 2 連続（または 1 レコード + journal/padding 境界）、非宣言長 = 3 連続、再同期 = 4 連続。境界付き 1 レコードと「1 レコード後ろが grid」も許容。確率をコメントに明記し「random bytes では受理されない」断定を撤回 | `random_bytes_do_not_become_track_points`（50 seeds で 0 点）、`resync_needs_an_unbroken_run_not_two_lucky_checksums`、`one_record_before_a_journal_cluster_is_not_lost` |
-| 可読性 M5 | `is_journal_only` の doc が「erased も」と書き、空レコード未計上 | 定義を「journal item ≥1 かつ records / empty_records / bad_checksums / truncated_records / unparsed_bytes がすべて 0」に一本化。空レコードを `empty_records` で計上。CLI の断定を共有定数 1 つに | `a_journal_with_unreadable_bytes_is_not_journal_only`、`a_record_without_a_time_or_a_position_is_counted_as_empty`、`an_erased_block_is_not_journal_only`、CLI の journal-only 2 件 |
-| 可読性 M1 | 旧「checksum 不一致でも点を残す」の why が消えた | parse.rs module doc に (a) 旧ポリシーを捨てた実測（11-21: 11,088 点中 4,481 が checksum 不一致、うち 3,235 は block 0 の stale mask（3,244 点のうち 9 点は偶然一致） / 11-22 journal-only が 135・137 点）、(b) 代償（1 byte XOR のため壊れた実レコードも 1 点失う）、(c) mask を上書きする不変条件を追加 | doc、既存の fail-closed テスト |
-| 可読性 M2 | 実装と矛盾する rustdoc 3 箇所 | `record.rs` の契約（失敗は破棄）、`journal.rs` の認識契約（type/value は未確定なので検証しない・その代償）、`m241-gui/tests/render.rs` の 1 行コメントを実装に一致 | 各 doc、既存テスト（GUI はテスト 1 行のみ変更） |
-
-### Should への対応
-
-| # | 指摘 | 対応 |
-|---|---|---|
-| 仕様 S-2 文言 / docs | 「anything unrecognised fails the checksum」の断定 | 再同期の受理条件・確率・`unparsed_bytes` の代償を `03-hardware-facts.md` の本文に反映 |
-| 仕様 S-4 | mask と実長が食い違うときのフィールド意味 | `03-hardware-facts.md` に行を追加（境界=データ、意味=mask、収まらないフィールドは decode しない。block 0 の 3,244 点は speed なし、speed ありは 7,698 = blocks 1–3） |
-| 仕様 S-5 | `record.rs` の旧仕様 rustdoc | 可読性 M2 と同時に修正 |
-| 可読性 S2 | 判定に効く数値の why が無い | `DECLARED_LEADING_RECORDS` / `DETECTED_LEADING_RECORDS` / `RESYNC_LEADING_RECORDS` / `RESYNC_SCAN_BYTES` / `DETECTION_SAMPLE_RECORDS` に根拠と代償を rustdoc。走査上限の代償も明記 |
-| 可読性 S3 | journal の語・単位が混在 | `journal.rs` module doc で entry / name / cluster / item を定義。「settings journal」に統一。`journal_items` が name を含むことを doc 化 |
-| 可読性 S4 | `layout_mismatches` の名前と struct doc | `layout_mismatched_blocks` に改名（JSON キーも同じ）。struct doc を「観測とスキップ、単位はフィールドごと」に書き直し、`used_bytes` の doc も実装に一致 |
-| 可読性 S5 | `warn_about_damage` の責務拡大と二重文言 | `warn_about_parse_report` に改名し doc を「利用者に伝える parse 結果」に。journal-only の文言を `NO_TRACK_POINTS` 1 つに共有 |
-| 可読性 S6 | fixture の mask・`u16::MAX`・truncate の意図 | CLI fixture の mask が実測値（bit 27 込み）である理由、`COUNT_NOT_FULL` の使用、truncate の意図をコメント（entry 組立の重複は下記「見送り」） |
-| 可読性 S7 | テスト名・文言だけのテスト | `a_hundred_records_of_twenty_bytes_...` に改名。journal-only の text テストはラベル行をパースして個数 23 を検証。damage テストに CSV 行数（破損レコードが export されない）を追加。stale mask の CLI レベルテストと journal-only の `log read` テストを追加 |
-| 可読性 S8 | 新規 `pub` と `checksum_matches` | `journal::ENTRY_SIZE/NAME_SIZE` を private に。`checksum_matches` は mask を信頼できる呼び出し元向けとして rustdoc に理由を書き、parser は `checksum_matches_length` を使うと明記 |
-| 可読性 C2 | `used_bytes` の doc | 実装（レコードのみ・checksum 失敗分も含む）に一致 |
-| 可読性 C3 | journal の why が弱い | module doc に「旧 parser が configuration バイトから座標を捏造して export していた」と実測件数を明記 |
-| 可読性 C5 | 名前 | `Evidence` → `LengthEvidence`、`DETECTED_RECORD_LENGTHS` → `CANDIDATE_RECORD_LENGTHS`。resync は同じ定数を再利用 |
-| 可読性 C6 | ブロック単位で固定する理由 | 検出長を再検出しない理由（type 2 は未確認、構成変更は次 block の header に出る）をコメント |
-| 仕様 C-1 / C-3 | `log info` の節が無い / journal-only read の扱い | `02-cli.md` に `m241 log info` 節（text 行・JSON 全フィールドの単位と意味・exit code）を追加。`log read` の journal-only は警告 + 空 track + exit 0 と明記 |
-
-### 見送った指摘と理由
-
-- 仕様 S-3（`docs/dev/06-open-questions.md` §1 の「header checksum・原因未確定」更新）: この修正の write scope（`03-hardware-facts.md` / `02-cli.md`）外。本 PR の facts と `05-verification.md` の分析で原因は説明済みなので、follow-up として別途更新する。
-- 仕様 C-5（`AGENTS.md` §5 に stale mask の実測を反映）: 同じく write scope 外（`AGENTS.md` は本 PR の非変更要件）。follow-up。
-- 可読性 S1（`parse_dump` の Step enum 化）: 挙動を変えない大規模な構造変更で、Stage 1 の Must を直す今回の範囲を超える。例外経路（resync・decode 失敗）は追加テストで固定したので、次の整理で行う。
-- 可読性 S6 の 16 B entry 組立の重複: core の `journal_entry` はテスト専用の private helper、CLI fixture は別クレート。共有にはテスト支援 API の公開が要り、本 PR の目的に対して公開面を広げる。mask・`COUNT_NOT_FULL`・truncate の意味は揃えた。
-- 可読性 C4（GUI が journal-only を表示しない）: `m241-gui` 本体は本 PR の変更範囲外（テスト 1 行のみ許可）。CLI で区別できることを優先し、GUI は follow-up。
-
-### 検証
-
-- `M241_VENDOR_IMAGE=<vendor V1.13> TMPDIR=/var/tmp ./tools/check.sh`: **6/6**（修正コード head `bd65a07`）。
-- 実ファイル（読み取りのみ、リポジトリ外）:
-  - 2026-11-21 225,028 B: 10,942 点 / bad_checksums 0 / damaged 0 / journal_items 248 / layout_mismatched_blocks 1 / unparsed 0 / used_bytes 218,840（修正前と同値）
-  - 2026-11-22 3,228 B / 3,260 B: 0 点 / journal_only true / journal_items 164 / 166（修正前と同値）
-- 追加テスト（core）: `a_stale_twenty_byte_mask_still_reads_sixteen_byte_records`, `one_record_before_a_journal_cluster_is_not_lost`, `resync_needs_an_unbroken_run_not_two_lucky_checksums`, `a_journal_with_unreadable_bytes_is_not_journal_only`, `a_record_without_a_time_or_a_position_is_counted_as_empty`, `random_bytes_do_not_become_track_points`（50 seeds）。ほか record 1 件、CLI 2 件。
-- 実測の再現: 旧ポリシーの checksum 不一致は、旧グリッドを Python で再現して 11-21 が 4,481 件、11-22 が 135 / 137 件であることを確認した（リポジトリ外・読み取りのみ）。
-
-### Stage 3 検証
-
-未検証（別エージェントが記入する）。
-
-## 2026-11-23 / PR #37 GUI ログ/NMEA 操作の Stage 2 修正（`feat-gui-logops`）
-
-対象: `c571039606e7d0c4f83d140b3598489d84670515`（base `origin/main` = `142750ed`）、
-修正 head `607b77b`。Stage 1 は仕様検収
-（[仕様レビュー](https://github.com/haruki0420/holux-m241-rs/pull/37#issuecomment-7083569806)）と
-可読性（[可読性レビュー](https://github.com/haruki0420/holux-m241-rs/pull/37#issuecomment-7083518741)）の
-2 本を別レビュアーが実施。Stage 2 は別エージェント（`pr37-fixer`）が担当した。変更範囲は
-`crates/m241-gui` と docs（`02-cli.md` / `DESIGN.md` / 本ファイル）のみで、
-`m241-core` / `m241-cli` / `m241-flash` / `Cargo.*` / `tools/` / `screens/connect.rs` /
-`screens/firmware.rs` は未変更。実機ポートは開いていない（ハードウェア検証はしていない）。
-
-### Stage 1 の Must への対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| 仕様 M1 | GUI のプロジェクト保存が常に絶対パスで、CLI の「プロジェクト基点相対」契約（`02-cli.md:393-400`）を満たさない | `stored_path` を CLI と同じ規則に置換: cwd で一度解決し、プロジェクト親基準の相対＋`/` 区切りで保存。絶対パスは絶対のまま。`save_project_in` に cwd を明示してプロセス cwd を変えずに往復を試験 | `a_project_in_a_subdirectory_stores_paths_relative_to_its_directory`（`../track.bin` → 読込で元ファイル）、`an_absolute_path_is_stored_absolute_and_read_back_as_the_same_file` |
-| 仕様 M2 | 「読み書き」の JSON に `nmea` / `offset_days` が無い（`02-cli.md:348-352`） | `ReadFacts`（shift と NMEA counts）を `LoadedLog` に持たせ、core `export()` の出力へ CLI の `attach_read_report` と同型に付与。`LogScreen` が読み取り事実を保持し、書き出しバーとプロジェクト読込経由の両方で同じ JSON を書く | `a_json_read_export_carries_the_nmea_counts_and_the_day_shift`、`a_dump_json_export_has_neither_read_report_field`、`the_read_report_is_only_added_to_json`、`the_export_bar_writes_the_read_report_into_json`、`a_project_load_writes_the_read_report_fields_it_stored` |
-| 可読性 M1 | `log.rs:9-22` のモジュール doc が「端末と話さない」「`--tz-offset-minutes` のコントロール無し」「icon 非公開」と実装に反する | doc を実装に合わせて書き直し（吸い出し/中継は端末を開く・未検証、KMZ tz の操作子あり、icon は opt-in、地図はクリック選択のみ） | 目視（`--screenshot` と `M241_GUI_OPS_SCREENSHOTS` の再出力） |
-| 可読性 M2 | 40 フィールドの共有状態が、消去パネルに無いポート欄・上書き欄をエラー文で指示する | `LogOps` をパネル別 struct（Download / Erase / Project / Repair / Proxy / Read）に分割。Download と Erase が各自ポート・上書き・進捗を描く。状態文は `PanelStatus { mode, .. }` で発生元パネルだけが表示 | `the_transfer_panels_draw_the_controls_their_refusals_name`（エラー文が引用するラベルと同じ文字列が両パネルに描かれる）、`a_status_from_another_panel_is_not_drawn` |
-| 可読性 M3 | KMZ icon を理由なく既定 ON にして旧ゲートを外した | core が `icon/` の意味を未確定と記録し CLI の `log kmz` は icon を書かないため、**既定 OFF の opt-in** に戻した。フィールド doc・モジュール doc・ホバー文・DESIGN に理由を記載 | `a_kmz_with_the_icon_option_bundles_an_icon_entry`（既定 OFF を assert し、ON のときだけ `icon/` が出る） |
-
-### Should への対応（1 行ずつ）
-
-| 指摘 | 対応 |
-|---|---|
-| 仕様 S1 `--port auto` の意味が違う | core がポート名しか公開しないため、CLI の USB-ID 判定を名前に写した「USB シリアルらしい名前」フィルタを追加（`/dev/ttyUSB*`・`/dev/ttyACM*`・macOS の `cu.*USB*/SLAB/wchusbserial*`・`COM*`）。0 件/複数件は拒否し全ポートを列挙。USB-ID 判定を core に移すのが最終形である旨を `device.rs` と `02-cli.md` に明記。`auto_only_considers_a_cable_shaped_port` で固定 |
-| 仕様 S2 プロジェクト読込が kmz+NMEA / `photos:null` を受ける | CLI と同じ 2 つの拒否を読込前に追加（`a_kmz_project_is_refused_for_the_same_inputs_the_cli_refuses`） |
-| 仕様 S3 消去パネルに `--force` / `--port` 相当が無い | M2 のパネル分割で消去パネル自身がポート欄と上書き欄を持ち、エラー文が実際に描かれるラベルを引用するよう修正（上記 M2 のテスト） |
-| 仕様 S4 geotag の `--tz-offset-minutes` 相当が無い | **見送り**。GUI の写真ブロックは `photo_shift`（スコープ別の写真時計シフト）を持ち、CLI の「トラックのコピーをカメラ時計へ移す」tz と合成したときの正しい意味（両方が写真時刻側か、片方がトラック側か）をテストで固定できない。誤った合成は静かに写真を誤マッチさせるので、tz 単独の操作子と合成規則のテストを follow-up にする |
-| 仕様 S5 DESIGN.md 未更新（座標形式・空ログ copy・消去パネル） | DESIGN §5 設定行に座標形式、§6 空ログ、§10 に ログ操作コンソール・消去パネル（amber なし）・icon 既定 OFF・相対保存・JSON 契約を追記 |
-| 仕様 S6 標準 `--screenshot` 8 枚に新パネルが写らない | 設計として DESIGN §8 に記録: 標準 8 枚はサンプル軌跡つきの Log 画面で、コンソールは地図の下。空ログ時のみ先頭に出る。パネルのレビューは opt-in `M241_GUI_OPS_SCREENSHOTS` の 6 枚で行う（今回は再出力して目視） |
-| 仕様 S7 中継の `--max-lines` 相当が無い | `ProxyConfig.max_lines` と中継パネルの「最大行数」欄（空欄＝停止まで）を追加し、行ループ内で終了（`a_line_limit_ends_the_relay_after_that_many_lines`） |
-| 可読性 S1 `ops.rs` の責務分割 | パネル別状態＋実行関数の分割（`finish_dump`/`finish_backup`、`load_project` → `refuse_unsupported_project`/`adopt_project`、`proxy_panel` → 4 つの描画関数）、`run_repair` のファイル I/O を `nmea::repair_file` へ移動。**1 ファイル複数モジュールへの物理分割は見送り**: 純移動でレビュー差分が膨らみ、Stage 2 の Must 修正と独立なため |
-| 可読性 S2 長大関数 | 上記の切り出しで `load_project` 113→約 20 行、`proxy_panel` 132→4 関数に分割。`log.rs` の描画関数（写真・export）の分割は Stage 3 の指摘があれば follow-up |
-| 可読性 S3 共通化不足 | テキスト収集テストヘルパを `test_support` に移して 2 モジュールで共有（複製を解消）。ラベル定数（ポート・上書き）はエラー文と描画で共有。ラベル+`TextEdit` の ~11 箇所の helper 化と `write_dump`/`write_text` の統合は follow-up |
-| 可読性 S4 上書きポリシーが 3 通り | **未変更**（download/read は拒否、repair/project は上書き）。ツールの性格（repair は派生出力、project は設定ファイル）が違い、CLI も同様なので、設計意図を DESIGN §10 に 1 行残すに留めた |
-| 可読性 S5 文言を `contains` で機械判定するテスト | 消去は `press_erase` の挙動（armed でのみ拒否文が消去パネルの status になる）を検証。パネル描画テストは色数だけでなく各パネルの action 文言を `screen_texts` で検証。`settings.rs` の座標形式テストの偽のコンパイルエラー主張は未修正（follow-up） |
-| 可読性 S6 実機未検証と読める書き方 | `device.rs` 冒頭に「GUI 経由の吸い出しは実機未検証」を明記。KMZ icon の断定は既定 OFF と 未検証 表示で解消。project の相互運用はパス規則をテストで固定（CLI が書いた固定 JSON の読込テストは follow-up） |
-| 可読性 S7 `pub` が最小でない | `DownloadJob` のフィールドを private にし `purpose()` / `try_recv()` を追加。新規モジュール全体の `pub` → `pub(super)` の一括変更は機械的で本 PR の Must と独立なため follow-up（`unreachable_pub` 相当の lint 導入と併せて） |
-| 可読性 S8 NMEA 修復・暦算の丸ごと複製 | **共有化は見送り**（write scope が `m241-core` を禁止）。`nmea.rs` の module doc に CLI 側ファイル（`m241-cli/src/nmea.rs` / `cal.rs`）との対応と「片方だけ変えるな」、最終形は core に 1 実装であることを明記 |
-
-### Could（記録）
-
-- C1 空ログの扱い（GUI は保存しない / CLI は 0 バイトを書く）と C2 上書き既定（GUI は拒否 / CLI は上書き）は、GUI が安全側である差として `02-cli.md` の GUI 対応表に明記。
-- C3 KMZ icon は Must 5 で既定 OFF に変更（CLI と同じ出力が既定）。
-- C4 proxy の既定 TCP 待受は維持（ループバック限定）。`--bind` 省略＝TCP なしの CLI との差を GUI 対応表に明記し、欄を空にすれば CLI と同じになる。
-- C5 `--utc-offset-days` 相当は「読み書き」の日付補正とプロジェクトの保存値で代替できることを `log.rs` module doc に明記。C6（proxy 開始時の一過性表示）と C7（吸い出し成功時の解析警告）は未対応（follow-up）。
-
-### 追加・更新テスト（実測 `cargo test -p m241-gui` = 176 passed）
-
-- project: `a_project_in_a_subdirectory_stores_paths_relative_to_its_directory`、
-  `an_absolute_path_is_stored_absolute_and_read_back_as_the_same_file`、
-  `a_json_read_export_carries_the_nmea_counts_and_the_day_shift`、
-  `a_dump_json_export_carries_the_position_and_no_input_facts`、
-  `an_unpositioned_track_writes_no_position_object`、
-  `a_gpx_source_is_named_in_the_json_like_the_cli`、
-  `the_read_report_is_only_added_to_json`。
-- ops: `the_transfer_panels_draw_the_controls_their_refusals_name`、
-  `a_status_from_another_panel_is_not_drawn`、
-  `a_kmz_project_is_refused_for_the_same_inputs_the_cli_refuses`、
-  `the_export_bar_writes_the_read_report_into_json`、
-  `a_project_load_writes_the_read_report_fields_it_stored`。
-  既存の `the_erase_action_needs_a_saved_backup_and_the_confirmation` を文言コピー検査から
-  `press_erase` の挙動検査へ変更。
-- device: `auto_only_considers_a_cable_shaped_port`。
-- proxy: `a_line_limit_ends_the_relay_after_that_many_lines`。
-- log: `a_kmz_with_the_icon_option_bundles_an_icon_entry` に既定 OFF の assert を追加。
-
-### ゲート・スクリーンショット
-
-- `M241_VENDOR_IMAGE=<vendor V1.13> TMPDIR=/var/tmp ./tools/check.sh`: 本節を含む head の
-  ツリーで 6/6（fmt / clippy / test / docs / design / safety）。修正コードの commit は `607b77b`。
-- `cargo run -p m241-gui -- --screenshot`: 標準 8 枚を再出力（`.design/firmware-wizard/screenshots/`、
-  gitignore 済み）し、Log 1024/1280 を目視。`M241_GUI_OPS_SCREENSHOTS=/var/tmp/pr37-ops cargo test ...`
-  で 6 パネルを再出力し、消去パネルのポート欄・上書き欄、中継の「最大行数」、KMZ icon が
-  既定 OFF で表示されることを目視。
-- 実機の吸い出し・中継・消去は未検証のまま（GUI から実行していない）。
-
-### main 追従（PR #36 の core/CLI 変更）後の再突き合わせ（2026-11-23）
-
-- main の `5b2ffce`（PR #36）へ `06e4e1d` で merge。競合は本ファイル末尾のみで、
-  PR #37 節と PR #36 節を両方残して解消（`### Stage 3 検証` は両節がそれぞれ持つ）。
-- PR #36 で CLI の `attach_read_report` が `ReadReport` を受け取る形になり、`log read --format json`
-  は `input:"gpx"` / `simplify` / `position` を追加していた。GUI の JSON は `input` と `position`
-  を欠いていたため、GUI 側を新しい CLI に合わせた:
-  - `position`（最初と最後の位置点、decimal 度、`format` / `start` / `end` と
-    `latitude`/`longitude`/`lat`/`lon`）を書き出しバー・読み書きパネル・プロジェクト読込に追加。
-    `TrackPoint::position()` と core の `format_coordinate` を使い、CLI の `position_report` と同じ
-    規則（両端が揃ったときだけ）にした。
-  - 画面の「ログを開く」で GPX を読んだ場合、`log read --gpx` と同じく `"input": "gpx"` を付与。
-  - JSON は CLI と同じく常に `serde_json::Value` で再直列化してから付与する形にした（従来は
-    付与する事実が無いとき core のバイト列をそのまま書いていた）。
-  - `simplify` は GUI に間引きの操作子が無いため対象外（CLI でも `--simplify` 指定時のみ）。
-    `--cache` / `--csv-report` / `--coord-format` も GUI に対応する操作子が無い。`position` は
-    CLI の既定と同じ decimal 固定（Settings の座標形式は表示専用）。
-- 実出力での再突き合わせ（`/var/tmp` の合成 2 点ダンプと、そこから CLI で作った NMEA/GPX。
-  リポジトリ外で破棄）:
-  - dump: `m241 log read --format json` と GUI の読み書き → **file diff なし**
-  - NMEA: `--nmea --utc-offset-days 1` → **file diff なし**
-  - GPX: `--gpx` と GUI の「ログを開く」→ JSON → **file diff なし**
-- 追加テスト: `a_dump_json_export_carries_the_position_and_no_input_facts`、
-  `an_unpositioned_track_writes_no_position_object`、
-  `a_gpx_source_is_named_in_the_json_like_the_cli`。既存の JSON テスト
-  （`the_export_bar_writes_the_read_report_into_json`、
-  `a_project_load_writes_the_read_report_fields_it_stored`）に `position` の assert を追加。
-  旧 `a_dump_json_export_has_neither_read_report_field` は上記の position テストに置き換え。
-- ゲート: 最終 head（本節を含む）で `./tools/check.sh` 6/6、`cargo test -p m241-gui` は
-  lib 178 passed。`git diff origin/main...HEAD` は `crates/m241-gui`（`Cargo.toml` /
-  `Cargo.lock` の `serde_json` 追加を含む）と docs のみ（merge で取り込んだ core/CLI は
-  PR の差分に出ない）。
-- PR #38（`812a0b5`、GUI のファーム書き込み）を merge した。GUI が `m241-flash` をリンクする
-  ようになり「GUI は書き込みクレートをリンクしない」という前提は消えたため、ログ操作コンソールの
-  消去拒否文・module doc・`DESIGN.md` / `02-cli.md` を「GUI はファーム書き込み用に
-  `m241-flash` をリンクするが、この画面からログ消去の経路は呼び出さない（端末のログを消すには
-  ユーザーの明示的な承認が必要）」に更新した。挙動は変えていない。今回の merge は conflict
-  なし（自動マージ）で、PR #37 / #36 / #38 の節をすべて残した。
-
-### Stage 3 検証（検証者記録の代筆）
-
-Stage 3 再検証は head `d14a129`（PR #36 追従後、PR #38 マージ前）で合格:
-`./tools/check.sh` は **6/6 PASS**、`cargo test -p m241-gui` は **226 passed**
-（lib 178 + design_gate 6 + design_invariants 6 + render 36）。GUI と新しい CLI の
-`--format json` を dump / NMEA / GPX の 3 ケースで突き合わせ、**raw 一致**を確認した。
-Stage 3 検証者は worktree 編集禁止のため、この記録のみを修正担当が代筆した
-（検証対象のコード・テストは変更していない）。
-
----
-
-## 2026-11-23 / PR #36 ezTour パリティ core/CLI Stage 2 修正（`feat-parity-core`）
-
-- 対象: PR #36（base `origin/main` = `142750ed`、Stage 1 レビュー head `2e0252b`）。修正コードの head は `c7f986c`、本節はその次の commit。
-- Stage 1: [仕様検収](https://github.com/haruki0420/holux-m241-rs/pull/36#issuecomment-7083503414) と[可読性](https://github.com/haruki0420/holux-m241-rs/pull/36#issuecomment-7083435520)。修正者はどちらのレビューにも参加していない。
-- 実機ポートは開いていない。実ログ・実座標は使っていない（KML 検証用の合成ダンプは `/var/tmp` に作り、リポジトリ外で破棄）。
-
-### Must への対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| 仕様 M1 | 単体 KML の `<LookAt>` が `<Style>` の後ろで KML 2.0 の content model 違反 | `to_kml` で `LookAt` を `<name>` 直後・両 `Style` の前に移動。`to_kml` の rustdoc に FeatureType の sequence と「contains では順序を検出できない」理由を明記 | `a_kml_feature_children_follow_the_schema_order`（Document 直下の `name < LookAt < trackStyle < waypointStyle < Placemark` と、Placemark 内の `name < styleUrl < geometry` を index 比較） |
-| 可読性 M1 | `--cache` ヒットで解析警告が消え、破損ダンプが 2 回目にきれいに見える | キャッシュに `ParseReport` の全カウンタを保存（`CACHE_VERSION` を 2 に）し、ヒット時に `warn_about_parse_report` を fresh parse と同じ引数で呼ぶ。レポート欠落の v2 キャッシュは警告して再パース | `a_cache_hit_replays_the_parse_warnings_it_stored`（checksum を 1 バイト壊したダンプで、1 回目の警告行が 2 回目のヒットでも全て出ることを比較。`docs/reference/02-cli.md` の「ヒット時も同じ警告」記述と対） |
-| 可読性 M2 | `--gpx` が既定の `--utc-offset-days auto` を通り、2000〜2010 年代の GPX を +7,168 日ずらす | **GPX 入力には auto を適用しない**と決定。`OffsetInput::{Unit, Gpx}` を導入し、GPX + `Auto` は shift 0。stale 窓に入る GPX では「auto は適用しない・`--utc-offset-days 7168` で明示的にshiftできる」と警告。明示日数は従来どおり適用。`read` の rustdoc・`--utc-offset-days` の help・02-cli に明記 | `a_historical_gpx_keeps_its_dates_under_the_auto_default`（2015-06-01 の GPX が既定で 2015 のまま・警告に `7168`、明示 `7168` では 2035-01-15 になる） |
-| 可読性 M3 | GGA が `quality=1, satellites=00` で自己矛盾、同じ関数の doc と出力が不一致 | GGA の衛星数フィールドを **空**（NMEA の "not available"）に変更。`00` は有効な衛星数であり fix quality 1 の隣で測定値に見えるため。`to_nmea` / `gga_sentence` の rustdoc、`03-hardware-facts.md`、`02-cli.md` を「mask（0x1D/0x3D）が選ばず `TrackPoint` も保持しないので書けない」に統一。GSA の fix type は「height フィールドからの推論であって受信機の判定ではない」と出力側 doc に明記 | `an_nmea_gga_carries_the_altitude_and_says_what_the_log_cannot` の契約を `fields[7] == ""` に更新（既存テストの期待値変更はこの 1 件のみ、理由は仕様変更） |
-
-### Should への対応（仕様検収）
-
-| # | 指摘 | 対応 / 理由 |
-|---|---|---|
-| 仕様 S1 | 「衛星数・DOP のフィールドが無い」は `block.rs` と矛盾 | `03-hardware-facts.md` の行と本文、`02-cli.md` の NMEA 節を「mask が選ばない／`TrackPoint` が保持しない」に訂正。`block.rs` の `SID`/`NSAT`/DOP 定義と `field_layout` に触れ、誤った断定を撤回 |
-| 仕様 S2 | バックアップ既定 true の影響（GUI も `_original` を作る）が未告知 | `CHANGELOG.md` の Unreleased に「1.0.0 以前は作らなかった・GUI の書き込みにも同じ既定が効く」を追加。`02-cli.md` の Backups 節に `GeotagOptions` が既定の置き場所であることと GUI への波及を明記 |
-| 仕様 S3 | `--gpx` が非空・点 0 で exit 0・空出力 | `--nmea` と同じ規則に統一し、`<trkpt>` が無い GPX は `Error::State`（exit 1）で何も書かない。help・02-cli に明記 | `read_gpx_refuses_a_document_with_no_track_point`（`<wpt>` だけの GPX、stdout 空） |
-| 仕様 S4 | `log info --json` の例 `"end": null` が起こり得ない | `position` は start/end 両方が揃ったときだけ生成される実装に合わせ、例を両側の座標で埋め、その契約を本文に追加 |
-| 仕様 C1 | `--simplify 1` でも JSON に `"simplify": 1`、stderr も「間引いた」 | stride 1 は間引きとして扱わない（`filter(|s| *s > 1)`）。JSON フィールドも stderr 行も出さない。help と 02-cli に「1 は指定しないのと同じ」 | `a_stride_of_one_thins_nothing_and_reports_no_simplify_fact` |
-| 仕様 C2 | CSV レポートの `REPORT` 行と `GENERATED BY` / `TRACK NAME` が docs に無い | 02-cli の `--csv-report` 説明に追記 |
-| 仕様 C3 | fix 0 で `distance : 0.00 m`（docs は「no data は `-`」） | `print_info` で `stats.fixes == 0` のとき distance を `-` に。02-cli の distance 説明と JSON の扱いも明記 | `info_shows_no_distance_for_a_track_without_a_fix` |
-| 仕様 C4 | 9 桁の根拠「f64 としてビットを保つ」が不正確 | `export.rs` module doc を「ezTour の `%.9f` であり、f32 由来の f64 にそれ以上の桁は無い」に修正 |
-| 仕様 C5 | `--icons` の decode 失敗が docs に無い | 02-cli の `--icons` 説明に「ヘッダが読めて長辺超過かつ decode 不能なら exit 1 のエラー」を追記 |
-| 仕様 C6 | `"kept every 3th point"`、stride 1 でも simplified 表示 | 文言を `kept the first point, every {stride}th after it, and the last` に変更。stride 1 は C1 のとおり無出力 |
-| 仕様 C7 | 新 GPX/KML/NMEA 出力の外部検証状況が未記録 | `05-verification.md` §2 に、KML を xmllint で検証した事実と、ビューア/GPX/NMEA は未検証である旨を追記 |
-
-### Should への対応（可読性）
-
-| # | 指摘 | 対応 / 理由 |
-|---|---|---|
-| 可読性 S1 | キャッシュ約 200 行が `logcmd.rs` にインライン、module doc なし | `crates/m241-cli/src/logcache.rs` を新設。module doc に「dump が真実・長さと hash の一致だけを信頼・壊れた/古いキャッシュは警告して再パース・ヒットは track と report を返す」を明記。`logcmd` の module doc を `--gpx` / `--cache` / `--csv-report` / `--coord-format` / `--simplify` に追随 |
-| 可読性 S2 | `TrackStats` の API 設計（`of_points` 不在・`records`/`fixes` 重複・`non_exhaustive` なし・GUI が未使用） | 一部対応: struct doc を「CLI が読み、GUI が読む予定」「精度は由来どおり f32/f64 混在」に修正。`of_points` 追加・重複フィールドの一本化・`#[non_exhaustive]` は公開 API の形を変えるため見送り（下記） |
-| 可読性 S3 | 「位置を持つ点」判定が 5 か所に複製、writer は `is_finite` を見ない | `TrackPoint::position()`（有限座標のみ）を追加し、GPX/KML writer・`look_at`・`TrackStats::of`・CLI の position report・geotag のグルーピングを一本化。NaN 座標が `lat="NaN"` として出力されないことをテストで固定 | `a_non_finite_position_is_not_written_to_gpx_or_kml` |
-| 可読性 S4 | バックアップ既定の GUI 波及が読めない／`geotag_options()` を 3 回呼ぶ | docs は仕様 S2 で対応。コードは `geotag_options` を 1 回作り、表示と JSON の両方へ渡す形に（JSON 側は `GeotagCounts` に集約して引数 8 個を避けた） |
-| 可読性 S5 | `--icons` の命名と parser 3 つの複製 | 見送り: CLI の公開フラグ名変更と parser 統合は挙動不変の整理で、本修正の Must とは独立。名前は `max_photo_edge` / `KmzIconOptions::max_edge_pixels` と揃っていないが、help に値の意味を明記済み |
-| 可読性 S6 | `log read` のフラグ分岐を型で表す（`ReadOutput` など） | 見送り: 入出力選択の型化は挙動不変の大規模整理。`--csv-report` と `--format` の conflict は clap で既に排除されており、実害はない |
-| 可読性 S7 | CSV レポートが wrap 区間を含む距離であることを出していない | 見送り: wrap の境界セグメントは距離の定義（`TrackStats::distance_m` の doc）に明記済みで、CSV に注記を足すには「wrap したか」を判定する追加の契約が要る。次回の整理で扱う |
-| 可読性 C1 | `to_nmea` の `# Errors` 節（失敗しない関数） | 削除 |
-| 可読性 C2 | `log/mod.rs` の索引と `edit.rs` module doc が古い | 索引に CSV report・`icon/`・stride thinning を追加、`edit.rs` の doc に `simplify_track` を追加 |
-| 可読性 C3 | キャッシュに `source` が無いと警告なしで `Ok(None)` | `logcache::load` で「キャッシュに source の記録が無い」と警告して再パース（他と同じ扱い） |
-| 可読性 C4 | `--cache` の上書きが `ensure_free` ゲートを通らない | 見送り: パスは利用者が明示する `--cache <FILE>` であり、キャッシュの更新はこのフラグの目的そのもの。`log edit` の派生 sibling のような「利用者が名指ししていないパス」ではないため、`--force` を要求するとキャッシュが実質使えなくなる。02-cli に「指定パスの既存ファイルを置き換える」と明記 |
-| 可読性 C5 | `log read --format json` が `stats` を出さない | 見送り: `--csv-report` と `log info` で取得でき、`--format json` の点データ契約に stats を足すと `--simplify` 後の統計の意味（編集後か parser の事実か）を決める必要がある。可読性 S2 の決着と同時に扱う |
-| 可読性 C6 | `gga_sentence` / `gsa_sentence` が `pub` | 見送り: `rmc_sentence` が既に `pub` で、3 文を個別に組み立てる呼び出し元を将来許す公開面。`pub(crate)` 化は公開 API の縮小で、本修正の範囲外 |
-| 可読性 C7 | GPX の `<wpt>` を何個捨てたか出さない | 見送り: `import_gpx` は点だけを返す契約で、捨てた数を出すには import の戻り値型を変える（公開 API 変更）。0 点はエラーにしたので「全部 `<wpt>`」は必ず失敗し、黙って消える経路は減った |
-| 可読性 C8 | `print_info` の 7 引数・75 行 | 見送り: 表示専用関数の分割で挙動は変わらない。Must の修正を優先し、次回の整理で helper 化する |
-| 可読性 C9 | テスト名・同語反復テストの細部 | 一部対応: 新しいテスト名は仕様の文にした。`the_coord_format_labels_are_the_values_clap_accepts` の削除・`logcmd` の cache テスト分割は見送り（既存テストの整理で、Must/Should の挙動修正とは独立） |
-
-### 見送った指摘と理由（まとめ）
-
-- **可読性 S2 の API 変更**（`of_points` 追加、`LogSummary` と重複する `records`/`fixes` の一本化、`#[non_exhaustive]`）: `TrackStats` は `m241-core` の公開型で、GUI を含む利用側の構築方法を変える。本 PR は CLI/core のパリティ追加であり、互換約束を強める変更は別 PR で設計レビューする。今回は doc の誤り（GUI が既に読むという断定）だけ直した。
-- **可読性 S5・S6・C4・C5・C6・C7・C8・C9**: 挙動不変の整理、または公開 API の変更。Stage 1 の Must 4 件を確実に解消し、Should のうち利用者に見える契約（出力・警告・exit code・docs）を優先した。残りは follow-up。
-- **`--gpx` の auto を「明示時だけ許可」にしなかった理由**: 既定値と明示 `auto` を区別するには `LogReadOptions::utc_offset_days` を `Option<OffsetSpec>` に変える必要があり、CLI/プロジェクト読込/テスト 20 か所以上の構築変更を伴う。`auto` は「未パッチ個体のダンプ」のための規則であり、他ツールの GPX に意味のある既定ではないため、GPX では常に無効＋理由を警告する形にした。明示日数で従来どおり補正できる。
-
-### 検証
-
-- `M241_VENDOR_IMAGE=<vendor V1.13> TMPDIR=/var/tmp ./tools/check.sh`: **6/6 PASS**（`c7f986c` のツリー。fmt 0.4s / clippy 0.9s / test 40.1s / docs 3.9s / design 0.0s / safety 0.8s）。
-- `cargo test --workspace -- --list`: **936 件**（Stage 1 時点 929 + 追加 7。`#[ignore]` 追加 0）。
-- 既存テストの期待値変更は **1 件のみ**: `an_nmea_gga_carries_the_altitude_and_says_what_the_log_cannot` の `fields[7]` を `"00"` → `""`（Must 4 の仕様変更そのもの）。
-- KML の外部検証: 合成 3 点ダンプ（`/var/tmp`、リポジトリ外）から `m241 log read --format kml` で生成し、KML 2.0 の `FeatureType` 順序を写した最小 XSD で `xmllint --schema` を実行 → **valid**。`<LookAt>` を `<Style>` の後ろに戻したファイルは `Element … LookAt: This element is not expected` で **invalid**（旧順序の再現）。ビューアでの描画は未検証（`05-verification.md` §2 に記録）。
-- 1 回目の `cargo test --workspace` で `fw::tests::flash_reports_an_unusable_line_after_the_restart` が 1 度だけ失敗したが、単体実行および直後の全テスト再実行で pass。本修正のファイル（fw.rs）には触れておらず、並列実行下の既存 flake と判断した。check.sh の test ゲートは 6/6 の回で pass。
-- 実機ポートは開いていない。実ログ・実座標・実写真はリポジトリに入れていない。
-
-### Stage 3 検証
-
-未検証（別エージェントが記入する）。
-
-## 2026-11-23 / PR #38 GUI 書き込み Stage 2 修正（`feat-gui-write`）
-
-- 対象: PR #38（base `origin/main` = `142750ed`、Stage 1 レビュー head `77d4f6e`）。修正コードの head は `e83370f`、本節はその次の commit。
-- Stage 1: [仕様・安全検収](https://github.com/haruki0420/holux-m241-rs/pull/38#issuecomment-7083564043) と[可読性](https://github.com/haruki0420/holux-m241-rs/pull/38#issuecomment-7083539732)。修正は Stage 1 のどちらのレビューにも参加していない担当が行った。
-- 実機ポートは開いていない。実機書き込みもしていない（シミュレータのみ）。個人データは扱っていない。
-
-### Must への対応
-
-| # | 指摘 | 対応 | 固定するテスト |
-|---|---|---|---|
-| 仕様 M1 | GUI の破壊的オペコード検査が宣言どおりに動かない（`masked_source` で `\xNN` / `$PMTK182,6` が死に、裸リテラルのパターンが無い） | 走査を 2 系統に分割。識別子と裸の整数リテラルはコメント・文字列マスク済みソース、`\xNN` と `$PMTK182,6` はコメントのみ除去（文字列は保持）したソース。`theme.rs` の RGB とログ fixture の `0xD9` だけパス限定で除外。ゲート docstring を「Nine checks」に直し、`AGENTS.md` / `11-safety-review.md` の主張と一致させた | `a_bare_hex_opcode_in_gui_code_is_reported`（`0xD3` / `0xD5u8` / `0xD9`）、`a_hex_escape_opcode_in_gui_code_is_reported`（`\xd3` / `\xD5` / `\xD9`）、`a_pmtk_erase_in_gui_code_is_reported`、`gui_operator_prose_naming_an_opcode_is_not_a_finding`、`a_colour_or_journal_fixture_literal_is_not_an_opcode` |
-| 仕様 M2 | GUI の吸い出しが 1 回読みなのに README / `docs/user` は 2 回読み＋ハッシュ比較と書く | GUI を 2 回読みに実装（安全側）。1 回目は `Job::Dump` が digest を報告して電源入れ直し待ち、2 回目は `Job::DumpSecond` がハッシュ比較し、一致したときだけ `create_new` で保存（不一致は何も保存しない）。`DumpState::WaitingForPowerCycle` / `Mismatch` が再び到達可能になった。`02-cli.md` と `02-fix-the-date.md` に GUI も同じ 2 回読みであることを明記 | `a_dump_is_two_reads_and_the_second_pass_needs_the_first`、`two_reads_that_disagree_are_shown_and_nothing_is_verified`、`two_reads_that_agree_become_the_loaded_backup`、`save_dump_never_replaces_a_file_and_writes_the_bytes_it_was_given` |
-| 可読性 M1 | 成功表示「検証済み」と Connect 画面「未検証」が矛盾、`firmware.rs:29-31` の doc も不一致 | 成功表示を「読み戻しが一致しました（実機での書き込み検証は未実施）」に。書き込みステップに `Status::Unverified` の「この書き込み経路は実機で未検証です」を追加（同じ語を Connect 画面と共有）。module doc を実装に合わせた | `the_write_success_text_does_not_claim_hardware_verification` |
-| 可読性 M2 | `Confirmation` の保証の過大表示、`PROBE` のタイプ語ゲートが検査外 | `firmware.rs` / `device.rs` の doc を「token は入力の証明ではない。`start_write` / `start_probe_da` の再検査がゲート」に修正。`check_safety.py` に connect.rs の `PROBE_CONFIRMATION` + `Confirmation::granted` を追加し、`Confirmation::granted` と `Job::Flash` の構築ファイルを allowlist 化（テキスト検査であることも docstring に明記） | `a_gui_probe_without_its_typed_word_is_reported`、`a_gui_confirmation_outside_the_typed_word_screens_is_reported`、`a_gui_write_job_outside_the_firmware_screen_is_reported` |
-| 可読性 M3 | 書き込み状態パネルの二重描画 | `ui()` の 1 箇所だけに（`Idle` も含めて常時）描画し、`flash_step` 末尾の呼び出しを削除。コメントを実装に一致させた | render テスト（各状態）で重複なし |
-| 可読性 M4 | 何も検証しないテスト、`probe_da` / `probe_bootrom` / `settled` 未検証 | 自己参照 assert を削除。`settled` を純関数 `settled_address` に切り出し 0/1/2 件を直接テスト。`FakeDa` 経由で `probe_da` と `probe_bootrom` を通すテストを追加。`probe_da` は digest token を引数に取り、シミュレータでテスト可能にした | `a_probe_settles_only_on_exactly_one_matching_page`、`probe_da_reads_both_candidate_pages_through_the_fake_and_writes_no_flash`、`probe_bootrom_confirms_the_sync_without_touching_the_device` |
-| 可読性 M5 | preflight の検査結果を捨ててファイルを読み直す（TOCTOU） | `preflight` が `Preflight { backup, image, da }` を返し、`run` はそのバイト列で `FlashRequest` を構築（読み直さない）。vendor token も同じ in-memory バイトから作る | `a_backup_of_the_wrong_length_is_refused_with_the_expected_size`（次の一手まで文言に含む）、既存の recovery / missing-backup テスト |
-| 可読性 M6 | 外した安全ゲートの理由が削除箇所に無い | `firmware.rs` と `device.rs` の module doc に「旧ゲートは依存グラフ、新ゲートはテキスト検査で弱い。構造で残る保証は `m241-flash` 側」と明記。`AGENTS.md` §0 / §2.2 と `11-safety-review.md` も同じ主張に統一。型に近い強制として `Job::Flash` / `Confirmation::granted` の構築ファイル allowlist をゲートに追加 | `a_gui_write_job_outside_the_firmware_screen_is_reported` ほか上記 |
-
-### Should への対応
-
-| # | 指摘 | 対応 |
-|---|---|---|
-| 仕様 S1 / 可読性 S1 | 「Eight checks」が 9 項目、タイトルが範囲不足 | 「Nine checks」に修正し、タイトルを「read-only crate が write path に到達する / GUI が writer を迂回する」に拡張 |
-| 可読性 S2 | ゲートは token の存在しか見ない | docstring に「証明できるのは構築場所まで。入力を拒むのはアクションの再検査と単体テスト」と明記。`Job::Flash` allowlist を追加して迂回路を狭めた |
-| 可読性 S3 | `REENTRY_SETTLE` の「同じ数字に依存しない」が false、未検証の範囲が広い | 「意図は同じだが独立した 2 リテラル。手で揃える規約」に修正。CLI 経路は実機で実行済み、GUI 経由の組み合わせが未検証、と範囲を限定 |
-| 可読性 S4 | 復旧 / vendor の進捗が 0% のまま | `write_vendor_with_progress` を追加し、`flow::write_once` の 3 経路すべてが progress sink を渡す |
-| 可読性 S5 | `probe_da` が digest を引数に取らずテスト不能 | `da_digest: DaDigest` を引数に追加（`flash` と同じ形）。CLI は `DaDigest::vendor()`、テストは simulator token |
-| 可読性 S6 | 未使用 `pub` と無意味なヘルパ | `flow::probe_page_size`、`firmware::verified_bytes`、`is_meaning` を削除。`set_flash_state` などは screenshot / render テストが使うため `pub` のまま（理由は各 doc） |
-| 可読性 S7 | 長大関数 | `screenshot::write_all` の render→PNG→write 反復を `write_frame` に集約。`flash_step` / `diagnostics_panel` / `device::run` は「1 パネルを順に読ませる」「1 つの message と busy を共有」「エラー経路が 1 チャネル」という分割しない理由を doc に 1 行ずつ。`connect::diagnostics_panel` の 3 分割は見送り（理由を doc） |
-| 可読性 S8 | `poll_job` の 2 画面コピー | `device::poll_channel` に drain ループを 1 本化。`JobEvent` を画面別 enum に割る変更は見送り（job enum が GUI の起動可能ジョブの一覧であり、ゲートの allowlist の対象でもある。共有 channel 型のまま、握り潰し腕には理由コメントがある） |
-| 可読性 S9 | `start()` の doc が「キャンセル」と言うが中断しない | 「receiver を落としても書き込みは完走し、報告だけ止まる。安全側の挙動」に修正 |
-| 可読性 S10 | `device.rs` の「jobs call flow and nothing else」が false | module doc に例外（`Restart` は `DownloadAgent::restart` 直呼び、`Doctor` は `Port` / `PmtkClient` 直使用）と理由を列挙 |
-| 可読性 S11 | 表示文字列を分類に使う（`kind.contains("DA")`） | `DropKind` enum（`Da` / `DaCandidate` / `Firmware` / `TooLarge` / `Unreadable` / `Unknown`）を追加し、表示は `label()`。doctor のポート列挙エラーは `ports_error` に分離 | 
-| 可読性 S12 | 次の一手の無いエラー文言 | backup 長・recovery 不一致に「どのファイルを選び直すか」を追加。worker が結果を返さず死んだ場合を「端末の状態は不明。吸い出しで確認するか復旧へ」に変更（書き込み失敗時の再試行を勧めない） |
-| 可読性 S13 | 削除された why コメント | `progress_bar` の `animate(false)`、`write_patched`（元ファイルを上書きしない理由）、`open` の `MAX_IMAGE_BYTES` に理由コメントを戻した |
-| 可読性 S14 | 死んだ `DumpState` 変種 | 2 回読み実装で `WaitingForPowerCycle` / `Mismatch` が実際に生成されるようになった（テストと screenshot も追加） |
-| 可読性 S15 | マジックナンバーとテスト専用関数 | `256` を `PACKET_SIZE` に。テスト専用 `recovery_command` とそのテストを削除（GUI は CLI コマンド文字列を生成しない） |
-| 仕様 Should 1 | `Confirmation` が型で強制されていない | 型での強制は見送り（画面の入力状態を型に持ち上げる変更で、本 PR の範囲を超える）。代わりにゲートで `Job::Flash` / `Confirmation::granted` の構築ファイルを限定し、`AGENTS.md` §2.2 を「型ではなくソース検査」と明記 |
-| 仕様 Should 2 | ファーム画面に「未検証」表示が無い | 書き込みステップに `Unverified` の行を追加（上記 M1） |
-| 仕様 Should 3 / Could 3 | CLI との差（自動リトライ・`check_layout` のタイミング） | `02-cli.md` の GUI 対応表の下に 3 点（リトライなし / `check_layout` は DA ロード後だが最初の `0xD3` より前 / GUI 書き込みは実機未検証）を記載 |
-| 仕様 Could 1 | 「Eight checks」 | 上記 S1 で解消 |
-| 仕様 Could 2 | `show_sample_write` が `WRITE` を自動充填 | 「`pub(crate)`、ポートを開かずジョブも開始しない、sample にポートが無いので `write_armed` は false のまま、全 figure は 見本」と doc に明記して維持（armed ボタンの描画に必要） |
-| 仕様 Could 4 | 接続画面の成功スクリーンショットに「見本」マーカーが無い | 見送り: 診断 / probe-da のフレームは sample 状態を注入して描いており、画面側の `見本` 表示は sample パネルにしか出ない。実機値との誤読を避けるには Connect 画面の sample 表示自体を広げる必要があり、本 PR の範囲外 |
-| 仕様 Could 5 | 死んだ `DumpState` | 上記 S14 で解消 |
-
-### 見送った指摘と理由
-
-- 可読性 S8 の `JobEvent` 分割: 画面ごとの channel 型に割ると `device::start` が 2 本になり、job enum・ゲート allowlist・テストが同時に増える。まず drain ループの重複を `poll_channel` で解消し、enum 分割は follow-up。
-- 仕様 Should 1 の型強制: `FlashJob` を画面外で構築不能にするには、タイプ語の入力を型状態として持ち上げる設計変更が要る。ゲートの allowlist で「別ファイルからの構築」は検出できるようにした。
-- 接続画面の診断 / probe-da screenshot の「見本」マーカー: 上記 Could 4。
-- `connect::diagnostics_panel` の 3 分割: 3 セクションが 1 つの `message` 行と `busy` を共有しており、分割すると同じ `&mut self` を 3 つに渡すだけになる。理由を doc に記載。
-
-### 検証
-
-- `M241_VENDOR_IMAGE=<vendor V1.13> TMPDIR=/var/tmp ./tools/check.sh`: **6/6**（修正コード head `e83370f`、46 秒）。
-- `cargo test -p m241-flash -p m241-gui`: flash 135 + safety_gate 31 + gui 141 + design_gate 6 + design_invariants 6 + render 36。`cargo test --workspace` も成功。
-- 追加テスト: safety_gate 8 件（上表）、firmware 4 件、device 4 件、flow 3 件。既存のレイアウトゲート変異テスト 3 件は、`write` / `write_vendor` が `_with_progress` 本体へ委譲する形に合わせて対象関数を更新した。
-- `--screenshot /tmp/m241-pr38-stage2`: 全画面 2 サイズ + 注入フレーム（write-progress / write-result / write-recovery / dump-power-cycle / dump-mismatch / connect-diagnostics / connect-probe-da）を出力し、成功表示・未検証表示・復旧パネル・2 回目読み取りの待ち画面を目視した（別項に詳細）。
-- 注意（実状態）: `cargo test --workspace` の 1 回で `fw::tests::probe_da_reads_both_candidates_through_the_fake_and_sends_no_write_opcode`（`m241-cli`、本差分の非変更経路）が失敗したが、単体実行とその後の full run 2 回では成功。再現しなかったため flaky として記録し、原因は特定していない。
-- 実機: 開いていない。GUI からの書き込み・2 回読みはシミュレータのみで、実機では未検証。
-
-### Stage 3 検証（`43af066` 時点）
-
-- 判定: **合格**。Stage 3 検証者が `43af066` に `review-gate: success` を付与した（著者セッションは付けていない）。
-- 変異テスト: 17 種の変異を入れて **17 種すべて検出**、**誤検出 7 種なし**。指摘との対応は本節の表のとおりで、Stage 3 は修正者の説明を読まずに差分とテストだけを読んだ。
-- 残る未検証: 実機での GUI 書き込み・GUI 2 回読み（シミュレータのみ）。GUI 経由の書き込み経路は依然として実機未検証である。
-- 本節の後に main（`5b2ffce`、PR #36）を追従マージしたため、**マージ後の head は新しい SHA であり、Stage 3 の再検証と `review-gate` の付け直しが必要**。`43af066` の gate はマージ前 head に対する判定である。
-
-## 2026-11-23 / PR #39 OSM タイル地図 Stage 2 修正（`feat-map-tiles`）
-
-- 対象: Stage 1 head `20a9f42`（base `origin/main` = `e934157`）への 2 レビュー、仕様検収 `#issuecomment-7084469149`（Must 1 / Should S1–S6）と可読性 `#issuecomment-7084367266`（Must M1–M7、Should S1–S8）。
-- Stage 2 修正（別エージェント）: 変更は `crates/m241-gui`（`tiles.rs` / `log.rs` / `settings.rs` / `Cargo.toml`）、`DESIGN.md`、`PRODUCT.md`、`DISCLAIMER.md`、`README.md`、本ファイルのみ。`m241-core` / `m241-cli` / `m241-flash` と connect / firmware 画面は未変更。実機ポートは開いていない。
-- 修正コミット: `80f4f62`（コードと本節）。本節に自分の SHA を書くため、SHA の追記だけを後続の小さなコミットにしている。最終 head は PR #39 のコメントを参照。
-
-### Must への対応
-
-| 指摘 | 対応 |
-|---|---|
-| 仕様 M1 Wayland でタイル取得なし | 取得ゲートを `inner_rect.is_some()` から `native_pixels_per_point.is_some()`（`tiles::has_window`）に変更。Wayland は `inner_rect` を返さないため旧判定では実ウィンドウでも fetch しなかった。headless は `Background::Headless` として理由を表示。X11 / Wayland / headless の 3 経路をテストで固定し、`tiles.rs` 冒頭 doc と `DESIGN.md` §10 の「no viewport = headless」記述を実態に合わせた |
-| 可読性 M1 消えた安全ゲートの記録 | `crates/m241-gui/Cargo.toml` に NETWORK GATE 節を追加: 旧規則が「headless で検証できないので GUI にネットワーク依存を入れない」だったこと、解除理由がユーザーの地図要求であること、現在の保証（`TileFetcher` の fake / `has_window` / `sample`）と**保証でないもの**（`check_safety.py` のような機械ゲートは無い）を明記。`DESIGN.md` §10 にも同内容。`AGENTS.md` は変更範囲外のため触っていない |
-| 可読性 M2(a) fetch しないことを未検証 | `app::tests::a_headless_app_draw_never_starts_a_tile_fetch` が fake fetcher の呼び出し **0** を検証。`render.rs` の旧テストは名前に反してテキストだけ見ていたので「ヘッドレス表示の契約」に改名し、fetch 回数は App テストが持つ |
-| 可読性 M2(b) sample で矛盾する合格条件 | sample フレームは OSM クレジットを出さない契約に変更（`a_sample_map_does_not_credit_tiles_it_does_not_show`）。「見本：地図タイルは表示しません」とクレジットの同居を合格条件から外した |
-| 可読性 M2(c) settings の描画順未検証 | `ui()` を実際に描画してラベルの出現順を検証する `the_rendered_rows_are_the_ones_the_design_names_in_order` に置換（旧テストは手書き配列同士の比較だった） |
-| 可読性 M3 未検証を検証済みと読ませる記述 | `draw_attribution` / `draw_note` が矩形を返すようにし、狭いキャンバス＋長い注記で両者が重ならないことを `the_zoom_note_stays_clear_of_the_credit` で固定。「first screenshot showed exactly that overlap」のコメントをテストの記述に修正 |
-| 可読性 M4 クレジット無条件描画 | `draw_map` が描画した OSM タイル枚数 `MapDrawn.tiles` を返し、`tiles > 0` のときだけクレジットを描く（sample / offline / loading / headless は出さない）。`log.rs` と render テストで固定 |
-| 可読性 M5 `pub` 過多 | `pub mod tiles` → `pub(crate) mod tiles`。`tiles.rs` の `pub` は 0 個（外部 API を廃止し、30 個強を `pub(crate)` / private に）。テスト専用 API は `#[cfg(test)]`（`with_fetcher_for_test`, `set_cache`, `texture_count`） |
-| 可読性 M6 デコード上限が事後検査 | `image::ImageReader` に `Limits`（2048 角・64 MiB）を **decode 前**に設定。2049px の PNG がデコード前に拒否されるテストを追加 |
-| 可読性 M7 `TooLarge` が到達不能 | `BodyExceedsLimit` を `TileError::TooLarge` にマップ（`map_body_error`）。上限超過 body がキャッシュに書かれないこと、`map_body_error` の分岐、をテストで固定。あわせて `x-blocked` と非 image Content-Type はエラーにし、ブロック画像を 30 日キャッシュしない |
-| Must 8（回帰） | X11 実ウィンドウでの取得と、headless の fetch 0 / キャッシュ書込み 0 を維持（下記「検証」） |
-
-### Should への対応
-
-| 指摘 | 対応 |
-|---|---|
-| 仕様 S1 部分失敗の再試行なし | **修正**。`failed` を `HashMap<TileId, Instant>` にし、60 秒経過後に再試行（`a_failed_tile_is_retried_only_after_the_retry_window`）。部分失敗の注記は追加せず、再試行で解消する方針 |
-| 仕様 S2 失敗理由が「オフライン」に丸め | **見送り**。理由: 状態 enum に理由を載せると `Background` の表示契約と UI 文言を同時に作り直す必要があり、本 Must 修正の範囲外。`TooLarge`/`Status`/`Decode` はログにも出していない |
-| 仕様 S3 HTTP キャッシュヘッダ無視 | **一部修正**。`x-blocked` のブロック画像はキャッシュしない。`max-age`/ETag の保存と条件付き GET は**見送り**（sidecar メタデータと 304 経路が必要。30 日 TTL はポリシー最低 7 日を満たす）。理由はこの行に記録 |
-| 仕様 S4 fit 直後の ± が表示 zoom と不一致 | **修正**。`sync_fit_zoom` が描画した `MapView::fit` の zoom を `map_zoom` に反映してから ± する（`a_fit_view_publishes_its_zoom_to_the_zoom_buttons`） |
-| 仕様 S5 送信説明・永続化 | **一部修正**。Settings の ON 注記に「表示中の範囲を OpenStreetMap に送り」を追加。トグルの永続化は**見送り**（`AppSettings` はセッション限定という既存契約の変更になる） |
-| 仕様 S6 `DISCLAIMER` / `PRODUCT` の事実誤認 | **修正**。`walkers` → `ureq`、ネットワーク機能の記述（タイルは既定 ON、表示範囲が OSM に渡る）、README の帰属条件を更新。ルート `Cargo.toml` の `walkers` コメントは**変更範囲外**のため未修正（同じ誤記は PRODUCT / README から消えた） |
-| 可読性 S1 投影・中心・zoom の重複 | **一部修正**。`MIN_ZOOM`/`MAX_ZOOM` を `tiles::MIN_TILE_ZOOM`/`MAX_TILE_ZOOM` から導出。`plotted_points` の再計算と `compute_fit_zoom` の一本化は**見送り**（`MapView::center` の追加と全点 2 回走査の解消は follow-up） |
-| 可読性 S2 ライフサイクル・reset 不在 | **修正**。`set_track` / `adopt_edited_track` で `MapTiles::reset()`、`request` で queue を `wanted` に filter、`pump` は pending でない結果を捨てる（`a_new_track_forgets_the_previous_areas_tiles`）。worker panic の `in_flight` 再同期と spawn 失敗理由の記録は**見送り** |
-| 可読性 S3 stale cache が「最新」に見える | **見送り**。`Background::Stale` の追加は状態 enum と文言の変更で、S2 の理由表示と同じ follow-up |
-| 可読性 S4 キャッシュ書込失敗が無言 | **見送り**。失敗を画面に出す状態経路の追加が必要。本 Stage 2 では Must を優先した |
-| 可読性 S5 UI スレッドのディスク I/O | **見送り**。Settings の 1 操作であり、worker 化には job 配線が必要（follow-up） |
-| 可読性 S6 エラーから次の行動が分からない | **一部修正**。`Background::Headless` を追加して「読み込み中」の永久表示を廃止。`Offline` の文言に接続確認・設定への導線を足すのは**見送り**（S2 と同じ文言変更） |
-| 可読性 S7 `tiles.rs` の責務分割 | **見送り**。`pub(crate)` 化で外部 API の問題は解消。キャッシュ部と取得部を別モジュールへ割るのは follow-up |
-| 可読性 S8 Settings の行描画 4 方式 | **見送り**。描画順テストで画面との一致は固定した。`RowSpec` への統一は follow-up |
-| 可読性 Could（`human_bytes` の単位、`TileId::url` 重複、`get_or_init` の Err 不能、`has_viewport` 名） | 一部修正: 未使用の `TileId::url` を削除、`HttpTiles` の `OnceLock<Result<..>>` を `OnceLock<Agent>` に、`has_viewport` → `has_window`。`human_bytes` の KB/MB 表記は**見送り**（表示仕様の変更） |
-
-### 追加テスト
-
-- Must 1: `screens::log::tiles::tests::an_x11_window_fetches_tiles` / `a_wayland_window_has_no_inner_rect_and_still_fetches_tiles` / `a_headless_context_never_requests_a_tile`
-- Must 2(a): `app::tests::a_headless_app_draw_never_starts_a_tile_fetch`（fake fetcher 呼び出し 0）
-- Must 2(b): `render.rs::a_sample_map_does_not_credit_tiles_it_does_not_show` / `a_headless_render_says_why_it_shows_no_tiles`
-- Must 2(c): `screens::settings::tests::the_rendered_rows_are_the_ones_the_design_names_in_order`
-- Must 3: `screens::log::tiles::tests::the_zoom_note_stays_clear_of_the_credit`
-- Must 4: `screens::log::tests::the_attribution_is_drawn_only_when_a_tile_is_on_screen`
-- Must 6/7: `a_body_limit_error_maps_to_too_large_not_offline` / `an_oversized_tile_is_too_large_and_is_not_cached` / `a_png_larger_than_a_tile_is_refused_by_the_decoder_limits`
-- Should: `a_failed_tile_is_retried_only_after_the_retry_window`、`a_new_track_forgets_the_previous_areas_tiles`、`a_fit_view_publishes_its_zoom_to_the_zoom_buttons`
-
-### 検証
-
-- `M241_VENDOR_IMAGE=<vendor V1.13> TMPDIR=/var/tmp ./tools/check.sh`: **6/6**（48 秒。初回は docs ゲートが本節の未実在パス参照を検出したため、モジュール名の表記を修正して再実行）。
-- `cargo test -p m241-gui`: lib 175 / design_gate 6 / design_invariants 6 / render 38。**実ネットワークを使うテストはない**（タイル取得はすべて `TileFetcher` の fake）。
-- `--screenshot`（空の `XDG_CACHE_HOME`）: 15 枚生成、**タイルキャッシュ書込み 0**（fontconfig のみ）。ログ画面の見本フレームはクレジットなしで「見本：地図タイルは表示しません」、設定画面は新しい ON 注記を表示。1280×800 と 1024×640 を目視した。
-- 実ウィンドウ: Wayland（Hyprland、winit の Wayland バックエンド）で **8 枚**、X11（`WAYLAND_DISPLAY` を外して Xwayland を強制）で **16 枚**のタイルがキャッシュに書かれた。headless は 0 枚。ライブ画像の取得は compositor の screencopy（grim / wf-recorder）が応答せず断念し、見た目は `--screenshot` の画像で確認した。変更前の X11 実ウィンドウ画像（`/tmp/m241-tiles-live.png`）でタイルと軌跡の整合を確認済み。
-- 未検証: Wayland の実画面での見た目（取得は確認）、`.bin` 読込からの地図表示（ライブ確認は合成トラック）、HTTP キャッシュヘッダ尊重（見送り）。実機ポートは開いていない。
-
-### Stage 3
-
-- 未実施（本節は Stage 2 の記録。`review-gate` は付けていない。Stage 3 は別エージェントが新しい head SHA で行う）。
-
-### Stage 3 差し戻し: main 追従（PR #37 の GUI モジュール分割）
-
-- Stage 3 は Must 8 件の解消を確認したが、`origin/main`（`e934157`、PR #37）との競合で blocked。`git merge origin/main` の 4 競合を解消した（マージコミット `0bf83b0`。最終 head は PR コメントを参照）。
-- `log.rs`: PR #37 の `ops` / `project` / `nmea` / `proxy` 分割の上に、タイル層・Mercator `MapView`・条件付き attribution・`sync_fit_zoom` を再適用。`map_panel(ui, settings)` と 2 箇所の呼び出しも再適用した。
-- `settings.rs`: 実測キャッシュ行・タイル ON/OFF・消去行を、PR #37 の座標形式行と同じページ順（キャッシュ → タイル → 単位 → テーマ → 言語 → 座標形式 → 動きの低減 → 消去）に再適用。`AppSettings` は `coord_format` と `map_tiles` の両方を保持する。
-- `Cargo.lock`: `ureq` / `image` / `dirs` と `serde_json` を統合。`DESIGN.md`: 地図節と PR #37 の設定/コンソール節の両方を残した。
-- 回帰: `cargo test -p m241-gui` は lib 232 / render 38 / design_gate 6 / design_invariants 6 全合格、`check.sh` 6/6。実ウィンドウは X11 16 枚 / Wayland 4 枚のタイル取得、headless は 0 枚（スクリーンショット 15 枚）。`pub(crate) mod tiles`、帰属条件、実測キャッシュ行はマージ後もテストで固定されている。
-- 1 点だけ main 側テストを変更した: PR #37 の座標形式行とタイル行で設定ページが 800pt を超えてスクロールするようになったため、`render.rs` の reduced-motion 表示テストは 1200pt で描画する。行はスクロールで到達でき、テストの意図（注記が設定値を反映する）は変えていない。
-
-## 2026-11-23 / PR #42 Log の地図主面化 Stage 2 修正（`feat-map-layout`）
-
-- 対象: Stage 1 head `a9635b9`（base `origin/main` = `1cc76f2`）への 2 レビュー、仕様検収 `#issuecomment-7089921477`（Must 1 / Should S1–S6 / Could C1–C3）と可読性 `#issuecomment-7089789165`（Must M1–M5、Should S1–S11）。
-- Stage 2 修正（別エージェント）。変更は `crates/m241-gui`（`screens/log.rs` / `screens/log/drawer.rs` / `screens/log/tiles.rs` / `theme.rs` / `screenshot.rs`）、`tests/render.rs`、`DESIGN.md`、本ファイルのみ。他画面と `m241-core` / `m241-cli` / `m241-flash` は未変更。実機ポートは開いていない。
-- 修正コミット: `81aed83`（コード・DESIGN・テスト）。本節は記録用の後続コミットで追加した。
-
-### Must への対応
-
-| 指摘 | 対応 | 実装 / テスト |
-|---|---|---|
-| 仕様 Must 1: 帰属板とズーム板がドロワー開 × 窓幅 1100〜1255 で交差 | **修正（実装＋テスト）** | 帰属板の配置を `drawer::Plates::credit` に移し、`tiles::draw_attribution` が「ズーム板左端 − 余白」の幅で折り返す。帰属板の右端は常にズーム板の左端より左になり、幅 96pt 未満の極小幅だけズーム板上へ退避する。描画も `map_canvas`（板の外）から `map_overlays`（板と同じ座標系・z-order）へ移した。ドロワー判定は `ctx.content_rect()`（ウィンドウ幅）から `ui.max_rect()`（Log 本文幅）へ変更し、`metric::NARROW` を 1100 → **1000** に（DESIGN §5/§6/§10 も 1000 に更新）。追加テスト `the_credit_and_the_zoom_plate_stay_apart_with_the_drawer_open` が 1100 / 1200 / 1240 / 1280 で fake fetch により帰属を実描画し、記録された帰属板が描かれること・右端 ≤ ズーム左端・全 overlay 非交差・浮遊ドロワーが再生/ズーム板を覆わないことを固定。既存 `the_map_plates_do_not_overlap_each_other_or_the_credit` も credit area を使う形に更新 |
-| 可読性 M1: `--screenshot` がドロワー未追随 | **修正（実装＋doc）** | `screenshot::write_all` に `log-drawer-{summary,photos,edit,export,ops}-{1280x800,1024x640}.png` の 10 枚を追加。`prepare` のコメントを「写真/KMZ はドロワー各フレームで見る」に、`open_drawer` の doc を「render テストと `--screenshot` のドロワー frame が使う」に修正。DESIGN §8 の「nine images」記述も標準セットの説明に書き換え。headless 非通信は維持（`XDG_CACHE_HOME` 空でタイル 0 枚） |
-| 可読性 M2: `theme.rs` の doc が実装と逆（ground 塗り＋ink リング） | **修正（doc）** | 実装は「10 色パレット ×0.7 ＋ ground 下敷き」で、ink リングは選択点だけ。`TRACK_PALETTE` と `metric::track` の doc を実装（両 canvas でパレット、OSM 上は ground 円を下に敷く、ink リングなし）に合わせた。実装は変更していない（旧テストが守っていた巡回は Must 4 で復元） |
-| 可読性 M3: 自己成就テスト＋巡回保証の消失 | **修正（テスト）** | `the_track_is_five_points_of_data_over_a_seven_point_ground_casing` を、`App::draw` の描画 shape（`PathShape` の幅 5/7 と色）から検証する形に変更。旧テストが持っていた巡回は `the_record_fill_cycles_through_the_ten_colours` として復元（`record_fill(10) == record_fill(0)`、隣接色の相違、10 色、先頭が `DATA × 0.7`） |
-| 可読性 M4: 未使用 `pub`（`close_drawer` / `is_drawer_open` / `drawer_tab`） | **修正（実装）** | 3 つを削除。`open_drawer` は render テストと `--screenshot` が使うため pub のまま、doc のみ実態に合わせた |
-| 可読性 M5: エラー 1 行切り詰めと「全文はパネル側」の虚偽 | **修正（実装＋テスト）** | `drawer::status_height` が折り返し後の行高を測り、`Plates` がファイル板をその分だけ高くしてから `common::status_line`（折り返し）で全文を描く。`Label::truncate` と「全文はパネル側」の説明を削除。追加テスト `a_long_load_error_wraps_inside_the_file_plate` が「全文が lay out されること・2 行以上・板が伸びること」を固定 |
-| 仕様の可読性 Must: 選択点マーカーと板 alpha 0.92 の契約が未テスト | **修正（テスト）** | `tests/render.rs` に `the_selected_point_is_a_ground_halo_an_ink_disc_and_a_ring`（halo 3.5× / ink disc 2× / 3× ring が同中心・描画順）と `the_map_plates_are_rail_at_ninety_two_percent`（描画された `RectShape` の fill が `RAIL × 0.92`、1024 では 360pt の浮遊ドロワー板も同値）を追加。実装は `PLATE_ALPHA` を credit と共有する形にしただけ |
-
-### Should / Could への対応
-
-| 指摘 | 対応 |
-|---|---|
-| 仕様 S1 狭幅の浮遊ドロワーがズーム/再生板・空ログの主 CTA を覆う | **修正**。浮遊矩形を `log.rs` から `drawer::Plates::floating` へ移し、ファイル板の下から再生板の上までに制限（再生板が無いときはズーム板の上まで）。空状態板は浮遊ドロワーを除いた幅の中央に置く。追加テスト `an_empty_log_keeps_its_plate_clear_of_the_drawer`（1000 / 1024 / 1200 / 1280） |
-| 仕様 S2 ドロワー開・空ログ・中間幅の幾何テストが無い | **修正**。`the_credit_and_the_zoom_plate_stay_apart_with_the_drawer_open`（1100–1280）と `an_empty_log_keeps_its_plate_clear_of_the_drawer`（1000–1280） |
-| 仕様 S3 再生板が 3 行目を予約して 2 行しか描かない | **修正**。2 行分（測定値 28 + 4 + 30）＋ frame margin に縮め、DESIGN §5 の表も「transport and timeline」に訂正 |
-| 仕様 S4「content width 1100」と実装（ウィンドウ幅）の不一致 | **修正**。実装を content 幅基準（`ui.max_rect()`）にし、閾値 1000 を DESIGN §5/§6/§10 と `metric::NARROW` の doc に反映 |
-| 仕様 S5 選択点・板 alpha の契約が未テスト | **修正**。上記の render テスト 2 本 |
-| 仕様 S6 4/5 タブの実画面が標準スクショに無い | **修正**。ドロワー 5 タブ × 2 サイズの 10 枚を追加（標準セットは 8 + 10 = 18 枚、その他 7 枚と合わせて 25 枚） |
-| 可読性 S1 `drawer.rs` の責務分割 | **一部修正**。浮遊矩形の計算を `Plates` に集約。配置（プレート）とドロワーを別モジュールへ分ける再編は見送り（Must 修正の差分を膨らませないため） |
-| 可読性 S2 `map_canvas` 約 160 行の分割 | **見送り（doc で契約を明記）**。描画順（grid → tiles → casing → line → records → start/end → photos → selection、credit は overlay で最後）が契約であることを関数 doc に書いた。分割は描画順の回帰をレビューしやすくする follow-up |
-| 可読性 S3 未使用 `_settings` | **修正**。`map_overlays` から引数を削除 |
-| 可読性 S4 浮遊矩形が `log.rs` に残り `TOOL_ROW` を別意味で再利用 | **修正**。`Plates::floating` へ移し、「ファイル板の下から始める」意図を doc 化 |
-| 可読性 S5 板 alpha が 0.92 / 0.9 の 2 値 | **修正**。`drawer::PLATE_ALPHA` を `tiles::draw_attribution` と共有 |
-| 可読性 S6 status 行の描画が 2 実装 | **修正**。`status_plate_line` を削除し `common::status_line` に統合（折り返しは共通実装のまま） |
-| 可読性 S7 `labelled_field` ヘルパー、S8 `chunks(3)` | **見送り**。`ops.rs` の 5 か所・4 か所に触れると変更範囲（本 PR の Must）を超えるため |
-| 可読性 S9 テストの穴（タブ列フィット、トグルクリック、空 strip） | **一部修正**。空ログで高さ 0 の選択点 strip を描かないようにし、clip 無視の text 収集に混ざらないようにした。タブ列のクリップ検証とトグルクリックのテストは見送り |
-| 可読性 S10 日フィルタの適用範囲 | **見送り**。図表を日フィルタに追随させるかは仕様判断で、Stage 1 の Must ではない |
-| 可読性 S11 `layout_probe` の本番ビルド混入 | **見送り**。11 か所の `#[cfg(test)]` 化は差分が大きく、Stage 3 の焦点を Must からそらす |
-| 仕様 C2 / 可読性 C2 ログのタイトルが `display` でない | **修正**。実装を `size::DISPLAY`（24）に戻し DESIGN §3 と一致させた |
-| 可読性 C1 `strip_height` の rustdoc、C6 332/328 のコメント | **修正**。doc を返り値に合わせ、内側幅のコメントを「332（列）/ 328（浮遊）」に |
-| その他の Could（`Canvas` 改名、`LINE_OPACITY` 改名、位置引数 bool、空状態板の clamp、描画順/`Sense` の未固定、`LogTab` 三重管理、mutex poisoning） | **見送り**。挙動を変えない改名・分割が中心で、本 Stage 2 の Must 修正とは独立 |
-
-### 追加・更新テスト
-
-- `screens::log::tests::the_credit_and_the_zoom_plate_stay_apart_with_the_drawer_open`（新規、1100 / 1200 / 1240 / 1280、fake fetch）
-- `screens::log::tests::an_empty_log_keeps_its_plate_clear_of_the_drawer`（新規、1000 / 1024 / 1200 / 1280）
-- `screens::log::tests::a_long_load_error_wraps_inside_the_file_plate`（新規）
-- `screens::log::tests::the_record_fill_cycles_through_the_ten_colours`（新規、旧巡回保証の復元）
-- `screens::log::tests::the_track_is_five_points_of_data_over_a_seven_point_ground_casing`（描画 shape ベースに変更）
-- `screens::log::tests::the_map_plates_do_not_overlap_each_other_or_the_credit`（credit area 使用に更新）
-- `tests/render.rs::the_selected_point_is_a_ground_halo_an_ink_disc_and_a_ring`（新規）
-- `tests/render.rs::the_map_plates_are_rail_at_ninety_two_percent`（新規）
-
-### 検証
-
-- `M241_VENDOR_IMAGE=<vendor V1.13> TMPDIR=/var/tmp ./tools/check.sh`: **6/6**（68 秒）。
-- `cargo test -p m241-gui --lib`: **240 passed**。`cargo test -p m241-gui --test render`: **40 passed**。design_invariants 6 / design_gate 6 も合格。
-- `--screenshot`（空の `XDG_CACHE_HOME`）: **25 枚**生成（標準 15 + ドロワー 10）。キャッシュは fontconfig 3 件のみで**タイル 0 枚**、ネットワーク未使用。
-- 目視: 1280×800 / 1024×640 の閉状態とドロワー 5 タブ（summary / photos / edit / export / ops）を確認。1024 の浮遊ドロワーは再生板・ズーム板の上で止まり、覆っていない。1280 の列ドロワーは 5 タブが 1 行に収まる。
-- 帰属とズームの実測（テストが記録した矩形、ウィンドウ座標 pt）:
-
-  | 窓 | 状態 | 本文幅 | map 幅 | 帰属板 | ズーム板左端 | 間隔 |
-  |---|---|---|---|---|---|---|
-  | 1280×800 | 閉 | 1056 | 1056 | x 204.0–560.4（356.4、1 行） | 944.0 | 383.6 |
-  | 1100×800 | 開（浮遊） | 876 | 876 | x 204.0–560.4（1 行） | 764.0 | 203.6 |
-  | 1200×800 | 開（浮遊） | 976 | 976 | x 204.0–560.4（1 行） | 864.0 | 303.6 |
-  | 1240×800 | 開（列） | 1016 | 656 | x 204.0–396.8（192.8、2 行） | 544.0 | 147.2 |
-  | 1264×800 | 開（列） | 1040 | 680 | x 204.0–396.8（192.8、2 行） | 568.0 | 171.2 |
-  | 1269×800 | 開（列） | 1045 | 685 | x 204.0–560.4（1 行） | 573.0 | **12.6** |
-  | 1280×800 | 開（列） | 1056 | 696 | x 204.0–560.4（1 行） | 584.0 | 23.6 |
-
-  Stage 1 が報告した「1200×800・map 幅 616・交差 56.4pt」の状態は、閾値を content 幅 1000 にしたことで 1200 ではドロワーが浮遊（map 976）になり再現しない。列ドロワーになるのは本文 1000pt 以上（窓 1224 以上）で、そこでも帰属板はズーム板の左で折り返す。最小間隔は、1 行の帰属がちょうど収まる境目（1269×800）の 12.6pt（下記 Stage 3 の修正で 8.0pt から拡大）。
-- 目視（タイル入り）: 一時テストで fake fetcher とウィンドウ入力を与え、1280 閉 / 1200 開 / 1240 開 を software rasteriser で PNG に書き、帰属板がズーム板の左で 1 行（1200）／2 行（1240）に折り返すこと、浮遊ドロワーが再生板とズーム板を覆わないことを確認した。確認後に一時テストは削除（working tree は clean）。
-- 未検証: 実機（ポートは開いていない）、実ネットワークでのタイル取得、実ウィンドウでの見た目。スクリーンショットは headless の software rasteriser で、OSM タイルは描かない（クレジットも出ないのが正しい）。
-
-### Stage 3 の軽微指摘と main 追従（2026-11-23）
-
-- Stage 3 は head `01f682a` で合格（mergeable / gate success on `01f682a`）。その後 `origin/main` = `1cc76f2`（PR #41）が先に入ったため `git merge origin/main` で追従した。競合は `docs/dev/10-review-log.md` のみで、本節（PR #42）と PR #41 節の両方を残した。他のファイル（`AGENTS.md` / `CHANGELOG.md` / `Cargo.*` / `README.md` / `m241-cli` / `m241-core` / `docs/reference/02-cli.md` / `docs/dev/05-verification.md` / `docs/dev/12-progress-summary.md`）は main 側の内容をそのまま取り込み、本ブランチからの変更は無い。
-- 軽微 1: 帰属とズームの最小間隔が 1264pt 幅で 8.00pt → `Plates::credit` の右余白を `space::S`（8pt）から `space::M`（12pt）に変更。幾何テストは 1264 / 1269 を追加し、全サンプル幅で「帰属右端 + 12pt ≤ ズーム板左端」を assert。実測は上の表のとおり、1 行の帰属がちょうど収まる 1269×800 で **12.6pt** が最小（1264 は折り返して 2 行、171.2pt）。
-- 軽微 2: ドロワー 10 枚が枚数として検証されていない → `write_all` を `write_all_with(directory, sizes)` に分け、テスト `screenshot::tests::the_standard_screenshot_set_includes_every_drawer_tab` が 320×200 で同じ writer を駆動して 16 枚（4 画面 + 3 write 状態 + 2 dump 状態 + 2 Connect + 5 タブ）を数え、5 タブ名を assert。標準セットの 1280/1024 出力は不変（device 側フレームは最初のサイズで描くため、`write_all` の 2 サイズで従来どおり 1280×800）。
-- 追従後の head で `./tools/check.sh` 6/6。新 head は Stage 3 の再検証対象で、`review-gate` はこのセッションでは付けていない。
-
-## 2026-11-23 / PR #41 ezTour 形式 Stage 2 修正（`feat-eztour-formats`）
-
-- 対象: Stage 1 head `58696153ad57fb7975a76fc6d98a00fc27061eb9`（base `origin/main` = `e7367dc`）への 2 レビュー。仕様検収 `#issuecomment-7089143300`（Must 3 / Should 3）と可読性 `#issuecomment-7088073677`（Must M1–M5、Should S1–S10）。
-- Stage 2 修正（別エージェント）: 変更は `crates/m241-core/src/log/import.rs`、`crates/m241-core/src/log/html.rs`、`crates/m241-core/src/log/report.rs`、`crates/m241-cli/src/cli.rs`、`docs/reference/02-cli.md`、本ファイルのみ。`crates/m241-gui` は別エージェントが編集中のため未変更。実ログ・実座標は追加していない。実機ポートは開いていない。
-- 修正コミット: `8645edc`（コード・docs）。本節は自己参照を避けるため後続の docs コミットに置いた。最終 head は PR #41 のコメントを参照。
-
-### Must および同根の Should への対応
-
-仕様検収レビューの Must は **1〜3**（KML の計算量・KMZ のメモリ上限・暗号化 ZIP）、可読性レビューの Must は M1〜M5。下表はその両方と、対応する指摘が無い側の項目を並べる（初版は仕様の Should を Must-4〜7 と誤記していた。Stage 3 の指摘で修正した）。
-
-| 指摘 | 対応 | 種別 |
-|---|---|---|
-| 仕様 Must-1 / 可読性 M5: KML 読み込みが O(n²) | `next_kml_geometry` を 1 パス走査に変更。`<Point>` と `<LineString>` を別々に `from` から EOF まで探さない | 実装変更 + テスト |
-| 仕様 Must-2 / 可読性 M1: 64 MiB 上限が展開後検査でメモリを制限しない | `zip_entry_bytes` の deflate 経路を `Read::take(64 MiB + 1)` に変更し、stored 経路も実体長 `data.len()` を検査。宣言 `uncompressed_size` の早期拒否は残した。`read_to_end` の倍々成長で上限の 2 倍（128 MiB）を確保しないよう、`Vec` は上限 +1 を一度だけ予約する（未使用ページは常駐しない） | 実装変更 |
-| 仕様 Must-3 / 可読性 M2: 暗号化 ZIP を検出しない | 中央ディレクトリ +8 とローカルヘッダ +6 の general-purpose flag bit 0 を読み、どちらかが立てば `KMZ entry … is encrypted, which is not supported` で拒否。旧実装は暗号化フラグ付き有効 deflate を exit 0 でインポートしていた。あわせてエントリ単位の ZIP64 マーカー（サイズ / オフセット = `0xFFFFFFFF`）を ZIP64 として理由付きで拒否 | 実装変更 + テスト |
-| 可読性 M3: `impl Default for LogReadOptions` が未使用で doc が偽（仕様レビューに対応指摘なし） | impl を削除。clap の既定（`--utc-offset-days auto`、`--format gpx`、`--coord-format decimal` ほか）を `log_read_defaults_are_the_documented_ones` で固定 | 実装削除 + テスト |
-| 可読性 M4 / 仕様 Should-1: ZIP パーサの異常系テスト 0 本 | 6 経路（EOCD 無し・中央ヘッダ署名破損・ローカルヘッダ署名破損・ZIP64・未知メソッド・宣言/実体の上限超過）と暗号化 2 経路（中央 / ローカル）のテストを追加 | テスト追加 |
-| 可読性 S5 / 仕様 Should-2: `--help` と docs の不整合 | `--help` を「**imported document**（`--gpx` / `--kml` / `--kmz`）」に更新。`docs/reference/02-cli.md` の "(see below)" に対応する説明（imported document には `auto` を適用しない理由）を Input kinds に復活 | docs 変更 |
-| 仕様 Should-3 / Should-4: HTML/RTF のテストが部分文字列のみ | HTML は出力全体を禁止トークン 16 種（`<script` / `<img` / `<link` / `<iframe` / `<object` / `<embed` / `src=` / `href=` / `http://` / `https://` / `url(` / `javascript:` / `@import` / ` onload=` / ` onerror=` / `xlink:href`）で走査し、閉じタグも確認。RTF は `to_rtf` の出力全体でブレース均衡・ASCII・`\par` 行数を検査 | テスト変更 |
-
-### その他の Should への対応
-
-仕様 Should-1（ZIP 拒否経路のテスト）・Should-2（`--utc-offset-days` の docs）・Should-3/4（HTML/RTF のテスト強度）は上表に含めた。
-
-| 指摘 | 対応 |
-|---|---|
-| 可読性 S7: CRC 未検証が公開 API の doc に無い | `import_kmz` の rustdoc と `02-cli.md` に「CRC は検証しない。stored エントリの 1 ビット反転は妥当な座標として読まれ得る」を明記 |
-| 可読性 S6: RTF の doc「declares one font」と実装（2 font、`\f1` 未使用）の不一致 | 未使用の `{\f1\fmodern Courier New;}` を削除し、doc と実装を一致させた |
-| 可読性 S3: `import_kml` の doc が「root element」、実装は「どこかの `<kml` 要素」 | doc を「`<kml` 要素」に修正（実装は変えていない） |
-| MHT 未実装（仕様 §2 は HTML / MHT） | `02-cli.md` に「MHT is not implemented」節を追加。仕様の記載、実装が無いこと、レイアウトが仕様に無いことを書いた |
-| PR 本文の「18 new tests」 | 実数は Stage 1 時点で 20、Stage 2 後で 32（`git diff e7367dc -- '*.rs' | grep -c '^+    #\[test\]'` = 32）。PR 本文の数字は書き換えず、PR コメントで訂正した |
-
-### 見送り
-
-- 可読性 S1（4 値ブール + 手書き conflict を `ArgGroup` へ）、S2（`read()` の分割）、S9（`map_svg` の分割）、S10（`format_duration` の可視性）、Could 群: 挙動を変えない構造整理で、今回の Must 修正とは独立。Stage 3 の判定後に follow-up とする。
-- 可読性 S4（エラー位置がコメント除去後の座標系）、S8（非 UTF-8 の文言が NMEA 向け）: 既存の GPX 経路と同じ挙動で、KML/KMZ 固有の回帰ではない。文言・座標系の変更は別 PR とする。
-- `.dst` と実 ezTour サンプルとの比較: 仕様検収の判定どおり未実装・未検証のまま。捏造しない。
-
-### 追加テスト
-
-`crates/m241-core/src/log/import.rs`:
-
-- `a_point_only_kml_is_read_in_one_pass_not_once_per_point`（10,000 点が 5 秒以内。旧実装は debug 78 秒 / release 7.0 秒）
-- `an_archive_without_an_end_of_central_directory_record_is_refused`
-- `a_central_directory_header_with_a_bad_signature_is_refused`
-- `a_local_file_header_with_a_bad_signature_is_refused`
-- `a_zip64_archive_is_refused`
-- `an_entry_with_an_unknown_compression_method_is_refused`
-- `an_entry_that_declares_more_than_the_limit_is_refused`
-- `an_encrypted_entry_is_refused`
-- `a_local_header_that_says_encrypted_is_refused_even_when_the_central_directory_does_not`
-- `a_doc_kml_that_decompresses_past_the_limit_is_refused_while_reading`（宣言 0・実体 160 MiB。エラーが報告する長さが `64 MiB + 1` = 67,108,865 で止まることを assert）
-
-`crates/m241-core/src/log/report.rs`:
-
-- `the_whole_rtf_document_is_balanced_and_ascii`
-
-`crates/m241-cli/src/cli.rs`:
-
-- `log_read_defaults_are_the_documented_ones`
-
-既存テストの変更: `the_snapshot_has_no_javascript_and_no_remote_reference` を 16 トークンの全体走査に拡張。削除したテストは無い。
-
-### 性能実測
-
-`--release` バイナリで計測。ホストに `/usr/bin/time` が無いため、`getrusage(RUSAGE_CHILDREN).ru_maxrss` を 1 コマンド 1 プロセスで読むラッパーを使った。入力は `/var/tmp/pr41fix/` に合成した Point-only KML（880,112 B / 10,000 点）と、`uncompressed_size = 0` を宣言し実体 160 MiB に膨れる KMZ（163,186 B）。実ログ・実座標は使っていない。
-
-| 計測 | 修正前（`5869615`） | 修正後（`8645edc`） |
-|---|---:|---:|
-| 10,000 点 KML の処理時間 | 7.198 s | **0.011 s** |
-| 160 MiB アーカイブのピーク RSS | 197.1 MiB | **69.1 MiB**（上限 64 MiB） |
-| 暗号化フラグ付き KMZ | exit 0（成功） | **exit 1** `is encrypted, which is not supported` |
-
-PSS ではなく RSS のため、`Vec` 予約分やバイナリ・アロケータの常駐分を含む。上限 64 MiB に対して 69.1 MiB で止まり、実体 160 MiB には比例しない。小さい KMZ（186 B、1 点）は 12.2 MiB、上限内の 10 MiB 展開は 26.8 MiB だった。
-
-### 検証
-
-- `M241_VENDOR_IMAGE=<vendor V1.13> TMPDIR=/var/tmp ./tools/check.sh`: **6/6**（fmt / clippy / test / docs / design / safety）。
-- `cargo test -p m241-core --lib`: 361 passed、`cargo test -p m241-cli --lib`: 281 passed（いずれも Stage 2 の追加テストを含む）。
-- 変更後に `cargo fmt --all -- --check` と `cargo clippy --all-targets -- -D warnings` が通ることを確認した。
-- 外部ビューア（ブラウザ・Word）での表示確認は未実施。実 ezTour の KML/KMZ/HTML/RTF との比較も未実施（Stage 1 と同じ）。
-- 異常系の一部（切り詰めたデータ、EOCD のコメント長、ローカルヘッダの extra field 長）は単体テストの経路で確認したが、実アーカイバが作る全変種を網羅したわけではない。
-
-### main 追従（PR #40）と Stage 3 の軽微指摘（2026-11-23）
-
-- Stage 3 は head `c0b4c5d` で合格（mergeable / gate success）。その後 docs PR #40 が先に main（`3c97d5b`）へ入ったため `git merge origin/main` で追従した。競合は無く自動マージで、`docs/reference/02-cli.md` は PR #40 の GUI 対応表 2 行と本 PR の `log read` 記述を両方残している。`AGENTS.md` / `CHANGELOG.md` / `README.md` / `docs/dev/05-verification.md` / `docs/dev/12-progress-summary.md` は main 側の内容をそのまま取り込み、本ブランチからの変更は無い。
-- 追従後の head で `./tools/check.sh` 6/6。新 head は Stage 3 の再検証対象で、`review-gate` はこのセッションでは付けていない。
-- Stage 3 の軽微指摘 2 件:
-  1. 上限テストが `take` 除去を検知できない → fixture を実体 160 MiB にし、拒否メッセージが報告するサイズが `64 MiB + 1`（67,108,865）であることを assert する形に変更。`take` を外す変異を入れてテストが `167772160 bytes` で FAILED になることを確認し、変異を戻した。
-  2. 本節の対応表の「仕様 Must-4〜7」が誤り → 仕様レビューの Must は 1〜3。該当行を Should-1 / Should-2 / Should-3・4 に修正し、Must 表の重複行を整理した（上表）。
-
-### Stage 3
-
-- 未実施。`review-gate` は付けていない（Stage 3 は別エージェントが新しい head SHA で行う）。
-
----
-
-## 2026-11-23 / PR #43 Tauri v2 GUI の Stage 2 修正（`feat-tauri-p0`）
-
-対象: Stage 1 head `5e25205c7874177dbdedf0948e68e15245c5f438`（base `origin/main` = `db15b2f`）。
-仕様・安全検収（Must 3、追加 Must 5、Should 8）と可読性・デザイン（Must 2、Should 17、Could 12）の
-うち、Must 全件と実害の確認された追加 Must を修正した。修正後の head は push 後に PR へ記録する。
-
-**検証の限界**: 実機・実シリアルポートは一切開いていない。UI の実測はビルド済み `dist` を
-ヘッドレス Chrome（CDP、1280×800）で表示し、`window.__TAURI_INTERNALS__` だけモックしたもの。
-Tauri 実ウィンドウ内の CSP・IME・OS ダイアログ、Windows / macOS は未検証。
-
-### Must への対応
-
-| 指摘 | 対応 | 実装 / テスト |
-|---|---|---|
-| 安全ゲートが `m241-app` を網羅しない | `check_safety.py` に 3 条項を追加: (a) `APP_MAY_LINK_FLASH = False` の間は manifest と `cargo tree` の両方で `m241-flash` を拒否（P3 で定数を True にし、GUI と同じ write-route 条項を足す設計）、(b) `m241-app/src` と `ui/src` に `0xD3`/`0xD4`/`0xD5`/`0xD9`/`PMTK182,6` を拒否、(c) `Port::open` は `src/device.rs::probe` の 1 箇所だけ・`device_info` が呼び手、他の serial コンストラクタは拒否 | 実装 + テスト（`safety_gate.rs` に 4 本追加） |
-| クリーンチェックアウトで 4/6 | `check.sh` に準備段: `ui/dist/index.html` が無ければ `pnpm install --frozen-lockfile && pnpm build`。pnpm 不在/失敗時は `m241-app` を clippy/test から外し `[SKIP] m241-app: …` を 1 行出して 5/6＋skip と報告。AGENTS.md / README.md に前提を明記 | 実装（スクリプト）+ docs |
-| 写真マッチングが §6.1 の 2 規則を落としている | `PhotoOptions`（カメラ時差 分・ログの日数ずれ・許容差・グループ距離）を追加し、`GeotagOptions` の許容差と `geotag::group_matched_plans` でグループ化。写真パネルに「カメラ時差（分）」「ログの日付ずれ（日）」「同じ地点にまとめる距離（m）」を追加（既定 0） | 実装 + テスト 4 本 |
-| 同期コマンドが webview を止める | `open_log` / `load_photos` / `export_log` を `async fn` + `spawn_blocking` に変更（`device_info` と同じ形）。共有文書を `Arc<Mutex<…>>` にして blocking closure が自分の handle を持つ | 実装（Tauri runtime が要るため自動テストは無し。clippy/test/build で確認） |
-| テスト名が検証範囲を偽る | `every_error_variant_has_exactly_one_next_action_line` は 11 バリアント全部を配列で渡す（件数 assert 付き）。`logdoc` の弱いテストは `a_relative_destination_is_refused` に改名し、`assert!(!same.is_empty())` を削除 | テスト |
-| 保存先の symlink で上書き禁止を回避できる | 保存先を `canonicalize`（新規ファイルは親を解決）し、Unix では dev/ino も比較。`../` 表記・symlink・hard link の 3 経路を拒否し、元ファイルのバイト列が変わらないことも assert | 実装 + テスト 3 本 |
-| 開いた直後の fit が follow に打ち消される | 文書を fit した直後の follow を 1 回だけ抑止（`suppressFollowOnceRef`）。`fitBounds` の padding をヘッダ/ツールバー/タイムライン用の非対称値に | 実装 + スクショ実測 |
-| 地図の占有率 53.3% | ヘッダとツールバーを地図上のオーバーレイに変更。1280×800 で地図 **784×800 = 61.25%**、ドック 272px は維持 | 実装 + 実測 |
-| OSM ラスタがフルカラーで軌跡より目立つ | `raster-saturation: -0.7` / `raster-brightness-max: 0.85` / `raster-opacity: 0.9`。平均彩度 0.105→0.051、p90 0.315→0.103 | 実装 + 実測 |
-| UI に開発者向けの痕跡 | DeviceCard の「（P3）」を実態の文に、「10 秒ほど」を「最大 15 秒ほど」に（identity 5s + usage 5s + log_enabled 5s）。常に空のコメントブロックを削除 | 実装 |
-
-補足: 依頼文の「タイムゾーン変換（`--utc-offset-days` 相当）」は、CLI では
-`--utc-offset-days` が**軌跡の時刻**を日単位で動かすフラグで、カメラ側の時差は
-`--tz-offset-minutes` である。仕様 §6.1-2 は「写真のタイムゾーン」を要求しているため、
-カメラ時差（分）とログの日数ずれ（日、`--utc-offset-days` と同じ意味）の両方を実装した。
-
-### ゲートの変異テスト（実際に落ちることの確認）
-
-`/home/kuni/dev/holux-m241-wnro-toolkit/rust` の作業ツリーで一時的に変異を入れ、
-`python3 tools/check_safety.py` が **exit 1** になることを確認してから `git checkout --` で戻した。
-
-| 変異 | ゲートの出力 |
-|---|---|
-| `m241-app/Cargo.toml` に `m241-flash.workspace = true` | manifest 条項と `cargo tree` 条項の 2 件で FAIL（exit 1） |
-| `m241-app/src/lib.rs` に `pub const …: u8 = 0xD5;` と `"$PMTK182,6"` | 2 件の destructive command で FAIL |
-| `ui/src/lib/format.ts` に `0xd5` / `"\xd5"` / `"$PMTK182,6"` | 3 件の frontend 違反で FAIL |
-| `commands.rs` に 2 つ目の `Port::open` | 「opens a serial port in 2 places」で FAIL |
-
-変異を戻した後のゲートは exit 0。同じ 4 種は `crates/m241-flash/tests/safety_gate.rs` の
-fixture テスト 4 本としても固定した。
-
-### Stage 1 Should への対応
-
-| 指摘 | 対応 |
-|---|---|
-| 見本の集計がギャップ込みで誤解を招く | 10 分超の間隔を距離・時間・平均から除外（区間ごとに `TrackStats::of` を合計）。見本は 24:44:30 → **1:44:00**、平均 0.3 → 3.3 km/h。日別行にも同じ規則を適用し、注記を追加 |
-| タブの `aria-controls` が存在しない id を指す | アクティブタブだけに `aria-controls` を付与。実測で非アクティブ 4 つは `null`、アクティブは `targetExists: true` |
-| 地図 canvas が 2 つ目のタブストップで outline が消える | canvas を `tabIndex = -1` + `aria-hidden="true"` にし、`:focus-visible` の輪郭を復活。実測 `tabIndex: -1` / `aria-hidden: true` |
-| ポップアップ/ダイアログにフォーカスが移らない | 点ポップアップは閉じるボタンへ、書き出しは保存先入力へフォーカス。実測 `aria-label=閉じる` / `activeElement.id=export-destination` |
-| CSP が `null`、未使用の `opener:default` | CSP を最小構成に（`self`、IPC schemes、`tile.openstreetmap.org`、`worker-src blob:`）。opener は権限・plugin 初期化・依存を削除。※Tauri 実ウィンドウでの CSP 動作は未検証 |
-| DESIGN.md の「ネットワーク消費者は 1 つ」 | egui の `TileFetcher` と Tauri WebView の 2 消費者として更新。AGENTS.md の同記述も更新 |
-| 写真タイムゾーンを設定画面に出す | Must 3 の写真パネル入力を実装（設定画面は P4 扱い） |
-
-### 見送り
-
-- 1024×640 の地図占有率（新レイアウトでも 52.8%）とドックの折りたたみ: 要求は 1280×800 の 60% 超。
-  狭い幅のレスポンシブは別対応とする。
-- 可読性 S-2（`logdoc.rs` 分割）、S-4（`useLogDocument` のリクエストチケット）、S-5（ESLint）、
-  型スケール 11px の整理、チャート時間軸の日付併記、Connect の地図プレースホルダ、
-  タイル取得失敗の案内、サムネイル帯・回転: Must と独立の構造/文言で、stage 3 の判定後に follow-up。
-- Tauri 実ウィンドウでの CSP・キーボード操作・IME: ヘッドレス Chrome では Tauri の CSP が掛からないため未検証。
-
-### 検証
-
-- `./tools/check.sh`（head `c8e8b9e`）: **6/6**（fmt / clippy / test / docs / design / safety、115s）。
-- クリーン複製 `/var/tmp/pr43-clean`（`git worktree add --detach`、`ui/dist` を削除、head `c8e8b9e`）:
-  `check.sh` が `prepare: … running pnpm install + build` → `prepare: built …` を出し **6/6**（101s、test 88.5s）。
-- `cargo test -p m241-app`: **28 passed**。`cargo test -p m241-flash --test safety_gate`: **35 passed**
-  （うち 4 本が新しい `m241-app` 条項）。
-- `pnpm --dir crates/m241-app/ui typecheck` / `build`: 成功。
-- 地図: 変更前 784×696 = 53.29%（自作ビルド、Stage 1 レビューの 53.3% と一致）、
-  変更後 784×800 = **61.25%**（ドック 272px 維持）。
-- ラスタ: 平均彩度 0.105 → 0.051、p90 0.315 → 0.103（地図領域の HSV saturation、PIL で計測）。
-  軌跡の accent `#145f75` は彩度 ~0.83 で、地図の p90 を大きく上回る。
-- fit: スクリーンショット上の軌跡 bbox は (330,120)–(951,729)。fit padding top=120 の内側で、
-  2 セッションとも切れていない。
-- 追加テスト: `a_camera_offset_puts_a_utc_plus_nine_photo_on_the_track`、
-  `a_log_offset_moves_the_track_into_the_photo_clock`、`the_time_tolerance_is_the_geotag_max_gap`、
-  `photos_at_the_same_place_share_a_group_when_grouping_is_on`、
-  `exporting_through_a_dot_dot_path_over_the_source_is_refused`、
-  `exporting_through_a_symlink_to_the_source_is_refused`、
-  `exporting_over_a_hard_link_to_the_source_is_refused`、
-  `the_summary_excludes_the_gap_between_sessions`、
-  `app_linking_the_write_crate_is_reported`、`app_destructive_opcode_is_reported`、
-  `app_frontend_destructive_opcode_is_reported`、`app_second_serial_open_is_reported`。
-- スクリーンショット: `/var/tmp/pr43-shots/after-1280x800.png`（タイル OFF、fit）、
-  `tiles-after-1280x800.png`（タイル ON、彩度）、`before-tiles-1280x800.png`（変更前の比較）、
-  `photo-panel.png`（写真パネルの入力）、`a11y-export.png`。
-- 未検証: 実機、実シリアルポート、Tauri 実ウィンドウ、Windows / macOS、写真フォルダの実データでの
-  カメラ時差の一致（合成 JPEG の mtime でテスト）。`review-gate` は付けていない（Stage 3）。
+- **対象**: `DaLoader`（`0xA1`/`0xAF`/`0xA8`）および `m241 fw probe-da`（`0xD6`）
+- **判定**: Stage 1 不合格 → Stage 2 / Stage 2 v2 で Must 全件・V-Must-1 解消（`check.sh` 6/6）
+- **主な指摘と解消**:
+  - `BaseVerdict` を `Settled` / `Inconclusive::{Unread, NoMatch, Ambiguous}` に厳格化し、2 候補とも読めて片方のみ一致した場合だけ確定
+  - `0xA8` の count を 0（`DA_JUMP_COUNT`）に固定、DA 先頭 4 バイト `00 00 A0 E1` 検査、`clear_input()` 失敗の伝播、`testing.rs` に end-to-end 偽 DA を追加
+  - 偽 DA の `0xD6` 非ゼロ開始アドレスずれバグを修正
+- **未検証**: `0xD6` 最終ページ後の advance 送出要否、ページ長可変、V1.14 個体での probe
+
+## 2026-11-22 / PR #19 `fix/flash-d3-resync`
+
+- **対象**: `m241-flash` / `m241-cli` の `0xD3` 応答再同期・自動 `0xD9` 再試行・`fw da-restart`
+- **判定**: Stage 1（並行）→ Stage 2 修正完了（`check.sh` 6/6）
+- **主な指摘と解消**:
+  - `02-cli.md` に `da-restart` 実機未検証を明記、`0xD9` の「再起動した」断定を「送った（未確認）」に修正
+  - 再試行前の再入失敗に `--recover` を出さない分岐（`Reentry::BeforeRetry`）、`0xD5` ヘッダ送信失敗時の非再試行、残留 `0x5A` と status `0x00` 検査、8 バイト上限境界テストを追加
+
+## 2026-11-22 / PR #20 `feat-log-kmz`
+
+- **対象**: `crates/m241-cli/`（`log kmz`, `log edit`）および docs
+- **判定**: Stage 1（並行）→ Stage 2 修正完了（`check.sh` 6/6）
+- **主な指摘と解消**:
+  - `log kmz` の写真スキップ理由を `GeotagPlan::skipped` の実理由に変更、`--tz-offset-minutes` 追加、`--utc-offset-days` 適用順テスト追加
+  - `log edit` の入力不変性、時刻なしマージ末尾配置、split 派生ファイルの上書き拒否（exit 5）、破損ブロック警告を追加
+- **未検証**: Google Earth / `unzip` での実表示確認
+
+## 2026-11-22 / PR #21 `feat-log-edit`
+
+- **対象**: `crates/m241-core/src/log/`（`PhotoTimeShift`, `PhotoShiftScope`, `CameraModel`, `KmzIconOptions`）および docs
+- **判定**: Stage 1（並行）→ Stage 2 修正完了（`check.sh` 6/6）
+- **主な指摘と解消**:
+  - `CameraModel` を厳密 UTF-8・末尾 NUL/空白のみ除去へ変更（非 UTF-8 は `None`）、実カメラ IFD0 配置の未検証を明記し `06-open-questions.md` §6/§7 に記録
+  - スコープ別シフトの e2e テスト、overflow のファイル読込前拒否、JPEG セグメント走査の `exif` 統合、`export_kmz_inner` 分割を実施
+
+## 2026-11-22 / PR #23 `feat-geotag-cli`
+
+- **対象**: `crates/m241-cli/`（`log geotag` の `--shift-*` / `--scope` / `--photo` / `--camera-*`）および docs
+- **判定**: Stage 1（並行）→ Stage 2 修正完了（`check.sh` 6/6）
+- **主な指摘と解消**:
+  - mtime 由来写真のシフト非永続化を警告・doc 化、`--scope selected` の 0 件一致を `Error::State`（exit 1）化、シフト要約を `requested` 表記へ変更
+  - スコープ外フラグの警告テスト、tz 併用 e2e テスト、`--scope` 綴り定数化、`flags_for_other_scopes()` への一本化を実施
+
+## 2026-11-22 / PR #24 W2a DA 全文 SHA-256（`feat-da-digest`）
+
+- **対象**: `m241-flash` / `m241-cli` の DA ダイジェスト検証と `tools/check_safety.py`
+- **判定**: Stage 1（並行）→ Stage 2 修正完了（`check.sh` 6/6）
+- **主な指摘と解消**:
+  - 生 `&str` を `DaDigest` トークン（通常ビルドは `DaDigest::vendor()` のみ）に置換し、`DaDigest::for_test_da` の `#[cfg]` 制限を `check_safety.py` 検査 8 に追加
+  - CI で常に走る pin 値リテラル回帰テストを追加し、ベンダー DA 実ファイル依存テストの条件付き skip を `11-safety-review.md` に明記
+
+## 2026-11-22 / PR #26 1.0.0 リリース整備（`feat-release-prep`）
+
+- **対象**: `README.md`, `CHANGELOG.md`, `docs/user/01-install.md`, `05-verification.md`, `12-progress-summary.md`, `.github/workflows/release.yml`
+- **判定**: Stage 1（並行）→ Stage 2 修正完了（`check.sh` 6/6、当時 810 テスト）
+- **主な指摘と解消**:
+  - `nmea proxy` 実機未検証・`v1.0.0` タグ未作成・個体データ 14/4/1 バイトの関係・Linux glibc/libudev 前提・未署名バイナリ注意を明記
+  - `release.yml` のタグ制約（`v[0-9]+.[0-9]+.[0-9]+`）、版一致検査、`cargo test --locked`、`LICENSE` 同梱を追加
+- **見送り**: 署名 / build provenance、composite action 化
+
+## 2026-11-22 / PR #27 GUI デザイン整備（`feat-gui-design`）
+
+- **対象**: `crates/m241-gui/` および `DESIGN.md` §10
+- **判定**: Stage 1（仕様・可読性・デザインの 3 レビュー）→ Stage 2・Stage 3 軽微対応完了（`check.sh` 6/6、GUI 152 テスト）
+- **主な指摘と解消**:
+  - `WaitingForPowerCycle` の進捗 100% 保持、設定「地図キャッシュの場所」行追加、`common::focus_ring`（2pt ink フォーカス輪）、`common::tool_button` 統一、`Shadow::NONE`、rail の quadratic ease-out、「動きの低減」表記統一、コピーの括弧化を実施
+  - `DESIGN.md` §10 に書体同梱方針（SIL OFL 1.1・非同梱）と 10 色軌跡の設計判断を記録
+
+## 2026-11-22 / PR #28 ezTour P2 互換（`feat-p2-compat`）
+
+- **対象**: `m241-core` / `m241-cli`（NMEA インポート、プロジェクト保存/読込、CSV 出力）および docs
+- **判定**: Stage 1（並行）→ Stage 2 修正完了（`check.sh` 6/6）
+- **主な指摘と解消**:
+  - プロジェクト保存の相対パスをプロジェクト親基準に統一し、`"input": "dump" | "nmea"` と必須フィールド検証を追加
+  - 非空 NMEA 全却下を `Error::State` 化、`--format json` へ `nmea` カウント付与、`$GPGSA` 等の `ignored`/`dropped` 境界修正、自己上書き拒否（exit 5）を追加
+- **未検証**: 実 ezTour 出力との突き合わせ
+
+## 2026-11-23 / PR #31 GUI 配線（`feat-gui-wiring`）
+
+- **対象**: `crates/m241-gui/`（写真シフト・byCamera・KMZ 書き出し・ログ編集）および `DESIGN.md`
+- **判定**: Stage 1（並行）→ Stage 2 修正完了（`check.sh` 6/6、GUI 169 テスト）
+- **主な指摘と解消**:
+  - 再計画失敗時の一覧保持＋`plan_stale` 拒否、byCamera 基準カメラ表示・変更時再計画、シフト arm 中の KMZ 拒否、範囲内/外枚数の報告、`見本` キャプション統一、編集 UI の 1 始まり統一を実施
+- **未検証**: Google Earth / `unzip`、実写真・実カメラでの byCamera 一致
+
+## 2026-11-23 / PR #34 ログの設定ジャーナル（`fix-log-journal`）
+
+- **対象**: `m241-core` / `m241-cli` の設定ジャーナル解析と stale mask 対応
+- **判定**: Stage 1（並行）→ Stage 2 修正完了（`check.sh` 6/6）
+- **主な指摘と解消**:
+  - 実測の journal type（2/3/4/6/7、計 248 件）を正確に反映、`record::decode_with_length` で mask 20 B / 実長 16 B ブロックを救済
+  - 再同期の連続チェックサム要件を名前付き定数化（宣言 2 / 非宣言 3 / 再同期 4、ランダム 50 seeds で 0 点）、`is_journal_only` 定義を厳格化、`02-cli.md` に `log info` 節を追加
+
+## 2026-11-23 / PR #36 ezTour パリティ core/CLI（`feat-parity-core`）
+
+- **対象**: `m241-core` / `m241-cli`（KML `LookAt`、キャッシュ、`--gpx`、`--simplify`、`--csv-report`、`--coord-format`、NMEA GGA/GSA）
+- **判定**: Stage 1（並行）→ Stage 2 修正完了（`check.sh` 6/6、936 テスト）
+- **主な指摘と解消**:
+  - KML `<LookAt>` を `<Style>` 前に移動（最小 XSD + `xmllint` で検証済）、`logcache.rs` 分離と `ParseReport` 警告リプレイ（v2 キャッシュ）
+  - `--gpx` で `auto` 日数補正を無効化（歴史的 GPX の誤シフト防止）し 0 点 GPX をエラー化、GGA 衛星数を空欄へ変更、`TrackPoint::position()` で有限座標判定を統一
+- **未検証**: 外部ビューア描画、GPX/NMEA 出力の外部検証
+
+## 2026-11-23 / PR #37 GUI ログ/NMEA 操作（`feat-gui-logops`）
+
+- **対象**: `crates/m241-gui/`（吸い出し・消去パネル・プロジェクト・NMEA 修復/中継）および docs
+- **判定**: Stage 1（並行）→ Stage 2 → PR #36/#38 追従 → Stage 3 再検証（`d14a129`）**合格**（`check.sh` 6/6、GUI 226 テスト、CLI と JSON 出力の raw 一致を確認）
+- **主な指摘と解消**:
+  - プロジェクト相対パス規則・JSON の `nmea`/`offset_days`/`input`/`position` を CLI と統一
+  - `LogOps` をパネル別 struct に分割し、KMZ icon を既定 OFF へ戻し、`--port auto` のケーブル形状フィルタと中継の最大行数制限を追加
+- **残件・未検証**: geotag の `--tz-offset-minutes` 相当は follow-up。GUI 経由の実機吸い出し・中継・消去は未検証
+
+## 2026-11-23 / PR #38 GUI 書き込み（`feat-gui-write`）
+
+- **対象**: `crates/m241-flash` / `crates/m241-gui` / `tools/check_safety.py`（Firmware 書き込み・2 回読み吸い出し・Connect 診断/probe-da）
+- **判定**: Stage 1（並行）→ Stage 2 → Stage 3 検証（`43af066`）**合格**（17 変異全検出・誤検出 0、`review-gate: success`；その後 main 追従マージ）
+- **主な指摘と解消**:
+  - `check_safety.py` を 9 検査へ拡張（GUI 破壊的オペコードの 2 系統走査、`Confirmation::granted` / `Job::Flash` のファイル allowlist）
+  - GUI 吸い出しを 2 回読み＋ハッシュ一致検証へ実装、preflight のメモリ保持で TOCTOU 解消、未検証表示の統一、`probe_da` / `probe_bootrom` / `settled_address` テスト追加
+- **未検証**: GUI 経由の実機書き込み・2 回読み（シミュレータのみ）
+
+## 2026-11-23 / PR #39 OSM タイル地図（`feat-map-tiles`）
+
+- **対象**: `crates/m241-gui/`（`tiles.rs`, `log.rs`, `settings.rs`）および `DESIGN.md` / `PRODUCT.md` / `DISCLAIMER.md` / `README.md`
+- **判定**: Stage 1（並行）→ Stage 2 → PR #37 競合解消マージ完了（`check.sh` 6/6、GUI 282 テスト）
+- **主な指摘と解消**:
+  - 取得ゲートを `native_pixels_per_point.is_some()` へ変更（Wayland/X11 実ウィンドウで取得、headless/sample は fetch 0・キャッシュ 0）
+  - タイル描画枚数 > 0 のみ帰属クレジット描画、`image::Limits` によるデコード前上限、`BodyExceedsLimit` の `TooLarge` 変換、失敗タイルの 60 秒後再試行、`pub(crate) mod tiles` 化
+- **残件・未検証**: HTTP キャッシュヘッダ（`max-age`/ETag）・失敗理由の詳細表示・設定永続化は見送り。Wayland 実画面の見た目と実 `.bin` でのライブ表示は未検証
+
+## 2026-11-23 / PR #41 ezTour 形式（`feat-eztour-formats`）
+
+- **対象**: `crates/m241-core/src/log/`（`import.rs`, `html.rs`, `report.rs`）, `crates/m241-cli/src/cli.rs`, `docs/reference/02-cli.md`
+- **判定**: Stage 1（並行）→ Stage 2 → Stage 3（`c0b4c5d`）**合格** → PR #40 追従＋軽微 2 件修正（`check.sh` 6/6）
+- **主な指摘と解消**:
+  - KML 読込を O(n) 1 パス化（10,000 点: 7.198 s → 0.011 s）、ZIP 展開を `Read::take(64 MiB + 1)` 制限（160 MiB 展開 RSS: 197.1 MiB → 69.1 MiB）、暗号化 ZIP と ZIP64 の拒否、ZIP 異常系テスト追加
+  - HTML 禁止トークン 16 種検査・RTF 全体検証・CRC 未検証の明記・MHT 未実装節を追加
+- **未検証**: ブラウザ/Word での表示確認、実 ezTour 出力との比較
+
+## 2026-11-23 / PR #42 Log の地図主面化（`feat-map-layout`）
+
+- **対象**: `crates/m241-gui/`（`log.rs`, `drawer.rs`, `tiles.rs`, `theme.rs`, `screenshot.rs`）および `DESIGN.md`
+- **判定**: Stage 1（並行）→ Stage 2 → Stage 3（`01f682a`）**合格** → PR #41 追従＋軽微 2 件修正（`check.sh` 6/6、GUI 292 テスト）
+- **主な指摘と解消**:
+  - 帰属板を `Plates::credit` へ移しズーム板左端で折り返し（最小間隔 12.6pt、ドロワー判定を content 幅 1000pt 基準へ変更）、浮遊ドロワーの重なり回避、長文エラーの折り返し対応
+  - `--screenshot` にドロワー 5 タブ × 2 サイズの 10 枚を追加、10 色巡回・選択点マーカー・板 alpha 0.92 の描画テストを追加
+- **未検証**: 実機、実ネットワークのタイル取得、実ウィンドウでの見た目
+
+## 2026-11-23 / PR #43 Tauri v2 GUI（`feat-tauri-p0`）
+
+- **対象**: `crates/m241-app/`（Rust バックエンド + `ui/`）、`tools/check_safety.py`、`tools/check.sh`、docs
+- **判定**: Stage 1（仕様・安全・可読性・デザイン）→ Stage 2 修正完了（`check.sh` 6/6、`m241-app` 28 テスト、`safety_gate` 35 テスト、クリーンチェックアウト確認済み）
+- **主な指摘と解消**:
+  - `check_safety.py` に `m241-app` の 3 条項（`m241-flash` 禁止、破壊的コマンド禁止、`Port::open` 1 箇所限定）を追加し、4 種の変異で失敗を実証
+  - `check.sh` に `ui/dist` 自動ビルド段を追加、同期コマンドを `async fn` + `spawn_blocking` 化、symlink/hard link 経由の自己上書き拒否を追加
+  - 写真マッチングにカメラ時差・ログ日数ずれ・許容差・距離グループ化を追加、地図占有率 53.3% → 61.25%（1280×800）、OSM ラスタ減彩（平均彩度 0.105 → 0.051）、CSP 設定と a11y フォーカス管理を実施
+- **未検証**: 実機、実シリアルポート、Tauri 実ウィンドウ（CSP・IME・OS ダイアログ）、Windows / macOS、実写真フォルダでのカメラ時差一致

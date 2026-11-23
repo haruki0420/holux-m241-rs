@@ -1,6 +1,6 @@
 # Fixing the date
 
-Four steps. Only the last one can damage the device.
+Four steps — only step 4 can damage the device:
 
 ```bash
 m241 device ports                      # 1. find the cable
@@ -10,75 +10,27 @@ m241 fw patch backup/stock.bin -o backup/fixed.bin
 m241 fw flash backup/fixed.bin --da vendor/DA_v3.8.4.bin --backup backup/stock.bin --yes
 ```
 
-## Step 2 asks you to power-cycle
+## Step 2: Dump twice across a power-cycle (read-only)
 
-The dump reads your firmware twice and compares the hashes, because a single read
-that silently truncated would look like success. Between the passes the tool stops
-and asks you to remove the battery for about ten seconds, put it back, switch on,
-and press Enter. A second read from a fresh boot is what makes the comparison
-mean something.
+`fw dump` (and GUI 吸い出す) reads firmware twice and saves only when both SHA-256 hashes match. Between passes, remove the battery for ~10 seconds, reinsert, switch on, and press Enter.
 
-The GUI's 吸い出す does the same two reads: the first pass ends with a
-power-cycle prompt, and the second pass is compared with it. Both paths save the
-file only when the two hashes agree.
+## Step 3: Check the patch plan
 
-**This step never writes to the device.** It can be repeated as often as you like.
+`--dry-run` writes nothing and should list exactly three changed bytes: `0x402F6`, `0x402F7` (epoch constant) and `0x59C2C` (version digit). Stop if any other offset appears.
 
-## Step 3 shows what will change
+## Step 4: Flash (destructive)
 
-`--dry-run` prints the plan and writes nothing. Expect three changed bytes:
+Read [`docs/dev/05-verification.md`](../dev/05-verification.md), [`docs/reference/01-da-protocol.md`](../reference/01-da-protocol.md), and [`docs/dev/11-safety-review.md`](../dev/11-safety-review.md) first.
 
-```
-0x402F6, 0x402F7   the two high bytes of the date constant
-0x59C2C            one digit of the version string
-```
+Before erasing, `fw flash` compares the unit's full firmware against `--backup` (`verify_device`), verifies the image differs only at profile patch offsets (strict path; `--allow-vendor` is separate), validates the pinned layout (`0x00000000`, `406620` B) and pinned `DA_v3.8.4.bin` SHA-256, and requires `--yes` (`AGENTS.md` §2.5). After writing, it sends `0xD9`, re-enters BootROM via NMEA/`$PMTK180*3B`, and reads back the full range.
 
-A fourth offset means the image is not the version this tool expects. Stop.
+## Step 5: Verify the date
 
-## Step 4 is the only dangerous step
-
-> **Status: implemented, not verified on hardware.** `m241 fw flash` is wired
-> through the DA write and read-back, but this build has not flashed a unit.
-> Read `docs/dev/05-verification.md` before running it, and review the sequence
-> against `docs/reference/01-da-protocol.md` and
-> `docs/dev/11-safety-review.md`.
-
-The command first compares the unit's whole firmware span with `--backup`
-(`DownloadAgent::verify_device`). The library's `DownloadAgent::write` does not
-call that check itself: it compares the image with `backup`, not with the unit.
-The device check belongs to the CLI route, not to the library `write`. After
-that it refuses unless all three of these hold:
-
-1. the image matches a known firmware profile and is either identical to
-   `--backup` or differs from it only at that profile's patch offsets. The
-   strict path has no vendor-package or cross-model exception; the explicit
-   `--allow-vendor` gate (fixed V1.13 SHA-256) is separate and is not used here;
-2. the layout gate accepts the pinned start `0x00000000` and length `406620`;
-3. you passed `--yes` (this build has no typed `WRITE` prompt; `AGENTS.md` §2.5
-   governs who may pass it).
-
-The write sends `0xD9`, then re-enters the BootROM with the same NMEA probe and
-`$PMTK180*3B` hand-over the first entry used, and reads the range back. If the
-re-entry fails, the command reports that the read-back was not performed; it
-never reports success. Confirm the live NMEA date in Step 5 as well.
-
-## Step 5: check the date
-
-The read-back leaves the unit in the BootROM. Remove the battery for about ten
-seconds, put it back, switch the unit on, and reconnect before the commands
-below; otherwise `device info` and the NMEA proxy will find no firmware.
+Read-back leaves the unit in BootROM. Remove the battery for ~10 seconds, reinsert, power on, reconnect, then check:
 
 ```bash
 m241 device info
 m241 nmea proxy --stdout
 ```
 
-The ninth field of `$GPRMC` is the date as `ddmmyy`. It should be today. If it is
-still nineteen years ago, the write did not take; re-flash your backup and read
-[recovery](03-recovery.md).
-
-## What is not verified
-
-The display on the device is expected to show the corrected date, because it
-reads the same conversion result, but nobody has photographed it after a flash.
-`docs/dev/05-verification.md` keeps that list.
+Check `$GPRMC` field 9 (`ddmmyy`). If the date is still 19.6 years behind, re-flash your backup via [recovery](03-recovery.md). Note: post-flash OLED appearance and live GPS-fix dates remain unverified (`docs/dev/05-verification.md` §2).

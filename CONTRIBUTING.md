@@ -1,115 +1,30 @@
 # Contribution guide
 
-This project repairs and reads a discontinued GPS logger. The most valuable
-contributions are hardware reports and firmware profiles, not features.
+Hardware reports and firmware profiles are the highest-value contributions.
 
-## Before you change anything
+## Checks before every commit
 
-```bash
-cargo fmt --all
-cargo clippy --all-targets -- -D warnings
-cargo test --workspace
-```
+Run `./tools/check.sh` and require **6/6** (`fmt`, `clippy`, `test`, `docs`, `design`, `safety`). The workspace denies `unsafe`, `unwrap`, `expect`, and `panic` outside tests so serial errors return recoverable values instead of aborting mid-write.
 
-`./tools/check.sh` runs all six gates together (`fmt`, `clippy`, `test`, `docs`,
-`design`, `safety`) and is the gate this repository actually requires at 6/6. Use
-the individual commands above when you need to iterate on one of them.
+## Non-negotiable rule: disassembly over porting
 
-All three must be clean. The workspace denies `unsafe`, `unwrap`, `expect` and
-`panic`, so a serial failure becomes an error value rather than a process abort.
-That is not style: the device may be mid-write when a cable is pulled, and the
-recovery instructions have to survive it.
+Every constant and command in `crates/m241-flash/src/da.rs` must cite a function and instruction range in [`docs/reference/01-da-protocol.md`](docs/reference/01-da-protocol.md). Prior Python implementations are hypotheses; disagreements are recorded in [`docs/dev/04-prior-art.md`](docs/dev/04-prior-art.md).
 
-## The one rule that is not negotiable
-
-**The flash path is rebuilt from the vendor binary's disassembly, not ported.**
-
-`DA_v3.8.4.bin` has been disassembled, and its command semantics are recorded in
-`docs/reference/01-da-protocol.md` before any code implements them. Two things
-follow:
-
-- A change to `crates/m241-flash/src/da.rs` needs a citation into that
-  document, naming the function and the instruction range it came from. The DA
-  is in `m241-flash` rather than `m241-core` so a binary that only reads cannot
-  link it.
-- The previous Python implementation and the upstream project are **hypotheses**.
-  Where they disagree with the disassembly, the disassembly wins, and the
-  disagreement is recorded in `docs/dev/04-prior-art.md` so it is not re-litigated.
-
-Do not "simplify" a safety gate. The three that exist each stopped a real
-failure: the NMEA pre-probe, the backup diff check, and the `--yes`
-confirmation.
-
-## Safety gates
-
-| Gate | Where | Why |
-|---|---|---|
-| NMEA pre-probe | `protocol::brom` | Pulsing DTR/RTS at a streaming firmware leaves the unit unresponsive until the battery is removed |
-| Backup diff check | `firmware::patch` | Any image whose differing bytes fall outside the patch offsets is refused |
-| `--yes` confirmation | `cli`, `gui` | A confirmation dialogue is clicked by reflex; the flag must be deliberate, and `AGENTS.md` §2.5 governs who may pass it |
+Never weaken safety gates:
+- **NMEA pre-probe** (`protocol::brom`): prevents hanging running firmware with DTR/RTS.
+- **Backup diff check** (`firmware::patch`): refuses changes outside profile patch offsets.
+- **`--yes` / `WRITE` confirmation** (`cli`, `gui`): deliberate consent (`AGENTS.md` §2.5).
 
 ## Adding a firmware profile
 
-A profile is measured facts about one image: size, SHA-256, version marker
-offset, epoch offset. It belongs with the other profiles in
-`crates/m241-core/src/firmware/`, with a test that asserts the hashes.
+Run `m241 fw dump --port auto -o backup/mine.bin` and `m241 fw patch backup/mine.bin --dry-run`, then open an issue with the output (hashes and offsets only — never firmware bytes). Profiles live in `crates/m241-core/src/firmware/` with hash tests.
 
-```bash
-m241 fw dump --port auto -o backup/mine.bin
-m241 fw patch backup/mine.bin --dry-run
-```
+## Documentation & pull requests
 
-Open an issue with that output. It contains hashes and offsets only, never
-firmware bytes.
+- `docs/reference/` is normative; update code and reference together.
+- Only [`docs/dev/05-verification.md`](docs/dev/05-verification.md) moves a claim from unverified to hardware-verified.
+- Follow the three-stage independent review protocol and Tier 1/2/3 rules in [`docs/dev/09-review-protocol.md`](docs/dev/09-review-protocol.md). Every PR requires an independent reviewer's `review-gate` status on the exact head SHA plus 6/6 `./tools/check.sh` and CI.
 
-## Documentation
+## Commits & personal data
 
-- `docs/reference/` is normative. If code and reference disagree, one of them is
-  a bug; fix both in the same commit.
-- `docs/dev/04-prior-art.md` records what was taken from where. Keep it honest.
-- `docs/dev/05-verification.md` separates what was measured on hardware from
-  what was only tested against the simulator. Never move a claim across that
-  line without a hardware run.
-
-## Before you open a pull request
-
-The merge gate is more than CI. Read
-[`docs/dev/09-review-protocol.md`](docs/dev/09-review-protocol.md) for the full
-three-stage process. In short:
-
-- **Tier 1** — docs/tests only, or 1–100 non-test lines: one independent
-  reviewer does the specification review of the diff and the tests (readability
-  is n/a). The `review-gate` status is still required.
-- **Tier 2** — 101–300 non-test lines, one module: specification and
-  readability reviews by two agents, a third agent verifies the fix, and 3–5
-  mutation tests.
-- **Tier 3** — safety-critical (`m241-flash`, the protocol, geotag (EXIF
-  rewrite), destructive paths) regardless of size, or 301+ non-test lines, or
-  more than one module: two reviewers over every changed file, a deep
-  third-agent verification, and 10+ mutation tests. Split the pull request first
-  if you can.
-
-Count non-test lines as the added plus deleted lines in `git diff --numstat`
-with `tests/` and `*_test.rs` excluded; inline `#[cfg(test)]` tests count. If
-unsure, count more and take the higher tier.
-
-`docs/dev/09-review-protocol.md` is authoritative; this list and the pull
-request template are summaries of its tier table.
-
-After the independent review, the reviewer posts the `review-gate` status on
-the exact head SHA. Branch protection requires it in every tier, and a new push
-needs a new review. `./tools/check.sh` must be 6/6 and every required CI check
-must pass.
-
-## Commits
-
-Conventional prefixes: `feat:`, `fix:`, `docs:`, `chore:`, `test:`. Say what was
-measured and what it replaced. For protocol fixes, name the byte sequence and the
-symptom it caused.
-
-## Personal data
-
-Track logs are personal location data. Never commit one, never paste coordinates
-into an issue, and never add a test fixture built from a real recording. Use
-`35.6812360, 139.7671250` (a city centre) or the no-fix placeholder
-`8960.0000,N,00000.0000,E`.
+Use Conventional prefixes (`feat:`, `fix:`, `docs:`, `chore:`, `test:`), naming byte sequences and symptoms for protocol fixes. Never commit real track logs, coordinates, local paths, or vendor binaries — use `35.6812360, 139.7671250` or `8960.0000,N,00000.0000,E`.
