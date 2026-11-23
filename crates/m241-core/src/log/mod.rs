@@ -11,7 +11,11 @@
 //!   export     a `Track` -> GPX / KML / CSV / CSV report / NMEA / JSON
 //!   kmz        a `Track` + photos -> uncompressed KMZ (KML 2.0 + Store ZIP),
 //!              with optional `icon/` thumbnails for the map
-//!   import     GPX 1.0/1.1 or NMEA 0183 -> `Track` (plus the NMEA line counts)
+//!   import     GPX 1.0/1.1, KML 2.0/2.2 or KMZ, or NMEA 0183 -> `Track`
+//!              (plus the NMEA line counts)
+//!   html       a `Track` -> one static HTML page: inline SVG map and summary
+//!   report     the summary rows, and RTF output of the same rows plus the
+//!              point table
 //!   edit       split, merge, delete points, thin by stride, and multi-step
 //!              Undo/Redo
 //!   coord      format coordinates as Decimal, DMS, or WGS84 UTM
@@ -47,11 +51,13 @@ pub mod edit;
 pub mod exif;
 pub mod export;
 pub mod geotag;
+pub mod html;
 pub mod import;
 pub mod journal;
 pub mod kmz;
 pub mod parse;
 pub mod record;
+pub mod report;
 
 #[cfg(test)]
 mod fixture;
@@ -70,7 +76,9 @@ pub use geotag::{
     apply as apply_geotags, group_matched_plans, plan as plan_geotags, plan_with_shift,
     plan_with_time_shift,
 };
-pub use import::{NmeaImport, import_gpx, import_nmea};
+pub use html::to_html;
+pub use import::{NmeaImport, import_gpx, import_kml, import_kmz, import_nmea};
 pub use kmz::{KmzIconOptions, KmzPhoto, export_kmz, export_kmz_with_icons};
 pub use parse::{ParseReport, parse_dump};
 pub use record::{DEFAULT_RECORD_BYTES, MIN_RECORD_BYTES, decode};
+pub use report::to_rtf;

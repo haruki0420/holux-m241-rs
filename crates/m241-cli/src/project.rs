@@ -178,9 +178,13 @@ pub fn load(options: &LogProjectLoadOptions, session: Session<'_>) -> Result<()>
     let read = LogReadOptions {
         nmea: document.input.is_nmea(),
         gpx: false,
+        kml: false,
+        kmz: false,
         file: log,
         format,
         csv_report: false,
+        html: false,
+        rtf: false,
         coord_format: CoordFormatArg::Decimal,
         simplify: None,
         cache: None,

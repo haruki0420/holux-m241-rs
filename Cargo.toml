@@ -33,6 +33,10 @@ serialport = "4"
 # `jpeg` feature is enabled; the other format back-ends are not built. The
 # reduction is in `crates/m241-core/src/log/kmz.rs`.
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# Reading a KMZ needs one inflate for the deflate entries a KMZ normally holds;
+# `zip` itself is not pulled in because only `doc.kml` is ever read. The
+# pure-Rust backend keeps the dependency C-toolchain-free like `image`'s.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 serde_json = "1"
 egui = "0.37"
 eframe = "0.37"

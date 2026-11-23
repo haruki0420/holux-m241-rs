@@ -394,12 +394,13 @@ damage or with no points at all.
 
 ## `m241 log read`
 
-Converts a dumped log — or, with `--nmea` / `--gpx`, another kind of input — to
-CSV, GPX, KML, NMEA or JSON (`--format`, default `gpx`), writing to
+Converts a dumped log — or, with `--nmea` / `--gpx` / `--kml` / `--kmz`, another
+kind of input — to CSV, GPX, KML, NMEA or JSON (`--format`, default `gpx`), or to
+one of the three report writers (`--csv-report`, `--html`, `--rtf`), writing to
 `-o/--output <FILE>` or stdout when omitted.
 `--utc-offset-days` accepts a number or `auto` (default `auto`); `auto` shifts
 only if the newest record looks stale, and **is never applied to an imported
-GPX** (see below). An explicit number is applied to every input.
+document** (see below). An explicit number is applied to every input.
 
 ### Input kinds
 
@@ -428,20 +429,37 @@ exported by ezTour or another tool. `<trkpt>` elements (with `ele`, `time`,
 `<speed>` and this toolkit's `<extensions><speed_kmh>`) become points.
 **`<wpt>` waypoints are not read**: a saved place is a different kind of object
 from a recorded position, and this importer has no rule for turning one into the
-other. The two input switches cannot be combined with each other or with
+other. The four input switches cannot be combined with each other or with
 `--cache`. A GPX document with no `<trkpt>` (a `<wpt>`-only or `<rte>`-only
 file) is an **error** naming the file, with nothing written: the same rule as an
 NMEA capture that yields no point, because an empty export with exit code 0
 would look like a successful conversion.
 
-**`auto` is not applied to an imported GPX.** The stale window `auto` uses
-(1999-08-22 to 2019-04-06) identifies a dump from an unpatched unit; a GPX from
-another tool can be a genuinely historical trip in the same window, so its
-timestamps are kept as written. When a GPX's newest date falls in that window,
-the run warns and names the day count that would shift it
-(`--utc-offset-days 7168` for a file exported from an unpatched unit); a GPX
-exported by this toolkit from a fixed unit needs no shift. An explicit number
-always applies.
+`--kml` reads the input as a **KML 2.0 or 2.2** document — the other way in for a
+track exported by ezTour or another tool. The `<coordinates>` of every `<Point>`
+and `<LineString>` are read in document order, and each `lon,lat[,alt]` tuple
+becomes a point. Namespace prefixes are ignored, so the 2.0 namespace
+(`http://earth.google.com/kml/2.0`) and the 2.2 one
+(`http://www.opengis.net/kml/2.2`), with or without a prefix, all load. A KML
+records a shape rather than a time series: no `<TimeStamp>`, speed or placemark
+name is read, so an imported point carries a position and an optional height and
+nothing else. A `<LinearRing>` (a Polygon outline) is skipped because an area
+outline is not a recorded track. A document with no geometry is an **error**,
+with nothing written, on the same rule as a GPX with no `<trkpt>`.
+
+`--kmz` reads a **KMZ archive** — a ZIP that holds `doc.kml` — and imports that
+document with `--kml`'s reader. When `doc.kml` is absent the first `.kml` entry is
+used. Stored and deflated entries are both read (a deflated `doc.kml` is the
+normal case); ZIP64, encryption and other compression methods are refused with
+an error naming the reason, as is a `doc.kml` larger than 64 MiB once
+decompressed. An archive with no `.kml` entry is an error.
+
+`.dst` ("Destination File"), which the specification lists as readable
+([`07-eztour-spec.ja.md`](../dev/07-eztour-spec.ja.md) §2), is **not
+implemented**. The specification records no structure for it and no sample exists
+in this repository or in the vendor distribution; a parser written against a
+guess would be a format this project invented, so it is left out until a real
+file defines it.
 
 Dropped sentences are a warning: a partial track is still written. A **non-empty**
 capture that yields no point at all is an error naming the file and the counts,
@@ -456,7 +474,8 @@ carried as fields in the exported object, so a script does not have to parse a
 human message:
 
 * `"nmea": {"imported": N, "dropped": N, "ignored": N}` for `--nmea`;
-* `"input": "gpx"` for `--gpx`;
+* `"input": "gpx"`, `"input": "kml"` or `"input": "kmz"` for the matching input
+  switch;
 * `"offset_days": N` when the day shift was not zero;
 * `"simplify": N` when `--simplify` thinned the points;
 * `"position": {"format": ..., "start": {...}, "end": {...}}` when a point
@@ -525,6 +544,26 @@ own layout, so a byte comparison with ezTour is 未検証. The summary carries t
 recomputed facts (`RECORDS`, `FIXES`, `START`, `END`, `DISTANCE M`,
 `DURATION S`, `AVERAGE SPEED KMH`, `MAX SPEED KMH`, `MIN ALTITUDE M`,
 `MAX ALTITUDE M`); a fact with no data is an empty value there.
+
+`--html` writes the static HTML snapshot ezTour's HTML export produced
+([`07-eztour-spec.ja.md`](../dev/07-eztour-spec.ja.md) §2, §5), without its
+dependency on the Google Maps API: one self-contained file with an inline SVG
+map and the summary table. The map draws the track's own coordinates in an
+equirectangular projection, with a scale bar, start and end markers, and an
+attribution line; it uses **no tiles, no JavaScript and no external request**, so
+the file works offline and can be archived. The summary is `--csv-report`'s ten
+facts in a table. A track with no positioned point gets the summary and a
+sentence instead of an empty map. `--html` is exclusive with `--format`,
+`--csv-report` and `--rtf`.
+
+`--rtf` writes a printable report: the same ten summary facts and a table of
+every point (index, UTC date and time, latitude, longitude, altitude, speed). Text
+is escaped for RTF (`\`, `{` and `}`, and every non-ASCII character as a `\uN?`
+control word), so no name or value can end the document early; it opens in any
+word processor and needs no template. `--rtf` is exclusive with `--format`,
+`--csv-report` and `--html`. Neither writer is a byte-compatible copy of ezTour's
+output — the specification records the formats and not their layout — so a
+comparison with a real ezTour file is 未検証.
 
 `--format gpx` writes GPX 1.1 with ezTour's template shape
 ([`07-eztour-spec.ja.md`](../dev/07-eztour-spec.ja.md) §2): `lat`/`lon` to nine

@@ -787,7 +787,7 @@ pub struct EraseOptions {
 #[derive(Debug, Args)]
 pub struct LogReadOptions {
     /// The raw dump `m241 log download` wrote, an NMEA 0183 capture with `--nmea`,
-    /// or a GPX document with `--gpx`.
+    /// or a GPX/KML document or KMZ archive with `--gpx` / `--kml` / `--kmz`.
     pub file: PathBuf,
 
     /// Read the input as an NMEA 0183 capture instead of a raw dump.
@@ -801,8 +801,25 @@ pub struct LogReadOptions {
     /// are **not** read, because a saved place is a different kind of object
     /// from a recorded position. A document with no `<trkpt>` is an error (exit
     /// 1) rather than an empty export with exit 0.
-    #[arg(long, conflicts_with = "nmea")]
+    #[arg(long, conflicts_with_all = ["nmea", "kml", "kmz", "cache"])]
     pub gpx: bool,
+
+    /// Read the input as a KML 2.0/2.2 document instead of a raw dump.
+    ///
+    /// Reads the `<coordinates>` of every `<Point>` and `<LineString>`;
+    /// namespace prefixes are ignored, so both KML namespaces load. A KML
+    /// records a shape rather than a time series, so an imported point carries
+    /// a position and an optional height but no timestamp or speed. A document
+    /// with no geometry is an error, as an empty GPX is.
+    #[arg(long, conflicts_with_all = ["nmea", "gpx", "kmz", "cache"])]
+    pub kml: bool,
+
+    /// Read the input as a KMZ archive (a ZIP holding `doc.kml`).
+    ///
+    /// The archive's `doc.kml` is read as KML; when that name is absent the
+    /// first `.kml` entry is used. Stored and deflated entries are both read.
+    #[arg(long, conflicts_with_all = ["nmea", "gpx", "kml", "cache"])]
+    pub kmz: bool,
 
     /// Output format.
     #[arg(long, value_parser = parse_format, default_value = "gpx")]
@@ -813,8 +830,25 @@ pub struct LogReadOptions {
     /// Exclusive with `--format`: the report is a different document, not a
     /// sixth `--format` value. Its point table reuses the twelve point columns;
     /// the summary rows above it are this project's own layout.
-    #[arg(long, conflicts_with = "format")]
+    #[arg(long, conflicts_with_all = ["format", "html", "rtf"])]
     pub csv_report: bool,
+
+    /// Write one static HTML page: an inline SVG map and the summary table.
+    ///
+    /// No tiles, no JavaScript and no external request: the track's own
+    /// coordinates are drawn in an equirectangular projection with a scale bar
+    /// and an attribution line, so the file stays readable offline. Exclusive
+    /// with `--format`, `--csv-report` and `--rtf`.
+    #[arg(long, conflicts_with_all = ["format", "csv_report", "rtf"])]
+    pub html: bool,
+
+    /// Write an RTF report: the summary and a table of every point.
+    ///
+    /// RTF opens in any word processor and prints without a template. Text is
+    /// escaped for the format (`\`, `{`, `}`, and non-ASCII as `\uN?`).
+    /// Exclusive with `--format`, `--csv-report` and `--html`.
+    #[arg(long, conflicts_with_all = ["format", "csv_report", "html"])]
+    pub rtf: bool,
 
     /// How to render the start and end coordinates in the report on stderr and
     /// in `--format json`'s `position` object.
@@ -844,7 +878,7 @@ pub struct LogReadOptions {
     /// unreadable or older cache is a warning and a re-parse. It is this
     /// project's own format and is not ezTour's `.tki`; only a raw dump can be
     /// cached.
-    #[arg(long, conflicts_with_all = ["nmea", "gpx"], value_name = "FILE")]
+    #[arg(long, conflicts_with_all = ["nmea", "gpx", "kml", "kmz"], value_name = "FILE")]
     pub cache: Option<PathBuf>,
 
     /// Where to write the converted track; stdout when omitted.
@@ -870,6 +904,31 @@ pub struct LogReadOptions {
         default_value = "auto"
     )]
     pub utc_offset_days: OffsetSpec,
+}
+
+impl Default for LogReadOptions {
+    /// The documented defaults: what clap fills in when a flag is omitted.
+    ///
+    /// A test that builds the options by hand starts from the same values, so
+    /// adding a flag does not silently change what the other tests exercise.
+    fn default() -> Self {
+        Self {
+            file: PathBuf::new(),
+            nmea: false,
+            gpx: false,
+            kml: false,
+            kmz: false,
+            format: ExportFormat::Gpx,
+            csv_report: false,
+            html: false,
+            rtf: false,
+            coord_format: CoordFormatArg::Decimal,
+            simplify: None,
+            cache: None,
+            output: None,
+            utc_offset_days: OffsetSpec::Days(0),
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -2211,7 +2270,11 @@ mod tests {
         let options = parse_read(&["m241", "log", "read", "track.bin"]);
         assert!(!options.nmea);
         assert!(!options.gpx);
+        assert!(!options.kml);
+        assert!(!options.kmz);
         assert!(!options.csv_report);
+        assert!(!options.html);
+        assert!(!options.rtf);
         assert_eq!(options.coord_format, CoordFormatArg::Decimal);
         assert_eq!(options.simplify, None);
         assert_eq!(options.cache, None);
@@ -2220,6 +2283,22 @@ mod tests {
         let options = parse_read(&["m241", "log", "read", "track.gpx", "--gpx"]);
         assert!(options.gpx);
         assert!(!options.nmea);
+
+        let options = parse_read(&["m241", "log", "read", "track.kml", "--kml"]);
+        assert!(options.kml);
+        assert!(!options.kmz);
+
+        let options = parse_read(&["m241", "log", "read", "track.kmz", "--kmz"]);
+        assert!(options.kmz);
+        assert!(!options.kml);
+
+        let options = parse_read(&["m241", "log", "read", "track.bin", "--html"]);
+        assert!(options.html);
+        assert!(!options.rtf);
+
+        let options = parse_read(&["m241", "log", "read", "track.bin", "--rtf"]);
+        assert!(options.rtf);
+        assert!(!options.html);
 
         let options = parse_read(&[
             "m241",
@@ -2248,10 +2327,15 @@ mod tests {
         assert!(options.csv_report);
         assert_eq!(options.cache, Some(PathBuf::from("track.cache.json")));
 
-        // The input kinds are one choice, and so are the point CSV and the report.
+        // The input kinds are one choice, and so are the point CSV, the HTML
+        // snapshot and the RTF report.
         for args in [
             vec!["m241", "log", "read", "a", "--gpx", "--nmea"],
             vec!["m241", "log", "read", "a", "--cache", "c.json", "--gpx"],
+            vec!["m241", "log", "read", "a", "--kml", "--nmea"],
+            vec!["m241", "log", "read", "a", "--kmz", "--gpx"],
+            vec!["m241", "log", "read", "a", "--kml", "--kmz"],
+            vec!["m241", "log", "read", "a", "--kml", "--cache", "c.json"],
             vec![
                 "m241",
                 "log",
@@ -2261,6 +2345,9 @@ mod tests {
                 "--format",
                 "csv",
             ],
+            vec!["m241", "log", "read", "a", "--html", "--format", "csv"],
+            vec!["m241", "log", "read", "a", "--rtf", "--csv-report"],
+            vec!["m241", "log", "read", "a", "--html", "--rtf"],
         ] {
             let err = Cli::try_parse_from(&args).expect_err("the flags conflict");
             assert_eq!(
