@@ -39,7 +39,7 @@ export function Sidebar({
   onSelect: (screen: ScreenId) => void;
 }) {
   return (
-    <aside className="flex w-56 shrink-0 flex-col border-r border-hair px-4 py-4">
+    <aside className="flex w-56 shrink-0 flex-col border-r border-hair px-4 pb-4 pt-[72px]">
       <p className="px-2 text-xs text-ink-3">画面</p>
       <nav aria-label="画面" className="mt-2">
         <ul className="flex flex-col gap-1">

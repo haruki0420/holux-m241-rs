@@ -42,6 +42,29 @@ const WHITE = "#ffffff";
 /** How close, in screen pixels, a click or hover counts as "on the track". */
 const HIT_PIXELS = 20;
 
+/**
+ * Room for the chrome that floats over the map: the 56 px header, the 48 px
+ * toolbar below it, and the timeline at the bottom. `fitBounds` fits the track
+ * into the uncovered rectangle, not the whole canvas, so nothing is framed
+ * under the header.
+ */
+const FIT_PADDING = { top: 120, bottom: 72, left: 56, right: 56 };
+
+/**
+ * A quiet basemap: the track is the only saturated element on the map.
+ *
+ * OSM's default raster is full colour — pink motorways, green parks, coloured
+ * POI icons — and at 5 px the accent track loses the "one light element"
+ * contest (DESIGN.md: the map is a pale surface). Desaturating almost to grey
+ * and capping the brightness keeps roads and labels readable while leaving the
+ * accent as the only colour that means something.
+ */
+const RASTER_PAINT = {
+  "raster-opacity": 0.9,
+  "raster-saturation": -0.7,
+  "raster-brightness-max": 0.85,
+} as const;
+
 type Basemap = { readonly tiles: boolean };
 
 /** The map's empty style: either a raster OSM basemap or no network at all. */
@@ -71,7 +94,7 @@ function baseStyle({ tiles }: Basemap): NonNullable<Parameters<maplibregl.Map["s
               id: "osm",
               type: "raster" as const,
               source: "osm",
-              paint: { "raster-opacity": 0.9 },
+              paint: { ...RASTER_PAINT },
             },
           ]
         : []),
@@ -158,6 +181,8 @@ export function MapCanvas({
   const pointMapRef = useRef(new Map<number, PointDto>());
   const locatorRef = useRef<PointLocator | null>(null);
   const popupIndexRef = useRef<number | null>(null);
+  const popupCloseRef = useRef<HTMLButtonElement | null>(null);
+  const pendingPopupFocusRef = useRef(false);
   const followRef = useRef(follow);
   const pointsRef = useRef<PointDto[]>(points);
   const playingRef = useRef(playing);
@@ -188,7 +213,19 @@ export function MapCanvas({
 
   useEffect(() => {
     popupIndexRef.current = popupPoint?.index ?? null;
+    pendingPopupFocusRef.current = popupPoint !== null;
   }, [popupPoint]);
+
+  // A dialog that opens without moving focus leaves the keyboard on the map
+  // behind it. The popup is positioned by `popupAt` one render later, so the
+  // focus waits for the first placement; `pendingPopupFocusRef` keeps later
+  // placements (every map move) from stealing the caret back.
+  useEffect(() => {
+    if (pendingPopupFocusRef.current && popupAt !== null) {
+      pendingPopupFocusRef.current = false;
+      popupCloseRef.current?.focus();
+    }
+  }, [popupAt]);
 
   const photoForPoint = useMemo(() => {
     const map = new Map<number, PhotoDto>();
@@ -212,7 +249,7 @@ export function MapCanvas({
           [bounds.west, bounds.south],
           [bounds.east, bounds.north],
         ],
-        { padding: 56, maxZoom: 15, duration },
+        { padding: FIT_PADDING, maxZoom: 15, duration },
       );
     },
     [summary.bounds],
@@ -248,6 +285,12 @@ export function MapCanvas({
       return;
     }
     mapRef.current = map;
+    // The wrapper is the one keyboard surface (`role="application"` with the key
+    // help in its label). MapLibre's canvas is a second tab stop with no visible
+    // outline, so it is removed from the tab order and from the accessibility
+    // tree; the wrapper speaks for the map.
+    map.getCanvas().tabIndex = -1;
+    map.getCanvas().setAttribute("aria-hidden", "true");
     map.addControl(new maplibregl.ScaleControl({ maxWidth: 110, unit: "metric" }), "bottom-right");
     // Not compact: the OSM credit has to be readable without a click.
     map.addControl(new maplibregl.AttributionControl({ compact: false }), "bottom-right");
@@ -375,12 +418,20 @@ export function MapCanvas({
   }, [summary.source]);
 
   // Fit the whole track once the style has loaded, then leave the camera alone.
+  //
+  // The first selection (point 0, set when the document opens) also fires the
+  // follow effect below. If it won, it would ease the camera to point 0 at zoom
+  // 14 and the fit would be thrown away — the review saw the second session
+  // clipped off the top. The fit therefore suppresses exactly one follow pass;
+  // every later selection change still follows.
   const fittedRef = useRef<string | null>(null);
+  const suppressFollowOnceRef = useRef(false);
   useEffect(() => {
     if (!ready || summary.source === fittedRef.current) {
       return;
     }
     fittedRef.current = summary.source;
+    suppressFollowOnceRef.current = true;
     fitAll(0);
   }, [ready, summary.source, fitAll]);
 
@@ -396,7 +447,7 @@ export function MapCanvas({
         [fitTarget.bounds.west, fitTarget.bounds.south],
         [fitTarget.bounds.east, fitTarget.bounds.north],
       ],
-      { padding: 56, maxZoom: 16, duration: 420 },
+      { padding: FIT_PADDING, maxZoom: 16, duration: 420 },
     );
   }, [fitTarget, ready]);
 
@@ -481,6 +532,12 @@ export function MapCanvas({
   useEffect(() => {
     const map = mapRef.current;
     if (!ready || map === null || !follow || selectedIndex === null) {
+      return;
+    }
+    if (suppressFollowOnceRef.current) {
+      // The document was just fitted; this selection is the fit's own point 0,
+      // not the operator asking to follow a point.
+      suppressFollowOnceRef.current = false;
       return;
     }
     const point = pointMapRef.current.get(selectedIndex);
@@ -619,7 +676,7 @@ export function MapCanvas({
       />
 
       <div className="pointer-events-none absolute inset-0">
-        <div className="pointer-events-auto absolute right-3 top-3 flex flex-col gap-1">
+        <div className="pointer-events-auto absolute right-3 top-[120px] flex flex-col gap-1">
           <MapButton label="拡大" onClick={() => mapRef.current?.zoomIn({ duration: 160 })}>
             <Plus size={16} strokeWidth={1.5} aria-hidden="true" />
           </MapButton>
@@ -679,6 +736,7 @@ export function MapCanvas({
               {popupPoint.waypoint ? <p className="mt-1 text-xs text-ink-3">目印</p> : null}
             </div>
             <button
+              ref={popupCloseRef}
               type="button"
               onClick={onClosePopup}
               aria-label="閉じる"

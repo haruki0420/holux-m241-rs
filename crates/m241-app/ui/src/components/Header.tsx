@@ -30,7 +30,7 @@ export function Header({ controller }: { controller: DeviceProbeController }) {
         : activePort;
 
   return (
-    <header className="flex h-14 shrink-0 items-center justify-between gap-6 border-b border-hair bg-card px-4">
+    <header className="absolute inset-x-0 top-0 z-header flex h-14 items-center justify-between gap-6 border-b border-hair bg-card px-4">
       <div className="flex min-w-0 items-center gap-3">
         <Mark />
         <span className="text-md font-medium text-ink">Holux M-241</span>

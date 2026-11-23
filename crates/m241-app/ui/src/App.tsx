@@ -16,6 +16,8 @@ export default function App() {
 
   return (
     <div className="flex h-dvh flex-col bg-paper text-ink">
+      {/* The header floats over the map so the map can own the full window
+          height; the screens that are not a map pad their own content below it. */}
       <Header controller={controller} />
       <div className="flex min-h-0 flex-1">
         <Sidebar
@@ -26,7 +28,9 @@ export default function App() {
         />
         <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
           {screen === "connect" ? (
-            <ConnectScreen controller={controller} onOpenLog={() => setScreen("log")} />
+            <div className="flex min-h-0 flex-1 flex-col pt-14">
+              <ConnectScreen controller={controller} onOpenLog={() => setScreen("log")} />
+            </div>
           ) : (
             <LogScreen log={log} />
           )}

@@ -360,6 +360,11 @@
     z-index: 10;
   }
 
+  /* The chrome that floats over the map (header, toolbar) sits above it. */
+  .z-header {
+    z-index: 40;
+  }
+
   .z-popup {
     z-index: 20;
   }
@@ -399,7 +404,8 @@
 
   .map-readout {
     position: absolute;
-    top: 12px;
+    /* Below the header (56 px) and the floating toolbar (48 px). */
+    top: 120px;
     left: 12px;
     min-width: 196px;
     padding: 8px 10px;
@@ -554,8 +560,12 @@
   color: var(--ink-2);
 }
 
-.maplibregl-canvas:focus {
-  outline: none;
+/* The canvas is not a tab stop (the wrapper owns the keyboard), but if a
+   pointer or script focuses it the focus is still visible. Denying the outline
+   outright was the review's "invisible second tab stop". */
+.maplibregl-canvas:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 @media (prefers-reduced-motion: reduce) {

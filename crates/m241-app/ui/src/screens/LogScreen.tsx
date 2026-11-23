@@ -92,34 +92,37 @@ export function LogScreen({ log }: { log: LogController }) {
   }
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col" data-dragging={dragging ? "true" : "false"}>
-      <LogToolbar log={log} tiles={tiles} onToggleTiles={() => setTiles((on) => !on)} />
-      <div className="flex min-h-0 flex-1">
-        <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-          <MapCanvas
-            summary={state.summary}
-            points={log.points}
-            photos={log.photos}
-            selectedIndex={log.selectedIndex}
-            popupPoint={log.popupPoint}
-            follow={log.follow}
-            playing={log.playing}
-            tiles={tiles}
-            fitTarget={log.fitTarget}
-            onOpenPopup={log.openPopup}
-            onClosePopup={log.closePopup}
-            onToggleFollow={log.toggleFollow}
-          />
-          <Timeline
-            points={log.points}
-            selectedIndex={log.selectedIndex}
-            playing={log.playing}
-            onSeek={log.seek}
-            onTogglePlay={log.togglePlaying}
-          />
+    <div className="flex min-h-0 flex-1" data-dragging={dragging ? "true" : "false"}>
+      <div className="relative flex min-h-0 min-w-0 flex-1">
+        <MapCanvas
+          summary={state.summary}
+          points={log.points}
+          photos={log.photos}
+          selectedIndex={log.selectedIndex}
+          popupPoint={log.popupPoint}
+          follow={log.follow}
+          playing={log.playing}
+          tiles={tiles}
+          fitTarget={log.fitTarget}
+          onOpenPopup={log.openPopup}
+          onClosePopup={log.closePopup}
+          onToggleFollow={log.toggleFollow}
+        />
+        <Timeline
+          points={log.points}
+          selectedIndex={log.selectedIndex}
+          playing={log.playing}
+          onSeek={log.seek}
+          onTogglePlay={log.togglePlaying}
+        />
+        {/* The toolbar floats over the map instead of taking a band of its
+            own: the map is the screen, and every row above it is chrome over
+            the same surface. */}
+        <div className="absolute inset-x-0 top-14 z-map">
+          <LogToolbar log={log} tiles={tiles} onToggleTiles={() => setTiles((on) => !on)} />
         </div>
-        <Dock log={log} />
       </div>
+      <Dock log={log} />
     </div>
   );
 }
@@ -132,7 +135,7 @@ function LogStart({ log, dragging }: { log: LogController; dragging: boolean }) 
   };
 
   return (
-    <div className="relative flex min-h-0 flex-1 flex-col overflow-y-auto">
+    <div className="relative flex min-h-0 flex-1 flex-col overflow-y-auto pt-14">
       <div aria-hidden="true" className="contour absolute inset-0" />
       <div className="relative mx-auto flex w-full max-w-4xl flex-1 flex-col justify-center gap-10 px-10 py-10 lg:flex-row lg:items-center lg:justify-between lg:gap-16">
         <div className="w-full max-w-md">
@@ -210,7 +213,7 @@ function Fact({ label, children }: { label: string; children: ReactNode }) {
 function LogLoading({ label }: { label: string }) {
   return (
     <div
-      className="relative flex min-h-0 flex-1 flex-col items-center justify-center gap-3"
+      className="relative flex min-h-0 flex-1 flex-col items-center justify-center gap-3 pt-14"
       role="status"
       aria-busy="true"
     >
@@ -240,7 +243,7 @@ function LogFailure({
   dragging: boolean;
 }) {
   return (
-    <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-y-auto px-8 py-10">
+    <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-y-auto px-8 pb-10 pt-[96px]">
       <div aria-hidden="true" className="contour absolute inset-0" />
       <div className="relative w-full max-w-md" role="alert">
         <p className="flex items-center gap-2 text-sm font-medium text-ink">

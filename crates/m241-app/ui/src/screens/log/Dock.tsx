@@ -46,7 +46,7 @@ export function Dock({ log }: { log: LogController }) {
   };
 
   return (
-    <aside className="flex w-[272px] shrink-0 flex-col border-l border-hair bg-card">
+    <aside className="flex w-[272px] shrink-0 flex-col border-l border-hair bg-card pt-14">
       <div
         role="tablist"
         aria-label="ログのパネル"
@@ -81,7 +81,10 @@ export function Dock({ log }: { log: LogController }) {
               role="tab"
               id={`dock-tab-${id}`}
               aria-selected={active}
-              aria-controls={`dock-panel-${id}`}
+              // Only the active panel exists in the DOM, so only that tab may
+              // point at it. The other four used to reference ids that were
+              // never rendered (the review measured targetExists: false ×4).
+              aria-controls={active ? `dock-panel-${id}` : undefined}
               aria-label={label}
               title={label}
               tabIndex={active ? 0 : -1}

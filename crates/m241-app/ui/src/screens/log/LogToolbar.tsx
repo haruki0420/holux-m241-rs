@@ -124,6 +124,13 @@ function ExportMenu({ log, onDone }: { log: LogController; onDone: () => void })
   const [destination, setDestination] = useState(() =>
     summary === null ? "" : swapExtension(summary.source, "gpx"),
   );
+  const destinationRef = useRef<HTMLInputElement | null>(null);
+
+  // `role="dialog"` promises the keyboard it lands inside the dialog; without
+  // this the menu opened with focus still on the trigger behind it.
+  useEffect(() => {
+    destinationRef.current?.focus();
+  }, []);
 
   if (summary === null) {
     return null;
@@ -172,6 +179,7 @@ function ExportMenu({ log, onDone }: { log: LogController; onDone: () => void })
       </label>
       <input
         id="export-destination"
+        ref={destinationRef}
         className="field mt-1 h-8 text-xs"
         value={destination}
         placeholder="/home/user/track.gpx"
