@@ -45,9 +45,9 @@ export function Timeline({
         className="flex size-8 shrink-0 items-center justify-center rounded-control text-ink-2 hover:bg-raise hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
       >
         {playing ? (
-          <Pause size={14} strokeWidth={1.5} aria-hidden="true" />
+          <Pause size={16} strokeWidth={1.5} aria-hidden="true" />
         ) : (
-          <Play size={14} strokeWidth={1.5} aria-hidden="true" />
+          <Play size={16} strokeWidth={1.5} aria-hidden="true" />
         )}
       </button>
 

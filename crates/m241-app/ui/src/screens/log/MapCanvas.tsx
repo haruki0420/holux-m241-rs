@@ -684,7 +684,7 @@ export function MapCanvas({
               aria-label="閉じる"
               className="-mr-1 -mt-1 flex size-6 items-center justify-center rounded-tag text-ink-3 hover:bg-raise hover:text-ink"
             >
-              <X size={14} strokeWidth={1.5} aria-hidden="true" />
+              <X size={16} strokeWidth={1.5} aria-hidden="true" />
             </button>
           </div>
           <p className="mono mt-2 text-xs text-ink-2">

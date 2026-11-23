@@ -93,7 +93,7 @@ export function Dock({ log }: { log: LogController }) {
               }
             >
               {active ? <span aria-hidden="true" className="trail-mark" /> : null}
-              <Icon size={18} strokeWidth={1.5} aria-hidden="true" />
+              <Icon size={16} strokeWidth={1.5} aria-hidden="true" />
             </button>
           );
         })}

@@ -53,7 +53,7 @@ export function PhotoFolder({ log }: { log: LogController }) {
           });
         }}
       >
-        <FolderOpen size={14} strokeWidth={1.5} aria-hidden="true" />
+        <FolderOpen size={16} strokeWidth={1.5} aria-hidden="true" />
         {log.photoLoading ? "読み込み中" : "読み込む"}
       </button>
       <p className="mt-2 text-[11px] text-ink-3">撮影時刻で最も近い記録点に結び付けます</p>
@@ -98,7 +98,7 @@ export function PhotoViewPanel({ log }: { log: LogController }) {
       <div className="relative overflow-hidden rounded-control border border-hair bg-inset">
         {photo.thumbnail === null ? (
           <div className="flex aspect-[4/3] w-full flex-col items-center justify-center gap-2 text-ink-3">
-            <Camera size={20} strokeWidth={1.5} aria-hidden="true" />
+            <Camera size={16} strokeWidth={1.5} aria-hidden="true" />
             <p className="text-xs">表示できません</p>
           </div>
         ) : (
@@ -118,7 +118,7 @@ export function PhotoViewPanel({ log }: { log: LogController }) {
           disabled={log.photos.length < 2}
           onClick={() => log.movePhoto(-1)}
         >
-          <ChevronLeft size={14} strokeWidth={1.5} aria-hidden="true" />
+          <ChevronLeft size={16} strokeWidth={1.5} aria-hidden="true" />
         </button>
         <span className="mono text-[11px] text-ink-3">
           {index + 1} / {log.photos.length}
@@ -130,7 +130,7 @@ export function PhotoViewPanel({ log }: { log: LogController }) {
           disabled={log.photos.length < 2}
           onClick={() => log.movePhoto(1)}
         >
-          <ChevronRight size={14} strokeWidth={1.5} aria-hidden="true" />
+          <ChevronRight size={16} strokeWidth={1.5} aria-hidden="true" />
         </button>
       </div>
 

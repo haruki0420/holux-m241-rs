@@ -98,7 +98,7 @@ export function LogToolbar({
             aria-haspopup="dialog"
             onClick={() => setExportOpen((open) => !open)}
           >
-            <Download size={14} strokeWidth={1.5} aria-hidden="true" />
+            <Download size={16} strokeWidth={1.5} aria-hidden="true" />
             書き出し
           </button>
           {exportOpen ? <ExportMenu log={log} onDone={() => setExportOpen(false)} /> : null}
@@ -111,7 +111,7 @@ export function LogToolbar({
           className="btn-quiet"
           onClick={log.close}
         >
-          <X size={14} strokeWidth={1.5} aria-hidden="true" />
+          <X size={16} strokeWidth={1.5} aria-hidden="true" />
         </button>
       </div>
     </div>

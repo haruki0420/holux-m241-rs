@@ -28,7 +28,7 @@ export function MapPanel({ stage, onOpenLog }: { stage: number; onOpenLog: () =>
           </div>
           <button type="button" className="btn-quiet -mr-2 shrink-0" onClick={onOpenLog}>
             ログを開く
-            <ArrowRight size={14} strokeWidth={1.5} aria-hidden="true" />
+            <ArrowRight size={16} strokeWidth={1.5} aria-hidden="true" />
           </button>
         </div>
 
