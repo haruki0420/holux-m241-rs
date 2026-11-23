@@ -31,23 +31,16 @@ export function DeviceCard({
 
   return (
     <section aria-labelledby="device-title" className="card flex flex-col p-5">
-      <div className="flex items-start justify-between gap-4">
-        <div>
-          <h2 id="device-title" className="text-md font-medium text-ink">
-            端末の情報
-          </h2>
-          <p className="mt-1 text-xs text-ink-3">接続後に読み取った値</p>
-        </div>
-        {connected ? null : (
-          <button type="button" className="btn-quiet -mr-2 shrink-0" onClick={onToggleSample}>
-            {sample ? "見本を閉じる" : "見本を表示"}
-          </button>
-        )}
+      <div>
+        <h2 id="device-title" className="text-md font-medium text-ink">
+          端末の情報
+        </h2>
+        <p className="mt-1 text-xs text-ink-3">接続後に読み取った値</p>
       </div>
 
       <div className="mt-4">
         {sample ? (
-          <SampleBody />
+          <SampleBody onClose={onToggleSample} />
         ) : connected ? (
           <ConnectedBody info={state.info} />
         ) : state.kind === "probing" ? (
@@ -55,14 +48,14 @@ export function DeviceCard({
         ) : state.kind === "error" ? (
           <FailedBody message={state.message} hint={state.hint} />
         ) : (
-          <IdleBody />
+          <IdleBody onSample={onToggleSample} />
         )}
       </div>
     </section>
   );
 }
 
-function IdleBody() {
+function IdleBody({ onSample }: { onSample: () => void }) {
   return (
     <div>
       <ol className="grid grid-cols-[1rem_1fr] items-baseline gap-x-3 gap-y-2">
@@ -85,6 +78,10 @@ function IdleBody() {
           ))}
         </ul>
       </div>
+
+      <button type="button" className="btn-quiet -ml-2 mt-2" onClick={onSample}>
+        見本で試す
+      </button>
     </div>
   );
 }
@@ -156,11 +153,17 @@ function ConnectedBody({ info }: { info: DeviceInfo }) {
   );
 }
 
-function SampleBody() {
+function SampleBody({ onClose }: { onClose: () => void }) {
   return (
     <div>
-      <p className="text-xs text-ink-3">実機から読んだ値ではありません</p>
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-xs text-ink-3">実機から読んだ値ではありません</p>
+        <span className="tag shrink-0">見本</span>
+      </div>
       <Figures info={SAMPLE} />
+      <button type="button" className="btn-quiet -ml-2 mt-2" onClick={onClose}>
+        見本を閉じる
+      </button>
     </div>
   );
 }

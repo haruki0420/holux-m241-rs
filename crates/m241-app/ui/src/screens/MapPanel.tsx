@@ -21,7 +21,7 @@ export function MapPanel({ stage }: { stage: number }) {
           <h2 id="map-title" className="text-md font-medium text-ink">
             地図
           </h2>
-          <p className="mt-1 text-xs text-ink-3">ログ画面（P2）で表示します</p>
+          <p className="mt-1 text-xs text-ink-3">記録を開くと、軌跡をここに描きます</p>
         </div>
 
         <StageTrail stages={STAGES} current={stage} />
