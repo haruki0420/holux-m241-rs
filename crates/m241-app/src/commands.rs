@@ -154,6 +154,11 @@ pub fn log_points(
 
 /// Read a folder of photos and match them to the loaded track.
 ///
+/// The three numeric arguments are the §6.1 clock and grouping settings: the
+/// camera's offset from UTC in minutes, the track's whole-day offset (the same
+/// meaning as `--utc-offset-days`) and the grouping distance in metres
+/// (`0` disables grouping).
+///
 /// # Errors
 ///
 /// A Japanese two-line message from [`logdoc::load_photos`], or when no document
@@ -163,13 +168,22 @@ pub fn load_photos(
     state: State<'_, AppState>,
     path: String,
     directory: String,
+    camera_offset_minutes: i32,
+    log_offset_days: i32,
+    group_distance_meters: f64,
 ) -> Result<PhotoLoad, String> {
     let mut guard = state.log.lock().map_err(|_| internal("log"))?;
     let loaded = guard.as_mut().ok_or_else(no_document)?;
     if loaded.source != path {
         return Err(source_changed());
     }
-    logdoc::load_photos(loaded, &directory)
+    let options = logdoc::PhotoOptions {
+        camera_offset_minutes,
+        log_offset_days,
+        group_distance_meters,
+        ..logdoc::PhotoOptions::default()
+    };
+    logdoc::load_photos(loaded, &directory, &options)
 }
 
 /// Write the loaded track to `destination` in `format`.

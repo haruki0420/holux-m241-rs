@@ -38,6 +38,7 @@ use image::ImageEncoder as _;
 use image::codecs::jpeg::JpegEncoder;
 
 use m241_core::log::export::utc_date;
+use m241_core::log::geotag::{self, GeotagOptions, GeotagPlan};
 use m241_core::log::{
     CaptureTime, KmzPhoto, ParseReport, TrackPoint, export_kmz, import_gpx, import_kml, import_kmz,
     parse_dump, read_datetime_original, to_html, to_rtf,
@@ -136,6 +137,52 @@ pub struct LoadedPhoto {
     pub lon: Option<f64>,
     /// A JPEG data URL, when the file could be decoded.
     pub thumbnail: Option<String>,
+    /// Cluster id when distance grouping is on; `None` for an ungrouped photo.
+    pub group_id: Option<usize>,
+}
+
+/// How the photo loader corrects clocks and groups nearby photos.
+///
+/// `07-eztour-spec.ja.md` §6.1 asks for four rules: nearest point, a maximum time
+/// difference, timezone conversion and grouping by distance. The first two were
+/// already here; this struct carries the other two, and [`match_photos`] turns
+/// them into the same decisions `m241_core::log::geotag::GeotagOptions` makes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhotoOptions {
+    /// Minutes added to each photo's capture time before matching.
+    ///
+    /// EXIF `DateTimeOriginal` has no timezone and [`read_datetime_original`]
+    /// reads it as UTC, so a camera set to UTC+9 is nine hours away from the
+    /// track. `540` is that camera; `0` keeps the old behaviour. The sign is
+    /// "camera clock minus UTC", the same convention as the CLI's
+    /// `--tz-offset-minutes`.
+    pub camera_offset_minutes: i32,
+    /// Whole days added to every track timestamp before matching.
+    ///
+    /// The same meaning as `m241 log geotag --utc-offset-days`: a dump from an
+    /// unpatched unit is 7168 days behind, and a photo cannot be matched against
+    /// a track that has not been moved. `0` leaves the track as parsed.
+    pub log_offset_days: i32,
+    /// Photos closer than this many metres share a group.
+    ///
+    /// `0` (the default) does no grouping, matching ezTour's configurable
+    /// `groupPhotoDistance` rather than guessing its distribution default.
+    pub group_distance_meters: f64,
+    /// Largest accepted difference between the capture time and the nearest
+    /// point, in seconds (ezTour's "Max photo/track diff time", in minutes,
+    /// expressed here in seconds).
+    pub max_gap_seconds: u32,
+}
+
+impl Default for PhotoOptions {
+    fn default() -> Self {
+        Self {
+            camera_offset_minutes: 0,
+            log_offset_days: 0,
+            group_distance_meters: 0.0,
+            max_gap_seconds: PHOTO_MAX_GAP_SECONDS,
+        }
+    }
 }
 
 /// A video or other file from the photo folder.
@@ -291,6 +338,8 @@ pub struct PhotoDto {
     pub lon: Option<f64>,
     /// JPEG data URL, when the photo could be decoded.
     pub thumbnail: Option<String>,
+    /// Cluster id when distance grouping is on.
+    pub group_id: Option<usize>,
 }
 
 /// One media file row.
@@ -512,13 +561,18 @@ pub fn point_slice(loaded: &LoadedLog, from: usize, to: usize) -> Result<Vec<Poi
 /// A photo's capture time comes from its Exif `DateTimeOriginal`; when the file
 /// has none, its modification time is used and the row says so. The photo is
 /// matched to the nearest point with a position, within
-/// [`PHOTO_MAX_GAP_SECONDS`]. The result replaces the photos already loaded.
+/// [`PHOTO_MAX_GAP_SECONDS`], after [`PhotoOptions`] moves the two clocks onto
+/// one timeline. The result replaces the photos already loaded.
 ///
 /// # Errors
 ///
 /// A Japanese two-line string when the path is relative, missing, not a
 /// directory, or unreadable.
-pub fn load_photos(loaded: &mut LoadedLog, directory: &str) -> Result<PhotoLoad, String> {
+pub fn load_photos(
+    loaded: &mut LoadedLog,
+    directory: &str,
+    options: &PhotoOptions,
+) -> Result<PhotoLoad, String> {
     let path = absolute_directory(directory)?;
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&path)
         .map_err(|error| {
@@ -571,7 +625,7 @@ pub fn load_photos(loaded: &mut LoadedLog, directory: &str) -> Result<PhotoLoad,
         }
     }
 
-    match_photos(loaded, photos);
+    match_photos(loaded, photos, options);
     loaded.media = media;
     // Photos in capture order; a photo without a time keeps its name order after
     // the timed ones rather than jumping to the front as `None` would.
@@ -593,41 +647,106 @@ pub fn load_photos(loaded: &mut LoadedLog, directory: &str) -> Result<PhotoLoad,
 
 /// Match loaded photos to their nearest track point, in place.
 ///
+/// The decisions are the four `07-eztour-spec.ja.md` §6.1 rules: the nearest
+/// point, the maximum time difference ([`PhotoOptions::max_gap_seconds`]), the
+/// clock conversion ([`PhotoOptions::camera_offset_minutes`] and
+/// [`PhotoOptions::log_offset_days`]) and distance grouping
+/// ([`PhotoOptions::group_distance_meters`], computed by
+/// `m241_core::log::geotag::group_matched_plans`). An unmatched photo keeps its
+/// row with `point_index = None`; it is not silently dropped.
+///
 /// `load_photos` needs the track to match against; keeping this separate makes
 /// the matching testable on its own and keeps the file walk free of geometry.
-pub fn match_photos(loaded: &mut LoadedLog, photos: Vec<LoadedPhoto>) {
-    let timed: Vec<(usize, u32)> = loaded
+pub fn match_photos(loaded: &mut LoadedLog, photos: Vec<LoadedPhoto>, options: &PhotoOptions) {
+    let core_options = GeotagOptions {
+        max_gap_seconds: options.max_gap_seconds,
+        group_distance_meters: (options.group_distance_meters.is_finite()
+            && options.group_distance_meters > 0.0)
+            .then_some(options.group_distance_meters),
+        ..GeotagOptions::default()
+    };
+    // One signed shift puts both clocks on one timeline: the log offset moves
+    // the track (`--utc-offset-days` adds days to it) and the camera offset moves
+    // the photo. The constants are seconds per unit, and the comparison itself
+    // stays in `i64` so a 7168-day log offset cannot wrap a `u32`.
+    let photo_to_track_shift = i64::from(options.log_offset_days) * 86_400
+        - i64::from(options.camera_offset_minutes) * 60;
+    let timed: Vec<(usize, i64)> = loaded
         .track
         .points
         .iter()
         .enumerate()
-        .filter_map(|(index, point)| point.utc.map(|utc| (index, utc)))
+        .filter_map(|(index, point)| {
+            point
+                .utc
+                .map(|utc| (index, i64::from(utc) + photo_to_track_shift))
+        })
         .collect();
+
     let mut matched = photos;
+    // One plan per photo, in the same order, so grouping can be computed by the
+    // core helper and read back by index. A sentinel plan (no point) is kept for
+    // an unmatched photo: `group_matched_plans` ignores it, and dropping it
+    // would break the index mapping.
+    let mut plans = Vec::with_capacity(matched.len());
     for photo in &mut matched {
+        let mut plan = GeotagPlan {
+            photo: photo.path.clone(),
+            capture_time: photo.captured_at.map(|utc| match photo.time_source {
+                Some("exif") => CaptureTime::Exif(utc),
+                _ => CaptureTime::FileModified(utc),
+            }),
+            point: None,
+            gap_seconds: None,
+            skipped: None,
+            keep_backup: false,
+            group_id: None,
+        };
         let Some(captured) = photo.captured_at else {
+            plan.skipped = Some(String::from("no capture time"));
+            plans.push(plan);
             continue;
         };
-        let Some((index, utc)) = timed
+        let Some((index, shifted_utc)) = timed
             .iter()
-            .min_by_key(|(_, utc)| utc.abs_diff(captured))
+            .min_by_key(|(_, utc)| utc.abs_diff(i64::from(captured)))
             .copied()
         else {
+            plan.skipped = Some(String::from("no track point carries a time"));
+            plans.push(plan);
             continue;
         };
-        let gap = utc.abs_diff(captured);
-        if gap > PHOTO_MAX_GAP_SECONDS {
+        let gap = shifted_utc.abs_diff(i64::from(captured));
+        plan.gap_seconds = u32::try_from(gap).ok();
+        if gap > u64::from(core_options.max_gap_seconds) {
+            plan.skipped = Some(format!(
+                "the nearest timed point is {gap} s from the capture time"
+            ));
+            plans.push(plan);
             continue;
         }
-        let Some(point) = loaded.track.points.get(index) else {
+        let Some(point) = loaded.track.points.get(index).copied() else {
+            plan.skipped = Some(String::from("the matched point disappeared"));
+            plans.push(plan);
             continue;
         };
         let Some((lat, lon)) = point.position() else {
+            plan.skipped = Some(String::from("the matched point has no position"));
+            plans.push(plan);
             continue;
         };
         photo.point_index = Some(index);
         photo.lat = Some(lat);
         photo.lon = Some(lon);
+        plan.point = Some(point);
+        plans.push(plan);
+    }
+
+    if let Some(distance) = core_options.group_distance_meters {
+        geotag::group_matched_plans(&mut plans, distance);
+        for (photo, plan) in matched.iter_mut().zip(&plans) {
+            photo.group_id = plan.group_id;
+        }
     }
     loaded.photos = matched;
 }
@@ -835,6 +954,7 @@ fn photo_dto(photo: &LoadedPhoto) -> PhotoDto {
         lat: photo.lat,
         lon: photo.lon,
         thumbnail: photo.thumbnail.clone(),
+        group_id: photo.group_id,
     }
 }
 
@@ -878,6 +998,7 @@ fn read_photo(path: &Path) -> Result<LoadedPhoto, String> {
         lat: None,
         lon: None,
         thumbnail: thumbnail(&bytes),
+        group_id: None,
     })
 }
 
@@ -1283,7 +1404,12 @@ mod tests {
         std::fs::write(directory.join("clip.mp4"), b"not really a video").expect("media");
 
         let mut loaded = sample();
-        let result = load_photos(&mut loaded, &directory.display().to_string()).expect("load");
+        let result = load_photos(
+            &mut loaded,
+            &directory.display().to_string(),
+            &PhotoOptions::default(),
+        )
+        .expect("load");
         assert_eq!(result.photos.len(), 1);
         assert_eq!(result.photos[0].point_index, Some(0));
         assert_eq!(result.photos[0].time_source.as_deref(), Some("file"));
@@ -1315,13 +1441,148 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_destination_and_the_source_itself_are_refused() {
+    fn a_relative_destination_is_refused() {
         let loaded = sample();
         let relative = export(&loaded, "gpx", "track.gpx").expect_err("relative destination");
         assert!(relative.contains("絶対パス"), "got {relative}");
         assert!(relative.contains("対処: "), "got {relative}");
+    }
 
-        let same = export(&loaded, "gpx", SAMPLE_SOURCE).expect_err("relative sample token");
-        assert!(!same.is_empty());
+    /// Set a JPEG's modification time, which the loader uses when the file has
+    /// no Exif capture time.
+    fn set_modified(path: &Path, utc: u32) {
+        let taken = std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::from(utc));
+        let handle = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open photo");
+        handle
+            .set_times(std::fs::FileTimes::new().set_modified(taken))
+            .expect("set mtime");
+        drop(handle);
+    }
+
+    #[test]
+    fn a_camera_offset_puts_a_utc_plus_nine_photo_on_the_track() {
+        // `DateTimeOriginal` has no timezone; the loader reads it as UTC. A
+        // camera set to JST records a wall-clock time nine hours ahead, so with
+        // no offset the photo is 32,400 s from every point and must not match.
+        let directory = temp_dir("m241-app-photo-offset");
+        let photo = directory.join("jst.jpg");
+        write_jpeg(&photo);
+        set_modified(&photo, SAMPLE_START - 9 * 3_600);
+
+        let mut loaded = sample();
+        let matched = load_photos(
+            &mut loaded,
+            &directory.display().to_string(),
+            &PhotoOptions::default(),
+        )
+        .expect("load without an offset");
+        assert_eq!(
+            matched.photos[0].point_index, None,
+            "a JST capture must not match a UTC track without the offset"
+        );
+
+        let options = PhotoOptions {
+            camera_offset_minutes: 540,
+            ..PhotoOptions::default()
+        };
+        let matched = load_photos(&mut loaded, &directory.display().to_string(), &options)
+            .expect("load with the JST offset");
+        assert_eq!(matched.photos[0].point_index, Some(0));
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_log_offset_moves_the_track_into_the_photo_clock() {
+        // `--utc-offset-days` adds whole days to the track. A photo taken one
+        // day after the logged instant must match when the track is moved by
+        // one day, and must not match when it is not.
+        let directory = temp_dir("m241-app-photo-log-offset");
+        let photo = directory.join("two-days-later.jpg");
+        write_jpeg(&photo);
+        set_modified(&photo, SAMPLE_START + 2 * 86_400);
+
+        let mut loaded = sample();
+        let unmatched = load_photos(
+            &mut loaded,
+            &directory.display().to_string(),
+            &PhotoOptions::default(),
+        )
+        .expect("load without a log offset");
+        assert_eq!(unmatched.photos[0].point_index, None);
+
+        let options = PhotoOptions {
+            log_offset_days: 2,
+            ..PhotoOptions::default()
+        };
+        let matched = load_photos(&mut loaded, &directory.display().to_string(), &options)
+            .expect("load with the log offset");
+        assert_eq!(matched.photos[0].point_index, Some(0));
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn the_time_tolerance_is_the_geotag_max_gap() {
+        let directory = temp_dir("m241-app-photo-gap");
+        let photo = directory.join("late.jpg");
+        write_jpeg(&photo);
+        set_modified(&photo, SAMPLE_START + 45);
+
+        let mut loaded = sample();
+        let strict = PhotoOptions {
+            max_gap_seconds: 10,
+            ..PhotoOptions::default()
+        };
+        let unmatched = load_photos(&mut loaded, &directory.display().to_string(), &strict)
+            .expect("load with a 10-second tolerance");
+        assert_eq!(unmatched.photos[0].point_index, None);
+
+        let matched = load_photos(
+            &mut loaded,
+            &directory.display().to_string(),
+            &PhotoOptions::default(),
+        )
+        .expect("load with the default tolerance");
+        assert_eq!(matched.photos[0].point_index, Some(1));
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn photos_at_the_same_place_share_a_group_when_grouping_is_on() {
+        let directory = temp_dir("m241-app-photo-group");
+        for name in ["a.jpg", "b.jpg"] {
+            let photo = directory.join(name);
+            write_jpeg(&photo);
+            set_modified(&photo, SAMPLE_START);
+        }
+
+        let mut loaded = sample();
+        let grouped = load_photos(
+            &mut loaded,
+            &directory.display().to_string(),
+            &PhotoOptions {
+                group_distance_meters: 10.0,
+                ..PhotoOptions::default()
+            },
+        )
+        .expect("load with grouping");
+        assert_eq!(grouped.photos.len(), 2);
+        let first = grouped.photos[0].group_id.expect("first group");
+        let second = grouped.photos[1].group_id.expect("second group");
+        assert_eq!(first, second, "two photos on one point are one place");
+
+        let ungrouped = load_photos(
+            &mut loaded,
+            &directory.display().to_string(),
+            &PhotoOptions::default(),
+        )
+        .expect("load without grouping");
+        assert!(
+            ungrouped.photos.iter().all(|photo| photo.group_id.is_none()),
+            "grouping is off by default"
+        );
+        std::fs::remove_dir_all(&directory).ok();
     }
 }

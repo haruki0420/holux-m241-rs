@@ -95,6 +95,8 @@ export type PhotoDto = {
   lat: number | null;
   lon: number | null;
   thumbnail: string | null;
+  /** Cluster id when distance grouping is on; `null` when it is off. */
+  groupId: number | null;
 };
 
 /** One video or other file beside the photos. */
@@ -166,8 +168,20 @@ export function logPoints(
 }
 
 /** `load_photos` — read a folder and match its photos to the loaded track. */
-export function loadPhotos(path: string, directory: string): Promise<PhotoLoad> {
-  return invoke<PhotoLoad>("load_photos", { path, directory });
+export function loadPhotos(
+  path: string,
+  directory: string,
+  cameraOffsetMinutes: number,
+  logOffsetDays: number,
+  groupDistanceMeters: number,
+): Promise<PhotoLoad> {
+  return invoke<PhotoLoad>("load_photos", {
+    path,
+    directory,
+    cameraOffsetMinutes,
+    logOffsetDays,
+    groupDistanceMeters,
+  });
 }
 
 /** `export_log` — write the loaded track to an absolute destination. */

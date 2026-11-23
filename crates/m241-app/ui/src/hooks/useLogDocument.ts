@@ -30,6 +30,23 @@ const POINT_CHUNK = 50_000;
 /** Milliseconds between two points during playback. */
 const PLAY_INTERVAL_MS = 80;
 
+/** How photos are matched to the track: the §6.1 clock and grouping settings. */
+export type PhotoMatchOptions = {
+  /** Camera clock minus UTC, in minutes (UTC+9 = 540). */
+  cameraOffsetMinutes: number;
+  /** Whole days added to the track before matching (`--utc-offset-days`). */
+  logOffsetDays: number;
+  /** Photos closer than this many metres share a group; 0 disables grouping. */
+  groupDistanceMeters: number;
+};
+
+/** The defaults: no clock correction and no grouping, as ezTour starts. */
+const DEFAULT_PHOTO_OPTIONS: PhotoMatchOptions = {
+  cameraOffsetMinutes: 0,
+  logOffsetDays: 0,
+  groupDistanceMeters: 0,
+};
+
 /**
  * Owns the Log screen: the document, its points, the selection, the photos and
  * the export.
@@ -54,6 +71,7 @@ export function useLogDocument() {
   const [photoError, setPhotoError] = useState<string | null>(null);
   const [photoLoading, setPhotoLoading] = useState(false);
   const [photoIndex, setPhotoIndex] = useState<number | null>(null);
+  const [photoOptions, setPhotoOptions] = useState<PhotoMatchOptions>(DEFAULT_PHOTO_OPTIONS);
 
   // A request from the dock to frame one day. The map owns the camera; this is
   // the one-way message that asks it to move.
@@ -280,7 +298,7 @@ export function useLogDocument() {
   );
 
   const readPhotoFolder = useCallback(
-    async (directory: string): Promise<boolean> => {
+    async (directory: string, options?: PhotoMatchOptions): Promise<boolean> => {
       if (summary === null) {
         return false;
       }
@@ -289,10 +307,18 @@ export function useLogDocument() {
         setPhotoError("パスが空です\n対処: 写真が入っているフォルダの絶対パスを入力してください。");
         return false;
       }
+      const chosen = options ?? photoOptions;
       setPhotoLoading(true);
       setPhotoError(null);
       try {
-        const loaded = await loadPhotos(summary.source, trimmed);
+        const loaded = await loadPhotos(
+          summary.source,
+          trimmed,
+          chosen.cameraOffsetMinutes,
+          chosen.logOffsetDays,
+          chosen.groupDistanceMeters,
+        );
+        setPhotoOptions(chosen);
         setPhotos(loaded.photos);
         setMedia(loaded.media);
         setPhotoDirectory(loaded.directory);
@@ -311,7 +337,7 @@ export function useLogDocument() {
         setPhotoLoading(false);
       }
     },
-    [summary],
+    [summary, photoOptions],
   );
 
   const writeExport = useCallback(
@@ -366,6 +392,7 @@ export function useLogDocument() {
     photoError,
     photoLoading,
     photoIndex,
+    photoOptions,
     selectedPhoto,
     selectedPhotoForPoint,
     fitTarget,

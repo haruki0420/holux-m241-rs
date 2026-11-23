@@ -9,14 +9,42 @@ export function PhotoFolder({ log }: { log: LogController }) {
   const [path, setPath] = useState("");
   const [editing, setEditing] = useState(false);
   const [submitted, setSubmitted] = useState(false);
+  // The camera's clock is not necessarily UTC: EXIF `DateTimeOriginal` carries
+  // no zone. These are the §6.1 settings, kept per panel and sent with the load.
+  const [cameraOffset, setCameraOffset] = useState(
+    String(log.photoOptions.cameraOffsetMinutes),
+  );
+  const [logOffsetDays, setLogOffsetDays] = useState(String(log.photoOptions.logOffsetDays));
+  const [groupDistance, setGroupDistance] = useState(
+    String(log.photoOptions.groupDistanceMeters),
+  );
   const loaded = log.photoDirectory !== null && log.photos.length + log.media.length > 0;
   const showForm = !loaded || editing;
 
+  const submit = () => {
+    setSubmitted(true);
+    void log
+      .readPhotoFolder(path, {
+        cameraOffsetMinutes: integerOr(cameraOffset, 0),
+        logOffsetDays: integerOr(logOffsetDays, 0),
+        groupDistanceMeters: Math.max(integerOr(groupDistance, 0), 0),
+      })
+      .then((ok) => {
+        if (ok) {
+          setEditing(false);
+        }
+      });
+  };
+
   if (!showForm) {
+    const offset = log.photoOptions.cameraOffsetMinutes;
+    const group = log.photoOptions.groupDistanceMeters;
     return (
       <div className="flex items-baseline justify-between gap-2 border-t border-hair pt-3">
         <p className="min-w-0 truncate text-xs text-ink-3" title={log.photoDirectory ?? ""}>
           {baseName(log.photoDirectory ?? "")} · {log.photos.length} 枚
+          {offset === 0 ? "" : ` · 時差 ${offset} 分`}
+          {group === 0 ? "" : ` · 同地点 ${group} m`}
         </p>
         <button type="button" className="btn-quiet shrink-0" onClick={() => setEditing(true)}>
           変更
@@ -40,23 +68,63 @@ export function PhotoFolder({ log }: { log: LogController }) {
           setSubmitted(false);
         }}
       />
+
+      <div className="mt-2 grid grid-cols-2 gap-2">
+        <div>
+          <label className="block text-xs text-ink-3" htmlFor="photo-camera-offset">
+            カメラ時差（分）
+          </label>
+          <input
+            id="photo-camera-offset"
+            className="field mt-1 h-8 text-xs"
+            type="number"
+            step={15}
+            value={cameraOffset}
+            onChange={(event) => setCameraOffset(event.target.value)}
+          />
+        </div>
+        <div>
+          <label className="block text-xs text-ink-3" htmlFor="photo-log-offset">
+            ログの日付ずれ（日）
+          </label>
+          <input
+            id="photo-log-offset"
+            className="field mt-1 h-8 text-xs"
+            type="number"
+            step={1}
+            value={logOffsetDays}
+            onChange={(event) => setLogOffsetDays(event.target.value)}
+          />
+        </div>
+        <div className="col-span-2">
+          <label className="block text-xs text-ink-3" htmlFor="photo-group-distance">
+            同じ地点にまとめる距離（m、0 で無効）
+          </label>
+          <input
+            id="photo-group-distance"
+            className="field mt-1 h-8 text-xs"
+            type="number"
+            min={0}
+            step={5}
+            value={groupDistance}
+            onChange={(event) => setGroupDistance(event.target.value)}
+          />
+        </div>
+      </div>
+      <p className="mt-1 text-[11px] text-ink-3">
+        カメラが UTC でない場合（日本なら 540）に入力します。写真の時刻は EXIF の
+        現地時刻として読み、この分だけ UTC に寄せてから記録点と比べます
+      </p>
+
       <button
         type="button"
         className="btn btn-primary mt-2 h-8 w-full text-xs"
         disabled={log.photoLoading || path.trim() === ""}
-        onClick={() => {
-          setSubmitted(true);
-          void log.readPhotoFolder(path).then((ok) => {
-            if (ok) {
-              setEditing(false);
-            }
-          });
-        }}
+        onClick={submit}
       >
         <FolderOpen size={16} strokeWidth={1.5} aria-hidden="true" />
-        {log.photoLoading ? "読み込み中" : "読み込む"}
+        {log.photoLoading ? "読み込み中" : loaded ? "再照合" : "読み込む"}
       </button>
-      <p className="mt-2 text-[11px] text-ink-3">撮影時刻で最も近い記録点に結び付けます</p>
       {log.photoError === null ? null : (
         <p role="alert" className="mt-2 text-xs whitespace-pre-line text-error">
           {log.photoError}
@@ -92,6 +160,13 @@ export function PhotoViewPanel({ log }: { log: LogController }) {
   if (photo === undefined) {
     return null;
   }
+  // Distance grouping from §6.1-5: photos closer than the threshold are one
+  // placemark, so the panel says how many share this one instead of repeating
+  // the same coordinates with no explanation.
+  const groupSize =
+    photo.groupId === null
+      ? 0
+      : log.photos.filter((entry) => entry.groupId === photo.groupId).length;
 
   return (
     <div>
@@ -163,12 +238,11 @@ export function PhotoViewPanel({ log }: { log: LogController }) {
               : `${photo.lat.toFixed(5)}, ${photo.lon.toFixed(5)}`
           }
         />
+        {groupSize < 2 ? null : <Row label="同じ地点" value={`${groupSize} 枚`} />}
+        {log.photoOptions.cameraOffsetMinutes === 0 ? null : (
+          <Row label="カメラ時差" value={`${log.photoOptions.cameraOffsetMinutes} 分`} />
+        )}
       </dl>
-
-      <div className="mt-3 border-t border-hair pt-3">
-        <p className="text-xs text-ink-3">コメント</p>
-        <p className="mt-1 text-xs text-ink-2">コメントはありません</p>
-      </div>
 
       <div className="mt-4">
         <PhotoFolder log={log} />
@@ -249,4 +323,10 @@ function Row({ label, value }: { label: string; value: string }) {
 function baseName(path: string): string {
   const parts = path.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] ?? path;
+}
+
+/** A number input's text as an integer, or `fallback` when it is not one. */
+function integerOr(value: string, fallback: number): number {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
 }
