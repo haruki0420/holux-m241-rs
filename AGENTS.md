@@ -14,6 +14,17 @@ expensive to learn so it does not have to be rediscovered.
 It runs six gates: formatting, lint, the workspace tests, the docs link check,
 the design invariant check and the safety check. It prints one line per gate.
 
+**The Tauri app needs its frontend built first.** `crates/m241-app` embeds
+`ui/dist` at compile time (`tauri::generate_context!`), so a checkout without it
+cannot build the crate. `check.sh` prepares it itself: when
+`crates/m241-app/ui/dist/index.html` is missing it runs
+`pnpm --dir crates/m241-app/ui install --frozen-lockfile` and
+`pnpm --dir crates/m241-app/ui build` (pnpm only, never npm/npx). If pnpm is
+missing or the build fails, the app is excluded from clippy and test, the
+reason is printed (`[SKIP] m241-app: ui/dist missing: …`) and the run reports
+5/6 plus that explicit skip — it does not claim 6/6. A clean clone with Node.js
+and pnpm installed therefore reaches 6/6 on the first `./tools/check.sh`.
+
 The design gate (`tools/check_design.py`) is not cosmetic. It checks three
 invariants mechanically: amber appears only in the destructive module, a corner
 radius is always `theme::RADIUS`, and a status colour always sits beside a text

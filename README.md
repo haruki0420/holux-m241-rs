@@ -165,7 +165,23 @@ cargo test --workspace
 ./tools/check.sh          # fmt / clippy / test / docs リンク / design / safety の 6 ゲート
 ```
 
-Rust 1.95 以降が必要（`Cargo.toml` の `rust-version`）。Linux でビルドする場合は、
+Rust 1.95 以降が必要（`Cargo.toml` の `rust-version`）。Tauri 版の GUI
+（`crates/m241-app`）をビルド・テストするには **Node.js と pnpm** も要る。
+`crates/m241-app` はビルド時に `crates/m241-app/ui/dist` を埋め込むため、
+フロントエンドを先にビルドしておく必要がある。
+
+```bash
+pnpm --dir crates/m241-app/ui install --frozen-lockfile
+pnpm --dir crates/m241-app/ui build
+```
+
+`./tools/check.sh` は `crates/m241-app/ui/dist/index.html` が無ければ上記の
+2 コマンドを自動で実行する。pnpm が無い、またはビルドに失敗した場合は
+`m241-app` を clippy / test の対象から外し、`m241-app skipped: ui/dist missing: …`
+と表示して残りを実行する（このとき 6/6 ではなく 5/6＋skip と報告する）。
+Node.js パッケージ操作は pnpm だけを使い、npm / npx は使わない。
+
+Linux でビルドする場合は、
 `serialport` が `libudev` を、GUI が X11 / Wayland と GL をリンクするため、次の
 パッケージが要る（CI と同じ）。
 
