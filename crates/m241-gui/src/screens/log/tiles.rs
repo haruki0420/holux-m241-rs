@@ -1176,13 +1176,11 @@ pub(crate) fn draw_attribution(painter: &Painter, area: Rect) -> Rect {
     // Bottom-left of the area: the zoom plate owns the bottom-right corner.
     let origin = Pos2::new(area.left(), area.bottom() - text_size.y);
     let plate = Rect::from_min_size(origin, text_size).expand(space::XS);
-    // The same plate the map's other overlays use, so the two alphas cannot
-    // drift apart (design review 2026-11-23, Should S5).
-    painter.rect_filled(
-        plate,
-        theme::RADIUS,
-        theme::OVERLAY.gamma_multiply(super::drawer::PLATE_ALPHA),
-    );
+    // The same plate as the map's other overlays: an opaque `OVERLAY` fill, so
+    // the tile cannot raise the background behind `INK` (design review
+    // 2026-11-23, Should S5). The credit is painted straight onto the painter and
+    // is too small for the one shadow, which the floating plates carry.
+    painter.rect_filled(plate, theme::RADIUS, theme::OVERLAY);
     painter.galley(origin, galley, theme::INK);
     plate
 }

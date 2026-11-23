@@ -983,8 +983,8 @@ fn connect_screen_renders_connected_and_failed_probes_without_blocking() {
 
 #[test]
 fn dragging_the_playback_slider_moves_the_selected_point() {
-    // 「再生位置」 is the only continuous control that moves the selection, so it
-    // is driven for real: press on its track, drag to the right, release. A
+    // The timeline is the only continuous control that moves the selection, so
+    // it is driven for real: press on its track, drag to the right, release. A
     // control rebuilt from `self.selected` every frame passes any state test and
     // fails here unless the drag itself writes the selection back.
     let ctx = context();
@@ -998,23 +998,26 @@ fn dragging_the_playback_slider_moves_the_selected_point() {
     let _ = render_at(&ctx, &mut app, width, height);
     let shapes = render_shapes_at(&ctx, &mut app, width, height);
 
-    // The slider is the horizontal rule on the same row as 「再生位置」 and the
-    // `n/240` counter: find the rule by its y, not by a guessed offset.
+    // The counter and the point's figures are on the timeline row (DESIGN.md
+    // §5), so the readout names the row; the timeline is the long horizontal rule
+    // within one line height of it. (The schematic grid also draws long
+    // horizontals, so the y has to come from the readout rather than from length
+    // alone.)
     let mut flat = Vec::new();
     flatten_shapes(&shapes, &mut flat);
-    let row_y = flat
+    let readout_y = flat
         .iter()
         .find_map(|shape| match shape {
-            egui::Shape::Text(text) if text.galley.job.text == "再生位置" => Some(text.pos.y),
+            egui::Shape::Text(text) if text.galley.job.text.contains("/240") => Some(text.pos.y),
             _ => None,
         })
-        .expect("the 再生位置 label did not render");
+        .expect("the n/N readout did not render");
     let track = flat
         .iter()
         .find_map(|shape| match shape {
             egui::Shape::LineSegment { points, .. }
                 if (points[0].y - points[1].y).abs() < f32::EPSILON
-                    && (points[0].y - row_y).abs() < 16.0
+                    && (points[0].y - readout_y).abs() < 20.0
                     && (points[1].x - points[0].x).abs() > 300.0 =>
             {
                 Some(*points)
@@ -1178,12 +1181,12 @@ fn the_selected_point_is_a_ground_halo_an_ink_disc_and_a_ring() {
 }
 
 #[test]
-fn the_map_plates_are_overlay_at_ninety_two_percent() {
-    // The plate weight is the contract that makes `ink` readable over a bright OSM
-    // tile (design review 2026-11-23, M1). Read from the painted rects rather than
-    // from the constant: a plate that left the plate weight, or a second one (the
-    // credit used 0.9 before the token was unified), fails here.
-    let plate_fill = theme::OVERLAY.gamma_multiply(0.92);
+fn the_map_plates_are_overlay_faces_with_the_one_shadow() {
+    // DESIGN.md §3/§4: a plate over the map is a floating layer, so it is
+    // `OVERLAY` — opaque, so a bright tile cannot raise the background behind
+    // `INK` — with a 1px `LINE` edge, the one radius and the one `POPUP_SHADOW`.
+    // Read from the painted rects rather than from the constants: a plate that
+    // left the surface, or one that lost its shadow, fails here.
     let ctx = context();
     // With the drawer open the toggle and the three map plates are four plates at
     // 1280; below `NARROW` the floating drawer adds a fifth.
@@ -1200,7 +1203,7 @@ fn the_map_plates_are_overlay_at_ninety_two_percent() {
             .iter()
             .filter_map(|shape| match shape {
                 egui::Shape::Rect(rect)
-                    if rect.fill == plate_fill && rect.corner_radius == theme::RADIUS =>
+                    if rect.fill == theme::OVERLAY && rect.corner_radius == theme::RADIUS =>
                 {
                     Some(rect)
                 }
@@ -1209,15 +1212,31 @@ fn the_map_plates_are_overlay_at_ninety_two_percent() {
             .collect();
         assert!(
             plates.len() >= minimum,
-            "at {width}x{height} only {} plate(s) painted rail at 0.92, expected at least {minimum}",
+            "at {width}x{height} only {} plate(s) painted the OVERLAY surface, expected at least {minimum}",
             plates.len()
+        );
+        // Every plate carries the one shadow: `Frame::shadow` paints a blurred
+        // rect in `POPUP_SHADOW.color` behind the face. A plate without one reads
+        // as part of the map instead of as a layer over it.
+        let shadowed = flat
+            .iter()
+            .filter(|shape| match shape {
+                egui::Shape::Rect(rect) => {
+                    rect.blur_width > 0.0 && rect.fill == theme::POPUP_SHADOW.color
+                }
+                _ => false,
+            })
+            .count();
+        assert!(
+            shadowed >= minimum,
+            "at {width}x{height} {shadowed} plate(s) carried the one shadow, expected at least {minimum}",
         );
         if width < 1280.0 {
             assert!(
                 plates
                     .iter()
                     .any(|rect| (rect.rect.width() - theme::metric::DRAWER).abs() < 1.0),
-                "the floating drawer was not painted as a rail plate at 0.92: {plates:?}"
+                "the floating drawer was not painted as an OVERLAY plate: {plates:?}"
             );
         }
     }

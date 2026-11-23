@@ -1328,16 +1328,28 @@ impl LogScreen {
         }
 
         // The plates depend on two measurements the canvas produced: the zoom
-        // note adds a row, and a file-load refusal adds the wrapped lines the
-        // plate has to hold. Both are measured before anything is laid out.
+        // note adds a line, and a file-load refusal adds the wrapped lines the
+        // plate has to hold. Both are measured with the font the label will use,
+        // before anything is laid out, because a plate's height has to be known
+        // before it is anchored to a corner.
         let file_status_height = self.load_status.as_ref().map_or(0.0, |(status, message)| {
             let plate_width = (map_rect.width() * 0.55).clamp(280.0, 440.0);
             drawer::status_height(ui, *status, message, plate_width)
         });
-        let plates = drawer::Plates::new(map_rect, file_status_height, canvas.note.is_some());
+        let zoom_note_height = canvas.note.map_or(0.0, |note| {
+            ui.painter()
+                .layout_no_wrap(
+                    note.to_owned(),
+                    egui::FontId::proportional(size::CAPTION),
+                    theme::INK,
+                )
+                .rect
+                .height()
+        });
+        let plates = drawer::Plates::new(map_rect, file_status_height, zoom_note_height);
         let floating = (self.drawer_open && !wide)
             .then(|| plates.floating(map_rect, self.track.points.is_empty()));
-        self.map_overlays(ui, map_rect, canvas, &plates, floating);
+        self.map_overlays(ui, map_rect, canvas, &plates, floating, settings);
         if let Some(rect) = floating {
             self.drawer_plate(ui, rect, settings);
         }
@@ -1951,14 +1963,32 @@ impl LogScreen {
 
     /// The playback strip drawn over the canvas: the transport, then the timeline.
     ///
-    /// The zoom owns its own plate; the selected point's figures live in the strip
-    /// under the canvas, so this plate stays two rows tall (DESIGN.md §5).
-    fn playback_controls(&mut self, ui: &mut Ui) {
+    /// Two `metric::DOCK_ROW` rows (DESIGN.md §5, §11): the transport, then the
+    /// timeline with the counter and the current point's time · speed ·
+    /// altitude. Keeping the figures on the timeline row is what lets the plate
+    /// stay two rows instead of three, so it covers less of the map — the plate
+    /// is the thing drawn over the page, and the page is the map.
+    fn playback_controls(&mut self, ui: &mut Ui, settings: &AppSettings) {
         let len = self.track.points.len();
         if len == 0 {
             return;
         }
-        ui.horizontal_wrapped(|ui| {
+        let max_idx = len.saturating_sub(1);
+        let pos = self.selected.unwrap_or(0).min(max_idx);
+
+        // Row 1: the transport. The row is allocated at exactly `DOCK_ROW` and
+        // the buttons are drawn into that rect, so the plate's height is a row
+        // count and not a guess about button metrics.
+        let (transport_rect, _transport) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), metric::DOCK_ROW),
+            Sense::hover(),
+        );
+        {
+            let mut transport = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(transport_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
             let play_label = if self.playing {
                 "一時停止"
             } else {
@@ -1968,44 +1998,72 @@ impl LogScreen {
             // face: on this screen the default made the playback strip the
             // brightest thing on the page, and a filled box beside 中止 (outline)
             // read as a second primary action (design review, Should 4).
-            if common::tool_button(ui, play_label, self.playing, true).clicked() {
+            if common::tool_button(&mut transport, play_label, self.playing, true).clicked() {
                 self.toggle_play();
             }
-            if common::tool_button(ui, "前の点", false, true).clicked() {
+            if common::tool_button(&mut transport, "前の点", false, true).clicked() {
                 let _moved = self.step_prev();
             }
-            if common::tool_button(ui, "次の点", false, true).clicked() {
+            if common::tool_button(&mut transport, "次の点", false, true).clicked() {
                 let _moved = self.step_next();
             }
-            if common::tool_button(ui, "全点表示", false, true).clicked() {
+            if common::tool_button(&mut transport, "全点表示", false, true).clicked() {
                 self.fit_all();
             }
-
             let follow = self.follow;
-            if common::tool_button(ui, "追従", follow, true).clicked() {
+            if common::tool_button(&mut transport, "追従", follow, true).clicked() {
                 self.set_follow(!follow);
             }
-        });
+        }
 
-        ui.add_space(space::XS);
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("再生位置")
-                    .size(size::CAPTION)
-                    .color(theme::MUTE),
+        // Row 2: the timeline, the counter, and the current point's figures.
+        // The vertical layout already puts one `space::S` (the theme's
+        // `item_spacing.y`) between the two rows, so the plate's height is exactly
+        // `2 × DOCK_ROW + S` of content.
+        let (timeline_rect, _timeline) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), metric::DOCK_ROW),
+            Sense::hover(),
+        );
+        {
+            let mut timeline = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(timeline_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
             );
-            let max_idx = len.saturating_sub(1);
-            let pos = self.selected.unwrap_or(0).min(max_idx);
-            let track_width = (ui.available_width() - 64.0).max(48.0);
+            let point = self.track.points.get(pos);
+            let figures = point.map_or_else(
+                || String::from("—"),
+                |point| {
+                    format!(
+                        "{}  速度 {}  標高 {}",
+                        common::utc_stamp(point.utc),
+                        settings.units.format_speed(point.speed_kmh),
+                        settings.units.format_altitude(point.height_m),
+                    )
+                },
+            );
+            let readout = format!("{}/{}  {figures}", pos + 1, len);
+            // One right-hand readout rather than two labels: the counter and the
+            // point's figures share the row, and measuring the whole string is
+            // what lets the slider take exactly the width that is left. A
+            // per-label guess put the figures past the plate's edge at 1280.
+            let mono = egui::FontId::monospace(size::CAPTION);
+            let readout_width = timeline
+                .painter()
+                .layout_no_wrap(readout.clone(), mono.clone(), theme::MUTE)
+                .rect
+                .width();
+            let track_width =
+                (timeline.available_width() - readout_width - 2.0 * space::S).max(96.0);
             // `Sense::CLICK | Sense::DRAG`, not `Sense::click_and_drag()`: the
             // timeline reads the pointer's position, so it is not keyboard
             // operable and must not be a focusable stop that shows nothing
             // (design review 2026-11-23, M4).
-            let (rect, response) = ui.allocate_exact_size(
+            let (rect, response) = timeline.allocate_exact_size(
                 Vec2::new(track_width, metric::ROW * 0.5),
                 Sense::CLICK | Sense::DRAG,
             );
-            let painter = ui.painter_at(rect);
+            let painter = timeline.painter_at(rect);
             let y = rect.center().y;
             // The empty track is `line` at the line width, not a hairline: a 1pt
             // line on `window` measured about 1:1, which is not a track at all
@@ -2027,8 +2085,8 @@ impl LogScreen {
             // Picking a point is what a click or a drag *means* here: the thumb is
             // rebuilt every frame from `self.selected`, so a drag that only moved a
             // local value would spring back and select nothing. The selection is
-            // made when the gesture ends — on release, and on each drag frame so the
-            // map follows the thumb while it moves.
+            // made when the gesture ends — on release, and on each drag frame so
+            // the map follows the thumb while it moves.
             if (response.clicked() || response.dragged() || response.drag_stopped())
                 && let Some(pointer) = response.interact_pointer_pos()
                 && max_idx > 0
@@ -2037,13 +2095,17 @@ impl LogScreen {
                 let target = (fraction * max_idx as f32).round() as usize;
                 self.select_point(Some(target.min(max_idx)));
             }
-            ui.label(
-                RichText::new(format!("{}/{}", pos + 1, len))
-                    .size(size::CAPTION)
-                    .color(theme::MUTE)
-                    .monospace(),
+            timeline.add_space(space::S);
+            let _readout = timeline.add(
+                egui::Label::new(
+                    egui::RichText::new(readout)
+                        .size(size::CAPTION)
+                        .color(theme::MUTE)
+                        .monospace(),
+                )
+                .truncate(),
             );
-        });
+        }
     }
 
     /// 速度: one series, baseline at zero, no smoothing, with active point marker.
@@ -5293,7 +5355,7 @@ mod tests {
             // A closed-drawer sample frame draws no OSM tiles, so the credit is
             // not in the recorded overlays; it is laid out from the plate geometry
             // that the screen would use on a tiled frame.
-            let plates = super::drawer::Plates::new(frame.map, 0.0, false);
+            let plates = super::drawer::Plates::new(frame.map, 0.0, 0.0);
             let painter =
                 egui::Painter::new(context.clone(), egui::LayerId::background(), frame.map);
             let credit = tiles::draw_attribution(&painter, plates.credit(frame.map));
@@ -5306,6 +5368,112 @@ mod tests {
                 "the credit sits outside the canvas at {label}",
             );
         }
+    }
+
+    #[test]
+    fn the_playback_plate_is_two_dock_rows_and_clear_of_the_zoom_plate() {
+        // DESIGN.md §5/§11: the playback plate is the transport row plus the
+        // timeline row, each `metric::DOCK_ROW`. The old plate reserved three
+        // rows' worth of height and a 4pt gap in the middle, which is what made
+        // it cover the centre of the map. The plate is also a floating layer, so
+        // it keeps at least 12pt from the zoom plate (DESIGN.md §3).
+        let frame = log_frame_at(1280.0, 800.0, None);
+        let playback = overlay_rect(&frame, "playback");
+        let zoom = overlay_rect(&frame, "zoom");
+        let expected = 2.0 * metric::DOCK_ROW + space::S + 2.0 * space::S + 2.0 * metric::HAIRLINE;
+        assert!(
+            (playback.height() - expected).abs() < 1.0,
+            "the playback plate is {:.1}pt tall, expected {expected:.1} (two rows of {})",
+            playback.height(),
+            metric::DOCK_ROW,
+        );
+        assert!(
+            zoom.top() - playback.bottom() >= space::M - 0.5,
+            "the playback plate {playback:?} and the zoom plate {zoom:?} are closer than {}pt",
+            space::M,
+        );
+        assert!(
+            playback.width() <= 720.0 + 2.0 * metric::HAIRLINE + 0.5,
+            "the playback plate is {:.1}pt wide; it is a strip, not the canvas",
+            playback.width(),
+        );
+        // The counter and the current point's figures are on the timeline row:
+        // their text is what proves the figures moved out of a third row.
+        let shapes = shell_shapes(1280.0, 800.0, |app| app.log_mut().show_sample());
+        let mut flat = Vec::new();
+        flatten(&shapes, &mut flat);
+        assert!(
+            flat.iter().any(|shape| match shape {
+                egui::Shape::Text(text) => text.galley.job.text.contains("/240"),
+                _ => false,
+            }),
+            "the playback plate lost its n/N counter",
+        );
+        assert!(
+            flat.iter().any(|shape| match shape {
+                egui::Shape::Text(text) => text.galley.job.text.contains("速度"),
+                _ => false,
+            }),
+            "the playback plate lost the current point's speed",
+        );
+    }
+
+    #[test]
+    fn every_plate_height_is_a_row_plus_the_frame_s_margin_and_edge() {
+        // §11: the plates are anchored to corners, so their heights are computed
+        // from rows and the frame's own margin. A plate that guessed wrong would
+        // either leave the corner or grow over its neighbour; the file plate is
+        // measured by the same rule that makes the status line wrap inside it.
+        let frame = log_frame_at(1280.0, 800.0, None);
+        let file = overlay_rect(&frame, "file");
+        assert!(
+            (file.height() - (metric::LIST_ROW + 2.0 * space::S + 2.0 * metric::HAIRLINE)).abs()
+                < 1.0,
+            "the file plate is {:.1}pt tall, expected one {} row plus margins",
+            file.height(),
+            metric::LIST_ROW,
+        );
+        let zoom = overlay_rect(&frame, "zoom");
+        // The headless sample carries the map-state note, so the zoom plate is
+        // one row plus that note. The note's height is the font's, so it is
+        // measured with the label's own font instead of assumed to be
+        // `CAPTION × 1.2` (the OS face's row height is not that).
+        let zoom_note_height = {
+            let context = egui::Context::default();
+            crate::theme::install(&context);
+            let note = tiles::Background::Headless
+                .note()
+                .expect("the headless map state has a note");
+            let mut height = 0.0;
+            let output = context.run_ui(egui::RawInput::default(), |ui| {
+                height = ui
+                    .painter()
+                    .layout_no_wrap(
+                        note.to_owned(),
+                        egui::FontId::proportional(size::CAPTION),
+                        theme::INK,
+                    )
+                    .rect
+                    .height();
+            });
+            output.drop_without_applying_deltas();
+            height
+        };
+        let expected_zoom = metric::DOCK_ROW
+            + space::S
+            + zoom_note_height
+            + 2.0 * space::S
+            + 2.0 * metric::HAIRLINE;
+        assert!(
+            (zoom.height() - expected_zoom).abs() < 1.0,
+            "the zoom plate is {:.1}pt tall, expected {expected_zoom:.1} (one row + a {zoom_note_height:.1}pt note)",
+            zoom.height(),
+        );
+        assert!(
+            drawer::strip_height(false) >= metric::SELECTION_STRIP,
+            "the selected-point strip is shorter than a {}pt line",
+            metric::SELECTION_STRIP,
+        );
     }
 
     #[test]

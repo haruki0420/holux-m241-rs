@@ -12,10 +12,12 @@
 //! 2026-11-23, Must 1).
 //!
 //! Two rules keep the canvas readable on its light surface (design review
-//! 2026-11-23, M1): every plate is [`theme::OVERLAY`] at [`PLATE_ALPHA`], which
-//! keeps [`theme::INK`] above 11:1 over whatever tile is beneath it, and the map's
-//! own line and markers carry a `window` casing so they read over land and water
-//! alike (the casing itself is painted by the map in `log.rs`).
+//! 2026-11-23, M1): every plate is [`theme::OVERLAY`] — opaque, so the tile can
+//! never raise the background behind [`theme::INK`] — with a 1px [`theme::LINE`]
+//! edge and the product's one [`theme::POPUP_SHADOW`], because a plate is a
+//! floating layer (DESIGN.md §3); and the map's own line and markers carry a
+//! `window` casing so they read over land and water alike (the casing itself is
+//! painted by the map in `log.rs`).
 
 use egui::{Align, Layout, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use m241_core::log::ParseReport;
@@ -25,16 +27,6 @@ use crate::screens::settings::AppSettings;
 use crate::theme::{self, metric, size, space};
 
 use super::{LogScreen, LogTab, sample_track};
-
-/// Opacity of a plate over the map.
-///
-/// `theme::OVERLAY` (#262E34) at 0.92 is #232A2F, so `theme::INK` on it clears
-/// 12:1 — the tile is bright, and the plate has to be dark enough that the tile
-/// cannot raise the background behind the text. The value scales the token's
-/// channels: the plate is opaque, it does not let the tile through. The OSM credit
-/// uses the same value (`tiles::draw_attribution`), so "the plate the attribution
-/// uses" is one number and not a second guess.
-pub(super) const PLATE_ALPHA: f32 = 0.92;
 
 /// The narrowest the credit is wrapped to before it moves above the zoom plate.
 ///
@@ -53,9 +45,11 @@ const MIN_FLOAT_HEIGHT: f32 = 160.0;
 
 /// Height of the selected-point strip under the canvas.
 ///
-/// One table row: the answer to a map click sits directly under the map, not in
-/// a panel below the fold (design review 2026-11-23, M3).
-const STRIP_HEIGHT: f32 = metric::ROW;
+/// [`metric::SELECTION_STRIP`] (40): the answer to a map click sits directly
+/// under the map, not in a panel below the fold (design review 2026-11-23, M3).
+/// The strip is one line; the text is truncated with an ellipsis rather than cut
+/// at the canvas edge, so a long waypoint suffix still reads as truncated.
+const STRIP_HEIGHT: f32 = metric::SELECTION_STRIP;
 
 /// The height the selected-point strip takes from the canvas, when it has one.
 #[must_use]
@@ -90,14 +84,23 @@ impl Plates {
     /// would move it into the plate above it. The status line is measured before
     /// this is called ([`status_height`]) and wraps inside the plate, so a long
     /// refusal is readable in the plate rather than cut at one line.
-    pub(super) fn new(map: Rect, file_status_height: f32, zoom_note: bool) -> Self {
+    ///
+    /// Every height is a row of [`metric::DOCK_ROW`] plus the frame's own
+    /// [`space::S`] margin and 1px edge, because a plate is a `Frame` and this
+    /// function has to predict the rect the frame will paint:
+    ///
+    /// - file: one `LIST_ROW` action row (the 40pt primary button) + status;
+    /// - zoom: one `DOCK_ROW` of tool buttons + the map-state note;
+    /// - playback: two `DOCK_ROW`s (transport, then timeline and figures)
+    ///   separated by one `space::S`.
+    pub(super) fn new(map: Rect, file_status_height: f32, zoom_note_height: f32) -> Self {
         let file_width = (map.width() * 0.55).clamp(280.0, 440.0);
         let file_status = if file_status_height > 0.0 {
             space::S + file_status_height
         } else {
             0.0
         };
-        let file_height = metric::ROW + file_status + 2.0 * space::S;
+        let file_height = metric::LIST_ROW + file_status + 2.0 * space::S + 2.0 * metric::HAIRLINE;
         let file = Rect::from_min_size(
             map.min + Vec2::splat(space::M),
             Vec2::new(file_width, file_height),
@@ -105,16 +108,18 @@ impl Plates {
 
         let zoom_width = 300.0_f32.min(map.width() - 2.0 * space::M);
         // The control row is one 36pt tool button high; the map-state note is one
-        // 12pt line below it (its `CAPTION` line is ~14pt tall on the OS face).
-        // The frame's 8pt margin and 1px edge are part of the plate's own height,
-        // because `overlay` measures the painted frame, not the content.
-        let zoom_note_height = if zoom_note {
-            space::S + size::CAPTION * 1.2
+        // measured `CAPTION` line below it. `zoom_note_height` is measured by the
+        // caller with the same font the label will use, because the OS face's
+        // line height is not `size × 1.2` and guessing it made the plate two
+        // points shorter than its frame. The frame's 8pt margin and 1px edge are
+        // part of the plate's own height too: `overlay` returns the *frame* rect,
+        // not the content rect.
+        let zoom_note = if zoom_note_height > 0.0 {
+            space::S + zoom_note_height
         } else {
             0.0
         };
-        let zoom_height =
-            metric::DOCK_ROW + zoom_note_height + 2.0 * space::S + 2.0 * metric::HAIRLINE;
+        let zoom_height = metric::DOCK_ROW + zoom_note + 2.0 * space::S + 2.0 * metric::HAIRLINE;
         let zoom = Rect::from_min_size(
             egui::pos2(
                 map.right() - space::M - zoom_width,
@@ -124,22 +129,21 @@ impl Plates {
         );
 
         let playback_width = (map.width() - 2.0 * space::M).min(720.0);
-        // Two rows: the transport (one 36pt tool row) and the timeline (a slider
-        // row, which a horizontal layout sizes to `interact_size.y`, 36), plus the
-        // 8pt block gap, the 4pt explicit space and the frame's own margin and
-        // edge. The playing point's figures live in the selected-point strip under
-        // the canvas, so no third row is reserved. Measured through `App::draw`:
-        // 102pt, which is what makes the plate clear the zoom plate by 8pt.
-        let playback_height = metric::DOCK_ROW
-            + space::S
-            + space::XS
-            + metric::DOCK_ROW
-            + 2.0 * space::S
-            + 2.0 * metric::HAIRLINE;
+        // Two rows, both `DOCK_ROW`: the transport (play / 前 / 次 / 全点表示 /
+        // 追従) and the timeline (slider, n/N, the point's time · speed ·
+        // altitude), separated by one `space::S`. The plate is deliberately two
+        // rows and not three: the selected point's figures used to be the reason
+        // for a third row, and they now sit on the second row with the slider so
+        // the plate covers less of the map.
+        let playback_height =
+            2.0 * metric::DOCK_ROW + space::S + 2.0 * space::S + 2.0 * metric::HAIRLINE;
         let playback = Rect::from_min_size(
             egui::pos2(
                 map.center().x - playback_width / 2.0,
-                zoom.top() - space::S - playback_height,
+                // The plates keep at least 12pt between them: a plate is a
+                // floating layer, and two floating layers that touch read as one
+                // badly divided panel.
+                zoom.top() - space::M - playback_height,
             ),
             Vec2::new(playback_width, playback_height),
         );
@@ -156,7 +160,10 @@ impl Plates {
         let width = 104.0;
         Rect::from_min_size(
             egui::pos2(map.right() - space::M - width, map.top() + space::M),
-            Vec2::new(width, metric::ROW_COMPACT + 2.0 * space::S),
+            Vec2::new(
+                width,
+                metric::DOCK_ROW + 2.0 * space::S + 2.0 * metric::HAIRLINE,
+            ),
         )
     }
 
@@ -296,13 +303,16 @@ impl LogScreen {
         canvas: Canvas,
         plates: &Plates,
         floating: Option<Rect>,
+        settings: &AppSettings,
     ) {
         if self.track.points.is_empty() {
             // Nothing to play: the strip and the playback controls are omitted so
             // the empty state owns the canvas it is explaining.
             self.empty_overlay(ui, map, floating);
         } else {
-            let rect = overlay(ui, plates.playback, |ui| self.playback_controls(ui));
+            let rect = overlay(ui, plates.playback, |ui| {
+                self.playback_controls(ui, settings);
+            });
             super::layout_probe::overlay("playback", rect);
         }
         let rect = overlay(ui, plates.file, |ui| self.file_controls(ui));
@@ -342,7 +352,7 @@ impl LogScreen {
             );
             let field = (ui.available_width() - metric::ACTION_WIDTH - space::M).max(96.0);
             let _response = ui.add_sized(
-                Vec2::new(field, metric::ROW),
+                Vec2::new(field, metric::LIST_ROW),
                 egui::TextEdit::singleline(&mut self.log_path)
                     .hint_text(egui::RichText::new("ログファイルのパス").size(size::CAPTION))
                     .font(egui::TextStyle::Monospace),
@@ -448,10 +458,13 @@ impl LogScreen {
     ///
     /// The canvas is a picker, so the answer to a click lives directly under it:
     /// UTC, coordinate in the chosen format, altitude and speed, in one monospace
-    /// row that does not wrap into a panel below the fold.
-    pub(super) fn selection_strip(&self, ui: &Ui, rect: Rect, settings: &AppSettings) {
+    /// row that does not wrap into a panel below the fold. A waypoint suffix can
+    /// make the row wider than a narrow canvas, so the label truncates with an
+    /// ellipsis instead of being cut at the sheet's edge — a cut reads as a
+    /// rendering bug, an ellipsis reads as more text.
+    pub(super) fn selection_strip(&self, ui: &mut Ui, rect: Rect, settings: &AppSettings) {
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, theme::RADIUS, theme::WINDOW);
+        painter.rect_filled(rect, theme::RADIUS, theme::SURFACE);
         painter.hline(
             rect.x_range(),
             rect.top(),
@@ -477,12 +490,22 @@ impl LogScreen {
                     )
                 },
             );
-        painter.text(
-            rect.left_center() + Vec2::new(space::L, 0.0),
-            egui::Align2::LEFT_CENTER,
-            text,
-            egui::FontId::monospace(size::CAPTION),
-            theme::INK,
+        let mut strip = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(Rect::from_min_max(
+                    egui::pos2(rect.left() + space::L, rect.top()),
+                    egui::pos2(rect.right() - space::L, rect.bottom()),
+                ))
+                .layout(Layout::left_to_right(Align::Center)),
+        );
+        let _label = strip.add(
+            egui::Label::new(
+                egui::RichText::new(text)
+                    .size(size::CAPTION)
+                    .color(theme::INK)
+                    .monospace(),
+            )
+            .truncate(),
         );
     }
 
@@ -565,9 +588,10 @@ impl LogScreen {
                 .layout(Layout::top_down(Align::LEFT)),
         );
         egui::Frame::new()
-            .fill(theme::OVERLAY.gamma_multiply(PLATE_ALPHA))
+            .fill(theme::OVERLAY)
             .stroke(Stroke::new(metric::HAIRLINE, theme::LINE))
             .corner_radius(theme::RADIUS)
+            .shadow(theme::POPUP_SHADOW)
             .inner_margin(space::L)
             .show(&mut child, |ui| self.drawer_contents(ui, settings));
         super::layout_probe::drawer(rect);
@@ -576,7 +600,9 @@ impl LogScreen {
 
 /// A plate over the canvas.
 ///
-/// `theme::OVERLAY` fill, `line` hairline, the product's one corner radius, and a
+/// `theme::OVERLAY` fill, `line` hairline, the product's one corner radius and
+/// the one shadow: a plate is a floating layer (DESIGN.md §3), which is the only
+/// elevation the design allows besides a fill and a 1px edge. Each plate has a
 /// fixed size: the caller computes the plate, so two anchored plates cannot grow
 /// into each other when a caption is translated. Returns the rect the frame used
 /// so a test can hold the no-overlap promise without reading pixels.
@@ -589,13 +615,13 @@ fn overlay(ui: &mut Ui, plate: Rect, body: impl FnOnce(&mut Ui)) -> Rect {
     let clip = plate.intersect(ui.clip_rect());
     child.set_clip_rect(clip);
     egui::Frame::new()
-        .fill(theme::OVERLAY.gamma_multiply(PLATE_ALPHA))
+        .fill(theme::OVERLAY)
         .stroke(Stroke::new(metric::HAIRLINE, theme::LINE))
         .corner_radius(theme::RADIUS)
+        .shadow(theme::POPUP_SHADOW)
         .inner_margin(space::S)
         .show(&mut child, |ui| {
             ui.set_width((plate.width() - 2.0 * space::S).max(1.0));
-            ui.set_height((plate.height() - 2.0 * space::S).max(1.0));
             body(ui);
         })
         .response
