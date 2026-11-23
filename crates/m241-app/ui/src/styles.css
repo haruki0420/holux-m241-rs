@@ -345,6 +345,219 @@
   }
 }
 
+
+/* ---------------------------------------------------------------------------
+ * The Log screen: map chrome, popup, timeline, switch, export menu.
+ *
+ * These sit over a MapLibre canvas, so they need their own surfaces. They are
+ * still the same tokens as the rest of the app: white card, one hairline, the
+ * cartographic accent only where it means "this is the track".
+ * ------------------------------------------------------------------------- */
+
+@layer components {
+  /* A small, fixed stack. No arbitrary z values elsewhere in the app. */
+  .z-map {
+    z-index: 10;
+  }
+
+  .z-popup {
+    z-index: 20;
+  }
+
+  .z-popover {
+    z-index: 30;
+  }
+
+  .map-control {
+    display: inline-flex;
+    min-width: 32px;
+    height: 32px;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 0 8px;
+    border: 1px solid var(--hair);
+    border-radius: var(--r-control);
+    background: var(--card);
+    color: var(--ink-2);
+    font-size: 12px;
+    transition:
+      background-color var(--fast) var(--ease),
+      color var(--fast) var(--ease),
+      border-color var(--fast) var(--ease);
+  }
+
+  .map-control:hover {
+    background: var(--raise);
+    color: var(--ink);
+  }
+
+  .map-control[aria-pressed="true"] {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .map-readout {
+    position: absolute;
+    top: 12px;
+    left: 12px;
+    min-width: 196px;
+    padding: 8px 10px;
+    border: 1px solid var(--hair);
+    border-radius: var(--r-control);
+    background: var(--card);
+    color: var(--ink-2);
+    font-size: 12px;
+    line-height: 1.6;
+    pointer-events: none;
+  }
+
+  .map-popup {
+    position: absolute;
+    z-index: 20;
+    width: 240px;
+    padding: 12px;
+    border: 1px solid var(--hair-strong);
+    border-radius: var(--r-card);
+    background: var(--card);
+    box-shadow: 0 8px 24px rgb(23 26 28 / 10%);
+  }
+
+  .timeline {
+    position: absolute;
+    bottom: 12px;
+    left: 50%;
+    display: flex;
+    width: clamp(320px, calc(100% - 260px), 520px);
+    transform: translateX(-50%);
+    align-items: center;
+    gap: 10px;
+    padding: 6px 10px;
+    border: 1px solid var(--hair);
+    border-radius: var(--r-card);
+    background: var(--card);
+    box-shadow: 0 1px 2px rgb(23 26 28 / 5%);
+  }
+
+  .timeline-range {
+    height: 20px;
+    appearance: none;
+    background: transparent;
+    cursor: pointer;
+  }
+
+  .timeline-range:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
+
+  .timeline-range::-webkit-slider-runnable-track {
+    height: 2px;
+    border-radius: 1px;
+    background: var(--hair-strong);
+  }
+
+  .timeline-range::-webkit-slider-thumb {
+    width: 12px;
+    height: 12px;
+    margin-top: -5px;
+    appearance: none;
+    border: 2px solid var(--card);
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
+  }
+
+  .timeline-range::-moz-range-track {
+    height: 2px;
+    border-radius: 1px;
+    background: var(--hair-strong);
+  }
+
+  .timeline-range::-moz-range-thumb {
+    width: 8px;
+    height: 8px;
+    border: 2px solid var(--card);
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 1px var(--accent);
+  }
+
+  .switch {
+    position: relative;
+    display: inline-block;
+    width: 28px;
+    height: 16px;
+    flex-shrink: 0;
+    border-radius: 8px;
+    background: var(--hair-strong);
+    transition: background-color var(--fast) var(--ease);
+  }
+
+  .switch[data-on="true"] {
+    background: var(--accent);
+  }
+
+  .switch-knob {
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #ffffff;
+    transition: transform var(--fast) var(--ease);
+  }
+
+  .switch[data-on="true"] .switch-knob {
+    transform: translateX(12px);
+  }
+
+  .export-menu {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    width: 272px;
+    padding: 14px;
+    border: 1px solid var(--hair-strong);
+    border-radius: var(--r-card);
+    background: var(--card);
+    box-shadow: 0 8px 24px rgb(23 26 28 / 10%);
+    text-align: left;
+  }
+}
+
+/* MapLibre's own chrome, brought onto the same tokens. */
+.maplibregl-ctrl-scale {
+  border: 0;
+  border-bottom: 1px solid var(--ink-3);
+  border-left: 1px solid var(--ink-3);
+  background: rgb(255 255 255 / 82%);
+  color: var(--ink-2);
+  font-family: var(--font-figures);
+  font-size: 11px;
+  line-height: 1.2;
+  padding: 1px 4px;
+}
+
+/* The map's credit and scale sit above the timeline strip instead of under it. */
+.maplibregl-ctrl-bottom-right {
+  bottom: 64px;
+}
+
+.maplibregl-ctrl-attrib {
+  font-family: var(--font-ui);
+  font-size: 11px;
+}
+
+.maplibregl-ctrl-attrib a {
+  color: var(--ink-2);
+}
+
+.maplibregl-canvas:focus {
+  outline: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
