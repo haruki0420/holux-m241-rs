@@ -725,8 +725,10 @@ pub fn sample_log() -> LoadedLog {
             let wobble = (angle * 3.0).sin();
             let latitude = session.lat + angle.sin() * session.lat_radius + wobble * 0.0008;
             let longitude = session.lon + angle.cos() * session.lon_radius;
-            let speed = 14.0 + (angle * 2.0).sin() as f32 * 7.0;
-            let height = 34.0 + (angle * 3.0).cos() as f32 * 11.0;
+            // One slow swing per session: a sample whose speed oscillates every
+            // few seconds would draw a sawtooth in the chart and read as noise.
+            let speed = 14.0 + angle.sin() as f32 * 6.0;
+            let height = 34.0 + angle.cos() as f32 * 11.0;
             points.push(TrackPoint {
                 utc: Some(session.start + step * session.interval),
                 latitude: Some(latitude),
@@ -1128,6 +1130,74 @@ mod tests {
         assert!(text.contains(".gpx"), "got {text}");
     }
 
+    /// Build a two-record dump: block header, two records, FF padding.
+    fn synthetic_dump() -> Vec<u8> {
+        let mut block = vec![0xFF_u8; 0x1_0000];
+        // Header: count 2, mask UTC|VALID|LATITUDE|LONGITUDE|HEIGHT|SPEED, policy
+        // "logging enabled", one-second period.
+        block[0..2].copy_from_slice(&2_u16.to_le_bytes());
+        let mask: u32 = 0b11_1111;
+        block[2..6].copy_from_slice(&mask.to_le_bytes());
+        block[6..8].copy_from_slice(&0x0106_u16.to_le_bytes());
+        block[8..12].copy_from_slice(&10_u32.to_le_bytes());
+        let mut offset = 0x200;
+        for step in 0..2_u32 {
+            let mut record = Vec::new();
+            record.extend_from_slice(&(1_763_283_600 + step * 30).to_le_bytes());
+            record.extend_from_slice(&0_u16.to_le_bytes());
+            record.extend_from_slice(&(35.681_236_f32).to_le_bytes());
+            record.extend_from_slice(&(139.767_13_f32).to_le_bytes());
+            // Height is the top three bytes of a little-endian f32.
+            let height = 42.0_f32.to_le_bytes();
+            record.extend_from_slice(&height[1..4]);
+            record.extend_from_slice(&18.0_f32.to_le_bytes());
+            let checksum = record.iter().fold(0_u8, |acc, byte| acc ^ byte);
+            record.push(checksum);
+            let end = offset + record.len();
+            block[offset..end].copy_from_slice(&record);
+            offset = end;
+        }
+        block
+    }
+
+    #[test]
+    fn a_bin_dump_is_opened_and_summarised() {
+        let directory = temp_dir("m241-app-bin");
+        let path = directory.join("track.bin");
+        std::fs::write(&path, synthetic_dump()).expect("write dump");
+        let loaded = read(&path.display().to_string()).expect("open dump");
+        assert_eq!(loaded.format, DocumentFormat::Bin);
+        let summary = summary(&loaded);
+        assert_eq!(summary.points, 2);
+        assert_eq!(summary.fixes, 2);
+        assert_eq!(summary.waypoints, 0);
+        assert_eq!(summary.started_at, Some(1_763_283_600));
+        assert_eq!(loaded.report.blocks, 1);
+        assert_eq!(loaded.report.records, 2);
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_kml_and_a_kmz_export_can_be_opened_again() {
+        let loaded = sample();
+        let directory = temp_dir("m241-app-import");
+        for (format, extension) in [("kml", "kml"), ("kmz", "kmz")] {
+            let destination = directory.join(format!("track.{extension}"));
+            export(&loaded, format, &destination.display().to_string()).expect("export");
+            let reopened = read(&destination.display().to_string())
+                .unwrap_or_else(|error| panic!("{format}: {error}"));
+            // KML writes waypoints as separate Placemarks, which the importer
+            // reads back as extra points; the track itself must not lose any.
+            assert!(
+                reopened.track.points.len() >= loaded.track.points.len(),
+                "{format}: {} < {}",
+                reopened.track.points.len(),
+                loaded.track.points.len()
+            );
+        }
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
     #[test]
     fn a_gpx_export_can_be_opened_again() {
         let loaded = sample();
@@ -1168,6 +1238,79 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{format}: {error}"));
             assert!(outcome.bytes > 0, "{format} produced no bytes");
         }
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        directory
+    }
+
+    fn write_jpeg(path: &Path) {
+        let image = image::RgbImage::from_fn(16, 12, |x, y| {
+            image::Rgb([(x * 12).min(255) as u8, (y * 18).min(255) as u8, 96])
+        });
+        let mut file = std::fs::File::create(path).expect("create jpeg");
+        let encoder = JpegEncoder::new_with_quality(&mut file, 80);
+        encoder
+            .write_image(image.as_raw(), 16, 12, image::ExtendedColorType::Rgb8)
+            .expect("encode jpeg");
+    }
+
+    #[test]
+    fn photos_are_thumbnailed_and_matched_to_the_nearest_point() {
+        let directory = temp_dir("m241-app-photos");
+        let photo = directory.join("photo.jpg");
+        write_jpeg(&photo);
+        // The first sample point's capture time, so the match is the first point.
+        let taken = std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::from(SAMPLE_START));
+        let handle = std::fs::File::options()
+            .write(true)
+            .open(&photo)
+            .expect("open photo");
+        handle
+            .set_times(std::fs::FileTimes::new().set_modified(taken))
+            .expect("set mtime");
+        drop(handle);
+        std::fs::write(directory.join("clip.mp4"), b"not really a video").expect("media");
+
+        let mut loaded = sample();
+        let result = load_photos(&mut loaded, &directory.display().to_string()).expect("load");
+        assert_eq!(result.photos.len(), 1);
+        assert_eq!(result.photos[0].point_index, Some(0));
+        assert_eq!(result.photos[0].time_source.as_deref(), Some("file"));
+        assert!(
+            result.photos[0]
+                .thumbnail
+                .as_deref()
+                .is_some_and(|url| url.starts_with("data:image/jpeg;base64,")),
+            "thumbnail was not a JPEG data URL"
+        );
+        assert_eq!(result.media.len(), 1);
+        assert_eq!(result.media[0].kind, "video");
+        assert_eq!(loaded.photos.len(), 1);
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn exporting_over_the_source_itself_is_refused() {
+        let loaded = sample();
+        let directory = temp_dir("m241-app-overwrite");
+        let destination = directory.join("track.gpx");
+        export(&loaded, "gpx", &destination.display().to_string()).expect("first export");
+        let reopened = read(&destination.display().to_string()).expect("reopen");
+        let text = export(&reopened, "gpx", &destination.display().to_string())
+            .expect_err("overwrite refused");
+        assert!(text.contains("同じ場所"), "got {text}");
+        assert!(text.contains("対処: "), "got {text}");
         std::fs::remove_dir_all(&directory).ok();
     }
 
