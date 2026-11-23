@@ -18,7 +18,7 @@ export function MapPanel({ stage }: { stage: number }) {
 
       <div className="relative flex flex-1 flex-col justify-between gap-6 p-5">
         <div>
-          <h2 id="map-title" className="text-sm font-medium text-ink-2">
+          <h2 id="map-title" className="text-md font-medium text-ink">
             地図
           </h2>
           <p className="mt-1 text-xs text-ink-3">ログ画面（P2）で表示します</p>

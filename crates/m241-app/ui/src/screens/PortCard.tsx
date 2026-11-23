@@ -91,7 +91,13 @@ export function PortCard({ controller }: { controller: DeviceProbeController }) 
             className="btn-quiet mt-1"
             onClick={() => setShowAll((current) => !current)}
           >
-            {showAll ? "候補だけ表示" : `ほか ${hidden} 件を表示`}
+            {showAll ? (
+              "候補だけ表示"
+            ) : (
+              <>
+                ほか <span className="mono">{hidden}</span> 件を表示
+              </>
+            )}
           </button>
         ) : null}
 
