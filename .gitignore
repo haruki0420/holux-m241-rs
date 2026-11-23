@@ -35,3 +35,10 @@
 # Python bytecode (the `__pycache__/` and `*.pyc` patterns are repository-wide).
 __pycache__/
 *.pyc
+
+# The Tauri app's frontend build output and the schema directory `tauri-build`
+# generates. Both are produced by `pnpm --dir crates/m241-app/ui build` and
+# `cargo build -p m241-app`; neither is source.
+/crates/m241-app/ui/node_modules/
+/crates/m241-app/ui/dist/
+/crates/m241-app/gen/

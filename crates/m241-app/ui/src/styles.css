@@ -1,0 +1,234 @@
+/*
+ * Light theme tokens for the Tauri rewrite (P0).
+ *
+ * The values are the ones the design direction names, read as a light theme:
+ * three surfaces, one hairline, three ink levels, one accent, one destructive
+ * colour. Everything else in the UI is composed from these plus spacing and
+ * type, so a screen cannot invent a fourth grey.
+ *
+ * `--danger` is reserved for destructive actions and is intentionally not used
+ * on the Connect screen. Failures use `--error`, which is a different semantic
+ * (something went wrong, nothing was destroyed).
+ */
+
+@import "tailwindcss";
+
+@font-face {
+  font-family: "Inter";
+  src: url("/fonts/inter-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Inter";
+  src: url("/fonts/inter-600.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Noto Sans JP";
+  src: url("/fonts/noto-sans-jp-400.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Noto Sans JP";
+  src: url("/fonts/noto-sans-jp-600.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  color-scheme: light;
+
+  /* Surfaces */
+  --surface: #ffffff;
+  --surface-2: #f5f6f7;
+  --surface-3: #eceef0;
+  --line: #dde1e4;
+  --line-strong: #c3c9cd;
+
+  /* Ink */
+  --ink: #171a1c;
+  --ink-2: #4a5156;
+  --ink-3: #6b7379;
+
+  /* Accent (track, selection, primary action) */
+  --accent: #1a6e82;
+  --accent-hover: #155b6b;
+  --accent-soft: #e9f1f3;
+  --accent-line: #c6dde2;
+
+  /* Destructive (reserved; not used on Connect) */
+  --danger: #c2410c;
+
+  /* Failure status (not destructive) */
+  --error: #b42318;
+  --error-soft: #fdf1ef;
+  --error-line: #f2c9c2;
+
+  /* Shape and elevation */
+  --radius: 8px;
+  --space: 8px;
+  --shadow-floating: 0 12px 32px rgb(23 26 28 / 0.14), 0 2px 8px rgb(23 26 28 / 0.08);
+
+  /* Bundled fonts: Inter for Latin, Noto Sans JP for Japanese. No system
+     fallback is required for the composed text; `system-ui` is last only so a
+     glyph both subsets miss still renders something. */
+  --font-stack: "Inter", "Noto Sans JP", system-ui, sans-serif;
+}
+
+@theme inline {
+  --font-sans: var(--font-stack);
+
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-line: var(--accent-line);
+  --color-danger: var(--danger);
+  --color-error: var(--error);
+  --color-error-soft: var(--error-soft);
+  --color-error-line: var(--error-line);
+
+  --radius-card: var(--radius);
+  --shadow-float: var(--shadow-floating);
+
+  /* Type scale: 12 / 14 / 16 / 20 / 28. Nothing below 12. */
+  --text-caption: 12px;
+  --text-caption--line-height: 1.5;
+  --text-caption--letter-spacing: 0.01em;
+  --text-ui: 14px;
+  --text-ui--line-height: 1.55;
+  --text-body: 16px;
+  --text-body--line-height: 1.6;
+  --text-title: 20px;
+  --text-title--line-height: 1.4;
+  --text-title--letter-spacing: -0.01em;
+  --text-display: 28px;
+  --text-display--line-height: 1.25;
+  --text-display--letter-spacing: -0.02em;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--surface-2);
+    color: var(--ink);
+    font-family: var(--font-stack);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  button {
+    font: inherit;
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-card border border-line bg-surface;
+  }
+
+  .btn {
+    @apply inline-flex h-10 items-center justify-center gap-2 rounded-card px-4 text-ui font-semibold transition-colors;
+  }
+
+  .btn:focus-visible {
+    @apply outline-none ring-2 ring-accent/40 ring-offset-2 ring-offset-surface;
+  }
+
+  .btn-primary {
+    @apply bg-accent text-white;
+  }
+
+  .btn-primary:hover:not(:disabled) {
+    @apply bg-accent-hover;
+  }
+
+  .btn-primary:disabled {
+    @apply cursor-not-allowed opacity-45;
+  }
+
+  .btn-quiet {
+    @apply inline-flex h-8 items-center justify-center gap-2 rounded-card px-2 text-caption font-semibold text-ink-2 transition-colors;
+  }
+
+  .btn-quiet:hover:not(:disabled) {
+    @apply bg-surface-3 text-ink;
+  }
+
+  .btn-quiet:focus-visible {
+    @apply outline-none ring-2 ring-accent/40 ring-offset-2 ring-offset-surface;
+  }
+
+  .btn-quiet:disabled {
+    @apply cursor-not-allowed opacity-45;
+  }
+
+  .field {
+    @apply h-10 w-full rounded-card border border-line bg-surface px-4 text-ui text-ink transition-shadow outline-none placeholder:text-ink-3;
+  }
+
+  .field:focus-visible {
+    @apply border-accent ring-2 ring-accent/30;
+  }
+
+  .card-title {
+    @apply text-body font-semibold text-ink;
+  }
+
+  .card-note {
+    @apply text-caption text-ink-3;
+  }
+
+  .figure-row {
+    @apply flex items-center justify-between gap-6 py-2;
+  }
+
+  .figure-label {
+    @apply text-ui text-ink-2;
+  }
+
+  .figure-value {
+    @apply text-right text-ui font-semibold text-ink tabular-nums;
+  }
+
+  .well {
+    @apply rounded-card bg-surface-2 p-4;
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-2 rounded-full border px-2 py-1 text-caption font-semibold;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
