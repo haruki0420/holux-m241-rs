@@ -79,7 +79,10 @@ beside a word.
 
 The map is the one light surface: OSM tiles are pale, and letting the map be the
 only bright rectangle on a graphite page is the intended reading — the paper
-figure on the manual's dark cover.
+figure on the manual's dark cover. The Tauri app reaches the same reading
+without a custom tile style: its MapLibre raster layer paints OSM with
+`raster-saturation: -0.7` and `raster-brightness-max: 0.85`, so roads and labels
+stay readable while the 5 px accent track remains the only saturated element.
 
 ### Type
 
@@ -543,14 +546,23 @@ approximation from a mistake.
   written to the cache), and X11/Xwayland was (16 tiles); the visual appearance
   on Wayland was not, because this environment's screen capture never answered
   (see README's unverified list).
-- The GUI has exactly one network consumer: background tiles. It used to be a
-  project rule that the GUI must not link a network client at all, because a
-  fetch cannot be exercised headlessly. The user asked for a real map, so that
-  rule was lifted for this module. What replaces it is the `TileFetcher` seam
-  (tests inject a fake), the window gate and the `sample` flag; what does not is
-  a mechanical check — `tools/check_safety.py` still knows nothing about the
-  network. A second network consumer would need the same seam and an update to
-  this bullet and the note in `crates/m241-gui/Cargo.toml`.
+- There are now **two** network consumers, and both fetch only background map
+  tiles. The egui GUI fetches them through the `TileFetcher` seam
+  (`crates/m241-gui/src/screens/log/tiles.rs`; tests inject a fake, and the
+  window gate plus the `sample` flag keep a headless render offline). The Tauri
+  app (`crates/m241-app`) fetches them from the webview with MapLibre from
+  `https://tile.openstreetmap.org`, which is why its CSP names that host in
+  `img-src` and `connect-src`. There is no seam on that side because the WebView
+  owns the request; its persisted tile switch is what turns the requests off.
+  Every other command stays offline, and `nmea proxy`'s TCP listener is
+  loopback by default. A third consumer needs its own note here and in the tool
+  that gates it.
+- The egui GUI used to have a rule that it must not link a network client at
+  all, because a fetch cannot be exercised headlessly. The user asked for a real
+  map, so that rule was lifted for the map module only. What replaces it is the
+  `TileFetcher` seam, the window gate and the `sample` flag; what does not is a
+  mechanical check — `tools/check_safety.py` still knows nothing about the
+  network.
 - The screenshots show the firmware write step with the sample image applied in
   memory and the confirmation armed — it is never written to disk, and the
   panel and screen still carry 「見本」. That is why the amber button appears in
