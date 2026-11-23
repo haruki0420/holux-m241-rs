@@ -1224,11 +1224,12 @@ fn the_map_plates_are_overlay_at_ninety_two_percent() {
 }
 
 #[test]
-fn the_map_track_is_five_points_of_data_over_a_seven_point_ground_casing() {
-    // 07-eztour-spec §5's 「幅 5」 is read off the painted line rather than off the
-    // constant that produced it. The 70% opacity is not: on OSM tile `data` at
-    // 70% measured 1.7:1, so the line carries a `ground` casing and a full
-    // `data` stroke (design review 2026-11-23, M1).
+fn the_track_is_one_solid_line_without_record_dots() {
+    // DESIGN.md §10: the map's track is one line. A record is not a visible dot:
+    // the old build painted a palette disc at every plotted record, which turned
+    // a 240-point track into beads and its line into a dotted outline. Read off
+    // the painted shapes rather than the constants, so "the line stopped being
+    // painted" fails here too.
     let ctx = context();
     let mut app = App::default();
     app.select(Screen::Log);
@@ -1238,51 +1239,6 @@ fn the_map_track_is_five_points_of_data_over_a_seven_point_ground_casing() {
     let mut flat = Vec::new();
     flatten_shapes(&shapes, &mut flat);
 
-    // Every record carries a `ground` disc one hairline wider than the dot, so
-    // the pale palette hue keeps a dark edge on the tile. The count is not fixed
-    // (the sample is 240 points), so the pair is asserted rather than counted.
-    let casing_dot = flat
-        .iter()
-        .find_map(|shape| match shape {
-            egui::Shape::Circle(circle)
-                if circle.fill == theme::WINDOW
-                    && (circle.radius - (theme::metric::POINT_DOT + theme::metric::HAIRLINE))
-                        .abs()
-                        < 0.01 =>
-            {
-                Some(circle)
-            }
-            _ => None,
-        })
-        .expect("no plotted record was painted with a window casing");
-    assert_eq!(
-        casing_dot.stroke.color,
-        egui::Color32::TRANSPARENT,
-        "the casing disc should not add a second stroke"
-    );
-    // The ten-colour cycle (07-eztour-spec §5) is only as real as the dots it
-    // paints, so at least three palette hues have to appear among the record
-    // fills. Reading `record_fill` in a unit test would still pass with the
-    // canvas painting one colour over every casing.
-    let hues: std::collections::BTreeSet<[u8; 4]> = flat
-        .iter()
-        .filter_map(|shape| match shape {
-            egui::Shape::Circle(circle)
-                if (circle.radius - theme::metric::POINT_DOT).abs() < 0.01
-                    && circle.fill != egui::Color32::TRANSPARENT
-                    && circle.fill != theme::WINDOW =>
-            {
-                Some(circle.fill.to_array())
-            }
-            _ => None,
-        })
-        .collect();
-    assert!(
-        hues.len() >= 3,
-        "the plotted records use {} colour(s); the ten-colour cycle is not in the paint",
-        hues.len()
-    );
-
     let tracks: Vec<&egui::epaint::PathShape> = flat
         .iter()
         .filter_map(|shape| match shape {
@@ -1290,6 +1246,12 @@ fn the_map_track_is_five_points_of_data_over_a_seven_point_ground_casing() {
             _ => None,
         })
         .collect();
+    assert_eq!(
+        tracks.len(),
+        2,
+        "the track is one line plus its casing; found {} path(s) over 100 points",
+        tracks.len()
+    );
     let casing = tracks
         .iter()
         .find(|path| (path.stroke.width - 7.0).abs() < f32::EPSILON)
@@ -1303,10 +1265,31 @@ fn the_map_track_is_five_points_of_data_over_a_seven_point_ground_casing() {
         .iter()
         .find(|path| (path.stroke.width - 5.0).abs() < f32::EPSILON)
         .expect("the track polyline did not render");
+    // The headless sample draws no tiles, so the line is the dark-chrome token.
     assert_eq!(
         line.stroke.color,
         egui::epaint::ColorMode::Solid(theme::DATA),
-        "the track is not the data colour at full opacity"
+        "the offline track is not the data colour at full opacity"
+    );
+
+    // No record is a dot: a filled circle at `POINT_DOT` would be one. The
+    // playback thumb is also 3pt but it is `ink` — a control, not a record — so
+    // the colour separates them. The selection, the two ends, the waypoint ring
+    // and the photo markers are the only other points on the canvas.
+    let record_dots = flat
+        .iter()
+        .filter(|shape| match shape {
+            egui::Shape::Circle(circle) => {
+                (circle.radius - theme::metric::POINT_DOT).abs() < 0.01
+                    && circle.fill != egui::Color32::TRANSPARENT
+                    && circle.fill != theme::INK
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        record_dots, 0,
+        "a record was painted as a dot; the track is one line (DESIGN.md §10)"
     );
 }
 

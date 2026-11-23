@@ -1299,13 +1299,21 @@ impl LogScreen {
 
         let available = ui.available_rect_before_wrap();
         let strip = drawer::strip_height(self.track.points.is_empty());
-        let map_rect = Rect::from_min_size(
-            available.min,
-            Vec2::new(available.width(), (available.height() - strip).max(0.0)),
+        // The sheet sits inside the page by `MAP_INSET`: the margin is what
+        // separates the map from the rail and the drawer, so the canvas reads as
+        // a surface laid on the window rather than as the window's own fill.
+        let inset = metric::MAP_INSET;
+        let sheet = Rect::from_min_size(
+            available.min + Vec2::splat(inset),
+            Vec2::new(
+                (available.width() - 2.0 * inset).max(1.0),
+                (available.height() - strip - 2.0 * inset).max(1.0),
+            ),
         );
+        let map_rect = sheet;
         let strip_rect = Rect::from_min_max(
-            egui::pos2(available.left(), map_rect.bottom()),
-            available.max,
+            egui::pos2(sheet.left(), sheet.bottom()),
+            egui::pos2(sheet.right(), sheet.bottom() + strip),
         );
         layout_probe::map(map_rect);
         // `Sense::CLICK` rather than `Sense::click()`: the canvas picks the
@@ -1780,11 +1788,20 @@ impl LogScreen {
         settings: &AppSettings,
     ) -> drawer::Canvas {
         let painter = ui.painter_at(rect);
+        // The map is the page: a `SUNKEN` sheet with the one radius, a `LINE`
+        // edge and the schematic grid. The sheet is what makes the canvas read as
+        // paper put down on the window rather than as a hole in it — the previous
+        // frame had the fill but neither the edge nor the margin around it, so
+        // the canvas and the window merged into one dark field.
         painter.rect_filled(rect, theme::RADIUS, theme::SUNKEN);
 
         let view = self.sync_fit_zoom(rect);
         let plotted: Vec<(usize, egui::Pos2)> = self.plotted_points(rect);
         if plotted.is_empty() {
+            // The grid stays underneath the tiles: it is the offline canvas, and
+            // it also fills a tile that has not arrived yet.
+            draw_grid(&painter, rect);
+            paint_sheet_edge(&painter, rect);
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
@@ -1799,8 +1816,6 @@ impl LogScreen {
         }
         let first_index = plotted.first().map(|(index, _pos)| *index);
         let last_index = plotted.last().map(|(index, _pos)| *index);
-        // The grid stays underneath the tiles: it is the offline canvas, and it
-        // also fills a tile that has not arrived yet.
         draw_grid(&painter, rect);
         let drawn = tiles::draw_map(
             ui,
@@ -1813,28 +1828,29 @@ impl LogScreen {
             },
         );
         let line: Vec<egui::Pos2> = plotted.iter().map(|(_index, pos)| *pos).collect();
+        let tiled = drawn.tiles > 0;
         if line.len() > 1 {
-            // 07-eztour §5's 5pt line, in the product's data colour, over the
-            // casing the light surface needs. The numbers live in `metric::track`
-            // so this screen names tokens rather than widths.
+            // 07-eztour §5's 5pt line, in the data colour for the surface under
+            // it, over the casing the light tile needs. The numbers live in
+            // `metric::track` so this screen names tokens rather than widths.
             painter.add(egui::Shape::line(
                 line.clone(),
                 metric::track::casing_stroke(),
             ));
-            painter.add(egui::Shape::line(line, metric::track::line_stroke()));
+            painter.add(egui::Shape::line(line, metric::track::line_stroke(tiled)));
         }
+        // Records are not dots (DESIGN.md §10). A track of 240 plotted points
+        // used to paint 240 palette discs, which read as beads and turned the
+        // line into a dotted outline; the trip is one series and is drawn as one
+        // line. A point is drawn only when it means something: a waypoint, the
+        // two ends, a photograph, or the selection.
         for (index, pos) in &plotted {
             if self.selected == Some(*index) {
                 continue;
             }
-            // A record: a `window` casing under the cycle's colour. On the offline
-            // grid the palette hue carries the sequence (07-eztour §5); on an OSM
-            // tile those hues measure under 2:1 against land, so the casing is what
-            // keeps the marker visible there (design review 2026-11-23, M1).
-            painter.circle_filled(*pos, metric::POINT_DOT + metric::HAIRLINE, theme::WINDOW);
-            painter.circle_filled(*pos, metric::POINT_DOT, metric::track::record_fill(*index));
-            // Waypoints are the device's own POI button: a second, wider ring so
-            // they read as a place rather than as another sample.
+            // Waypoints are the device's own POI button: a ring at twice a
+            // point's radius so they read as a place rather than as another
+            // sample.
             if self
                 .track
                 .points
@@ -1903,6 +1919,10 @@ impl LogScreen {
                 Stroke::new(metric::HAIRLINE, theme::INK),
             );
         }
+
+        // The sheet's edge is painted last on the canvas so a tile cannot cover
+        // it: the canvas is the page, and the page has an edge.
+        paint_sheet_edge(&painter, rect);
 
         // OSM requires the credit where its tiles are shown; a sample, offline or
         // still-loading frame shows none, so it carries none. The credit itself is
@@ -2971,8 +2991,12 @@ fn find_matching_point_index(track: &Track, plan: &GeotagPlan) -> Option<usize> 
 
 /// Faint grid, so a track with a straight edge can be read as geography rather
 /// than as a rectangle that got painted.
+///
+/// The grid is part of the paper: it is what the offline canvas is made of, and
+/// the same `LINE` rule a table row uses. It stays under the tiles so a frame
+/// whose fetch has not arrived yet still shows the geography the track is on.
 fn draw_grid(painter: &egui::Painter, rect: Rect) {
-    let stroke = Stroke::new(metric::HAIRLINE, theme::LINE.gamma_multiply(0.6));
+    let stroke = Stroke::new(metric::HAIRLINE, theme::LINE);
     for step in 1..4 {
         let fraction = step as f32 / 4.0;
         let x = rect.left() + rect.width() * fraction;
@@ -2980,6 +3004,20 @@ fn draw_grid(painter: &egui::Painter, rect: Rect) {
         painter.vline(x, rect.y_range(), stroke);
         painter.hline(rect.x_range(), y, stroke);
     }
+}
+
+/// The one `LINE` edge around the map sheet.
+///
+/// A fill and a 1px edge is the product's whole elevation grammar (DESIGN.md §3):
+/// a `SUNKEN` rectangle with no edge read as a hole in the window, which is what
+/// made the canvas look like the page's void instead of its paper.
+fn paint_sheet_edge(painter: &egui::Painter, rect: Rect) {
+    painter.rect_stroke(
+        rect,
+        theme::RADIUS,
+        Stroke::new(metric::HAIRLINE, theme::LINE),
+        StrokeKind::Inside,
+    );
 }
 
 /// A plausible trip, for looking at the layout without a device.
@@ -4083,13 +4121,12 @@ mod tests {
     }
 
     #[test]
-    fn the_track_is_five_points_of_data_over_a_seven_point_ground_casing() {
-        // 07-eztour-spec §5's 「幅 5」 is read from the shapes that were painted,
-        // not from the constants that produced them: the previous version
-        // compared `line_stroke().color` with `theme::DATA`, which is the same
-        // expression twice, and it would have kept passing if the canvas stopped
-        // drawing the line altogether. The casing and full-opacity rule come from
-        // the light OSM surface (design review 2026-11-23, M1).
+    fn the_track_is_one_solid_line_and_the_records_are_not_dots() {
+        // DESIGN.md §10: a record is not a visible point. The previous build drew
+        // a palette disc at every plotted record, which made a 240-point track
+        // read as beads and its line as a dotted outline. This reads the painted
+        // shapes, not the code: one 5pt line and one 7pt casing, no disc at a
+        // record's radius, and the markers that do carry meaning still there.
         let shapes = shell_shapes(1280.0, 800.0, |app| app.log_mut().show_sample());
         let mut flat = Vec::new();
         flatten(&shapes, &mut flat);
@@ -4101,6 +4138,12 @@ mod tests {
                 _ => None,
             })
             .collect();
+        assert_eq!(
+            tracks.len(),
+            2,
+            "the track should be one line and its casing, found {} path(s) over 100 points",
+            tracks.len()
+        );
         let casing = tracks
             .iter()
             .find(|path| (path.stroke.width - 7.0).abs() < f32::EPSILON)
@@ -4114,46 +4157,50 @@ mod tests {
             .iter()
             .find(|path| (path.stroke.width - 5.0).abs() < f32::EPSILON)
             .expect("the track polyline did not render");
+        // Headless frames draw no tiles, so the line is the dark-chrome token.
         assert_eq!(
             line.stroke.color,
             egui::epaint::ColorMode::Solid(theme::DATA),
-            "the track is not the data colour at full opacity"
+            "the offline track is not the data colour at full opacity"
         );
         assert!(
             casing.stroke.width > line.stroke.width,
             "the casing does not show past the polyline"
         );
-    }
 
-    #[test]
-    fn the_record_fill_cycles_through_the_ten_colours() {
-        // The render test can only see that at least three hues reached the
-        // canvas: a modulo that stopped cycling, or a palette that lost a
-        // colour, would still leave three. `TRACK_PALETTE`'s own doc says the
-        // sequence is what the records carry, so the cycle is pinned directly.
+        // No plotted record is a dot any more: nothing is painted at
+        // `POINT_DOT` (3pt) with a record's fill. The playback thumb is also 3pt
+        // but it is `ink` — a control, not a record — so the colour separates
+        // them.
+        let record_dots = flat
+            .iter()
+            .filter(|shape| match shape {
+                egui::Shape::Circle(circle) => {
+                    (circle.radius - metric::POINT_DOT).abs() < 0.01
+                        && circle.fill != egui::Color32::TRANSPARENT
+                        && circle.fill != theme::INK
+                }
+                _ => false,
+            })
+            .count();
         assert_eq!(
-            theme::TRACK_PALETTE.len(),
-            10,
-            "the cycle the reference spec names has ten colours"
+            record_dots, 0,
+            "a record was painted as a dot; the track is a line at 5pt (DESIGN.md §10)"
         );
-        assert_eq!(
-            metric::track::record_fill(10),
-            metric::track::record_fill(0),
-            "the eleventh record does not return to the first colour"
-        );
-        assert_eq!(
-            metric::track::record_fill(0),
-            theme::DATA.gamma_multiply(metric::track::LINE_OPACITY),
-            "the first colour is not the product's data colour at the record opacity"
-        );
-        for index in 1..theme::TRACK_PALETTE.len() {
-            assert_ne!(
-                metric::track::record_fill(index),
-                metric::track::record_fill(index - 1),
-                "records {index} and {} share a hue, so the sequence is invisible there",
-                index - 1,
-            );
-        }
+
+        // The markers that mean something are still painted: one waypoint ring.
+        let waypoint_rings = flat
+            .iter()
+            .filter(|shape| match shape {
+                egui::Shape::Circle(circle) => {
+                    circle.fill == egui::Color32::TRANSPARENT
+                        && (circle.radius - metric::POINT_DOT * 2.0).abs() < 0.01
+                        && circle.stroke.color == theme::INK
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(waypoint_rings, 1, "the waypoint ring was not painted");
     }
 
     #[test]
@@ -5149,8 +5196,8 @@ mod tests {
                 frame.tool.height(),
             );
             assert!(
-                (frame.map.width() - frame.content.width()).abs() < 1.0,
-                "the map does not use the content width at {width}×{height}",
+                (frame.map.width() - (frame.content.width() - 2.0 * metric::MAP_INSET)).abs() < 1.0,
+                "the map does not use the content width minus its 12pt sheet margin at {width}×{height}",
             );
         }
     }
@@ -5392,7 +5439,7 @@ mod tests {
             narrow.map,
         );
         assert!(
-            (narrow.map.width() - narrow.content.width()).abs() < 1.0,
+            (narrow.map.width() - (narrow.content.width() - 2.0 * metric::MAP_INSET)).abs() < 1.0,
             "the floating drawer shrank the map instead of covering it",
         );
         assert!(

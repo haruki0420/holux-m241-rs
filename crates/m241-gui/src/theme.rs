@@ -98,16 +98,12 @@ pub const DATA_MAP: Color32 = Color32::from_rgb(0x1A, 0x6E, 0x82);
 /// The ten colours a where-the-logger-has-been marker can take, in ezTour's
 /// order (purple → pink → olive …; 07-eztour-spec §5).
 ///
-/// The product paints one track with one line, so the cycle shows up on the
-/// plotted records rather than on ten polylines: the trip is still a single
-/// series, and the record dots carry the sequence. The hues are desaturated to
-/// sit on a dark surface without competing with the ink that marks the
-/// selection; [`DATA`] is the first entry, so a track less than ten points long
-/// stays in the product's own colour.
-///
-/// DESIGN.md §10 records that the cycle is inherited from the reference spec and
-/// is a named departure from §3's two data tokens: replacing it with one colour
-/// is follow-up work, not a token change made here.
+/// The Log screen draws **one track as one line** (DESIGN.md §10): the
+/// 2026-11-23 review read the per-record dots as beads, because 240 plotted
+/// records turned a single series into confetti and the line into a dotted
+/// outline. The palette is kept for the case it was designed for — telling
+/// several tracks apart — and a single track is [`DATA`] on the dark chrome or
+/// [`DATA_MAP`] over a tile.
 pub const TRACK_PALETTE: [Color32; 10] = [
     DATA,
     Color32::from_rgb(0xB4, 0x7E, 0xC8),
@@ -268,23 +264,32 @@ pub mod metric {
     /// #AAD3DF), so the track is [`DATA_MAP`](super::DATA_MAP) at full opacity
     /// over a [`WINDOW`](super::WINDOW) casing: the dark edge carries it on land
     /// and water alike (design review 2026-11-23, M1).
+    ///
+    /// The track is a **line**, not a chain of markers: a record is not a
+    /// visible dot (DESIGN.md §10). Only the selection, a waypoint, the two ends
+    /// and a photograph are drawn as points.
     pub mod track {
         /// Stroke width of the map's track polyline.
         pub const LINE_WIDTH: f32 = 5.0;
         /// Stroke width of the casing drawn under the polyline.
         pub const CASING_WIDTH: f32 = 7.0;
-        /// Opacity of one plotted record's fill.
-        ///
-        /// The line is painted opaque over its casing; the records keep the
-        /// reference implementation's 70% so a dense track does not turn into a
-        /// solid ribbon.
-        pub const LINE_OPACITY: f32 = 0.7;
 
-        /// The map's track polyline stroke, in the product's data colour.
+        /// The map's track polyline stroke.
         ///
-        /// `PathStroke` rather than `Stroke` because the map line is a path.
-        pub fn line_stroke() -> egui::epaint::PathStroke {
-            egui::epaint::PathStroke::new(LINE_WIDTH, super::super::DATA)
+        /// The colour is chosen by the surface the line is drawn on, because
+        /// neither data token clears 3:1 on both: [`DATA_MAP`](super::DATA_MAP)
+        /// measures 2.4:1 on the offline grid's `WINDOW` (too dark) and
+        /// [`DATA`](super::DATA) measures 1.7:1 on an OSM tile (too pale). So
+        /// `tiled` is the answer to "which surface is under this line", not a
+        /// style preference. `PathStroke` rather than `Stroke` because the map
+        /// line is a path.
+        pub fn line_stroke(tiled: bool) -> egui::epaint::PathStroke {
+            let colour = if tiled {
+                super::super::DATA_MAP
+            } else {
+                super::super::DATA
+            };
+            egui::epaint::PathStroke::new(LINE_WIDTH, colour)
         }
 
         /// The casing under [`line_stroke`]: the same geometry in `window`.
@@ -293,20 +298,6 @@ pub mod metric {
         /// the offline grid it is invisible, which is harmless.
         pub fn casing_stroke() -> egui::epaint::PathStroke {
             egui::epaint::PathStroke::new(CASING_WIDTH, super::super::WINDOW)
-        }
-
-        /// The fill of one plotted record, in ezTour's ten-colour cycle.
-        ///
-        /// The hue carries the sequence on the offline grid. On a tile the hue is
-        /// too pale to read, so the caller draws a `window` disc just under it —
-        /// the cycle stays true and the marker stays visible.
-        pub fn record_fill(index: usize) -> egui::Color32 {
-            let palette = super::super::TRACK_PALETTE;
-            palette
-                .get(index % palette.len())
-                .copied()
-                .unwrap_or(super::super::DATA)
-                .gamma_multiply(LINE_OPACITY)
         }
     }
     /// Radius of one plotted point.
@@ -737,9 +728,9 @@ mod tests {
                 "{name} is not the token DESIGN.md §3 names"
             );
         }
-        // The ten-colour cycle is still the record fill, but on an OSM tile a
-        // pale hue measures under 2:1 on land, so `map_canvas` puts a `window`
-        // casing under every record as well (design review 2026-11-23, M1).
+        // The ten-colour cycle is kept for telling several tracks apart. A single
+        // track is one line in one colour, so the palette has no painted consumer
+        // on this screen (DESIGN.md §10).
         assert_eq!(
             TRACK_PALETTE,
             [
@@ -754,8 +745,35 @@ mod tests {
                 Color32::from_rgb(0xC9, 0x9A, 0x6E),
                 Color32::from_rgb(0x8F, 0x9A, 0xA6),
             ],
-            "the ten-colour record cycle changed"
+            "the ten-colour track palette changed"
         );
+    }
+
+    #[test]
+    fn the_track_line_picks_its_data_token_by_the_surface_under_it() {
+        // DESIGN.md §3: `DATA` is for the dark chrome and `DATA_MAP` for an OSM
+        // tile. Neither clears 3:1 on the other's surface (1.7:1 and 2.4:1), so
+        // the map asks "were tiles painted" and this test pins the two answers.
+        let offscreen = metric::track::line_stroke(false);
+        assert_eq!(offscreen.width, metric::track::LINE_WIDTH);
+        assert_eq!(
+            offscreen.color,
+            egui::epaint::ColorMode::Solid(DATA),
+            "the track on the offline grid is not DATA"
+        );
+        let tiled = metric::track::line_stroke(true);
+        assert_eq!(tiled.width, metric::track::LINE_WIDTH);
+        assert_eq!(
+            tiled.color,
+            egui::epaint::ColorMode::Solid(DATA_MAP),
+            "the track over a tile is not DATA_MAP"
+        );
+        // The casing is the same geometry in the window colour, so the line reads
+        // on the light tile as well as on the dark grid.
+        let casing = metric::track::casing_stroke();
+        assert_eq!(casing.width, metric::track::CASING_WIDTH);
+        assert!(casing.width > tiled.width);
+        assert_eq!(casing.color, egui::epaint::ColorMode::Solid(WINDOW));
     }
 
     #[test]
