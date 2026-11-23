@@ -1,15 +1,23 @@
-//! The two IPC commands the P0 Connect screen calls.
+//! The IPC commands the Connect and Log screens call.
 //!
-//! The contract is intentionally small: the frontend can list ports and can ask
-//! the Rust side to open one and read the identity. There is no command that
-//! writes, erases or changes a device setting, and `m241-flash` is not a
+//! The contract is intentionally small: the frontend can list ports, ask the
+//! Rust side to open one and read the identity, open a saved document, fetch a
+//! point slice, load a photo folder and write one export. There is no command
+//! that writes, erases or changes a device setting, and `m241-flash` is not a
 //! dependency of this crate.
+//!
+//! Every command that touches the filesystem or decodes images runs on Tauri's
+//! blocking pool (`spawn_blocking`), not on the webview thread. The blocking
+//! command takes an `Arc` of the shared document state, so the work can move to
+//! another thread without borrowing the managed state for its whole duration.
 //!
 //! Errors cross the IPC boundary as one string whose **second line is the next
 //! action**, in Japanese. Tauri commands can return a richer error type, but a
 //! string keeps the contract in the task's shape (`Result<DeviceInfo, String>`)
 //! and lets the screen render the message and the recovery step in two places:
 //! the first line is what went wrong, the second is what to do about it.
+
+use std::sync::{Arc, Mutex};
 
 use m241_core::Error as CoreError;
 use tauri::State;
@@ -102,12 +110,18 @@ pub fn describe(error: &CoreError) -> String {
 /// parsed track stays in [`AppState`]; the point list is fetched separately with
 /// [`log_points`] so this reply stays small for a large dump.
 ///
+/// Reading and parsing a 16 MiB dump runs on the blocking pool; only the store
+/// of the result touches the state lock.
+///
 /// # Errors
 ///
 /// The Japanese two-line message from [`logdoc::read`].
 #[tauri::command]
-pub fn open_log(state: State<'_, AppState>, path: String) -> Result<LogSummary, String> {
-    open(&state, logdoc::read(&path)?)
+pub async fn open_log(state: State<'_, AppState>, path: String) -> Result<LogSummary, String> {
+    let loaded = tauri::async_runtime::spawn_blocking(move || logdoc::read(&path))
+        .await
+        .map_err(|error| blocking_failed("ログの読み込み", error))??;
+    open(&state, loaded)
 }
 
 /// Load the built-in sample track.
@@ -159,12 +173,16 @@ pub fn log_points(
 /// meaning as `--utc-offset-days`) and the grouping distance in metres
 /// (`0` disables grouping).
 ///
+/// This is the heaviest command on the Log screen: every image in the folder is
+/// read, decoded, reduced to a 640 px thumbnail and re-encoded. It runs on the
+/// blocking pool for that reason.
+///
 /// # Errors
 ///
 /// A Japanese two-line message from [`logdoc::load_photos`], or when no document
 /// is loaded or the source differs.
 #[tauri::command]
-pub fn load_photos(
+pub async fn load_photos(
     state: State<'_, AppState>,
     path: String,
     directory: String,
@@ -172,18 +190,20 @@ pub fn load_photos(
     log_offset_days: i32,
     group_distance_meters: f64,
 ) -> Result<PhotoLoad, String> {
-    let mut guard = state.log.lock().map_err(|_| internal("log"))?;
-    let loaded = guard.as_mut().ok_or_else(no_document)?;
-    if loaded.source != path {
-        return Err(source_changed());
-    }
+    let log = Arc::clone(&state.log);
     let options = logdoc::PhotoOptions {
         camera_offset_minutes,
         log_offset_days,
         group_distance_meters,
         ..logdoc::PhotoOptions::default()
     };
-    logdoc::load_photos(loaded, &directory, &options)
+    tauri::async_runtime::spawn_blocking(move || {
+        with_log_mut(&log, &path, |loaded| {
+            logdoc::load_photos(loaded, &directory, &options)
+        })
+    })
+    .await
+    .map_err(|error| blocking_failed("写真の読み込み", error))?
 }
 
 /// Write the loaded track to `destination` in `format`.
@@ -192,20 +212,28 @@ pub fn load_photos(
 /// `destination` is an absolute path; the frontend proposes the source path with
 /// the new extension and lets the operator change it.
 ///
+/// The document is already parsed, but encoding a KMZ and writing a multi-megabyte
+/// file is still filesystem work, so it runs on the blocking pool too.
+///
 /// # Errors
 ///
 /// A Japanese two-line message from [`logdoc::export`], or when no document is
 /// loaded or the source differs.
 #[tauri::command]
-pub fn export_log(
+pub async fn export_log(
     state: State<'_, AppState>,
     path: String,
     format: String,
     destination: String,
 ) -> Result<ExportOutcome, String> {
-    with_log(&state, &path, |loaded| {
-        logdoc::export(loaded, &format, &destination)
+    let log = Arc::clone(&state.log);
+    tauri::async_runtime::spawn_blocking(move || {
+        with_log_shared(&log, &path, |loaded| {
+            logdoc::export(loaded, &format, &destination)
+        })
     })
+    .await
+    .map_err(|error| blocking_failed("書き出し", error))?
 }
 
 /// Run `action` against the loaded document named by `source`.
@@ -220,6 +248,47 @@ fn with_log<T>(
         return Err(source_changed());
     }
     action(loaded)
+}
+
+/// The same check as [`with_log`] for a blocking thread holding its own state.
+///
+/// The `Arc` clone is what lets `spawn_blocking` take the document without
+/// borrowing the managed state across the await: the lock is taken and dropped
+/// inside the blocking closure.
+fn with_log_shared<T>(
+    log: &Arc<Mutex<Option<LoadedLog>>>,
+    source: &str,
+    action: impl FnOnce(&LoadedLog) -> Result<T, String>,
+) -> Result<T, String> {
+    let guard = log.lock().map_err(|_| internal("log"))?;
+    let loaded = guard.as_ref().ok_or_else(no_document)?;
+    if loaded.source != source {
+        return Err(source_changed());
+    }
+    action(loaded)
+}
+
+/// [`with_log_shared`] for a command that updates the document (photo matching
+/// replaces the photo rows).
+fn with_log_mut<T>(
+    log: &Arc<Mutex<Option<LoadedLog>>>,
+    source: &str,
+    action: impl FnOnce(&mut LoadedLog) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut guard = log.lock().map_err(|_| internal("log"))?;
+    let loaded = guard.as_mut().ok_or_else(no_document)?;
+    if loaded.source != source {
+        return Err(source_changed());
+    }
+    action(loaded)
+}
+
+/// The message for a blocking task that panicked or was cancelled.
+fn blocking_failed(what: &str, error: impl std::fmt::Display) -> String {
+    format!(
+        "{what}の処理中に内部エラーが発生しました（{error}）\n\
+         対処: 少し待ってから、もう一度実行してください。"
+    )
 }
 
 fn no_document() -> String {

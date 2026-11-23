@@ -30,7 +30,7 @@
 
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -64,10 +64,15 @@ const MAX_PHOTO_BYTES: usize = 24 * 1024 * 1024;
 const THUMBNAIL_EDGE: u32 = 640;
 
 /// The application state Tauri keeps for the Log screen.
+///
+/// The document is behind an `Arc<Mutex<…>>` so a blocking command can take its
+/// own handle into `spawn_blocking` and keep the webview thread free. The
+/// command still does not share the document with the frontend: it copies only
+/// the slice it was asked for.
 #[derive(Debug, Default)]
 pub struct AppState {
     /// The document the screen is showing, if one has been opened.
-    pub log: Mutex<Option<LoadedLog>>,
+    pub log: Arc<Mutex<Option<LoadedLog>>>,
 }
 
 /// One loaded document: the track plus everything derived from it.
