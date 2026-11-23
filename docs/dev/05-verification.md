@@ -367,6 +367,39 @@ it was built from was not recorded.
   are covered by the GUI tests only (🧪).
 * The screenshots were taken but are not committed: they show this host's port
   list (`AGENTS.md` §6).
+* **Later (2026-11-23)** the Log screen was exercised with a saved dump in a real
+  X11 window on the development host, with no unit attached; the track, OSM tiles
+  and attribution drew together. That is display evidence, not a hardware run —
+  see the next subsection. The Log screen's device paths (download, the erase
+  backup, the relay) and the firmware write from the GUI have still not been run
+  against a unit.
+
+#### The GUI's Log screen and map in a real window (2026-11-23, development host)
+
+Host: the development Linux machine — an X11 / Xwayland session and a Wayland
+session. **No M-241 was attached.** This records what the GUI drew from a log
+file on disk, not a hardware session; nothing about the logger is measured here.
+The log is the 225,028-byte dump recorded on 2026-11-21, which parses to the same
+10,942 points as §1.5.
+
+| Step | Result | Status |
+|---|---|---|
+| open the dump in the Log screen, real X11 window | the track of 10,942 points was drawn | ✅ (dev host) |
+| OSM tiles in the same X11 window | raster tiles were fetched over the network and drawn under the track; the attribution `© OpenStreetMap contributors` was visible in the same frame as the tiles and the track | ✅ (dev host) |
+| Wayland real window | tile fetch confirmed: 8 tiles in the on-disk cache | ✅ (fetch only; dev host) |
+| headless / `--screenshot` | no tile fetch; the GUI tests pin this (`a_headless_app_draw_never_starts_a_tile_fetch`) | 🧪 |
+| how the map looks on a Wayland screen | screen capture did not answer in this environment, so the appearance stays 未検証 | ⚠️ |
+
+* **This is development-host evidence, not M-241 verification.** The tiles are
+  fetched by the GUI; the unit is not involved. Do not use these rows to move a
+  hardware claim to ✅.
+* The tile request carries the map area on screen, which follows the track
+  (`PRODUCT.md`, `DISCLAIMER.md`); that is why the README records the network
+  behaviour.
+* The attribution is drawn only when an OSM tile was painted; the sample and the
+  offline frames do not carry it (the GUI tests pin that).
+* The X11 capture is a development-host screenshot and is not committed
+  (`AGENTS.md` §6).
 
 #### The vendor write completes but the read-back differs at `0x5C`
 
@@ -432,7 +465,8 @@ nothing on this page makes the final head verified.
 | The OLED after flashing | never observed; the display was not photographed |
 | The binary log's timestamps after flashing | ⚠️ a post-flash log **was** downloaded on 2026-11-22 (§1.5), but it holds only the settings / state journal and no track point. The parser that ran then read the journal as 20-byte records, so every record checksum failed and the decoded dates were nonsense; PR #34 recognises and skips the journal, and re-parsing the same dumps gives 0 points / journal-only. The download therefore does not verify a timestamp, and whether the unit records track points after the write — with or without a fix — is still 未検証 |
 | The NMEA date from a live GPS fix after patching | ⚠️ with no fix the unit reported the then-current UTC date on 2026-11-22 (§1.5), but that is a clock value, not a fix-derived one; the patched default with a zero clock is `22-08-99` (epoch `935280000`). No fix was available indoors, so a GPS-derived date after patching is still unobserved |
-| The GUI's Log screen, 追従 render and photo write on a real unit | ⚠️ not exercised. The Connect screen and 「接続して確認」 did run against the unit on 2026-11-22 (§1.5); the Log screen needs a log opened through its keyboard-driven path field (no keyboard could be injected into the X11 window) and the photo write needs a real camera JPEG. The KMZ writer, the photo clock shift (day / hour / minute / second, all-photos / selected / camera scope) and track editing (split / merge / delete / undo) that PR #31 wired into the Log screen are unexercised too; no KMZ output has been opened in Google Earth or `unzip` |
+| The GUI's Log screen with a real log file, and the OSM map in a real window | ✅ dev host 2026-11-23 (§1.5): the saved 2026-11-21 dump (10,942 points) opened in a real X11 window, and the track, OSM tiles and attribution drew together; a Wayland window fetched 8 tiles to the cache. **No M-241 was attached — this is not a hardware verification**, and the Wayland display appearance was not captured (screen capture did not answer) |
+| The GUI's device paths (download, erase backup, relay, firmware write) on a real unit | ⚠️ not exercised. The Connect screen and 「接続して確認」 did run against the unit on 2026-11-22 (§1.5). The GUI's firmware write goes through `m241_flash::flow` with the typed `WRITE` / `PROBE`, but it has **not been run against a unit**; neither have the Log screen's download, erase backup or relay, the follow render, the photo JPEG write, the KMZ writer, the photo clock shift (day / hour / minute / second, all-photos / selected / camera scope) or track editing (split / merge / delete / undo). No KMZ output has been opened in Google Earth or `unzip` |
 | `m241 device doctor` against a unit | the command and its tests exist, but no hardware session in §1 ran the port probe, the drop scan or the DA extraction on a unit |
 | `m241 log geotag` on a real camera JPEG | only synthetic JPEGs are written by the tests; no file from a real camera has been geotagged, and a real camera's IFD0 layout has not been read |
 | `m241 nmea proxy` on a live stream | ✅ stdout relay on 2026-11-22 and TCP `--bind` relay on 2026-11-22/23 (§1.5): 9 sentences over `tcp://127.0.0.1:10110`, checksums valid on 9 of 9, date `221126` = 2026-11-22, and `--offset-days 1` corrected it to `231126`. Long runs, multiple clients, a non-loopback bind and a stream carrying a fix are 未検証 |
