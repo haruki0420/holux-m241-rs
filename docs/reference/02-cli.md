@@ -59,6 +59,8 @@ GUI の書き込み系は `m241_flash::flow` の共有セッションを通り�
 | ファーム画面のベンダー書き込み | `m241 fw flash --allow-vendor ... --yes` | `WRITE` を入力 |
 | 書き込み失敗後の「0xD9 再起動」 | `m241 fw da-restart` | `RESTART` を入力 |
 | 書き込み失敗後の「BootROM 再入を確認」 | `m241 fw dump --assume-brom` | なし（同期確認のみ） |
+| ログ画面の「ログ操作」コンソール | `log download` / `log erase` / `log project save` / `log project load` / `log read` / `nmea repair` / `nmea proxy` | 消去はバックアップ＋同意のあと拒否で止まり、実行は CLI の `log erase` のみ（後述の「The GUI's ログ操作 console」） |
+| ログ画面の地図 | （CLI 相当なし。地図タイルは GUI で唯一の外部ネットワーク機能） | 地図タイルは設定から OFF にできる（既定 ON。要インターネット）。headless / `--screenshot` は取得しない |
 
 GUI には `--yes` に相当する引数はない。`WRITE` / `PROBE` / `RESTART` は
 ユーザー自身がキーボードで入力するものであり、エージェントが代行してはならない
