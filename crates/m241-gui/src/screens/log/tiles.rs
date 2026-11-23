@@ -309,6 +309,60 @@ impl MapView {
         self.rect.center() + Vec2::new((x - center_x) as f32, (y - center_y) as f32)
     }
 
+    /// The coordinate at the canvas centre.
+    pub(crate) fn center(self) -> (f64, f64) {
+        (self.center_latitude, self.center_longitude)
+    }
+
+    /// The coordinate under a canvas position.
+    ///
+    /// The inverse of [`Self::project`], used by the pointer interactions: a
+    /// wheel zoom keeps the coordinate under the cursor still, and a hover reads
+    /// the coordinate before it explains it.
+    pub(crate) fn unproject(self, pos: Pos2) -> (f64, f64) {
+        let scale = zoom_scale(self.zoom);
+        let (center_x, center_y) =
+            world_pixel(self.center_latitude, self.center_longitude, self.zoom);
+        let x = center_x + f64::from(pos.x - self.rect.center().x);
+        let y = center_y + f64::from(pos.y - self.rect.center().y);
+        (latitude_from_fraction(y / scale), x / scale * 360.0 - 180.0)
+    }
+
+    /// The centre that puts a coordinate under `screen` at `zoom`.
+    ///
+    /// A zoom is "around the pointer" when the coordinate it started on stays
+    /// under the pointer: this returns the centre that satisfies that for the
+    /// new level.
+    pub(crate) fn centre_for_screen_point(
+        latitude: f64,
+        longitude: f64,
+        zoom: f64,
+        rect: Rect,
+        screen: Pos2,
+    ) -> (f64, f64) {
+        let scale = zoom_scale(zoom);
+        let (x, y) = world_pixel(latitude, longitude, zoom);
+        let center_x = x - f64::from(screen.x - rect.center().x);
+        let center_y = y - f64::from(screen.y - rect.center().y);
+        (
+            latitude_from_fraction(center_y / scale),
+            center_x / scale * 360.0 - 180.0,
+        )
+    }
+
+    /// The centre a drag of `delta` points produces.
+    ///
+    /// A drag moves the *content*, so the centre moves the other way: dragging
+    /// right shows what was left of the canvas.
+    pub(crate) fn panned(self, delta: Vec2) -> (f64, f64) {
+        let scale = zoom_scale(self.zoom);
+        let (center_x, center_y) =
+            world_pixel(self.center_latitude, self.center_longitude, self.zoom);
+        let x = center_x - f64::from(delta.x);
+        let y = center_y - f64::from(delta.y);
+        (latitude_from_fraction(y / scale), x / scale * 360.0 - 180.0)
+    }
+
     /// Where one tile lands on the canvas.
     fn tile_rect(self, tile: TileId) -> Rect {
         let scale = 2.0_f64.powf(self.zoom - f64::from(tile.zoom));
@@ -1900,5 +1954,65 @@ mod tests {
             "an expired failure was never retried"
         );
         assert!(fetcher.calls() > 0, "the retry never reached the fetcher");
+    }
+
+    #[test]
+    fn a_pan_moves_the_centre_the_other_way() {
+        // Dragging content right shows what was to the west: the centre moves
+        // west by the same number of pixels. This is the arithmetic the map's
+        // drag handler calls; the render test drives the pointer.
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let view = MapView::new(TOKYO.0, TOKYO.1, 13.0, rect);
+        let (panned_latitude, panned_longitude) = view.panned(Vec2::new(60.0, 30.0));
+        assert!(
+            panned_longitude < TOKYO.1,
+            "dragging right did not move west"
+        );
+        assert!(
+            panned_latitude > TOKYO.0,
+            "dragging down did not move north"
+        );
+        // The shift is exact: the same coordinate must land 60pt to the right
+        // and 30pt down in the panned view.
+        let before = view.project(TOKYO.0, TOKYO.1);
+        let after =
+            MapView::new(panned_latitude, panned_longitude, 13.0, rect).project(TOKYO.0, TOKYO.1);
+        assert!((after.x - before.x - 60.0).abs() < 0.01);
+        assert!((after.y - before.y - 30.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_pointer_zoom_keeps_the_coordinate_under_the_pointer() {
+        // The wheel zooms around the cursor rather than the canvas centre: the
+        // coordinate the pointer started on has to stay under it at the new
+        // level, or every zoom shoves the map sideways.
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let view = MapView::new(TOKYO.0, TOKYO.1, 13.0, rect);
+        let pointer = Pos2::new(620.0, 240.0);
+        let (latitude, longitude) = view.unproject(pointer);
+        let (center_latitude, center_longitude) =
+            MapView::centre_for_screen_point(latitude, longitude, 15.0, rect, pointer);
+        let zoomed = MapView::new(center_latitude, center_longitude, 15.0, rect);
+        let (after_latitude, after_longitude) = zoomed.unproject(pointer);
+        assert!((after_latitude - latitude).abs() < 1e-9);
+        assert!((after_longitude - longitude).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_projection_round_trips_through_unproject() {
+        // `unproject` is the inverse of `project`; a hover reads a coordinate
+        // through it, so an inverse that drifted would put the coordinate plate
+        // somewhere other than the pointer.
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 480.0));
+        let view = MapView::new(TOKYO.0, TOKYO.1, 12.0, rect);
+        for (latitude, longitude) in [TOKYO, (35.7, 139.8), (35.65, 139.72)] {
+            let pos = view.project(latitude, longitude);
+            let (back_latitude, back_longitude) = view.unproject(pos);
+            // `project` returns an `f32` position, so the round trip is exact
+            // to the pixel, not to the last bit of the degrees: 1e-6° is about
+            // 0.1 m at this latitude.
+            assert!((back_latitude - latitude).abs() < 1e-6);
+            assert!((back_longitude - longitude).abs() < 1e-6);
+        }
     }
 }

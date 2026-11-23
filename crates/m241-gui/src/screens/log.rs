@@ -382,6 +382,19 @@ pub struct LogScreen {
     fit_mode: bool,
     /// Logical slippy-map zoom level (`1.0..=19.0`), clamped >= 12 while following.
     map_zoom: f32,
+    /// The map centre once the user has moved the map by hand.
+    ///
+    /// `None` means "derive it": the selected point, else the track's
+    /// bounding-box centre. A pan or a pointer-centred zoom sets an explicit
+    /// centre; 全点表示 and follow mode clear it so the derived centre takes
+    /// over again (DESIGN.md §5).
+    map_center: Option<(f64, f64)>,
+    /// The rect the canvas was last drawn into.
+    ///
+    /// Recorded so the interaction tests can aim a pointer at the real canvas
+    /// instead of re-deriving the shell's margins; it is also what a future
+    /// keyboard-focus target would need. `Rect::NOTHING` before the first frame.
+    map_rect: Rect,
     /// Background tiles, their textures and the fetch workers.
     tiles: tiles::MapTiles,
     /// Path input for loading photos (directory or single JPEG).
@@ -453,6 +466,8 @@ impl Default for LogScreen {
             follow: false,
             fit_mode: true,
             map_zoom: FOLLOW_MIN_ZOOM,
+            map_center: None,
+            map_rect: Rect::NOTHING,
             tiles: tiles::MapTiles::default(),
             photo_path: String::new(),
             photo_entries: Vec::new(),
@@ -499,6 +514,7 @@ impl LogScreen {
         self.last_step_at = None;
         self.fit_mode = true;
         self.follow = false;
+        self.map_center = None;
         self.map_zoom = self.compute_fit_zoom();
         // A different log means a different part of the world: the previous
         // textures, pending requests and failures belong to the old one.
@@ -627,6 +643,35 @@ impl LogScreen {
     #[must_use]
     pub fn map_zoom(&self) -> f32 {
         self.map_zoom
+    }
+
+    /// The centre the map was panned to, for the interaction tests.
+    ///
+    /// `None` means the centre is derived (the selected point, else the track's
+    /// bounding box). A drag or a pointer-centred zoom sets it; 全点表示 and
+    /// follow mode clear it (DESIGN.md §5).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn map_center(&self) -> Option<(f64, f64)> {
+        self.map_center
+    }
+
+    /// The coordinate the map would put at the canvas centre, for the tests.
+    ///
+    /// The derived centre is a function of the track and the selection, so the
+    /// interaction tests need the value the projection actually used rather than
+    /// the optional override.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn map_center_at(&self, rect: egui::Rect) -> (f64, f64) {
+        self.map_view(rect).center()
+    }
+
+    /// The canvas rect the last frame drew into, for the interaction tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn map_rect(&self) -> egui::Rect {
+        self.map_rect
     }
 
     /// Loaded photo entries (read-only geotag plans).
@@ -886,6 +931,7 @@ impl LogScreen {
     pub fn fit_all(&mut self) {
         self.follow = false;
         self.fit_mode = true;
+        self.map_center = None;
         self.map_zoom = self.compute_fit_zoom();
     }
 
@@ -899,6 +945,9 @@ impl LogScreen {
         self.follow = follow;
         if follow {
             self.fit_mode = false;
+            // Follow mode means "the map is centred on the current point", so a
+            // manual pan is released: keeping both would promise two centres.
+            self.map_center = None;
             let first_with_position = self.track.points.iter().position(TrackPoint::has_position);
             let fallback = first_with_position.or(if self.track.points.is_empty() {
                 None
@@ -1316,11 +1365,13 @@ impl LogScreen {
             egui::pos2(sheet.right(), sheet.bottom() + strip),
         );
         layout_probe::map(map_rect);
-        // `Sense::CLICK` rather than `Sense::click()`: the canvas picks the
-        // nearest point from the pointer's position, so it has nothing to say to
-        // a keyboard and must not become an invisible tab stop (design review
-        // 2026-11-23, M4).
-        let response = ui.allocate_rect(map_rect, Sense::CLICK);
+        self.map_rect = map_rect;
+        // `CLICK | DRAG`: the map both picks a point and pans, so the sheet is a
+        // focusable, draggable instrument (DESIGN.md §5). The click pick lives in
+        // `map_canvas`, after the gesture has moved the view.
+        let response = ui.allocate_rect(map_rect, Sense::click_and_drag());
+        self.handle_map_input(ui, &response, map_rect);
+        common::focus_ring(ui, &response);
         let canvas = self.map_canvas(ui, map_rect, &response, settings);
         ui.allocate_rect(strip_rect, Sense::hover());
         if strip > 0.0 {
@@ -1406,22 +1457,14 @@ impl LogScreen {
     }
 
     fn handle_keyboard(&mut self, ui: &Ui) {
-        if self.track.points.is_empty() || ui.ctx().egui_wants_keyboard_input() {
+        if self.track.points.is_empty() || ui.ctx().text_edit_focused() {
             return;
         }
-        let (space_pressed, right_pressed, left_pressed) = ui.input(|input| {
-            (
-                input.key_pressed(egui::Key::Space),
-                input.key_pressed(egui::Key::ArrowRight),
-                input.key_pressed(egui::Key::ArrowLeft),
-            )
-        });
-        if space_pressed {
+        // The arrows belong to the map when it has focus and to the point list
+        // otherwise; both are handled by `handle_map_input`, which is the only
+        // place that knows which one the focus is on. Space is global playback.
+        if ui.input(|input| input.key_pressed(egui::Key::Space)) {
             self.toggle_play();
-        } else if right_pressed {
-            let _moved = self.step_next();
-        } else if left_pressed {
-            let _moved = self.step_prev();
         }
     }
 
@@ -1945,14 +1988,18 @@ impl LogScreen {
         // Clicking the map selects the nearest plotted point: the map is a
         // picker, not a picture, and a track you cannot ask about is a diagram.
         // The answer is the strip under the canvas, so it is never below a fold.
+        // A click that ended a drag or a double-click is a movement gesture, not
+        // a pick, and a pick more than `POINT_HIT_RADIUS` from a record clears the
+        // selection instead of choosing a point across the sea.
         if response.clicked()
+            && !response.double_clicked()
+            && !response.dragged()
             && let Some(pointer) = response.interact_pointer_pos()
-            && let Some((index, _distance)) = plotted
-                .iter()
-                .map(|(index, pos)| (*index, pos.distance(pointer)))
-                .min_by(|left, right| left.1.total_cmp(&right.1))
         {
-            self.select_point(Some(index));
+            self.select_point(
+                self.nearest_plotted(rect, pointer)
+                    .map(|(index, _pos)| index),
+            );
         }
 
         drawer::Canvas {
@@ -2742,6 +2789,180 @@ impl LogScreen {
         view
     }
 
+    /// How far from a plotted point a map click or hover still means that point.
+    ///
+    /// 20 points (DESIGN.md §5): without a limit a click on empty sea selected
+    /// whichever record happened to be nearest, which made "click the map to look
+    /// at a place" impossible.
+    const POINT_HIT_RADIUS: f32 = 20.0;
+
+    /// The plotted point under `pointer`, if one is within the hit radius.
+    fn nearest_plotted(&self, rect: Rect, pointer: egui::Pos2) -> Option<(usize, egui::Pos2)> {
+        self.plotted_points(rect)
+            .into_iter()
+            .map(|(index, pos)| (index, pos, pos.distance(pointer)))
+            .filter(|(_index, _pos, distance)| *distance <= Self::POINT_HIT_RADIUS)
+            .min_by(|left, right| left.2.total_cmp(&right.2))
+            .map(|(index, pos, _distance)| (index, pos))
+    }
+
+    /// Move the map with the hand that is dragging it.
+    ///
+    /// A manual move releases 全点表示 and 追従 (DESIGN.md §5): both modes make a
+    /// claim about where the centre is, and a person who has just moved the map
+    /// is looking somewhere else. The centre is stored explicitly so the next
+    /// frame does not re-derive it from the selection.
+    fn pan_map(&mut self, rect: Rect, delta: egui::Vec2) {
+        if delta == egui::Vec2::ZERO {
+            return;
+        }
+        let view = self.map_view(rect);
+        self.map_center = Some(view.panned(delta));
+        self.map_zoom = view.zoom as f32;
+        self.fit_mode = false;
+        self.follow = false;
+    }
+
+    /// Zoom `levels` steps while keeping the coordinate under `pointer` still.
+    ///
+    /// The wheel and a double-click both land here; a keyboard zoom passes the
+    /// canvas centre, so it zooms around the middle of the sheet.
+    fn zoom_map_at(&mut self, rect: Rect, pointer: egui::Pos2, levels: f32) {
+        let view = self.map_view(rect);
+        let zoom = (view.zoom as f32 + levels).clamp(MIN_ZOOM, MAX_ZOOM);
+        let (latitude, longitude) = view.unproject(pointer);
+        let (center_latitude, center_longitude) =
+            MapView::centre_for_screen_point(latitude, longitude, f64::from(zoom), rect, pointer);
+        self.map_center = Some((center_latitude, center_longitude));
+        self.map_zoom = zoom;
+        self.fit_mode = false;
+        self.follow = false;
+    }
+
+    /// Handle the map's pointer and keyboard gestures.
+    ///
+    /// The map is an instrument, not a picture: it pans with a drag, zooms with
+    /// the wheel and a double-click, and takes arrow keys and `+`/`-` while it
+    /// has focus (DESIGN.md §5 lists every gesture). A single click is still a
+    /// point pick, so the pick is suppressed for the frame a double-click or a
+    /// drag completed — otherwise zooming would silently change the selection.
+    fn handle_map_input(&mut self, ui: &Ui, response: &egui::Response, rect: Rect) {
+        // A click focuses the map so the keyboard gestures below have a target.
+        // `request_focus` on click is what makes the map a first-class keyboard
+        // surface instead of the invisible tab stop the review removed.
+        if response.clicked() {
+            response.request_focus();
+        }
+
+        if response.dragged_by(egui::PointerButton::Primary) {
+            let delta = response.drag_delta();
+            self.pan_map(rect, delta);
+        }
+
+        if response.hovered()
+            && let Some(pointer) = response.hover_pos()
+        {
+            // A wheel notch is about 120 points of smooth scroll on the
+            // platforms this ships to; the clamp keeps one enormous event from
+            // jumping the whole zoom range in a frame.
+            let scroll = ui.input(|input| input.smooth_scroll_delta.y);
+            if scroll.abs() > 0.0 {
+                self.zoom_map_at(rect, pointer, (scroll / 120.0).clamp(-1.5, 1.5));
+            }
+            if response.double_clicked() {
+                let shift = ui.input(|input| input.modifiers.shift);
+                self.zoom_map_at(rect, pointer, if shift { -1.0 } else { 1.0 });
+            }
+        }
+
+        // The cursor says what the surface does: grab, grabbing, or a point to
+        // open. It is set only while the pointer is over the map, so it never
+        // leaks onto the drawer.
+        if response.hovered() || response.dragged() {
+            let pointer = response
+                .hover_pos()
+                .or_else(|| response.interact_pointer_pos());
+            let icon = if response.dragged() {
+                egui::CursorIcon::Grabbing
+            } else if pointer.is_some_and(|pos| self.nearest_plotted(rect, pos).is_some()) {
+                egui::CursorIcon::PointingHand
+            } else {
+                egui::CursorIcon::Grab
+            };
+            ui.ctx().set_cursor_icon(icon);
+        }
+
+        // A text field with the keyboard owns the keys while it is focused; the
+        // map may be focused too (a focus ring is drawn for it), so the guard is
+        // `text_edit_focused`, not "anything is focused".
+        if ui.ctx().text_edit_focused() {
+            return;
+        }
+        if response.has_focus() {
+            // The map is a keyboard surface: arrows pan it instead of moving
+            // the focus to the next widget, and Escape is the map's own (it
+            // closes the point popup). Without the lock, the first arrow press
+            // panned the map and then handed focus away, so `+` did nothing.
+            ui.memory_mut(|memory| {
+                memory.set_focus_lock_filter(
+                    response.id,
+                    egui::EventFilter {
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                        tab: false,
+                    },
+                );
+            });
+            let (left, right, up, down, zoom_in, zoom_out) = ui.input(|input| {
+                (
+                    input.key_pressed(egui::Key::ArrowLeft),
+                    input.key_pressed(egui::Key::ArrowRight),
+                    input.key_pressed(egui::Key::ArrowUp),
+                    input.key_pressed(egui::Key::ArrowDown),
+                    input.key_pressed(egui::Key::Plus) || input.key_pressed(egui::Key::Equals),
+                    input.key_pressed(egui::Key::Minus),
+                )
+            });
+            let step = egui::Vec2::new(rect.width() * 0.15, rect.height() * 0.15);
+            // Arrow keys look in that direction: the centre moves the opposite
+            // way from the content, which is the same arithmetic as a drag.
+            if left {
+                self.pan_map(rect, egui::Vec2::new(step.x, 0.0));
+            }
+            if right {
+                self.pan_map(rect, egui::Vec2::new(-step.x, 0.0));
+            }
+            if up {
+                self.pan_map(rect, egui::Vec2::new(0.0, step.y));
+            }
+            if down {
+                self.pan_map(rect, egui::Vec2::new(0.0, -step.y));
+            }
+            if zoom_in {
+                self.zoom_map_at(rect, rect.center(), 1.0);
+            }
+            if zoom_out {
+                self.zoom_map_at(rect, rect.center(), -1.0);
+            }
+        } else {
+            // Not focused: the arrows keep stepping the track, which is how the
+            // point list has always been reachable from the keyboard.
+            let (prev, next) = ui.input(|input| {
+                (
+                    input.key_pressed(egui::Key::ArrowLeft),
+                    input.key_pressed(egui::Key::ArrowRight),
+                )
+            });
+            if prev {
+                let _moved = self.step_prev();
+            }
+            if next {
+                let _moved = self.step_next();
+            }
+        }
+    }
+
     /// The view the map and the track are both drawn through.
     ///
     /// `fit_mode` fits the whole track; otherwise the canvas is centred on the
@@ -2760,27 +2981,31 @@ impl LogScreen {
         if points.is_empty() || self.fit_mode {
             return MapView::fit(rect, space::M, &points);
         }
-        let (center_latitude, center_longitude) = self
-            .selected
-            .and_then(|index| self.track.points.get(index))
-            .and_then(|point| Some((point.latitude?, point.longitude?)))
-            .unwrap_or_else(|| {
-                let Some(&(first_latitude, first_longitude)) = points.first() else {
-                    return (0.0, 0.0);
-                };
-                let (mut min_latitude, mut max_latitude) = (first_latitude, first_latitude);
-                let (mut min_longitude, mut max_longitude) = (first_longitude, first_longitude);
-                for &(latitude, longitude) in &points {
-                    min_latitude = min_latitude.min(latitude);
-                    max_latitude = max_latitude.max(latitude);
-                    min_longitude = min_longitude.min(longitude);
-                    max_longitude = max_longitude.max(longitude);
-                }
-                (
-                    (min_latitude + max_latitude) / 2.0,
-                    (min_longitude + max_longitude) / 2.0,
-                )
-            });
+        // The explicit centre comes first: a person who panned the map is
+        // looking at what they moved to, and re-centring on the selected point
+        // every frame would undo the drag (DESIGN.md §5).
+        let (center_latitude, center_longitude) = self.map_center.unwrap_or_else(|| {
+            self.selected
+                .and_then(|index| self.track.points.get(index))
+                .and_then(|point| Some((point.latitude?, point.longitude?)))
+                .unwrap_or_else(|| {
+                    let Some(&(first_latitude, first_longitude)) = points.first() else {
+                        return (0.0, 0.0);
+                    };
+                    let (mut min_latitude, mut max_latitude) = (first_latitude, first_latitude);
+                    let (mut min_longitude, mut max_longitude) = (first_longitude, first_longitude);
+                    for &(latitude, longitude) in &points {
+                        min_latitude = min_latitude.min(latitude);
+                        max_latitude = max_latitude.max(latitude);
+                        min_longitude = min_longitude.min(longitude);
+                        max_longitude = max_longitude.max(longitude);
+                    }
+                    (
+                        (min_latitude + max_latitude) / 2.0,
+                        (min_longitude + max_longitude) / 2.0,
+                    )
+                })
+        });
         MapView::new(
             center_latitude,
             center_longitude,

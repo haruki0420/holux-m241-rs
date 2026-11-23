@@ -1621,3 +1621,249 @@ fn the_map_marks_the_start_and_the_end_of_the_track_in_ink() {
         "the end ring at {end_radius}pt is not drawn in ink; rings were {rings:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Map gestures: the canvas is an instrument, not a picture.
+//
+// These drive real input events through the shell. A gesture that only sets
+// state on a `Response` the code never reads passes a shape test; pressing,
+// moving and releasing is what proves the map moves.
+// ---------------------------------------------------------------------------
+
+/// Drive one pass with input events at a window size.
+fn drive_events(ctx: &Context, app: &mut App, width: f32, height: f32, events: Vec<egui::Event>) {
+    let input = RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(width, height),
+        )),
+        events,
+        ..RawInput::default()
+    };
+    let output = ctx.run_ui(input, |ui| {
+        app.draw(ui);
+    });
+    output.drop_without_applying_deltas();
+}
+
+/// A pointer button event at `pos`.
+fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton {
+        pos,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+/// A wheel event of `delta` points.
+fn wheel(delta: egui::Vec2) -> egui::Event {
+    egui::Event::MouseWheel {
+        unit: egui::MouseWheelUnit::Point,
+        delta,
+        phase: egui::TouchPhase::Move,
+        source: egui::MouseWheelSource::Unknown,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+/// A key press event.
+fn key(key: egui::Key) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+#[test]
+fn dragging_the_map_pans_it_and_does_not_pick_a_point() {
+    // The map is the product's page, so it has to move like a map: a drag pans
+    // it, and the drag is not a point pick (a pick on every drag would make
+    // panning across the track select a new point at every frame). DESIGN.md §5
+    // lists the gestures.
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Log);
+    app.log_mut().show_sample();
+    render_at(&ctx, &mut app, 1280.0, 800.0);
+
+    let map = app.log_mut().map_rect();
+    assert!(map.width() > 200.0, "the map was not laid out: {map:?}");
+    let start = map.center();
+    let (latitude_before, longitude_before) = app.log_mut().map_center_at(map);
+    let selected_before = app.log_mut().selected_index();
+
+    let end = start + egui::vec2(60.0, 30.0);
+    for events in [
+        vec![egui::Event::PointerMoved(start), button(start, true)],
+        vec![egui::Event::PointerMoved(start + egui::vec2(30.0, 15.0))],
+        vec![egui::Event::PointerMoved(end)],
+        vec![button(end, false)],
+    ] {
+        drive_events(&ctx, &mut app, 1280.0, 800.0, events);
+    }
+
+    let map = app.log_mut().map_rect();
+    let (latitude_after, longitude_after) = app.log_mut().map_center_at(map);
+    assert_eq!(
+        app.log_mut().selected_index(),
+        selected_before,
+        "dragging the map changed the selected point"
+    );
+    assert!(
+        longitude_after < longitude_before,
+        "dragging right did not move the centre west: {longitude_before} -> {longitude_after}"
+    );
+    assert!(
+        latitude_after > latitude_before,
+        "dragging down did not move the centre north: {latitude_before} -> {latitude_after}"
+    );
+
+    // 60pt at the zoom the fit published. The two numbers are the contract:
+    // the pan is a pixel translation, not a fixed degree step.
+    let degrees_per_pixel = 360.0 / (256.0 * 2.0_f64.powf(f64::from(app.log_mut().map_zoom())));
+    let expected = 60.0 * degrees_per_pixel;
+    assert!(
+        ((longitude_before - longitude_after) - expected).abs() < 1e-6,
+        "a 60pt drag moved {} degrees, expected {expected}",
+        longitude_before - longitude_after,
+    );
+    assert!(
+        app.log_mut().map_center().is_some(),
+        "the pan did not record an explicit centre"
+    );
+    assert!(
+        app.log_mut().map_center().is_some(),
+        "the pan should leave 全点表示"
+    );
+}
+
+#[test]
+fn the_wheel_zooms_the_map_and_clamps_to_the_tile_range() {
+    // The wheel is the map's second gesture: one notch is one level, and the
+    // level stays inside the 1..19 range the tile server has.
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Log);
+    app.log_mut().show_sample();
+    render_at(&ctx, &mut app, 1280.0, 800.0);
+
+    let map = app.log_mut().map_rect();
+    let pointer = map.center();
+    let zoom_before = app.log_mut().map_zoom();
+    drive_events(
+        &ctx,
+        &mut app,
+        1280.0,
+        800.0,
+        vec![egui::Event::PointerMoved(pointer)],
+    );
+    drive_events(
+        &ctx,
+        &mut app,
+        1280.0,
+        800.0,
+        vec![wheel(egui::vec2(0.0, 120.0))],
+    );
+    // egui smooths a wheel notch over the frames that follow it; a real window
+    // is repainting during that time, so the test pumps the same frames.
+    for _ in 0..12 {
+        render_at(&ctx, &mut app, 1280.0, 800.0);
+    }
+    let zoom_after = app.log_mut().map_zoom();
+    assert!(
+        (zoom_after - (zoom_before + 1.0)).abs() < 0.6,
+        "one wheel notch moved the zoom from {zoom_before} to {zoom_after}, expected about {}",
+        zoom_before + 1.0,
+    );
+
+    // The upper clamp: many notches cannot pass 19.
+    for _ in 0..40 {
+        drive_events(
+            &ctx,
+            &mut app,
+            1280.0,
+            800.0,
+            vec![wheel(egui::vec2(0.0, 120.0))],
+        );
+        for _ in 0..12 {
+            render_at(&ctx, &mut app, 1280.0, 800.0);
+        }
+    }
+    assert!(
+        (app.log_mut().map_zoom() - 19.0).abs() < 1e-4,
+        "the wheel zoomed past the top of the tile range: {}",
+        app.log_mut().map_zoom(),
+    );
+
+    // The lower clamp: many notches cannot go below 1.
+    for _ in 0..40 {
+        drive_events(
+            &ctx,
+            &mut app,
+            1280.0,
+            800.0,
+            vec![wheel(egui::vec2(0.0, -120.0))],
+        );
+        for _ in 0..12 {
+            render_at(&ctx, &mut app, 1280.0, 800.0);
+        }
+    }
+    assert!(
+        (app.log_mut().map_zoom() - 1.0).abs() < 1e-4,
+        "the wheel zoomed past the bottom of the tile range: {}",
+        app.log_mut().map_zoom(),
+    );
+}
+
+#[test]
+fn the_keyboard_pans_and_zooms_a_focused_map() {
+    // The map can be operated without a mouse: clicking it focuses it, the
+    // arrows pan and +/- zoom around the centre (DESIGN.md §5).
+    let ctx = context();
+    let mut app = App::default();
+    app.select(Screen::Log);
+    app.log_mut().show_sample();
+    render_at(&ctx, &mut app, 1280.0, 800.0);
+
+    let map = app.log_mut().map_rect();
+    let click = map.center();
+    drive_events(
+        &ctx,
+        &mut app,
+        1280.0,
+        800.0,
+        vec![egui::Event::PointerMoved(click), button(click, true)],
+    );
+    drive_events(&ctx, &mut app, 1280.0, 800.0, vec![button(click, false)]);
+    // One idle frame: a real person clicked and then reached for the keyboard.
+    // The map installs its focus-lock filter on the first frame it holds focus,
+    // so the next arrow pans instead of moving the focus.
+    render_at(&ctx, &mut app, 1280.0, 800.0);
+
+    let (_latitude_before, longitude_before) = app.log_mut().map_center_at(map);
+    let zoom_before = app.log_mut().map_zoom();
+    drive_events(
+        &ctx,
+        &mut app,
+        1280.0,
+        800.0,
+        vec![key(egui::Key::ArrowLeft)],
+    );
+    let map_after = app.log_mut().map_rect();
+    let (_latitude_after_left, longitude_after_left) = app.log_mut().map_center_at(map_after);
+    assert!(
+        (longitude_after_left - longitude_before).abs() > 1e-6,
+        "ArrowLeft did not pan the focused map: {longitude_before} -> {longitude_after_left}"
+    );
+
+    drive_events(&ctx, &mut app, 1280.0, 800.0, vec![key(egui::Key::Plus)]);
+    let zoom_after = app.log_mut().map_zoom();
+    assert!(
+        (zoom_after - (zoom_before + 1.0)).abs() < 0.5,
+        "+ did not zoom the focused map: {zoom_before} -> {zoom_after}"
+    );
+}

@@ -315,6 +315,31 @@ falls back to the schematic grid and says so on the zoom plate in `ink` (not bar
 `mute` on a tile); the track, its records and every control keep working, because
 none of them needs the network.
 
+**Map gestures.** The canvas is an instrument, not a picture, so it moves like a
+map. The map is a focusable control: clicking it draws the 2px `ink` focus ring
+and gives it the keyboard, and a focus-lock filter keeps the arrow keys on the
+map instead of handing focus to the next widget. A manual gesture releases 全点表示
+and 追従 — both make a claim about where the centre is, and the person who has
+just moved the map is looking somewhere else. The centre is then stored
+explicitly (`fit_mode = false`, `map_center = Some(..)`) instead of being derived
+from the selection.
+
+| Gesture | Result |
+|---|---|
+| Drag | Pan. The centre moves by the drag delta in pixels; the click pick is suppressed for the frames of the drag |
+| Wheel | Zoom ±1 level per notch, clamped to 1–19, keeping the coordinate under the pointer still |
+| Double-click | Zoom in one level around the pointer; `Shift`+double-click zooms out |
+| Arrow keys (map focused) | Pan by 15% of the canvas in that direction |
+| Arrow keys (map not focused) | Previous / next point, as before |
+| `+` / `-` (map focused) | Zoom in / out one level around the canvas centre |
+| Click | Select the nearest plotted point within 20pt; a further click clears the selection |
+| Space | Play / pause, whether or not the map has focus |
+| Cursor | `Grab` over the map, `Grabbing` while dragging, `PointingHand` within 20pt of a point |
+
+The 20pt hit radius is the map's answer to "click empty sea": without it the
+nearest record anywhere on the canvas won, so a click on a place selected a point
+somewhere else.
+
 ### ファーム — Firmware
 
 ```
