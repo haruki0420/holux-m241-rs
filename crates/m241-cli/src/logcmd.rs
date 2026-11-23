@@ -237,15 +237,16 @@ fn print_download(
     console.result(&format!("{:<12}: {}", "fixes", summary.fixes));
 }
 
-/// Convert a dumped log — or, with `--nmea` / `--gpx`, another capture or
-/// document — to GPX, KML, CSV, NMEA or JSON, or to the CSV report.
+/// Convert a dumped log — or, with `--nmea` / `--gpx` / `--kml` / `--kmz`,
+/// another capture, document or archive — to GPX, KML, CSV, NMEA or JSON, or to
+/// the CSV report, the static HTML snapshot or the RTF report.
 ///
 /// `--utc-offset-days auto` shifts only a log whose newest record is stale — one
 /// written by an unpatched unit, whose every timestamp is 7168 days in the past.
 /// An explicit number is applied as given, including negative values. **`auto` is
-/// not applied to an imported GPX**: a GPX from another tool may genuinely be
-/// historical, and the stale window covers ordinary 2000s and 2010s trips. A GPX
-/// whose dates fall in that window is kept as written, with a warning naming the
+/// not applied to an imported document**: a GPX, KML or KMZ from another tool may
+/// genuinely be historical, and the stale window covers ordinary 2000s and 2010s
+/// trips. Such a track is kept as written, with a warning naming the
 /// `--utc-offset-days` value that would shift it; an explicit number always
 /// applies.
 ///
@@ -259,12 +260,12 @@ fn print_download(
 /// # Errors
 ///
 /// [`m241_core::Error::Io`] when the file cannot be read or the output written;
-/// [`m241_core::Error::Log`] when the input is not a dump, a GPX document or a
-/// capture of the kind named;
+/// [`m241_core::Error::Log`] when the input is not a dump, a GPX/KML/KMZ
+/// document or a capture of the kind named;
 /// [`m241_core::Error::State`] when a non-empty `--nmea` capture yields no point
-/// at all, or an imported GPX has no `<trkpt>` — in both cases an empty export
-/// must not look like a successful conversion — and when `--coord-format utm` is
-/// asked for a point outside the UTM band.
+/// at all, or an imported GPX has no `<trkpt>` / a KML or KMZ has no geometry —
+/// in each case an empty export must not look like a successful conversion — and
+/// when `--coord-format utm` is asked for a point outside the UTM band.
 pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
     let (mut track, input) = if options.nmea {
         let report = m241_core::log::import_nmea(&fileio::read_text(&options.file)?)?;
@@ -296,6 +297,39 @@ pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
             count_label(track.points.len(), "point")
         ));
         (track, ReadInput::Gpx)
+    } else if options.kml || options.kmz {
+        let track = if options.kml {
+            m241_core::log::import_kml(&fileio::read_text(&options.file)?)?
+        } else {
+            m241_core::log::import_kmz(&fileio::read(&options.file)?)?
+        };
+        // The same rule as `--gpx`: a document that parsed but produced no
+        // point is an error, because an empty export with exit 0 would look
+        // like a successful conversion of a shape-less KML.
+        if track.points.is_empty() {
+            return Err(Error::State(format!(
+                "{}: no point could be imported from this {}; a `<Point>` or `<LineString>` \
+                 carrying `<coordinates>` is required. Nothing was written",
+                options.file.display(),
+                if options.kml {
+                    "KML document"
+                } else {
+                    "KMZ archive"
+                }
+            )));
+        }
+        session.console.note(&format!(
+            "read {}: {} imported from {} (geometry only; no timestamp or speed is read)",
+            options.file.display(),
+            count_label(track.points.len(), "point"),
+            if options.kml { "KML" } else { "KMZ" }
+        ));
+        let input = if options.kml {
+            ReadInput::Kml
+        } else {
+            ReadInput::Kmz
+        };
+        (track, input)
     } else {
         (
             read_dump(&options.file, options.cache.as_deref(), session.console)?,
@@ -303,10 +337,11 @@ pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
         )
     };
 
-    // `--gpx` is somebody else's document: `auto` is not applied to it (see
-    // `apply_utc_offset`), so a historical GPX keeps its dates by default.
-    let offset_input = if options.gpx {
-        OffsetInput::Gpx
+    // `--gpx`, `--kml` and `--kmz` are somebody else's document: `auto` is not
+    // applied to them (see `apply_utc_offset`), so a historical track keeps its
+    // dates by default.
+    let offset_input = if options.gpx || options.kml || options.kmz {
+        OffsetInput::Imported
     } else {
         OffsetInput::Unit
     };
@@ -349,7 +384,11 @@ pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
     // thinning and the rendered positions — are announced on stderr and also
     // carried as JSON fields, so a script does not have to parse a human
     // message.
-    let exported = if options.csv_report {
+    let exported = if options.html {
+        m241_core::log::to_html(&track)
+    } else if options.rtf {
+        m241_core::log::to_rtf(&track)
+    } else if options.csv_report {
         m241_core::log::to_csv_report(&track)
     } else {
         export(&track, options.format)
@@ -360,7 +399,13 @@ pub fn read(options: &LogReadOptions, session: Session<'_>) -> Result<()> {
         simplify,
         position,
     };
-    let exported = attach_read_report(exported, options.format, &report);
+    // The JSON annotation only exists for `--format json`; the HTML and RTF
+    // documents carry their own facts and the CSV report is not JSON.
+    let exported = if options.html || options.rtf || options.csv_report {
+        exported
+    } else {
+        attach_read_report(exported, options.format, &report)
+    };
 
     match &options.output {
         Some(path) => {
@@ -432,6 +477,10 @@ enum ReadInput {
     Nmea(NmeaCounts),
     /// A GPX document from another tool.
     Gpx,
+    /// A KML document from another tool.
+    Kml,
+    /// A KMZ archive from another tool.
+    Kmz,
 }
 
 /// A position rendered in the caller's `--coord-format`.
@@ -607,6 +656,12 @@ fn attach_read_report(exported: String, format: ExportFormat, report: &ReadRepor
         ReadInput::Gpx => {
             object.insert(String::from("input"), serde_json::Value::from("gpx"));
         }
+        ReadInput::Kml => {
+            object.insert(String::from("input"), serde_json::Value::from("kml"));
+        }
+        ReadInput::Kmz => {
+            object.insert(String::from("input"), serde_json::Value::from("kmz"));
+        }
         ReadInput::Dump => {}
     }
     if let Some(stride) = report.simplify {
@@ -658,25 +713,25 @@ fn shift_track_days(track: &mut Track, days: i32) {
 ///
 /// `--utc-offset-days auto` exists for one input class: a dump written by an
 /// unpatched M-241, whose every timestamp is 7168 days in the past. An imported
-/// GPX is somebody else's document and can legitimately be historical, so `auto`
-/// is never applied to it — see [`apply_utc_offset`].
+/// GPX, KML or KMZ is somebody else's document and can legitimately be
+/// historical, so `auto` is never applied to it — see [`apply_utc_offset`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OffsetInput {
     /// A raw dump, an NMEA capture or an edited track, all written by the unit.
     Unit,
-    /// A GPX document imported from another tool.
-    Gpx,
+    /// A GPX, KML or KMZ document imported from another tool.
+    Imported,
 }
 
 /// Apply `--utc-offset-days` (`auto` or explicit) to `track` and return the applied day shift.
 ///
 /// `auto` shifts a WNRO-stale dump by one rollover. It is **never applied to an
-/// imported GPX**: a GPX from another tool can be genuinely historical, and the
-/// stale window (`cal::is_stale`, 1999-08-22 to 2019-04-06) catches ordinary
-/// 2000s and 2010s trips. When a GPX's dates fall in that window, this warns
-/// that `auto` did not act and how to shift the track deliberately; the dates
-/// themselves are left as written. An explicit number is applied to either
-/// input, including a negative one.
+/// imported GPX, KML or KMZ**: another tool's document can be genuinely
+/// historical, and the stale window (`cal::is_stale`, 1999-08-22 to 2019-04-06)
+/// catches ordinary 2000s and 2010s trips. When such a track's dates fall in
+/// that window, this warns that `auto` did not act and how to shift the track
+/// deliberately; the dates themselves are left as written. An explicit number is
+/// applied to either input, including a negative one.
 fn apply_utc_offset(
     track: &mut Track,
     spec: OffsetSpec,
@@ -684,13 +739,13 @@ fn apply_utc_offset(
     console: &dyn Console,
 ) -> i32 {
     let automatic = track_days(track).map_or(0, |days| spec.shift_for(days));
-    if input == OffsetInput::Gpx && matches!(spec, OffsetSpec::Auto) {
+    if input == OffsetInput::Imported && matches!(spec, OffsetSpec::Auto) {
         if automatic != 0 {
             console.warn(&format!(
-                "the imported GPX falls inside the window --utc-offset-days auto treats as \
+                "the imported document falls inside the window --utc-offset-days auto treats as \
                  WNRO-stale (1999-08-22 to 2019-04-06), but auto is not applied to an imported \
-                 GPX: its timestamps are kept as written. Pass --utc-offset-days {automatic} if \
-                 the file came from an unpatched unit"
+                 document: its timestamps are kept as written. Pass --utc-offset-days \
+                 {automatic} if the file came from an unpatched unit"
             ));
         }
         return 0;
@@ -1983,6 +2038,10 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                kml: false,
+                kmz: false,
+                html: false,
+                rtf: false,
                 nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Gpx,
@@ -2011,6 +2070,10 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                kml: false,
+                kmz: false,
+                html: false,
+                rtf: false,
                 nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Csv,
@@ -2043,6 +2106,10 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                kml: false,
+                kmz: false,
+                html: false,
+                rtf: false,
                 nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Json,
@@ -2086,6 +2153,10 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                kml: false,
+                kmz: false,
+                html: false,
+                rtf: false,
                 nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Json,
@@ -2116,6 +2187,10 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                kml: false,
+                kmz: false,
+                html: false,
+                rtf: false,
                 nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Json,
@@ -2150,6 +2225,10 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                kml: false,
+                kmz: false,
+                html: false,
+                rtf: false,
                 nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Csv,
@@ -2188,6 +2267,10 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                kml: false,
+                kmz: false,
+                html: false,
+                rtf: false,
                 nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Csv,
@@ -2229,6 +2312,10 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                kml: false,
+                kmz: false,
+                html: false,
+                rtf: false,
                 nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Csv,
@@ -2273,6 +2360,10 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                kml: false,
+                kmz: false,
+                html: false,
+                rtf: false,
                 nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Csv,
@@ -2393,6 +2484,10 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                kml: false,
+                kmz: false,
+                html: false,
+                rtf: false,
                 nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Json,
@@ -2432,6 +2527,10 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                kml: false,
+                kmz: false,
+                html: false,
+                rtf: false,
                 nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Json,
@@ -2468,6 +2567,10 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                kml: false,
+                kmz: false,
+                html: false,
+                rtf: false,
                 nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Json,
@@ -3097,6 +3200,10 @@ mod tests {
         let kml_console = RecordingConsole::default();
         read(
             &LogReadOptions {
+                kml: false,
+                kmz: false,
+                html: false,
+                rtf: false,
                 nmea: false,
                 file: path.clone(),
                 format: m241_core::ExportFormat::Kml,
@@ -3120,6 +3227,10 @@ mod tests {
         let nmea_console = RecordingConsole::default();
         read(
             &LogReadOptions {
+                kml: false,
+                kmz: false,
+                html: false,
+                rtf: false,
                 nmea: false,
                 file: path,
                 format: m241_core::ExportFormat::Nmea,
@@ -4560,6 +4671,10 @@ mod tests {
         let confirm = AutoConfirm;
         read(
             &LogReadOptions {
+                kml: false,
+                kmz: false,
+                html: false,
+                rtf: false,
                 nmea: true,
                 file: input,
                 format: m241_core::ExportFormat::Gpx,
@@ -4608,6 +4723,10 @@ mod tests {
 
         let err = read(
             &LogReadOptions {
+                kml: false,
+                kmz: false,
+                html: false,
+                rtf: false,
                 nmea: true,
                 file: input,
                 format: m241_core::ExportFormat::Gpx,
@@ -4649,6 +4768,10 @@ mod tests {
 
         let err = read(
             &LogReadOptions {
+                kml: false,
+                kmz: false,
+                html: false,
+                rtf: false,
                 nmea: true,
                 file: input,
                 format: m241_core::ExportFormat::Csv,
@@ -4697,6 +4820,10 @@ mod tests {
 
         read(
             &LogReadOptions {
+                kml: false,
+                kmz: false,
+                html: false,
+                rtf: false,
                 nmea: true,
                 file: input,
                 format: m241_core::ExportFormat::Json,
@@ -4852,7 +4979,7 @@ mod tests {
         assert!(
             console
                 .stderr()
-                .contains("auto is not applied to an imported GPX"),
+                .contains("auto is not applied to an imported document"),
             "the run says why nothing was shifted: {}",
             console.stderr()
         );
@@ -5408,6 +5535,64 @@ mod tests {
                 "the archive must carry {:?}",
                 String::from_utf8_lossy(name)
             );
+        }
+    }
+
+    #[test]
+    fn read_writes_the_html_snapshot_and_the_rtf_report() {
+        let scratch = Scratch::new("read-html-rtf");
+        let path = write_dump(&scratch, "track.bin", 3);
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+
+        let console = RecordingConsole::default();
+        let mut options = read_options(path.clone(), ExportFormat::Gpx);
+        options.html = true;
+        read(&options, Session::new(&links, &console, &confirm)).expect("html read");
+        let html = console.stdout();
+        assert!(html.starts_with("<!DOCTYPE html>"), "got {html}");
+        assert!(html.contains("<svg class=\"map\""), "no inline map");
+        assert!(html.contains("no basemap"), "no attribution");
+        assert!(!html.contains("<script"), "the snapshot must not script");
+
+        let console = RecordingConsole::default();
+        let mut options = read_options(path, ExportFormat::Gpx);
+        options.rtf = true;
+        read(&options, Session::new(&links, &console, &confirm)).expect("rtf read");
+        let rtf = console.stdout();
+        assert!(rtf.starts_with("{\\rtf1"), "got {rtf}");
+        assert!(rtf.contains("Summary"), "no summary");
+        assert!(rtf.contains("INDEX"), "no point table");
+    }
+
+    #[test]
+    fn read_imports_kml_and_kmz_like_gpx() {
+        let kml = r#"<kml xmlns="http://www.opengis.net/kml/2.2"><Document><Placemark>
+            <LineString><coordinates>139.767125,35.681236,42.5
+            139.780000,35.690000,38.0</coordinates></LineString>
+        </Placemark></Document></kml>"#;
+        let scratch = Scratch::new("read-kml-kmz");
+        let kml_path = scratch.join("track.kml");
+        fileio::write_text(&kml_path, kml).expect("write kml");
+        let track = m241_core::log::import_kml(kml).expect("kml imports");
+        let kmz_path = scratch.join("track.kmz");
+        fileio::write(
+            &kmz_path,
+            &m241_core::log::export_kmz(&track, &[]).expect("kmz export"),
+        )
+        .expect("write kmz");
+
+        let links = FakePorts::empty();
+        let confirm = AutoConfirm;
+        for (path, kml_input) in [(kml_path, true), (kmz_path, false)] {
+            let console = RecordingConsole::default();
+            let mut options = read_options(path, ExportFormat::Gpx);
+            options.kml = kml_input;
+            options.kmz = !kml_input;
+            read(&options, Session::new(&links, &console, &confirm)).expect("import");
+            let gpx = console.stdout();
+            assert!(gpx.contains("<trkpt"), "no point written: {gpx}");
+            assert_eq!(gpx.matches("<trkpt").count(), 2, "got {gpx}");
         }
     }
 }

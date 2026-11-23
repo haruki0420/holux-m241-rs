@@ -17,6 +17,8 @@
 use crate::error::{Error, Result};
 use crate::log::exif::days_from_civil;
 use crate::protocol::pmtk::parse_sentence;
+use std::io::Read as _;
+
 use crate::types::{Track, TrackPoint};
 
 /// Parse a GPX 1.0 or 1.1 XML document into a [`Track`].
@@ -134,6 +136,554 @@ pub fn import_gpx(text: &str) -> Result<Track> {
         points,
         damaged_blocks: Vec::new(),
     })
+}
+
+/// Parse a KML 2.0 or 2.2 document into a [`Track`].
+///
+/// Reads the `<coordinates>` of every `<Point>` and `<LineString>` in document
+/// order: each `lon,lat[,alt]` tuple becomes a point with a position and, when
+/// the tuple has a third field, a height. KML records a shape rather than a
+/// time series, so `<TimeStamp>`, speed and placemark names are not read, and a
+/// `<LinearRing>` (a Polygon outline) is skipped: an area outline is not a
+/// recorded track.
+///
+/// Namespace prefixes are ignored — `<kml:coordinates>` reads the same as
+/// `<coordinates>` — so the 2.0 namespace
+/// (`http://earth.google.com/kml/2.0`), the 2.2 one
+/// (`http://www.opengis.net/kml/2.2`) and a prefixed variant all load. Nothing
+/// depends on element order beyond "a geometry contains its own
+/// `<coordinates>`", which is the one order KML's schema fixes.
+///
+/// # Errors
+///
+/// Returns [`Error::Log`] when the text has no `<kml` element, carries an
+/// XML comment that is never closed (the points after it would otherwise vanish
+/// without a trace), leaves a geometry or `<coordinates>` element unclosed, or
+/// holds a tuple that is not a finite longitude/latitude pair.
+pub fn import_kml(text: &str) -> Result<Track> {
+    let cleaned = strip_xml_comments(text)?;
+    if find_open_tag_local(&cleaned, "kml", 0).is_none() {
+        return Err(Error::Log {
+            message: String::from("input is not a KML document (missing <kml element)"),
+            offset: None,
+        });
+    }
+
+    let mut points = Vec::new();
+    let mut cursor = 0usize;
+    while let Some((start, local)) = next_kml_geometry(&cleaned, cursor) {
+        let (body, after_element) = element_body(&cleaned, local, start)?;
+        if let Some(coordinates_start) = find_open_tag_local(body, "coordinates", 0) {
+            let (raw, _) = element_body(body, "coordinates", coordinates_start)?;
+            points.extend(parse_kml_coordinates(raw, start)?);
+        }
+        cursor = after_element;
+    }
+
+    Ok(Track {
+        points,
+        damaged_blocks: Vec::new(),
+    })
+}
+
+/// Parse a KMZ archive into a [`Track`].
+///
+/// A KMZ is a ZIP whose `doc.kml` is the document; when that name is absent the
+/// first `.kml` entry is used, which is the fallback the format's readers
+/// expect. Stored (method 0) and deflated (method 8) entries are read. A
+/// compressed KMZ is the normal case, so refusing deflate would accept only this
+/// toolkit's own archives.
+///
+/// The 64 MiB cap is enforced **while reading**, not after: the deflated entry
+/// is read through [`std::io::Read::take`] with one byte to spare, and a stored
+/// entry is measured before it is copied. A central-directory
+/// `uncompressed_size` is only a claim — a 0.16 MiB archive can declare zero and
+/// expand to 160 MiB — so the declared value is an early refusal, never the
+/// bound itself.
+///
+/// The entry's CRC is **not** verified. A stored entry corrupted in transit can
+/// therefore reach [`import_kml`] with plausible-looking coordinates; the KML
+/// structure checks catch a broken document but not a single flipped digit. CRC
+/// checking would need the CRC32 of the decompressed bytes compared against the
+/// central directory's, which is not done here.
+///
+/// # Errors
+///
+/// Returns [`Error::Log`] when the bytes are not a ZIP archive, the archive has
+/// no `.kml` entry, the entry uses ZIP64, encryption or a compression method
+/// other than store/deflate, the entry is larger than 64 MiB uncompressed (or
+/// would decompress past it), or the KML inside fails [`import_kml`]'s checks.
+pub fn import_kmz(bytes: &[u8]) -> Result<Track> {
+    let document = kmz_document(bytes)?;
+    let text = std::str::from_utf8(&document).map_err(|_| Error::Log {
+        message: String::from("KMZ doc.kml is not valid UTF-8"),
+        offset: None,
+    })?;
+    import_kml(text)
+}
+
+/// The uncompressed `doc.kml` (or first `.kml` entry) of a KMZ archive.
+fn kmz_document(bytes: &[u8]) -> Result<Vec<u8>> {
+    let entries = zip_entries(bytes)?;
+    let entry = entries
+        .iter()
+        .find(|entry| {
+            entry
+                .name
+                .trim_start_matches("./")
+                .eq_ignore_ascii_case("doc.kml")
+        })
+        .or_else(|| {
+            entries
+                .iter()
+                .find(|entry| entry.name.to_ascii_lowercase().trim_end().ends_with(".kml"))
+        })
+        .ok_or_else(|| Error::Log {
+            message: String::from("KMZ archive contains no .kml document"),
+            offset: None,
+        })?;
+    zip_entry_bytes(bytes, entry)
+}
+
+/// ZIP local-file-header signature (`PK\x03\x04`).
+const ZIP_LOCAL_SIGNATURE: u32 = 0x0403_4B50;
+/// ZIP central-directory-header signature (`PK\x01\x02`).
+const ZIP_CENTRAL_SIGNATURE: u32 = 0x0201_4B50;
+/// ZIP end-of-central-directory signature (`PK\x05\x06`).
+const ZIP_EOCD_SIGNATURE: u32 = 0x0605_4B50;
+/// The ZIP32 "value is in the ZIP64 record" markers.
+const ZIP64_COUNT: u16 = 0xFFFF;
+const ZIP64_OFFSET: u32 = 0xFFFF_FFFF;
+/// Refuse a `doc.kml` larger than this once decompressed.
+const MAX_KMZ_DOCUMENT_BYTES: u32 = 64 * 1024 * 1024;
+
+/// One central-directory entry, reduced to what reading `doc.kml` needs.
+struct ZipEntry {
+    name: String,
+    /// The general-purpose bit flag (bit 0 = encrypted).
+    flags: u16,
+    method: u16,
+    compressed_size: u32,
+    uncompressed_size: u32,
+    local_offset: u32,
+}
+
+/// The general-purpose flag's "this entry is encrypted" bit.
+const ZIP_FLAG_ENCRYPTED: u16 = 1 << 0;
+
+/// Find the end-of-central-directory record, scanning back over its comment.
+fn find_eocd(bytes: &[u8]) -> Option<usize> {
+    let signature = ZIP_EOCD_SIGNATURE.to_le_bytes();
+    let tail_len = bytes.len().min(66_000);
+    let tail_start = bytes.len().checked_sub(tail_len)?;
+    let tail = bytes.get(tail_start..)?;
+    let mut index = tail.len().checked_sub(4)?;
+    loop {
+        if tail.get(index..index.checked_add(4)?) == Some(signature.as_slice()) {
+            return tail_start.checked_add(index);
+        }
+        index = index.checked_sub(1)?;
+    }
+}
+
+fn zip_u16(bytes: &[u8], offset: usize) -> Result<u16> {
+    let field = bytes
+        .get(offset..offset.checked_add(2).ok_or_else(zip_truncated)?)
+        .ok_or_else(zip_truncated)?;
+    let low = *field.first().ok_or_else(zip_truncated)?;
+    let high = *field.get(1).ok_or_else(zip_truncated)?;
+    Ok(u16::from_le_bytes([low, high]))
+}
+
+fn zip_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    let field = bytes
+        .get(offset..offset.checked_add(4).ok_or_else(zip_truncated)?)
+        .ok_or_else(zip_truncated)?;
+    let mut raw = [0u8; 4];
+    for (slot, byte) in raw.iter_mut().zip(field.iter()) {
+        *slot = *byte;
+    }
+    Ok(u32::from_le_bytes(raw))
+}
+
+fn zip_truncated() -> Error {
+    Error::Log {
+        message: String::from("KMZ archive is truncated"),
+        offset: None,
+    }
+}
+
+/// Read the central directory into the entries worth looking at.
+fn zip_entries(bytes: &[u8]) -> Result<Vec<ZipEntry>> {
+    let eocd = find_eocd(bytes).ok_or_else(|| Error::Log {
+        message: String::from("not a ZIP archive (no end-of-central-directory record)"),
+        offset: None,
+    })?;
+    let count = zip_u16(bytes, eocd.checked_add(10).ok_or_else(zip_truncated)?)?;
+    let directory_offset = zip_u32(bytes, eocd.checked_add(16).ok_or_else(zip_truncated)?)?;
+    if count == ZIP64_COUNT || directory_offset == ZIP64_OFFSET {
+        return Err(Error::Log {
+            message: String::from("KMZ archive uses ZIP64, which is not supported"),
+            offset: None,
+        });
+    }
+
+    let mut entries = Vec::new();
+    let mut cursor = usize::try_from(directory_offset).map_err(|_| zip_truncated())?;
+    for _ in 0..count {
+        if zip_u32(bytes, cursor)? != ZIP_CENTRAL_SIGNATURE {
+            return Err(Error::Log {
+                message: String::from("KMZ central directory is malformed"),
+                offset: None,
+            });
+        }
+        let flags = zip_u16(bytes, cursor.checked_add(8).ok_or_else(zip_truncated)?)?;
+        let method = zip_u16(bytes, cursor.checked_add(10).ok_or_else(zip_truncated)?)?;
+        let compressed_size = zip_u32(bytes, cursor.checked_add(20).ok_or_else(zip_truncated)?)?;
+        let uncompressed_size = zip_u32(bytes, cursor.checked_add(24).ok_or_else(zip_truncated)?)?;
+        let name_length = usize::from(zip_u16(
+            bytes,
+            cursor.checked_add(28).ok_or_else(zip_truncated)?,
+        )?);
+        let extra_length = usize::from(zip_u16(
+            bytes,
+            cursor.checked_add(30).ok_or_else(zip_truncated)?,
+        )?);
+        let comment_length = usize::from(zip_u16(
+            bytes,
+            cursor.checked_add(32).ok_or_else(zip_truncated)?,
+        )?);
+        let local_offset = zip_u32(bytes, cursor.checked_add(42).ok_or_else(zip_truncated)?)?;
+        let name_start = cursor.checked_add(46).ok_or_else(zip_truncated)?;
+        let name_end = name_start
+            .checked_add(name_length)
+            .ok_or_else(zip_truncated)?;
+        let name = bytes
+            .get(name_start..name_end)
+            .and_then(|raw| std::str::from_utf8(raw).ok())
+            .ok_or_else(|| Error::Log {
+                message: String::from("KMZ entry name is not valid UTF-8"),
+                offset: None,
+            })?;
+        // An entry can carry ZIP64's "the real value is in the extra field"
+        // markers even when the EOCD is plain ZIP32. Those values are not read,
+        // so the size or offset would be a sentinel rather than a length; name
+        // the real cause here instead of failing later on an absurd size.
+        if compressed_size == ZIP64_OFFSET
+            || uncompressed_size == ZIP64_OFFSET
+            || local_offset == ZIP64_OFFSET
+        {
+            return Err(Error::Log {
+                message: format!("KMZ entry {name:?} uses ZIP64, which is not supported"),
+                offset: None,
+            });
+        }
+        entries.push(ZipEntry {
+            name: name.to_string(),
+            flags,
+            method,
+            compressed_size,
+            uncompressed_size,
+            local_offset,
+        });
+        cursor = name_end
+            .checked_add(extra_length)
+            .and_then(|offset| offset.checked_add(comment_length))
+            .ok_or_else(zip_truncated)?;
+    }
+    Ok(entries)
+}
+
+/// The uncompressed bytes of one central-directory entry.
+///
+/// The 64 MiB limit is applied to the bytes actually produced, not to the
+/// central directory's claim: the claim is written by whoever built the
+/// archive, and a small one does not make the bytes small. A stored entry is
+/// measured before it is copied; a deflated one is read through
+/// [`std::io::Read::take`] so the allocation cannot run past the cap.
+fn zip_entry_bytes(bytes: &[u8], entry: &ZipEntry) -> Result<Vec<u8>> {
+    if entry.flags & ZIP_FLAG_ENCRYPTED != 0 {
+        return Err(encrypted_entry(&entry.name));
+    }
+    if entry.method != 0 && entry.method != 8 {
+        return Err(Error::Log {
+            message: format!(
+                "KMZ entry {:?} uses compression method {}, which is not supported",
+                entry.name, entry.method
+            ),
+            offset: None,
+        });
+    }
+    if entry.uncompressed_size > MAX_KMZ_DOCUMENT_BYTES {
+        return Err(Error::Log {
+            message: format!(
+                "KMZ entry {:?} is {} bytes uncompressed, larger than the {} byte limit",
+                entry.name, entry.uncompressed_size, MAX_KMZ_DOCUMENT_BYTES
+            ),
+            offset: None,
+        });
+    }
+    let local = usize::try_from(entry.local_offset).map_err(|_| zip_truncated())?;
+    if zip_u32(bytes, local)? != ZIP_LOCAL_SIGNATURE {
+        return Err(Error::Log {
+            message: String::from("KMZ local file header is malformed"),
+            offset: None,
+        });
+    }
+    // The central directory and the local header each carry the flag; a
+    // disagreement is refused rather than resolved, because an entry that is
+    // encrypted according to either header cannot be read here.
+    let local_flags = zip_u16(bytes, local.checked_add(6).ok_or_else(zip_truncated)?)?;
+    if local_flags & ZIP_FLAG_ENCRYPTED != 0 {
+        return Err(encrypted_entry(&entry.name));
+    }
+    let name_length = usize::from(zip_u16(
+        bytes,
+        local.checked_add(26).ok_or_else(zip_truncated)?,
+    )?);
+    let extra_length = usize::from(zip_u16(
+        bytes,
+        local.checked_add(28).ok_or_else(zip_truncated)?,
+    )?);
+    let data_start = local
+        .checked_add(30)
+        .and_then(|offset| offset.checked_add(name_length))
+        .and_then(|offset| offset.checked_add(extra_length))
+        .ok_or_else(zip_truncated)?;
+    let data_end = data_start
+        .checked_add(usize::try_from(entry.compressed_size).map_err(|_| zip_truncated())?)
+        .ok_or_else(zip_truncated)?;
+    let data = bytes.get(data_start..data_end).ok_or_else(zip_truncated)?;
+
+    match entry.method {
+        0 => {
+            if data.len() > MAX_KMZ_DOCUMENT_BYTES as usize {
+                return Err(too_large(&entry.name, data.len()));
+            }
+            Ok(data.to_vec())
+        }
+        _ => {
+            // The extra byte makes "exactly at the limit" distinguishable from
+            // "past it": `take` stops there, the decoder never allocates more.
+            let capped = u64::from(MAX_KMZ_DOCUMENT_BYTES) + 1;
+            let mut decoder = flate2::read::DeflateDecoder::new(data).take(capped);
+            // Reserve the cap once instead of letting `read_to_end` double a
+            // `Vec` up to the limit: the last doubling for a 64 MiB + 1 byte
+            // document would ask for 128 MiB, and the transient growth is what
+            // the cap is supposed to prevent. Untouched pages of a reservation
+            // are not resident, so a small document still costs little.
+            let mut document = Vec::with_capacity(MAX_KMZ_DOCUMENT_BYTES as usize + 1);
+            decoder
+                .read_to_end(&mut document)
+                .map_err(|error| Error::Log {
+                    message: format!("KMZ doc.kml could not be decompressed: {error}"),
+                    offset: None,
+                })?;
+            if document.len() > MAX_KMZ_DOCUMENT_BYTES as usize {
+                return Err(too_large(&entry.name, document.len()));
+            }
+            Ok(document)
+        }
+    }
+}
+
+fn encrypted_entry(name: &str) -> Error {
+    Error::Log {
+        message: format!("KMZ entry {name:?} is encrypted, which is not supported"),
+        offset: None,
+    }
+}
+
+fn too_large(name: &str, bytes: usize) -> Error {
+    Error::Log {
+        message: format!(
+            "KMZ entry {name:?} is {bytes} bytes uncompressed, larger than the {} byte limit",
+            MAX_KMZ_DOCUMENT_BYTES
+        ),
+        offset: None,
+    }
+}
+
+/// The namespace-less local name of the tag whose `<` is at `start`.
+///
+/// Returns the index just past the name, the name after its last `:` and
+/// whether the tag is an end tag. `None` when `start` does not begin a tag with
+/// a name (a comment, a processing instruction, or the end of the text).
+fn tag_local_name(text: &str, start: usize) -> Option<(usize, &str, bool)> {
+    let rest = text.get(start..)?;
+    let (offset, is_end) = if rest.starts_with("</") {
+        (2usize, true)
+    } else if rest.starts_with('<') {
+        (1usize, false)
+    } else {
+        return None;
+    };
+    let mut cursor = start.checked_add(offset)?;
+    let name_start = cursor;
+    while let Some(character) = text.get(cursor..)?.chars().next() {
+        if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | ':' | '.') {
+            cursor = cursor.checked_add(character.len_utf8())?;
+        } else {
+            break;
+        }
+    }
+    let name = text.get(name_start..cursor)?;
+    if name.is_empty() {
+        return None;
+    }
+    Some((cursor, name.rsplit(':').next()?, is_end))
+}
+
+fn find_open_tag_local(text: &str, local: &str, from: usize) -> Option<usize> {
+    let mut cursor = from;
+    while let Some(relative) = text.get(cursor..)?.find('<') {
+        let start = cursor.checked_add(relative)?;
+        if let Some((_, name, is_end)) = tag_local_name(text, start)
+            && !is_end
+            && name.eq_ignore_ascii_case(local)
+        {
+            return Some(start);
+        }
+        cursor = start.checked_add(1)?;
+    }
+    None
+}
+
+fn find_close_tag_local(text: &str, local: &str, from: usize) -> Option<(usize, usize)> {
+    let mut cursor = from;
+    while let Some(relative) = text.get(cursor..)?.find("</") {
+        let start = cursor.checked_add(relative)?;
+        if let Some((_, name, is_end)) = tag_local_name(text, start)
+            && is_end
+            && name.eq_ignore_ascii_case(local)
+        {
+            let end = start
+                .checked_add(text.get(start..)?.find('>')?)?
+                .checked_add(1)?;
+            return Some((start, end));
+        }
+        cursor = start.checked_add(2)?;
+    }
+    None
+}
+
+/// The text between `<local ...>` and `</...local>`, and the index after it.
+///
+/// A self-closing element yields an empty body. The close tag may carry a
+/// namespace prefix of its own.
+fn element_body<'a>(text: &'a str, local: &str, tag_start: usize) -> Result<(&'a str, usize)> {
+    let tail = text.get(tag_start..).ok_or_else(|| Error::Log {
+        message: format!("missing <{local}> element"),
+        offset: Some(tag_start),
+    })?;
+    let open_end = tail.find('>').ok_or_else(|| Error::Log {
+        message: format!("unclosed <{local}> start tag"),
+        offset: Some(tag_start),
+    })?;
+    let after_open = tag_start
+        .checked_add(open_end)
+        .and_then(|offset| offset.checked_add(1))
+        .ok_or_else(|| Error::Log {
+            message: String::from("KML document is truncated"),
+            offset: Some(tag_start),
+        })?;
+    let open_tag = text
+        .get(tag_start..tag_start.checked_add(open_end).unwrap_or(tag_start))
+        .unwrap_or_default();
+    if open_tag.trim_end().ends_with('/') {
+        return Ok(("", after_open));
+    }
+    let (close_start, after_close) =
+        find_close_tag_local(text, local, after_open).ok_or_else(|| Error::Log {
+            message: format!("unclosed <{local}> element"),
+            offset: Some(tag_start),
+        })?;
+    let body = text
+        .get(after_open..close_start)
+        .ok_or_else(|| Error::Log {
+            message: format!("unclosed <{local}> element"),
+            offset: Some(tag_start),
+        })?;
+    Ok((body, after_close))
+}
+
+/// The next `<Point>` or `<LineString>` in document order, and its local name.
+///
+/// One scan from `from`, not one scan per candidate: looking for both tags
+/// separately makes a Point-only document quadratic, because every point pays
+/// for a full remaining-text search for the LineString that is not there.
+fn next_kml_geometry(text: &str, from: usize) -> Option<(usize, &'static str)> {
+    let mut cursor = from;
+    while let Some(relative) = text.get(cursor..)?.find('<') {
+        let start = cursor.checked_add(relative)?;
+        if let Some((_, name, is_end)) = tag_local_name(text, start)
+            && !is_end
+        {
+            if name.eq_ignore_ascii_case("point") {
+                return Some((start, "point"));
+            }
+            if name.eq_ignore_ascii_case("linestring") {
+                return Some((start, "linestring"));
+            }
+        }
+        cursor = start.checked_add(1)?;
+    }
+    None
+}
+
+fn parse_kml_coordinates(raw: &str, offset: usize) -> Result<Vec<TrackPoint>> {
+    let mut points = Vec::new();
+    for tuple in raw.split_whitespace() {
+        let mut fields = tuple.split(',');
+        let longitude = parse_kml_number(fields.next(), "longitude", offset)?;
+        let latitude = parse_kml_number(fields.next(), "latitude", offset)?;
+        let height_m = match fields.next() {
+            Some(field) if !field.is_empty() => {
+                let height = parse_kml_number(Some(field), "altitude", offset)? as f32;
+                if !height.is_finite() {
+                    return Err(kml_coordinate_error(tuple, offset));
+                }
+                Some(height)
+            }
+            _ => None,
+        };
+        if fields.next().is_some() {
+            return Err(kml_coordinate_error(tuple, offset));
+        }
+        if !(-180.0..=180.0).contains(&longitude) || !(-90.0..=90.0).contains(&latitude) {
+            return Err(kml_coordinate_error(tuple, offset));
+        }
+        points.push(TrackPoint {
+            utc: None,
+            latitude: Some(latitude),
+            longitude: Some(longitude),
+            height_m,
+            speed_kmh: None,
+            rcr: None,
+        });
+    }
+    Ok(points)
+}
+
+fn parse_kml_number(field: Option<&str>, name: &str, offset: usize) -> Result<f64> {
+    let raw = field.ok_or_else(|| Error::Log {
+        message: format!("KML coordinate tuple is missing its {name}"),
+        offset: Some(offset),
+    })?;
+    raw.parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| Error::Log {
+            message: format!("invalid KML {name} {raw:?}"),
+            offset: Some(offset),
+        })
+}
+
+fn kml_coordinate_error(tuple: &str, offset: usize) -> Error {
+    Error::Log {
+        message: format!("invalid KML coordinate tuple {tuple:?}"),
+        offset: Some(offset),
+    }
 }
 
 /// What an NMEA import read, kept and dropped.
@@ -1011,5 +1561,378 @@ mod tests {
         let imported = import_nmea("").expect("import empty nmea");
         assert!(imported.track.points.is_empty());
         assert_eq!(imported.imported + imported.dropped + imported.ignored, 0);
+    }
+
+    #[test]
+    fn import_kml_reads_linestrings_and_placemark_points_with_namespace_prefixes() {
+        let kml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<kml:kml xmlns:kml="http://www.opengis.net/kml/2.2">
+  <kml:Document>
+    <kml:Placemark>
+      <kml:LineString><kml:coordinates>
+        139.767125,35.681236,42.5
+        139.780000,35.690000,38.0
+      </kml:coordinates></kml:LineString>
+    </kml:Placemark>
+    <kml:Placemark>
+      <kml:Point><kml:coordinates>139.790000,35.695000</kml:coordinates></kml:Point>
+    </kml:Placemark>
+  </kml:Document>
+</kml:kml>"#;
+        let track = import_kml(kml).expect("import a prefixed KML 2.2 document");
+        assert_eq!(track.points.len(), 3);
+        assert!((track.points[0].longitude.unwrap() - 139.767_125).abs() < 1e-9);
+        assert!((track.points[0].latitude.unwrap() - 35.681_236).abs() < 1e-9);
+        assert_eq!(track.points[0].height_m, Some(42.5));
+        assert_eq!(track.points[2].height_m, None);
+        assert_eq!(track.points[2].utc, None, "KML carries no timestamp here");
+    }
+
+    #[test]
+    fn import_kml_accepts_kml_20_and_skips_polygon_rings() {
+        let kml = r#"<kml xmlns="http://earth.google.com/kml/2.0"><Document>
+  <Placemark><Point><coordinates>-70.25,-35.5,120.5</coordinates></Point></Placemark>
+  <Placemark><Polygon><outerBoundaryIs><LinearRing>
+    <coordinates>0,0 1,1 2,2 0,0</coordinates>
+  </LinearRing></outerBoundaryIs></Polygon></Placemark>
+</Document></kml>"#;
+        let track = import_kml(kml).expect("import a KML 2.0 document");
+        assert_eq!(track.points.len(), 1, "a polygon outline is not a track");
+        assert!((track.points[0].latitude.unwrap() + 35.5).abs() < 1e-9);
+        assert!((track.points[0].longitude.unwrap() + 70.25).abs() < 1e-9);
+        assert_eq!(track.points[0].height_m, Some(120.5));
+    }
+
+    #[test]
+    fn a_document_that_is_not_kml_is_an_error() {
+        let err = import_kml("<gpx version=\"1.1\"></gpx>").expect_err("not a KML document");
+        assert!(matches!(err, Error::Log { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn a_coordinate_tuple_without_a_latitude_is_an_error() {
+        let kml = r#"<kml><Document><Placemark><Point>
+            <coordinates>139.767125</coordinates>
+        </Point></Placemark></Document></kml>"#;
+        let err = import_kml(kml).expect_err("one field is not a coordinate");
+        assert!(matches!(err, Error::Log { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn import_kmz_round_trips_an_exported_track() {
+        let original = sample_track();
+        let archive = crate::log::kmz::export_kmz(&original, &[]).expect("export KMZ");
+        let imported = import_kmz(&archive).expect("import the exported KMZ");
+        assert_eq!(imported.points.len(), original.points.len());
+        assert!((imported.points[0].latitude.unwrap() - 35.681_236).abs() < 1e-9);
+        assert!((imported.points[1].longitude.unwrap() - 135.502_3).abs() < 1e-9);
+        assert!((imported.points[0].height_m.unwrap() - 42.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn import_kmz_reads_a_deflated_doc_kml() {
+        let kml = r#"<kml xmlns="http://www.opengis.net/kml/2.2"><Document><Placemark>
+            <Point><coordinates>139.767125,35.681236,0</coordinates></Point>
+        </Placemark></Document></kml>"#;
+        let archive = zip_with_one_entry("doc.kml", 8, kml.as_bytes());
+        let track = import_kmz(&archive).expect("import a deflated KMZ");
+        assert_eq!(track.points.len(), 1);
+        assert!((track.points[0].latitude.unwrap() - 35.681_236).abs() < 1e-9);
+    }
+
+    #[test]
+    fn import_kmz_falls_back_to_the_first_kml_entry() {
+        let archive = zip_with_one_entry("track/trip.kml", 0, b"<kml><Document/></kml>");
+        let track = import_kmz(&archive).expect("import the first .kml entry");
+        assert!(track.points.is_empty());
+    }
+
+    #[test]
+    fn an_archive_without_a_kml_entry_is_an_error() {
+        let archive = zip_with_one_entry("readme.txt", 0, b"no track here");
+        let err = import_kmz(&archive).expect_err("no .kml entry");
+        assert!(err.to_string().contains("no .kml document"), "got {err}");
+    }
+
+    #[test]
+    fn a_point_only_kml_is_read_in_one_pass_not_once_per_point() {
+        // The quadratic reader searched the rest of the document for a
+        // `<LineString>` once per `<Point>`: 10,000 points took 7 s in a release
+        // build (78 s in debug). The bound is deliberately loose — the point is
+        // to fail a return of the old shape, not to time the machine.
+        let mut kml = String::from("<kml xmlns=\"http://www.opengis.net/kml/2.2\"><Document>");
+        let count = 10_000usize;
+        for index in 0..count {
+            let latitude = 35.0 + f64::from(u32::try_from(index % 1000).expect("fits")) * 0.0001;
+            let longitude = 139.0 + f64::from(u32::try_from(index % 1000).expect("fits")) * 0.0001;
+            kml.push_str(&format!(
+                "<Placemark><Point><coordinates>{longitude:.6},{latitude:.6},0</coordinates>\
+                 </Point></Placemark>"
+            ));
+        }
+        kml.push_str("</Document></kml>");
+
+        let started = std::time::Instant::now();
+        let track = import_kml(&kml).expect("import a point-only KML");
+        let elapsed = started.elapsed();
+
+        assert_eq!(track.points.len(), count);
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "10,000 points took {elapsed:?}; the geometry scan is not linear"
+        );
+    }
+
+    #[test]
+    fn an_archive_without_an_end_of_central_directory_record_is_refused() {
+        let mut archive = zip_with_one_entry("doc.kml", 0, b"<kml><Document/></kml>");
+        archive.truncate(archive.len() - 22);
+        let err = import_kmz(&archive).expect_err("no end-of-central-directory record");
+        assert!(
+            err.to_string().contains("end-of-central-directory"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_central_directory_header_with_a_bad_signature_is_refused() {
+        let mut archive = zip_with_one_entry("doc.kml", 0, b"<kml><Document/></kml>");
+        let central = central_start(&archive);
+        patch_u32(&mut archive, central, 0);
+        let err = import_kmz(&archive).expect_err("a broken central directory");
+        assert!(
+            err.to_string().contains("central directory is malformed"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_local_file_header_with_a_bad_signature_is_refused() {
+        let mut archive = zip_with_one_entry("doc.kml", 0, b"<kml><Document/></kml>");
+        patch_u32(&mut archive, 0, 0);
+        let err = import_kmz(&archive).expect_err("a broken local header");
+        assert!(
+            err.to_string().contains("local file header is malformed"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_zip64_archive_is_refused() {
+        let mut archive = zip_with_one_entry("doc.kml", 0, b"<kml><Document/></kml>");
+        let eocd = eocd_start(&archive);
+        patch_u16(&mut archive, eocd + 10, ZIP64_COUNT);
+        let err = import_kmz(&archive).expect_err("a ZIP64 archive");
+        assert!(err.to_string().contains("ZIP64"), "got {err}");
+    }
+
+    #[test]
+    fn an_entry_with_an_unknown_compression_method_is_refused() {
+        let mut archive = zip_with_one_entry("doc.kml", 0, b"<kml><Document/></kml>");
+        let central = central_start(&archive);
+        patch_u16(&mut archive, central + 10, 12);
+        let err = import_kmz(&archive).expect_err("bzip2 is not a method this reader knows");
+        assert!(
+            err.to_string()
+                .contains("compression method 12, which is not supported"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn an_entry_that_declares_more_than_the_limit_is_refused() {
+        let declared = 100 * 1024 * 1024;
+        let archive = zip_with_encoded_entry("doc.kml", 0, 0, b"<kml/>", declared);
+        let err = import_kmz(&archive).expect_err("a declared size past the limit");
+        assert!(
+            err.to_string()
+                .contains("larger than the 67108864 byte limit"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn an_encrypted_entry_is_refused() {
+        let archive = zip_with_encoded_entry("doc.kml", 0, ZIP_FLAG_ENCRYPTED, b"<kml/>", 6);
+        let err = import_kmz(&archive).expect_err("an encrypted entry");
+        assert!(
+            err.to_string()
+                .contains("is encrypted, which is not supported"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_local_header_that_says_encrypted_is_refused_even_when_the_central_directory_does_not() {
+        // The two headers each carry the flag. A reader that trusts only the
+        // central directory would try to inflate ciphertext.
+        let mut archive = zip_with_one_entry("doc.kml", 0, b"<kml><Document/></kml>");
+        patch_u16(&mut archive, 6, ZIP_FLAG_ENCRYPTED);
+        let err = import_kmz(&archive).expect_err("the local header says encrypted");
+        assert!(
+            err.to_string()
+                .contains("is encrypted, which is not supported"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn a_doc_kml_that_decompresses_past_the_limit_is_refused_while_reading() {
+        // The archive is small (a deflate stream of zeros is ~160 KiB), its
+        // headers claim `uncompressed_size = 0`, and it really expands to
+        // 160 MiB — the shape that made the old reader allocate everything
+        // before checking. The reported length is the assertion that matters:
+        // it must be the cap plus the one look-ahead byte, never the 160 MiB
+        // the stream actually holds. Removing `Read::take` makes the message
+        // say 167772160 and this test fails.
+        use std::io::Write as _;
+
+        let total = 160 * 1024 * 1024;
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+        let block = [0u8; 64 * 1024];
+        let mut written = 0usize;
+        while written < total {
+            let chunk = (total - written).min(block.len());
+            encoder
+                .write_all(&block[..chunk])
+                .expect("feed the deflate stream");
+            written += chunk;
+        }
+        let stored = encoder.finish().expect("finish the deflate stream");
+        assert!(
+            stored.len() < 1_000_000,
+            "the fixture should stay small, got {} bytes",
+            stored.len()
+        );
+        let archive = zip_with_encoded_entry("doc.kml", 8, 0, &stored, 0);
+        let err = import_kmz(&archive).expect_err("the reader must stop at the cap");
+        let reported = u64::from(MAX_KMZ_DOCUMENT_BYTES) + 1;
+        assert!(
+            err.to_string()
+                .contains(&format!("is {reported} bytes uncompressed")),
+            "the reader did not stop at the cap + 1 look-ahead byte; got {err}"
+        );
+        assert!(
+            !err.to_string().contains(&total.to_string()),
+            "the reader measured the whole 160 MiB stream instead of the cap: {err}"
+        );
+    }
+
+    /// Build a one-entry ZIP32 archive, stored (method 0) or deflated (method 8).
+    ///
+    /// The reader does not verify the CRC, so it is written as zero; the point
+    /// of this helper is the deflate path, which the exported KMZ never takes.
+    fn zip_with_one_entry(name: &str, method: u16, data: &[u8]) -> Vec<u8> {
+        let stored = if method == 8 {
+            deflate(data)
+        } else {
+            data.to_vec()
+        };
+        zip_with_encoded_entry(
+            name,
+            method,
+            0,
+            &stored,
+            u32::try_from(data.len()).expect("entry fits ZIP32"),
+        )
+    }
+
+    /// Deflate `data` into a raw (headerless) deflate stream.
+    fn deflate(data: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(data).expect("deflate the entry");
+        encoder.finish().expect("finish the deflate stream")
+    }
+
+    /// Build a one-entry ZIP32 archive from an already-encoded payload.
+    ///
+    /// Every header field that decides a refusal is explicit, so a test can
+    /// write an archive the reader must turn away: a lying declared size, an
+    /// encryption flag, a method the reader does not know.
+    fn zip_with_encoded_entry(
+        name: &str,
+        method: u16,
+        flags: u16,
+        stored: &[u8],
+        uncompressed: u32,
+    ) -> Vec<u8> {
+        let name = name.as_bytes();
+        let size = u32::try_from(stored.len()).expect("entry fits ZIP32");
+        let dos_time = 0u16;
+        let dos_date = (1u16 << 5) | 1;
+        let mut archive = Vec::new();
+
+        // Local file header.
+        archive.extend_from_slice(&0x0403_4B50u32.to_le_bytes());
+        archive.extend_from_slice(&20u16.to_le_bytes());
+        archive.extend_from_slice(&flags.to_le_bytes());
+        archive.extend_from_slice(&method.to_le_bytes());
+        archive.extend_from_slice(&dos_time.to_le_bytes());
+        archive.extend_from_slice(&dos_date.to_le_bytes());
+        archive.extend_from_slice(&0u32.to_le_bytes());
+        archive.extend_from_slice(&size.to_le_bytes());
+        archive.extend_from_slice(&uncompressed.to_le_bytes());
+        archive.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        archive.extend_from_slice(&0u16.to_le_bytes());
+        archive.extend_from_slice(name);
+        archive.extend_from_slice(stored);
+
+        // Central directory header.
+        let directory_offset = u32::try_from(archive.len()).expect("archive fits ZIP32");
+        archive.extend_from_slice(&0x0201_4B50u32.to_le_bytes());
+        archive.extend_from_slice(&20u16.to_le_bytes());
+        archive.extend_from_slice(&20u16.to_le_bytes());
+        archive.extend_from_slice(&flags.to_le_bytes());
+        archive.extend_from_slice(&method.to_le_bytes());
+        archive.extend_from_slice(&dos_time.to_le_bytes());
+        archive.extend_from_slice(&dos_date.to_le_bytes());
+        archive.extend_from_slice(&0u32.to_le_bytes());
+        archive.extend_from_slice(&size.to_le_bytes());
+        archive.extend_from_slice(&uncompressed.to_le_bytes());
+        archive.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        archive.extend_from_slice(&0u16.to_le_bytes());
+        archive.extend_from_slice(&0u16.to_le_bytes());
+        archive.extend_from_slice(&0u16.to_le_bytes());
+        archive.extend_from_slice(&0u16.to_le_bytes());
+        archive.extend_from_slice(&0u32.to_le_bytes());
+        archive.extend_from_slice(&0u32.to_le_bytes());
+        archive.extend_from_slice(name);
+
+        // End of central directory.
+        let directory_size =
+            u32::try_from(archive.len()).expect("archive fits ZIP32") - directory_offset;
+        archive.extend_from_slice(&0x0605_4B50u32.to_le_bytes());
+        archive.extend_from_slice(&0u16.to_le_bytes());
+        archive.extend_from_slice(&0u16.to_le_bytes());
+        archive.extend_from_slice(&1u16.to_le_bytes());
+        archive.extend_from_slice(&1u16.to_le_bytes());
+        archive.extend_from_slice(&directory_size.to_le_bytes());
+        archive.extend_from_slice(&directory_offset.to_le_bytes());
+        archive.extend_from_slice(&0u16.to_le_bytes());
+        archive
+    }
+
+    /// The offset of the end-of-central-directory record in a fixture.
+    fn eocd_start(archive: &[u8]) -> usize {
+        find_eocd(archive).expect("the fixture has an end-of-central-directory record")
+    }
+
+    /// The offset of the first central-directory header in a fixture.
+    fn central_start(archive: &[u8]) -> usize {
+        let eocd = eocd_start(archive);
+        let offset = zip_u32(archive, eocd + 16).expect("the fixture records a directory offset");
+        usize::try_from(offset).expect("the directory offset fits")
+    }
+
+    fn patch_u16(archive: &mut [u8], offset: usize, value: u16) {
+        archive[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn patch_u32(archive: &mut [u8], offset: usize, value: u32) {
+        archive[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
     }
 }
