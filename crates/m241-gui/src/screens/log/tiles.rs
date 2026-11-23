@@ -1155,13 +1155,15 @@ pub(crate) fn draw_map(
 ///
 /// The plate is not decoration: OSM tiles are bright, and `theme::MUTE` on a
 /// white field would fail the contrast the rest of the product holds itself to.
-/// Returns the plate so the caller can keep the zoom note clear of it.
+/// The map draws this after the track and its markers, so a route that crosses
+/// the corner cannot paint over the credit (design review 2026-11-23, Should 1).
+/// Returns the plate so the caller can keep the zoom plate clear of it.
 pub(crate) fn draw_attribution(painter: &Painter, rect: Rect) -> Rect {
     let text = format!("{ATTRIBUTION} · {ATTRIBUTION_URL}");
     let galley =
         painter.layout_no_wrap(text, egui::FontId::proportional(size::CAPTION), theme::INK);
     let text_size = Vec2::new(galley.rect.width(), galley.rect.height());
-    // Bottom-left: the zoom note owns the bottom-right corner.
+    // Bottom-left: the zoom plate owns the bottom-right corner.
     let origin = Pos2::new(
         rect.left() + space::S,
         rect.bottom() - space::S - text_size.y,
@@ -1170,37 +1172,6 @@ pub(crate) fn draw_attribution(painter: &Painter, rect: Rect) -> Rect {
     painter.rect_filled(plate, theme::RADIUS, theme::RAIL.gamma_multiply(0.9));
     painter.galley(origin, galley, theme::INK);
     plate
-}
-
-/// The zoom/state caption, bottom-right, lifted clear of the attribution.
-///
-/// Both captions are one line tall and anchored to opposite bottom corners. At a
-/// wide canvas they cannot meet; at a narrow one a long state note (`追従 zoom
-/// 13（…）`) reaches past the credit. Rather than eliding either, the note moves
-/// up by the credit's height when the two rects would overlap. Returns the note
-/// rect so a test can hold that promise without reading pixels.
-pub(crate) fn draw_note(
-    painter: &Painter,
-    rect: Rect,
-    text: &str,
-    attribution: Option<Rect>,
-) -> Rect {
-    let galley = painter.layout_no_wrap(
-        text.to_owned(),
-        egui::FontId::proportional(size::CAPTION),
-        theme::MUTE,
-    );
-    let size = Vec2::new(galley.rect.width(), galley.rect.height());
-    let right_bottom = rect.right_bottom() + Vec2::new(-space::S, -space::S);
-    let mut origin = right_bottom - size;
-    if let Some(attribution) = attribution {
-        let provisional = Rect::from_min_size(origin, size);
-        if provisional.intersects(attribution.expand(space::XS)) {
-            origin.y = attribution.top() - space::XS - size.y;
-        }
-    }
-    painter.galley(origin, galley, theme::MUTE);
-    Rect::from_min_size(origin, size)
 }
 
 #[cfg(test)]
@@ -1869,38 +1840,6 @@ mod tests {
         );
         // The ordinary tile still decodes.
         assert!(decode_tile(&synthetic_png()).is_ok());
-    }
-
-    #[test]
-    fn the_zoom_note_stays_clear_of_the_credit() {
-        // The note owns the bottom-right and the attribution the bottom-left.
-        // At a narrow canvas a long state note reaches past the credit; the note
-        // then moves above it. This is the overlap the old comment claimed a
-        // screenshot had shown, but nothing held it.
-        let context = egui::Context::default();
-        let map_rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(360.0, 240.0));
-        // Fonts only exist after one `run_ui`; a painter created before it
-        // cannot lay out text.
-        let input = egui::RawInput {
-            screen_rect: Some(map_rect),
-            ..egui::RawInput::default()
-        };
-        let output = context.run_ui(input, |ui| {
-            let _ = ui.allocate_exact_size(Vec2::new(1.0, 1.0), egui::Sense::hover());
-        });
-        output.drop_without_applying_deltas();
-        let painter = egui::Painter::new(context, egui::LayerId::background(), map_rect);
-        let attribution = draw_attribution(&painter, map_rect);
-        let long_note = "追従 zoom 13（地図タイルを取得できません（オフライン））";
-        let note = draw_note(&painter, map_rect, long_note, Some(attribution));
-        assert!(
-            !note.intersects(attribution),
-            "the zoom note {note:?} overlaps the credit {attribution:?}"
-        );
-        assert!(
-            attribution.top() - note.bottom() >= space::XS - 0.5,
-            "the lifted note does not clear the credit: note {note:?}, credit {attribution:?}"
-        );
     }
 
     #[test]

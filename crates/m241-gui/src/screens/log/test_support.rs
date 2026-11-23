@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use egui::Vec2;
 
-use super::LogScreen;
+use super::{LogScreen, LogTab};
 use crate::screens::settings::AppSettings;
 
 /// A 64 KiB dump holding `points` as `(utc, latitude, longitude, speed)`.
@@ -115,6 +115,25 @@ pub fn screen_text_runs(screen: &mut LogScreen) -> Vec<(String, egui::Pos2)> {
 /// Every text run the screen laid out, without positions.
 pub fn screen_texts(screen: &mut LogScreen) -> Vec<String> {
     screen_text_runs(screen)
+        .into_iter()
+        .map(|(text, _pos)| text)
+        .collect()
+}
+
+/// Every text run the screen tessellated with the drawer open on `tab`.
+///
+/// The panels live in the drawer (DESIGN.md §5), so a test that asks "is this
+/// control drawn" has to say which tab draws it. Rendering with the drawer
+/// closed answers a different question — whether the canvas is uncluttered —
+/// and would make every panel assertion fail for the wrong reason.
+pub fn screen_text_runs_on(screen: &mut LogScreen, tab: LogTab) -> Vec<(String, egui::Pos2)> {
+    screen.open_drawer(tab);
+    screen_text_runs(screen)
+}
+
+/// The same, without positions.
+pub fn screen_texts_on(screen: &mut LogScreen, tab: LogTab) -> Vec<String> {
+    screen_text_runs_on(screen, tab)
         .into_iter()
         .map(|(text, _pos)| text)
         .collect()

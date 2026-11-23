@@ -742,34 +742,40 @@ fn the_rail_keeps_its_fixed_width_across_every_screen() {
 }
 
 #[test]
-fn an_empty_log_omits_the_export_footer_until_a_track_exists() {
+fn the_export_action_lives_in_the_drawer_not_on_the_empty_screen() {
+    // DESIGN.md §5 puts the map on the page and the export bar in the drawer, so
+    // the export no longer sits in a pinned footer. An empty log offers nothing
+    // to export; a populated one reaches it through the 書き出し tab.
     let ctx = context();
     let mut app = App::default();
     app.select(Screen::Log);
 
-    let empty_shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
-    let mut flat = Vec::new();
-    flatten_shapes(&empty_shapes, &mut flat);
-    let has_export_when_empty = flat.iter().any(|shape| match shape {
-        egui::Shape::Text(text) => text.galley.job.text.contains("書き出す"),
-        _ => false,
-    });
+    let draws_export = |app: &mut App| -> bool {
+        let shapes = render_shapes_at(&ctx, app, 1280.0, 800.0);
+        let mut flat = Vec::new();
+        flatten_shapes(&shapes, &mut flat);
+        flat.iter().any(|shape| match shape {
+            egui::Shape::Text(text) => text.galley.job.text.contains("書き出す"),
+            _ => false,
+        })
+    };
+
     assert!(
-        !has_export_when_empty,
-        "an empty log screen must not render the export footer"
+        !draws_export(&mut app),
+        "an empty log screen must not render the export action"
     );
 
     app.log_mut().show_sample();
-    let loaded_shapes = render_shapes_at(&ctx, &mut app, 1280.0, 800.0);
-    flat.clear();
-    flatten_shapes(&loaded_shapes, &mut flat);
-    let has_export_when_loaded = flat.iter().any(|shape| match shape {
-        egui::Shape::Text(text) => text.galley.job.text.contains("書き出す"),
-        _ => false,
-    });
     assert!(
-        has_export_when_loaded,
-        "a populated log screen must render the export footer"
+        !draws_export(&mut app),
+        "the closed drawer must not draw the export action over the map"
+    );
+
+    app.log_mut()
+        .open_drawer(m241_gui::screens::log::LogTab::Export);
+    assert!(
+        draws_export(&mut app),
+        "the 書き出し tab must render the export action"
     );
 }
 
@@ -1067,8 +1073,9 @@ fn dragging_the_playback_slider_moves_the_selected_point() {
 #[test]
 fn the_map_draws_a_poi_ring_at_the_waypoint() {
     // The POI bit is the device's own button. It is drawn as a ring at twice a
-    // record's radius, in ink; the count is asserted so a ring that stops being
-    // painted (or one painted for every record) fails here.
+    // record's radius; the ring is `ink` over a `ground` disc so it reads on the
+    // light OSM surface (design review 2026-11-23, M1). The count is asserted so
+    // a ring that stops being painted (or one painted for every record) fails.
     let ctx = context();
     let mut app = App::default();
     app.select(Screen::Log);
@@ -1084,6 +1091,7 @@ fn the_map_draws_a_poi_ring_at_the_waypoint() {
             egui::Shape::Circle(circle)
                 if circle.fill == egui::Color32::TRANSPARENT
                     && circle.stroke.width > 0.0
+                    && circle.stroke.color == theme::INK
                     && (circle.radius - (theme::metric::POINT_DOT * 2.0)).abs() < 0.01 =>
             {
                 Some(circle)
@@ -1106,9 +1114,11 @@ fn the_map_draws_a_poi_ring_at_the_waypoint() {
 }
 
 #[test]
-fn the_map_track_is_five_points_wide_at_seventy_percent_opacity() {
-    // 07-eztour-spec §5 「幅 5・不透明度 0.7」, read off the painted line rather
-    // than off the constant that produced it.
+fn the_map_track_is_five_points_of_data_over_a_seven_point_ground_casing() {
+    // 07-eztour-spec §5's 「幅 5」 is read off the painted line rather than off the
+    // constant that produced it. The 70% opacity is not: on OSM tile `data` at
+    // 70% measured 1.7:1, so the line carries a `ground` casing and a full
+    // `data` stroke (design review 2026-11-23, M1).
     let ctx = context();
     let mut app = App::default();
     app.select(Screen::Log);
@@ -1118,17 +1128,39 @@ fn the_map_track_is_five_points_wide_at_seventy_percent_opacity() {
     let mut flat = Vec::new();
     flatten_shapes(&shapes, &mut flat);
 
-    // The ten-colour cycle is only as real as the dots it paints. Reading
-    // `record_fill` in a unit test would pass with `map_panel` painting one
-    // colour over the whole track, so at least three palette hues have to appear
-    // among the filled point circles (the selection marker is ink, the rings are
-    // unfilled).
-    let dot_colours: std::collections::BTreeSet<[u8; 4]> = flat
+    // Every record carries a `ground` disc one hairline wider than the dot, so
+    // the pale palette hue keeps a dark edge on the tile. The count is not fixed
+    // (the sample is 240 points), so the pair is asserted rather than counted.
+    let casing_dot = flat
+        .iter()
+        .find_map(|shape| match shape {
+            egui::Shape::Circle(circle)
+                if circle.fill == theme::GROUND
+                    && (circle.radius - (theme::metric::POINT_DOT + theme::metric::HAIRLINE))
+                        .abs()
+                        < 0.01 =>
+            {
+                Some(circle)
+            }
+            _ => None,
+        })
+        .expect("no plotted record was painted with a ground casing");
+    assert_eq!(
+        casing_dot.stroke.color,
+        egui::Color32::TRANSPARENT,
+        "the casing disc should not add a second stroke"
+    );
+    // The ten-colour cycle (07-eztour-spec §5) is only as real as the dots it
+    // paints, so at least three palette hues have to appear among the record
+    // fills. Reading `record_fill` in a unit test would still pass with the
+    // canvas painting one colour over every casing.
+    let hues: std::collections::BTreeSet<[u8; 4]> = flat
         .iter()
         .filter_map(|shape| match shape {
             egui::Shape::Circle(circle)
-                if circle.fill != egui::Color32::TRANSPARENT
-                    && (circle.radius - theme::metric::POINT_DOT).abs() < 0.01 =>
+                if (circle.radius - theme::metric::POINT_DOT).abs() < 0.01
+                    && circle.fill != egui::Color32::TRANSPARENT
+                    && circle.fill != theme::GROUND =>
             {
                 Some(circle.fill.to_array())
             }
@@ -1136,28 +1168,35 @@ fn the_map_track_is_five_points_wide_at_seventy_percent_opacity() {
         })
         .collect();
     assert!(
-        dot_colours.len() >= 3,
-        "the plotted points use {} colour(s); the ten-colour cycle is not in the paint",
-        dot_colours.len()
+        hues.len() >= 3,
+        "the plotted records use {} colour(s); the ten-colour cycle is not in the paint",
+        hues.len()
     );
 
-    let track = flat
+    let tracks: Vec<&egui::epaint::PathShape> = flat
         .iter()
-        .find_map(|shape| match shape {
+        .filter_map(|shape| match shape {
             egui::Shape::Path(path) if path.points.len() > 100 => Some(path),
             _ => None,
         })
-        .expect("the track polyline did not render");
-
-    assert!(
-        (track.stroke.width - 5.0).abs() < f32::EPSILON,
-        "the track is {:.1}pt wide, expected 5",
-        track.stroke.width
-    );
+        .collect();
+    let casing = tracks
+        .iter()
+        .find(|path| (path.stroke.width - 7.0).abs() < f32::EPSILON)
+        .expect("the track casing did not render");
     assert_eq!(
-        track.stroke.color,
-        egui::epaint::ColorMode::Solid(theme::DATA.gamma_multiply(0.7)),
-        "the track is not painted at 70% opacity"
+        casing.stroke.color,
+        egui::epaint::ColorMode::Solid(theme::GROUND),
+        "the casing under the track is not the ground colour"
+    );
+    let line = tracks
+        .iter()
+        .find(|path| (path.stroke.width - 5.0).abs() < f32::EPSILON)
+        .expect("the track polyline did not render");
+    assert_eq!(
+        line.stroke.color,
+        egui::epaint::ColorMode::Solid(theme::DATA),
+        "the track is not the data colour at full opacity"
     );
 }
 
@@ -1348,13 +1387,17 @@ fn pressing_geotag_writes_nothing_until_the_write_button_is_pressed() {
 
     // Load the sample track and plan the photos through the screen's own loader.
     app.log_mut().show_sample();
+    // 写真に位置 lives in the 書き出し drawer tab (DESIGN.md §5), so the frame the
+    // click is measured against is the one with that tab open.
+    app.log_mut()
+        .open_drawer(m241_gui::screens::log::LogTab::Export);
     assert_eq!(
         app.log_mut().load_photos_from_path(&dir.0).expect("plan"),
         2
     );
     assert!(!app.log_mut().geotag_confirmation_open());
 
-    // 「写真に位置」 is in the pinned footer, so a click on it needs no scrolling.
+    // The drawer stays open with the prompt inside it, so a click needs no scroll.
     click_label(&ctx, &mut app, "写真に位置 (2 枚)");
     assert!(
         app.log_mut().geotag_confirmation_open(),

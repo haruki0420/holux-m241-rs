@@ -192,38 +192,66 @@ inside the wizard.
 
 ### ログ — Log
 
+The map **is** the page. One 40pt tool row (title, the sentence and 見本), then
+the canvas at the window's remaining height minus the one-row selected-point
+strip. Nothing on this screen scrolls. The panels that used to push the map down
+are tabs in a right-hand drawer that starts closed: the canvas is sized from the
+window, and opening the drawer takes 360pt from its width where the window is
+wide enough, or floats over it where it is not.
+
 ```
 ┌─ m241 ────────────────────────────────────────────────────────────┐
-│ ▌接続          │ ┌ 地図 ────────────────────────────────────────┐ │
-│   ▌ログ        │ │                                              │ │
-│     ▌ファーム  │ │        o----------o                          │ │
-│       ▌設定    │ │       ╱            ╲                         │ │
-│                │ │  o---'              o---o---o                │ │
-│ ┌ トラック ──┐ │ │                          [ OpenStreetMap ]   │ │
-│ │ [x] 11/14    │ │ └──────────────────────────────────────────────┘ │
-│ │ [x] 11/15    │ │ ┌ 速度 ───────────────────────────────────────┐  │
-│ │ [ ] 11/15    │ │ │ 60 ┤        ╭╮                              │  │
-│ └────────────┘ │ │  0 ┴────────╯╰──────────────────────         │  │
-│ ┌ 写真 ──────┐ │ └──────────────────────────────────────────────┘  │
-│ │ [x] 0042.jpg │ │ ┌ 選択した点 ──────────────────────────────────┐  │
-│ │ [x] 0043.jpg │ │ │ 2026-11-15 08:14:22 UTC  35.681236 139.767125│  │
-│ └────────────┘ │ │ 標高 42 m  速度 18.4 km/h  衛星 9           │  │
-│ ┌ 集計 ──────┐ │ └──────────────────────────────────────────────┘  │
-│ │ 距離 42.3  │ │                                                   │
-│ │ 時間 2h18m │ │  [ GPX ] [ KML ] [ KMZ ] [ CSV ] [ 写真に位置 ]   │
-│ │ 平均 18.4  │ │                                                   │
-│ └────────────┘ │                                                   │
+│ ▌接続          │ ログ  地図が主面です。点を選ぶと下の行に…  見本   │
+│   ▌ログ        │ ┌───────────────────────────────────┐ ┌─────────┐ │
+│     ▌ファーム  │ │ [パス          ] 開く  [パネル]   │ │ 集計 写真│ │
+│       ▌設定    │ │                                   │ │ 編集 書き│ │
+│                │ │        o----------o               │ │ 出し 操作│ │
+│                │ │       ╱            ╲              │ │ ──────── │ │
+│                │ │  o---'              o---o---o     │ │ 距離 42.3│ │
+│                │ │                                   │ │ 時間 2h18│ │
+│                │ │ © OpenStreetMap   [− ＋ zoom 15]  │ │ 平均 18.4│ │
+│                │ │    ┌ 再生 ───────────────────┐    │ │          │ │
+│                │ │    │ ▶ 前 次 全点 追従  12/240 │    │ │          │ │
+│                │ │    └────────────────────────┘    │ │          │ │
+│                │ └───────────────────────────────────┘ └─────────┘ │
+│                │ 選択した点  2026-11-15 08:14:22 UTC  35.681236 … │
 └───────────────────────────────────────────────────────────────────┘
 ```
 
-The left column is a **rail block**, not a second tab rail — same 8px staircase
-rhythm, but subordinate: headers in `caption`, rows 28px, no fill.
+Five plates live **over** the canvas, each anchored to a corner so none of them
+moves when another changes:
+
+| Plate | Corner | Contents |
+|---|---|---|
+| Log file | top-left | the path, 開く, and the result of the last load |
+| パネル | top-right | the drawer toggle, the only route into the panels |
+| 再生 | bottom-centre | transport, timeline and the playing point |
+| zoom | bottom-right | `−` / `＋`, the level actually drawn, the map's state note |
+| credit | bottom-left | `© OpenStreetMap contributors`, only when OSM pixels were drawn |
+
+Each plate is `rail` at 0.92 alpha with `ink` text: over OSM's light face that
+composites above 11:1, where bare `mute` measured 2.3:1. The plate rects are
+fixed and computed in one place (`screens::log::drawer`), and a render test
+asserts that no two of them — nor the credit and the zoom plate — intersect.
+
+The drawer is a 360pt right column holding five tabs: 集計 (figures, day filter,
+speed chart, point list), 写真, 編集, 書き出し (format chips, destination, geotag,
+KMZ options) and ログ操作 (download, backup, erase gates, projects, NMEA, read).
+Below 1100pt of content width there is no room for a 360pt column beside a
+readable map, so the drawer floats over the canvas instead; the map keeps its
+size and the toggle stays the last thing painted, so it always remains reachable.
+
+A 32pt selected-point strip sits directly under the canvas, not in a panel below
+the fold: the canvas is a picker, and the answer to a click belongs under the
+thing clicked. 編集, 写真 and ログ操作 no longer draw a second staircase beside
+the rail.
 
 The map is the product's one light face: OpenStreetMap tiles under the track,
 with the licence's `© OpenStreetMap contributors` credit on the canvas. When the
 tiles cannot be fetched — offline, or the setting switched off — the same canvas
-falls back to the schematic grid and says so in `mute`; the track, its records
-and every control keep working, because none of them needs the network.
+falls back to the schematic grid and says so on the zoom plate in `ink` (not bare
+`mute` on a tile); the track, its records and every control keep working, because
+none of them needs the network.
 
 ### ファーム — Firmware
 
@@ -284,8 +312,10 @@ reduced motion, and the clear-cache action.
 | Sync failed | Connect, Firmware | The device's own words first, the hint second |
 | Device state undefined | Firmware step 3 failure | `danger` border on the panel, the recovery command as copyable text |
 | Waiting for the user | Firmware step 2 | Progress held at 100%, the instruction given as an imperative |
-| Empty log | Log | "まだログがありません" plus the download action, which lives in the ログ操作 console drawn first on the empty page |
-| Offline map | Log | Schematic grid plus 「地図タイルを取得できません（オフライン）」 in `mute`; the track still draws |
+| Empty log | Log | A plate at the canvas centre: 「まだログがありません」, what to open or download, ログ操作を開く (opens that drawer tab) and the 見本 checkbox. The canvas stays the page |
+| Offline map | Log | Schematic grid plus 「地図タイルを取得できません（オフライン）」 on the zoom plate in `ink`, never bare `mute` on a tile; the track still draws |
+| Drawer closed | Log | The default: five plates over the canvas and no panel taking height from it |
+| Drawer open | Log | 360pt column beside the canvas at or above 1100pt content width; below it the drawer floats over the canvas and the toggle stays on top |
 | Unverified feature | Anywhere | The word 未検証 beside it, `mute`, never `danger` |
 | Loading | Any | Skeleton rows in the table, never a centred spinner |
 | Keyboard | All | Every control focusable, focus ring is a 2px `ink` outline inset 1px |
@@ -315,15 +345,14 @@ UI changes:
 3. Findings recorded in `docs/dev/10-review-log.md` with Must / Should / Could.
 
 The ログ操作 console is a design decision about the standard set: the two Log
-images carry the sample track, so the console sits below the map and the eight
-images show none of its six panels. The console is drawn **first only on an
-empty log**, where download is the action that fills the page; that is the
-state the standard set does not render. Its panels are reviewed from the opt-in
+images carry the sample track with the drawer closed, so the render is the map
+the review is about. The five drawer tabs are reviewed from two other places: a
+unit test (`every_drawer_tab_opens_and_draws_its_panel`) renders each tab and
+asserts that its panel draws its signature control, and the opt-in
 `M241_GUI_OPS_SCREENSHOTS=<dir>` run (`cargo test -p m241-gui` writes
-`ops-<mode>.png` for each panel, from the empty log at 1024×640). Adding a ninth
-standard image that empties the log would be the alternative; keeping the
-standard set to the four screens × two sizes and reviewing the console from an
-explicit run is the choice recorded here.
+`ops-<mode>.png` for each ログ操作 panel, from the empty log at 1024×640). Adding
+standard images with the drawer open would change what the nine images are for;
+the split keeps the standard set to the four screens × two sizes.
 
 Three checks are mechanical and belong in CI, not in a human pass:
 
@@ -356,8 +385,6 @@ A comp round needs image generation. Two ways to unblock, in preference order:
 
 - Whether the app ships light-mode at all. A daylight/outdoor reading mode may be
   warranted; not designed yet.
-- Table density on a 1024-wide window: the Log screen's three-zone layout needs a
-  collapse rule below 1100px.
 
 ## 10. As built — where the implementation approximates this document
 
@@ -392,24 +419,36 @@ approximation from a mistake.
 - `common::figure_row` (height 32) and `common::figure_row_compact` (height 28)
   draw the caption at the left edge, the figure at the right edge and one `rule`
   hairline underneath; `common::table_header` is 28.
-- The Log page's map is 160pt and its speed chart 80pt (`metric::PLOT`,
-  `metric::CHART`). That is smaller than a first draft and is what lets the
-  1280×800 page hold the heading, the file loader, the map, the speed chart and
-  the pinned export strip without scrolling. The selected-point block and the
-  point list do **not** fit above the fold at 1280×800 either: they are in the
-  scrolling body and reached by scroll at both documented sizes. On the rail, the
-  photo block's shift/scope controls are the last rows inside the viewport; the
-  集計 figures and the 編集 block sit below the fold for the same reason — both
-  are reached by scroll. An
-  earlier version of this section said §9 accepted the fold; §9 only leaves the
-  collapse rule open, so that sentence was wrong.
-- The Log screen's left column draws its four blocks (トラック / 写真 / 集計 /
-  編集) on one left edge, which is how §5's figure draws them. 集計 keeps the
-  third position §5's figure gives it, and 編集 is last because its fields are the
-  tallest: of the two, 集計 is the one the scroll reaches first. §5's prose says
-  "same 8px staircase rhythm"; the prose and the figure disagree, and the build
-  follows the figure, because a second staircase would compete with the rail's
-  signature.
+- The Log page's map takes the remaining height: the content's height minus the
+  40pt tool row (`metric::TOOL_ROW`) and, when a track is loaded, the 32pt
+  selected-point strip (one `metric::ROW`). The old fixed 160pt map and the
+  `metric::PLOT` figure beside it are gone from this screen. Measured through
+  `App::draw` at the two documented sizes, the canvas covers **88.2%** of the
+  content at 1280×800 and **84.6%** at 1024×640;
+  `log::tests::the_map_is_the_page_at_both_documented_sizes` fails below the
+  80% / 75% floors the review set.
+- The drawer is `metric::DRAWER` (360pt) wide and starts closed. It is a column
+  beside the canvas at a content width of `metric::NARROW` (1100pt) or more and
+  floats over the canvas below that, because 360pt beside a sub-800pt canvas
+  would leave the map a strip rather than the page. The same test drives both
+  branches at 1280×800 and 1024×640.
+- Nothing on the Log page itself scrolls. The one scrolling region is inside the
+  drawer: its selected tab's panel scrolls, so a tall 集計 or 編集 panel never
+  moves the map. The selected-point strip is one row directly under the canvas
+  and does not grow.
+- The five overlay plates are fixed rects computed in
+  `screens::log::drawer::Plates` and asserted non-overlapping — including the
+  OSM credit against the zoom plate — by
+  `the_map_plates_do_not_overlap_each_other_or_the_credit`. A caption that grew
+  with its text would move one plate into the next, so the plates truncate
+  instead.
+- The 書き出し panel is laid out for the drawer's 332pt inner width: the six
+  writer chips take two explicit rows, and the destination field and 書き出す
+  stack instead of sharing a line. `horizontal_wrapped` cannot break between two
+  `common::tool_button`s, because each is a `ui.scope` and a scope is placed
+  without a wrap check; left to the wrapping layout, the last chip and
+  写真に位置 were pushed past the drawer's clip edge, where egui stops painting
+  them (present in the code, absent from the screen).
 - Body line-height 1.5 and the caption's +0.01em tracking are not implemented:
   egui 0.37 sizes text by font and has no per-style line-height or letter-spacing
   hook. The five sizes are exact; the leading and tracking are the OS face's.
@@ -417,9 +456,11 @@ approximation from a mistake.
   that exists is the read-only device probe, which has no table to skeleton, so
   it prints the probing status line instead of inventing rows.
 - Footers are pinned, because the action is the reason the screen exists:
-  Connect carries 再読込 (secondary) / 接続して確認 (primary); Log carries the
-  export strip; Firmware carries 中止 / 続行・書き込む plus the step they belong
-  to; Settings carries the version and the session-scope sentence.
+  Connect carries 再読込 (secondary) / 接続して確認 (primary); Firmware carries
+  中止 / 続行・書き込む plus the step they belong to; Settings carries the version
+  and the session-scope sentence. The Log screen has no footer any more: its one
+  export action moved into the 書き出し drawer tab, and the map keeps the height
+  the strip used to hold.
 
 ### Buttons
 
@@ -437,6 +478,11 @@ approximation from a mistake.
   primary action beside 中止. Step 1/2's 参照 / 吸い出す / 開く / 保存 also moved
   to the secondary/primary classes, so only the destructive amber control is a
   filled button.
+- An input field is the raised surface: `visuals.text_edit_bg_color` is `panel`,
+  one step above `ground`, so a path field reads as an editable box rather than
+  as another heading (the theme sets it once, in `theme::apply`). egui's default
+  left a TextEdit as a hole slightly darker than the page, which is the
+  input/heading distinction the design direction asked for.
 - The firmware write button is armed by its gates, and pressing it runs the same
   session the CLI uses (`m241_flash::flow`) after the user types `WRITE`: the
   range is the fixed constant, the unit is compared with the backup, the image
@@ -451,8 +497,10 @@ approximation from a mistake.
   implementation's mixed-language leftover.
 - The log-file input's placeholder is `ログファイルのパス`, not a
   `path/to/log.bin` sample.
-- Empty log: 「まだログがありません」, the path with the ログを開く primary
-  action, and a disabled ログを吸い出す marked 未検証.
+- Empty log: 「まだログがありません」 on a plate at the canvas centre, the next
+  step in one sentence, `ログ操作を開く` (which opens that drawer tab, so download
+  is one press away) and the 見本 checkbox — the path input and 開く are on the
+  map's own file plate, where they stay available.
 - The map draws OpenStreetMap tiles under the track and credits them on the
   canvas whenever at least one OSM tile reached it. A sample, offline or
   still-loading frame draws no OSM pixels and carries no credit, because the
