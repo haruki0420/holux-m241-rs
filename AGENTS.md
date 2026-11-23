@@ -14,6 +14,17 @@ expensive to learn so it does not have to be rediscovered.
 It runs six gates: formatting, lint, the workspace tests, the docs link check,
 the design invariant check and the safety check. It prints one line per gate.
 
+**The Tauri app needs its frontend built first.** `crates/m241-app` embeds
+`ui/dist` at compile time (`tauri::generate_context!`), so a checkout without it
+cannot build the crate. `check.sh` prepares it itself: when
+`crates/m241-app/ui/dist/index.html` is missing it runs
+`pnpm --dir crates/m241-app/ui install --frozen-lockfile` and
+`pnpm --dir crates/m241-app/ui build` (pnpm only, never npm/npx). If pnpm is
+missing or the build fails, the app is excluded from clippy and test, the
+reason is printed (`[SKIP] m241-app: ui/dist missing: …`) and the run reports
+5/6 plus that explicit skip — it does not claim 6/6. A clean clone with Node.js
+and pnpm installed therefore reaches 6/6 on the first `./tools/check.sh`.
+
 The design gate (`tools/check_design.py`) is not cosmetic. It checks three
 invariants mechanically: amber appears only in the destructive module, a corner
 radius is always `theme::RADIUS`, and a status colour always sits beside a text
@@ -55,13 +66,17 @@ structurally is everything inside `m241-flash`: the fixed range,
 describe the GUI's gates as equivalent to the removed edge. See
 [`docs/dev/11-safety-review.md`](docs/dev/11-safety-review.md).
 
-**The GUI's map is the one network consumer.** With map tiles on (the default)
-the Log screen fetches OpenStreetMap raster tiles for the area on screen, through
-the `TileFetcher` seam in `crates/m241-gui/src/screens/log/tiles.rs`.
-`--screenshot` and a headless render never fetch: the window gate is
-`native_pixels_per_point`, and the sample frame says it shows no tiles. Every
-offline command stays offline; `nmea proxy`'s TCP listener is loopback by default.
-A second network consumer needs the same seam and an update to `DESIGN.md`.
+**Map tiles are the only network use, from two places.** The egui GUI's Log
+screen fetches OpenStreetMap raster tiles through the `TileFetcher` seam in
+`crates/m241-gui/src/screens/log/tiles.rs`; `--screenshot` and a headless render
+never fetch there (the window gate is `native_pixels_per_point`, and the sample
+frame says it shows no tiles). The Tauri app (`crates/m241-app`) fetches the
+same tiles from the webview with MapLibre; that is why its CSP in
+`tauri.conf.json` names `tile.openstreetmap.org`, and its persisted tile switch
+is what turns the requests off. There is no seam on the Tauri side because the
+WebView owns the request. Every other command stays offline; `nmea proxy`'s TCP
+listener is loopback by default. Any further network use needs its own note here
+and an update to `DESIGN.md`.
 
 **Long commands go in the background.** A first `cargo build` of the GUI pulls
 in `wgpu` and takes several minutes. Do not block a turn on it.

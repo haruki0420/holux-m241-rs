@@ -24,7 +24,10 @@
 //! * valid exclusions (comments, trailing inline comments, `erased`, SHA-256
 //!   constants like `0xd5a7_9147`, and `set_control_lines` inside its exact
 //!   allowlisted files) pass;
-//! * `tools/check.sh` still invokes `tools/check_safety.py`.
+//! * `tools/check.sh` still invokes `tools/check_safety.py`;
+//! * the Tauri app's clauses: no `m241-flash` in its manifest/tree while
+//!   `APP_MAY_LINK_FLASH` is False, no destructive opcode in the Rust or
+//!   frontend sources, and exactly one `Port::open` inside the read-only probe.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -60,7 +63,7 @@ fn python() -> String {
 const WORKSPACE_TOML: &str = "\
 [workspace]
 resolver = \"3\"
-members = [\"crates/m241-core\", \"crates/m241-flash\", \"crates/m241-gui\"]
+members = [\"crates/m241-core\", \"crates/m241-flash\", \"crates/m241-gui\", \"crates/m241-app\"]
 ";
 
 const CLEAN_CORE_TOML: &str = "\
@@ -90,6 +93,32 @@ edition = \"2024\"
 m241-core = { path = \"../m241-core\" }
 m241-flash = { path = \"../m241-flash\" }
 ";
+
+/// The Tauri app fixture: read-only until P3, so no write crate, and exactly
+/// one serial path (`device.rs::probe`). The gate's `m241-app` clauses read
+/// these files as text; the workspace member exists so `cargo tree` resolves.
+const CLEAN_APP_TOML: &str = "\
+[package]
+name = \"m241-app\"
+version = \"0.1.0\"
+edition = \"2024\"
+";
+
+const CLEAN_APP_DEVICE_RS: &str = "\
+use m241_core::protocol::Port;
+
+pub fn probe(name: &str) {
+    let _ = Port::open(name, 38_400);
+}
+";
+
+const CLEAN_APP_COMMANDS_RS: &str = "\
+pub fn device_info() {
+    device::probe(\"tty\");
+}
+";
+
+const CLEAN_APP_UI_TS: &str = "export const label = \"app\";\n";
 
 /// The smallest `da.rs` that satisfies both `m241-flash` rules: `check_image`
 /// accepts only by the backup diff (the doc comment names the forbidden tokens
@@ -182,6 +211,19 @@ impl FakeRepo {
         )
         .unwrap();
 
+        // The Tauri app fixture. `check_safety.py` refuses a write crate here
+        // while `APP_MAY_LINK_FLASH` is False, wants no destructive opcode in
+        // the Rust or frontend sources, and allows exactly one `Port::open`,
+        // inside `device.rs::probe`, with `device_info` as its caller.
+        let app = root.join("crates").join("m241-app");
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::create_dir_all(app.join("ui").join("src")).unwrap();
+        std::fs::write(app.join("Cargo.toml"), CLEAN_APP_TOML).unwrap();
+        std::fs::write(app.join("src").join("lib.rs"), "pub fn run() {}\n").unwrap();
+        std::fs::write(app.join("src").join("device.rs"), CLEAN_APP_DEVICE_RS).unwrap();
+        std::fs::write(app.join("src").join("commands.rs"), CLEAN_APP_COMMANDS_RS).unwrap();
+        std::fs::write(app.join("ui").join("src").join("main.ts"), CLEAN_APP_UI_TS).unwrap();
+
         let repo = Self { root };
         for (relative, source) in core_files {
             repo.write_core_file(relative, source);
@@ -217,6 +259,13 @@ impl FakeRepo {
             .join("m241-flash")
             .join("src")
             .join("da.rs");
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// Write a file under `crates/m241-app/` (e.g. `src/lib.rs` or `ui/src/x.ts`).
+    fn write_app_file(&self, relative: &str, content: &str) {
+        let path = self.root.join("crates").join("m241-app").join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, content).unwrap();
     }
 
@@ -1007,4 +1056,52 @@ edition = \"2024\"
 ",
     );
     repo.assert_reports("m241-flash does not depend on m241-core");
+}
+
+#[test]
+fn app_linking_the_write_crate_is_reported() {
+    // P0-P2: `m241-app` must not be able to reach the erase. The manifest text
+    // and the resolved tree are both checked, so a declared-but-unused edge is a
+    // finding too.
+    let repo = FakeRepo::new("app-write-crate", &[]);
+    repo.write_manifest(
+        "m241-app",
+        "\
+[package]
+name = \"m241-app\"
+version = \"0.1.0\"
+edition = \"2024\"
+
+[dependencies]
+m241-flash = { path = \"../m241-flash\" }
+",
+    );
+    repo.assert_reports("names `m241-flash` while APP_MAY_LINK_FLASH is False");
+}
+
+#[test]
+fn app_destructive_opcode_is_reported() {
+    let repo = FakeRepo::new("app-opcode", &[]);
+    repo.write_app_file("src/lib.rs", "pub const REVIEW_PROBE: u8 = 0xD5;\n");
+    repo.assert_reports("destructive command `0xD5` in m241-app");
+}
+
+#[test]
+fn app_frontend_destructive_opcode_is_reported() {
+    let repo = FakeRepo::new("app-frontend-opcode", &[]);
+    repo.write_app_file("ui/src/bad.ts", "export const PROBE = 0xD3;\n");
+    repo.assert_reports("destructive command `0xD3` in the frontend");
+}
+
+#[test]
+fn app_second_serial_open_is_reported() {
+    // One read path is the rule; a second `Port::open` is a route the gate
+    // cannot classify as a read.
+    let repo = FakeRepo::new("app-second-open", &[]);
+    repo.write_app_file(
+        "src/commands.rs",
+        "pub fn device_info() { device::probe(\"tty\"); }\n\
+         fn extra() { let _ = Port::open(\"x\", 9_600); }\n",
+    );
+    repo.assert_reports("opens a serial port in 2 places");
 }

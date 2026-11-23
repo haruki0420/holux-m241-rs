@@ -1,0 +1,55 @@
+[package]
+name = "m241-app"
+description = "Tauri desktop UI for the Holux M-241 GPS logger"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "m241-app"
+path = "src/main.rs"
+
+[lib]
+name = "m241_app"
+path = "src/lib.rs"
+
+[build-dependencies]
+# `tauri-build` turns `tauri.conf.json` and `capabilities/` into the code the
+# `tauri::generate_context!` macro embeds, and checks the configuration at build
+# time. Tauri 2 is pinned to the 2.x line: the 3.x line is still an alpha.
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The only toolkit crate this app is allowed to link. `m241-flash` is
+# deliberately absent: P0 is a read-only Connect screen, and the safety gate
+# (`tools/check_safety.py`) treats the absence of the write crate from a
+# read-only binary as a structural guarantee. `m241-flash` arrives in P3.
+m241-core.workspace = true
+# Enumerating ports is the one thing `m241-core::protocol::Port::list` does not
+# describe (it returns bare names). The command returns the OS description and a
+# cable hint, so it reads `serialport` directly — the same crate `m241-core`
+# already links, at the same workspace version.
+serialport.workspace = true
+# The window, the IPC bridge and the asset embedder.
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+# Photo thumbnails: decode the operator's JPEG/PNG and re-encode a small JPEG
+# data URL for the webview. `m241-core` already builds the same `image` crate for
+# KMZ reduction, so this adds the PNG decoder to the same dependency, not a new
+# one.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# The data URL's encoding. Tauri's IPC is JSON, so a thumbnail crosses the
+# boundary as text rather than an array of 40,000 numbers.
+base64 = "0.22"
+
+# The workspace denies `unwrap`/`expect`/`panic` so no library aborts on bad
+# input. This crate is a binary whose `main` must terminate the process with a
+# message when the window cannot be created, and Tauri's generated handler code
+# is not written against those lints; it therefore opts out of the workspace
+# lint set and keeps only the rules that fit an application entry point.
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"

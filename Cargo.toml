@@ -5,6 +5,9 @@ members = [
     "crates/m241-flash",
     "crates/m241-cli",
     "crates/m241-gui",
+    # The Tauri v2 rewrite (P0: the Connect screen). It links `m241-core` only;
+    # `m241-flash` arrives in P3. The egui `m241-gui` stays until parity.
+    "crates/m241-app",
 ]
 
 [workspace.package]

@@ -115,6 +115,13 @@ GPX / KML / KMZ などの書き出しは止まらない。`--screenshot` と hea
 NMEA 中継（`nmea proxy --bind`）は TCP で待ち受けるが、既定は loopback
 （`127.0.0.1`）で、非ループバックを許すには `--allow-non-loopback` を明示する。
 
+Tauri 版（`crates/m241-app`）のログ画面も、地図タイルは**既定で ON** である。
+タイルを要求するのはログ画面の地図を出している間だけで、表示範囲が
+OpenStreetMap に伝わる点は GUI と同じである。ログ画面ツールバーの「地図タイル」を
+OFF にするとタイル要求を止め、等高線パターンの背景に軌跡だけを描く（軌跡・再生・
+選択・書き出しはそのまま使える）。Tauri 版は独自のタイルキャッシュを持たず、
+WebView のキャッシュに任せるため、容量や失効を管理する画面はない。
+
 ## インストール
 
 ### リリースバイナリ
@@ -158,7 +165,23 @@ cargo test --workspace
 ./tools/check.sh          # fmt / clippy / test / docs リンク / design / safety の 6 ゲート
 ```
 
-Rust 1.95 以降が必要（`Cargo.toml` の `rust-version`）。Linux でビルドする場合は、
+Rust 1.95 以降が必要（`Cargo.toml` の `rust-version`）。Tauri 版の GUI
+（`crates/m241-app`）をビルド・テストするには **Node.js と pnpm** も要る。
+`crates/m241-app` はビルド時に `crates/m241-app/ui/dist` を埋め込むため、
+フロントエンドを先にビルドしておく必要がある。
+
+```bash
+pnpm --dir crates/m241-app/ui install --frozen-lockfile
+pnpm --dir crates/m241-app/ui build
+```
+
+`./tools/check.sh` は `crates/m241-app/ui/dist/index.html` が無ければ上記の
+2 コマンドを自動で実行する。pnpm が無い、またはビルドに失敗した場合は
+`m241-app` を clippy / test の対象から外し、`m241-app skipped: ui/dist missing: …`
+と表示して残りを実行する（このとき 6/6 ではなく 5/6＋skip と報告する）。
+Node.js パッケージ操作は pnpm だけを使い、npm / npx は使わない。
+
+Linux でビルドする場合は、
 `serialport` が `libudev` を、GUI が X11 / Wayland と GL をリンクするため、次の
 パッケージが要る（CI と同じ）。
 
