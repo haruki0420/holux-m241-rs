@@ -332,15 +332,50 @@ mod tests {
 
     #[test]
     fn every_error_variant_has_exactly_one_next_action_line() {
+        // Every variant, so the "two lines, the second starts with 対処:" contract
+        // is checked for all of them rather than for three representatives. The
+        // `describe` match has no catch-all, so adding a variant fails to
+        // compile here; this test is what checks the text of the ones that exist.
         let errors = [
             Error::Port {
                 message: String::from("busy"),
             },
+            Error::Timeout {
+                what: String::from("$PMTK705"),
+                timeout: std::time::Duration::from_secs(5).into(),
+            },
+            Error::Framing {
+                what: String::from("sync probe"),
+                offset: None,
+            },
             Error::Rejected {
                 what: String::from("$PMTK001"),
             },
+            Error::Safety {
+                reason: String::from("the range was not settled"),
+            },
+            Error::Firmware {
+                message: String::from("bad image"),
+                offset: Some(0x402F4),
+            },
+            Error::Profile {
+                message: String::from("unknown build"),
+                offset: None,
+            },
+            Error::Log {
+                message: String::from("truncated record"),
+                offset: Some(0x200),
+            },
+            Error::Nmea {
+                message: String::from("bad checksum"),
+            },
             Error::State(String::from("not connected")),
+            Error::Io {
+                path: Some(String::from("/tmp/track.gpx")),
+                source: std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+            },
         ];
+        assert_eq!(errors.len(), 11, "the list must cover every Error variant");
         for error in errors {
             let text = describe(&error);
             assert_eq!(text.lines().count(), 2, "got {text}");

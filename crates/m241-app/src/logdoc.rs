@@ -759,6 +759,50 @@ pub fn match_photos(loaded: &mut LoadedLog, photos: Vec<LoadedPhoto>, options: &
 /// The largest gap between a photo's capture time and its matched point.
 pub const PHOTO_MAX_GAP_SECONDS: u32 = 1_800;
 
+/// Resolve `path` to the file it names without requiring that file to exist.
+///
+/// For an existing path this is `canonicalize` (so `..`, `.` and symlinks are
+/// resolved). For a new file the parent is resolved and the file name appended,
+/// which is enough to compare it with a source that does exist.
+fn canonical_destination(path: &Path) -> Option<PathBuf> {
+    if path.exists() {
+        return std::fs::canonicalize(path).ok();
+    }
+    let parent = path.parent()?;
+    let name = path.file_name()?;
+    Some(std::fs::canonicalize(parent).ok()?.join(name))
+}
+
+/// Whether two paths name the same file.
+///
+/// Canonical paths are compared first; on Unix the device and inode are then
+/// compared too, so a hard link to the source is the same file even though its
+/// path is different.
+fn same_file(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    let (Ok(left_meta), Ok(right_meta)) =
+        (std::fs::metadata(left), std::fs::metadata(right))
+    else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        left_meta.dev() == right_meta.dev() && left_meta.ino() == right_meta.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let (Ok(left_canonical), Ok(right_canonical)) =
+            (std::fs::canonicalize(left), std::fs::canonicalize(right))
+        else {
+            return false;
+        };
+        left_canonical == right_canonical
+    }
+}
+
 /// Export the loaded track in one of the formats the core writers provide.
 ///
 /// # Errors
@@ -778,9 +822,16 @@ pub fn export(
         ));
     }
     let source = Path::new(&loaded.source);
-    if source.is_absolute() && source == destination {
+    // "Same place" must be decided on the files, not on the strings: `dir/sub/..`
+    // names the source, and so does a symlink or a hard link to it. Resolving the
+    // destination (and comparing inodes on Unix) is what makes the refusal hold
+    // for every spelling of the same file.
+    if source.is_absolute()
+        && let Some(resolved) = canonical_destination(&destination)
+        && same_file(source, &resolved)
+    {
         return Err(String::from(
-            "元のログと同じ場所には書き出せません\n対処: 別のファイル名を指定してください。",
+            "元のログと同じファイルには書き出せません\n対処: 別のファイル名を指定してください。",
         ));
     }
     if destination.is_dir() {
@@ -1440,8 +1491,63 @@ mod tests {
         let reopened = read(&destination.display().to_string()).expect("reopen");
         let text = export(&reopened, "gpx", &destination.display().to_string())
             .expect_err("overwrite refused");
-        assert!(text.contains("同じ場所"), "got {text}");
+        assert!(text.contains("同じファイル"), "got {text}");
         assert!(text.contains("対処: "), "got {text}");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn exporting_through_a_dot_dot_path_over_the_source_is_refused() {
+        // The source and `dir/sub/../track.gpx` are the same file, but the
+        // strings differ. `canonicalize` is what closes the hole the review
+        // reproduced: without it this overwrote the source (828 bytes written).
+        let loaded = sample();
+        let directory = temp_dir("m241-app-overwrite-dotdot");
+        let destination = directory.join("track.gpx");
+        export(&loaded, "gpx", &destination.display().to_string()).expect("first export");
+        std::fs::create_dir(directory.join("sub")).expect("sub");
+        let reopened = read(&destination.display().to_string()).expect("reopen");
+        let disguised = directory.join("sub").join("..").join("track.gpx");
+        let before = std::fs::read(&destination).expect("source before");
+        let text = export(&reopened, "gpx", &disguised.display().to_string())
+            .expect_err("dot-dot spelling must be refused");
+        assert!(text.contains("同じファイル"), "got {text}");
+        let after = std::fs::read(&destination).expect("source after");
+        assert_eq!(after, before, "the source must not be rewritten");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exporting_through_a_symlink_to_the_source_is_refused() {
+        let loaded = sample();
+        let directory = temp_dir("m241-app-overwrite-symlink");
+        let destination = directory.join("track.gpx");
+        export(&loaded, "gpx", &destination.display().to_string()).expect("first export");
+        let link = directory.join("innocent.gpx");
+        std::os::unix::fs::symlink(&destination, &link).expect("symlink");
+        let reopened = read(&destination.display().to_string()).expect("reopen");
+        let text = export(&reopened, "gpx", &link.display().to_string())
+            .expect_err("a symlink to the source must be refused");
+        assert!(text.contains("同じファイル"), "got {text}");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exporting_over_a_hard_link_to_the_source_is_refused() {
+        // A hard link has a different path and canonicalises to itself, so only
+        // the inode comparison catches it.
+        let loaded = sample();
+        let directory = temp_dir("m241-app-overwrite-hardlink");
+        let destination = directory.join("track.gpx");
+        export(&loaded, "gpx", &destination.display().to_string()).expect("first export");
+        let link = directory.join("hardlink.gpx");
+        std::fs::hard_link(&destination, &link).expect("hard link");
+        let reopened = read(&destination.display().to_string()).expect("reopen");
+        let text = export(&reopened, "gpx", &link.display().to_string())
+            .expect_err("a hard link to the source must be refused");
+        assert!(text.contains("同じファイル"), "got {text}");
         std::fs::remove_dir_all(&directory).ok();
     }
 
