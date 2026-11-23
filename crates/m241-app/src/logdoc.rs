@@ -481,6 +481,14 @@ pub fn summary(loaded: &LoadedLog) -> LogSummary {
     let track = &loaded.track;
     let stats = TrackStats::of(track);
     let span = track.time_span();
+    // Distance, duration and average exclude the gaps between sessions: the
+    // chart compresses a gap longer than ten minutes to a sliver, so the totals
+    // beside it must describe the same thing. Summing the whole span gave the
+    // sample "24:44:30 / 0.3 km/h", which read as one continuous 24-hour walk.
+    let (distance_m, duration_seconds) = gap_excluded_totals(track);
+    let average_speed_kmh = duration_seconds
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| distance_m / f64::from(seconds) * 3.6);
     LogSummary {
         source: loaded.source.clone(),
         name: loaded.name.clone(),
@@ -496,9 +504,9 @@ pub fn summary(loaded: &LoadedLog) -> LogSummary {
         started_at: span.map(|(start, _)| start),
         ended_at: span.map(|(_, end)| end),
         bounds: bounds_of(track),
-        distance_m: stats.distance_m,
-        duration_seconds: stats.duration_seconds,
-        average_speed_kmh: stats.average_speed_kmh,
+        distance_m,
+        duration_seconds,
+        average_speed_kmh,
         max_speed_kmh: stats.max_speed_kmh,
         min_altitude_m: stats.min_altitude_m,
         max_altitude_m: stats.max_altitude_m,
@@ -1199,6 +1207,56 @@ fn bounds_of(track: &Track) -> Option<Bounds> {
     bounds
 }
 
+/// A gap longer than this is not "moving": the chart draws it as a sliver, and
+/// the totals and day rows leave it out of distance, duration and average.
+const SEGMENT_GAP_SECONDS: u32 = 600;
+
+/// Distance and moving time, summed per session.
+///
+/// A session ends when two timed points are more than [`SEGMENT_GAP_SECONDS`]
+/// apart. `TrackStats::of` decides distance, duration and average on each
+/// session with the same rules the rest of the toolkit uses, and the totals are
+/// their sum, so the summary cannot drift from the segments the map draws.
+fn gap_excluded_totals(track: &Track) -> (f64, Option<u32>) {
+    let mut distance_m = 0.0;
+    let mut duration_seconds: Option<u32> = None;
+    let mut start = 0;
+    let mut previous_utc: Option<u32> = None;
+    for (index, point) in track.points.iter().enumerate() {
+        if let (Some(previous), Some(utc)) = (previous_utc, point.utc)
+            && utc.saturating_sub(previous) > SEGMENT_GAP_SECONDS
+        {
+            add_segment(
+                &track.points[start..index],
+                &mut distance_m,
+                &mut duration_seconds,
+            );
+            start = index;
+        }
+        if point.utc.is_some() {
+            previous_utc = point.utc;
+        }
+    }
+    add_segment(
+        track.points.get(start..).unwrap_or_default(),
+        &mut distance_m,
+        &mut duration_seconds,
+    );
+    (distance_m, duration_seconds)
+}
+
+fn add_segment(points: &[TrackPoint], distance_m: &mut f64, duration_seconds: &mut Option<u32>) {
+    let segment = Track {
+        points: points.to_vec(),
+        damaged_blocks: Vec::new(),
+    };
+    let stats = TrackStats::of(&segment);
+    *distance_m += stats.distance_m;
+    if let Some(seconds) = stats.duration_seconds {
+        *duration_seconds = Some(duration_seconds.unwrap_or(0).saturating_add(seconds));
+    }
+}
+
 fn day_summaries(track: &Track, span: Option<(u32, u32)>) -> Vec<DaySummary> {
     if span.is_none() {
         return Vec::new();
@@ -1226,12 +1284,13 @@ fn day_summaries(track: &Track, span: Option<(u32, u32)>) -> Vec<DaySummary> {
             };
             let stats = TrackStats::of(&slice);
             let span = slice.time_span();
+            let (distance_m, duration_seconds) = gap_excluded_totals(&slice);
             DaySummary {
                 date,
                 points: stats.records,
                 fixes: stats.fixes,
-                distance_m: stats.distance_m,
-                duration_seconds: stats.duration_seconds,
+                distance_m,
+                duration_seconds,
                 first_utc: span.map(|(start, _)| start),
                 last_utc: span.map(|(_, end)| end),
             }
@@ -1261,6 +1320,25 @@ mod tests {
         assert_eq!(summary.points, summary.fixes);
         assert!(summary.sample);
         assert_eq!(summary.format, "sample");
+    }
+
+    #[test]
+    fn the_summary_excludes_the_gap_between_sessions() {
+        // The two sample sessions are a day apart. The span is 89,070 s
+        // (24:44:30), but the operator was moving for 6,240 s; the chart draws
+        // the overnight gap as a sliver, so the totals must describe the same
+        // thing. This is the "24:44:30 / 0.3 km/h" the review found misleading.
+        let summary = summary(&sample());
+        assert_eq!(summary.duration_seconds, Some(6_240));
+        assert!(
+            summary.distance_m > 5_000.0 && summary.distance_m < 6_500.0,
+            "got {}",
+            summary.distance_m
+        );
+        let average = summary.average_speed_kmh.expect("average speed");
+        assert!(average > 2.0 && average < 6.0, "got {average}");
+        assert_eq!(summary.days[0].duration_seconds, Some(3_570));
+        assert_eq!(summary.days[1].duration_seconds, Some(2_670));
     }
 
     #[test]

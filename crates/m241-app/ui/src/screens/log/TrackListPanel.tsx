@@ -83,6 +83,9 @@ export function TrackListPanel({ log }: { log: LogController }) {
         />
         <Row label="目印" value={`${summary.waypoints} 点`} />
       </dl>
+      <p className="mt-2 text-[11px] text-ink-3">
+        10 分を超える間隔は距離・時間・平均速度から除外しています
+      </p>
     </div>
   );
 }

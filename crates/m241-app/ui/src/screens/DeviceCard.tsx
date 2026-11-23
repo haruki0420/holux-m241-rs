@@ -104,7 +104,7 @@ function ProbingBody({ port }: { port: string }) {
         ))}
       </div>
 
-      <p className="mt-4 text-xs text-ink-3">応答がない場合は 10 秒ほど待ちます</p>
+      <p className="mt-4 text-xs text-ink-3">応答がない場合は最大 15 秒ほど待ちます</p>
     </div>
   );
 }
@@ -143,7 +143,7 @@ function ConnectedBody({ info }: { info: DeviceInfo }) {
         <div className="mt-3 rounded-control bg-inset p-3">
           <p className="text-xs font-medium text-ink-2">未知のリリース</p>
           <p className="mt-1 text-xs text-ink-3">
-            ファーム画面（P3）で吸い出して確認します
+            この版ではファームの内容を確認できないため、対応状況は不明です
           </p>
         </div>
       )}
