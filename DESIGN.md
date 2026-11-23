@@ -22,34 +22,57 @@ Two consequences drive everything below:
 - The app must **address the person, then the device**: "go press the button on
   the logger" is a first-class interface state, not an error dialog.
 
-## 2. Direction (rolled: manual-acetate-tab-board)
+## 2. Direction (rolled: one-seam-instrument)
 
-A boxed-software reference manual lying open. Its fore edge carries a stepped
-thumb index; a punched acetate leaf hinges a millimetre above the page so figures
-sit on a second plane.
+An instrument panel beside a map: the map is the page, the drawer is the margin,
+and **the only seam through the screen is the drawer's edge**. Hierarchy is made
+with a stack of five surfaces, 20pt of inner space and one corner radius. A rule
+is used for a *data* boundary — a table row, a figure row — and never as the way a
+screen is divided.
 
-Translated into an Operate surface, the world lends exactly four things:
+This replaces the previous direction (`manual-acetate-tab-board`). The diagnosis
+is in §10: the world view was "a printed form", so the build put everything on one
+flat ground and drew a hairline around each block. On a 2020s tool, hierarchy is a
+fill and a change of surface; the manual's grammar made every screen a ruled
+sheet.
+
+Why this object fits this product: the job is **reading a recording on a map**.
+The reference implementation (ezTour, `docs/dev/07-eztour-spec.ja.md` §5) puts the
+map at 62% × 84%, a docked information column on the right, a 22px status bar at
+the bottom and controls in the map's corners. That placement is right for the job.
+What looks fourteen years old is its **execution** — a 96px three-row chrome, a
+Windows 95 bevel, a blue gradient, 116 glyph icons, the Google Maps frame. This
+design keeps the placement and replaces the execution, which is the whole
+difference between "reference" and "imitation".
+
+What the world lends, in four columns:
 
 | Contribution | What transfers |
 |---|---|
-| Type | A low-contrast technical grotesque (Barlow) for UI, tabular mono for every number that could be misread |
-| Palette | Graphite ground, bone text, one amber — and amber is spendable on nothing but danger |
-| Density | Reference-manual density: ruled tables, right-aligned figures, footnote-weight secondary text |
-| Signature move | **The fore-edge thumb index**: a vertical rail whose tabs step outward by position; the active tab is the one that protrudes |
+| Type | A small sans scale (12 / 14 / 16 / 20 / 28) where the smallest step is 12: no 11pt body copy. Every figure that could be misread is monospace. |
+| Palette | Five surfaces from `#090C0E` to `#262E34`, three text tones, two rules, two data colours — and one amber, spendable on nothing but danger. |
+| Density | 40pt list rows, 36pt drawer rows, 32pt table rows, 28pt headers; 20pt inside a card, 24pt between panels, 32pt between sections. |
+| Signature move | **The seam**: one full-height 1px `LINE` where the drawer meets the page. Nothing else divides the content. |
 
-No paper texture, no ruled ledger background, no serif body, no deckled edge. The
-manual is a *structural* memory, not a costume.
+What it refuses outright: bevels, gradients, glows, glass, a second accent colour,
+an icon that stands in for a word in the destructive path, and a card inside a
+card. The three mechanical invariants survive from the previous direction: amber
+is reserved, `theme::RADIUS` is the only corner, and a status colour always ships
+beside a word.
 
-### What the first pass proposed, and why it was rejected
+### What the previous pass proposed, and why it was rejected
 
 First pass: warm bone paper (#F4F1EA) with a terracotta accent, a display serif,
 and the map as a framed plate. Rejected on review: that is the default
 "humanist editorial" treatment any model produces for a heritage object, and it
-would have made a repair tool look like a magazine. The palette also put the
-saturated colour on decoration rather than on the one thing that deserves it.
+would have made a repair tool look like a magazine.
 
-Second pass, kept: dark graphite, one amber that means *this can destroy the
-device*, and the tab rail as the single authored move.
+Second pass: dark graphite, one amber that means *this can destroy the device*,
+and a stepped tab rail as the single authored move. Kept for a year; rejected in
+the 2026-11-23 review because the rail was the only *surface* in a build made
+entirely of hairlines, and because the map had become a strip under the panels.
+The palette, the amber rule, the monospace figures and the unverified language are
+carried forward; the ruled-form grammar and the staircase are not.
 
 ## 3. Tokens
 
@@ -57,106 +80,142 @@ device*, and the tab rail as the single authored move.
 
 Amber is a **reserved channel**. It may appear only on: the destructive action,
 the wizard step that writes to the device, and the state "device state is
-undefined". It never appears on hover, focus, selection, or as decoration.
+undefined" — three places in the firmware screen, counted by
+`tools/check_design.py` and by `tests/design_invariants.rs`. It never appears on
+hover, focus, selection, or as decoration.
 
-| Token | Value | On `ground` | On `panel` | Role |
-|---|---|---|---|---|
-| `ground` | `#14181A` | — | — | Window background, content ground |
-| `panel` | `#1B2023` | — | — | Raised surface: cards, table headers |
-| `rail` | `#111416` | — | — | The tab rail, inset from content |
-| `rule` | `#2C3437` | 1.4 | 1.3 | Hairlines between rows and sections |
-| `ink` | `#E8E6DF` | 14.3 | 13.2 | Primary text |
-| `mute` | `#9AA0A0` | 6.7 | 6.2 | Secondary text, units, captions |
-| `danger` | `#E3A008` | 7.9 | 7.3 | **Reserved.** Destructive affordances and states only |
-| `data` | `#5FB3C4` | 7.4 | 6.8 | Track line, chart series, selection on the map |
-| `ok` | `#6FBF73` | 8.0 | 7.3 | Verified / success |
-| `err` | `#E2705E` | 5.7 | 5.3 | Failure text (never a filled background) |
+| Token | Value | On window | On surface | On raised | On overlay | Role |
+|---|---|---|---|---|---|---|
+| `WINDOW` | `#0D1012` | — | — | — | — | Window ground and the navigation rail |
+| `SURFACE` | `#161B1E` | 1.10 | — | — | — | Cards and panels: the page's sheet |
+| `RAISED` | `#1E2429` | 1.22 | 1.11 | — | — | Header, drawer, tab strip, a control's hover face |
+| `OVERLAY` | `#262E34` | 1.38 | 1.26 | 1.14 | — | Floating layers only: popups, the map's plates, a selected tab |
+| `SUNKEN` | `#090C0E` | 1.03 | 1.13 | 1.25 | 1.42 | A well: input fields, the map canvas, a progress track |
+| `LINE` | `#2E373C` | 1.57 | 1.43 | 1.29 | 1.13 | A card's edge and a data row's boundary; the one rule |
+| `LINE_STRONG` | `#727E85` | 4.58 | 4.17 | 3.76 | 3.31 | A control's or an input's boundary (WCAG 1.4.11, 3:1) |
+| `INK` | `#EDEBE5` | 16.0 | 14.6 | 13.2 | 11.6 | Primary text |
+| `MUTE` | `#A9AFAF` | 8.6 | 7.8 | 7.1 | 6.2 | Secondary text, units, captions |
+| `FAINT` | `#939D9E` | 6.9 | 6.3 | 5.6 | 5.0 | Third tone: footnotes, unavailable labels |
+| `DATA` | `#5FB3C4` | 7.9 | 7.2 | 6.5 | 5.7 | Track, chart series, progress fill, selection — on dark chrome |
+| `DATA_MAP` | `#1A6E82` | — | — | — | — | The track over an OSM tile: 5.09 on OSM land, 3.64 on water |
+| `OK` | `#6FBF73` | 8.5 | 7.8 | 7.0 | 6.2 | Verified / success, always beside a word |
+| `ERR` | `#E8836F` | 7.2 | 6.5 | 5.9 | 5.2 | Failure text (never a filled background) |
+| `DANGER` | `#E3A008` | 8.5 | 7.7 | 6.9 | 6.2 | **Reserved.** Destructive affordances and states only |
 
-Every text value clears 4.5:1 on both `ground` and `panel`; `err` is the tightest
-at 5.3:1 and sets the floor for the palette. `rule` is a hairline, not text, so it
-is exempt. Status is never encoded by colour alone — `ok` and `err` always ship
-beside a word.
+The two rules are not text and are not judged as text: `LINE` clears 1.4–1.6:1
+and that is what a divider should measure. `LINE_STRONG` is the *component
+boundary* token and clears 3:1 on every surface, which is why a control's edge and
+an input's edge use it and a card's edge does not.
 
-The map is the one light surface: OSM tiles are pale, and letting the map be the
-only bright rectangle on a graphite page is the intended reading — the paper
-figure on the manual's dark cover.
+Surfaces step by only 1.10–1.14:1. That is deliberate: a card is read as a
+surface because it is **a fill, plus a 1px `LINE` edge, plus a 20pt inner
+margin**, not because the step is large. Stacking grey boxes with large luminance
+steps is the other way to look generated.
+
+`DATA_MAP` is a separate token because the map is the product's one light surface.
+`DATA` measures 1.7:1 on OSM land; the track over a tile is `DATA_MAP` and the
+casing under it is `WINDOW`, which is what makes a 5pt line legible on both land
+and water (design review 2026-11-23, M1).
 
 ### Type
 
-| Token | Size / weight | Role |
+| Token | Size | Role |
 |---|---|---|
-| `display` | 24 / 600 | Screen title, one per screen |
-| `title` | 20 / 600 | Section heading |
-| `body` | 16 / 400, 1.5 line | Prose, labels |
-| `ui` | 13 / 500 | Buttons, tabs, table cells |
-| `caption` | 11 / 400, +0.01em | Units, timestamps, footnotes |
+| `DISPLAY` | 28 | The ending screen's one line ("端末が見つかりません"). Not used on a normal screen. |
+| `TITLE` | 20 | A screen's title, one per screen |
+| `BODY` | 16 | Prose, and the one sentence that says why a screen exists |
+| `UI` | 14 | Buttons, tabs, table cells, a field's text, a card's caption |
+| `CAPTION` | 12 | Units, timestamps, footnotes, the third tone |
 
-Steps are 11 → 13 → 16 → 20 → 24, ratios 1.18 / 1.23 / 1.25 / 1.20. The first
-draft used 13/14 for `ui`/`body`, which is a 1.08 step — too close to carry two
-different jobs, so 14 was dropped and `body` moved to 16.
+Twelve is the floor: there is no 11pt text anywhere in the product. The scale is
+12 → 14 → 16 → 20 → 28; adjacent steps are at least 2pt apart and the smallest
+ratio is 1.14, which is what lets the two smallest steps carry two different jobs
+(a caption and a control's label) instead of one.
 
-Light text on a dark ground needs compensation, so body buys one extra weight
-step and +0.01em tracking relative to what the same face would need on paper.
-
-- **Barlow** for Latin UI. Highway-signage grotesque: it belongs to a device built
-  for driving, and its slightly squared bowls survive small sizes.
-- **Noto Sans JP** for Japanese. Loaded from the system when present; embedded
-  fallback only for the subset the UI actually uses.
-- **A tabular mono** for hashes, byte offsets (`0x402F4`), coordinates, and every
-  number in a column. Not decoration: `0x402F6` and `0x402F7` must align.
+- **One weight.** The OS face is installed at one weight and egui does not
+  synthesise a bold, so hierarchy is size + tone (`ink` / `mute` / `faint`) +
+  surface. Barlow 600 and Noto Sans JP bold are still not bundled (§10).
+- **Monospace for figures.** `0x402F6`, coordinates, byte counts, `10,399`,
+  zoom levels. Not decoration: a column of offsets is a column because the glyphs
+  have one width.
 - Fixed scale, no fluid type — desktop apps are viewed at a fixed DPI.
 
-### Spacing and shape
+### Spacing, shape and elevation
 
-4px base. `4 / 8 / 12 / 16 / 24 / 32 / 48`. Content margin 24. Panel padding 16.
-Row height 32, table header 28.
+4px base: `4 / 8 / 12 / 16 / 20 / 24 / 32 / 48`. A card's interior is 20, the gap
+between panels is 24, between sections 32, and inside a row 8. Rows: **list 40,
+drawer 36, table 32, table header 28**.
 
-Radius: **2px**. Not rounds — a manual's tabs are square-cut. Elevation is
-declared once, as a `rule` hairline; no shadows anywhere.
+Radius: **6px**, one token (`theme::RADIUS`). Not 2 (a cut-off corner reads as a
+printed form) and not 8 or more (too round for a dense instrument). Every control,
+card and plate takes it.
+
+Elevation is a **fill plus a 1px edge**. There is exactly **one shadow**
+(`POPUP_SHADOW`: offset `[0,6]`, blur 18, `black` at alpha 96) and it means *this
+layer floats*: a popup, a menu, the drawer when it floats over the canvas, a plate
+over the map. A card does not get a shadow; it gets `SURFACE` and a `LINE` edge.
 
 ### Motion
 
-150 ms, ease-out, and only for state change. No page-load choreography, no
-hover growth. The one authored moment is the tab rail's active tab stepping out
-by 4px. `prefers-reduced-motion` (and the app's own setting) drops it to zero.
+90ms for a hover, 150ms for a screen change, 180ms for a drawer opening; all
+ease-out, and all zero under the app's reduced-motion setting. There is no
+page-load choreography, no hover growth, no blur, no parallax.
 
 **Motion thesis.**
 
-- *Focal moment:* the rail tab stepping out 4px and joining the content edge
-  when a screen is selected. It is the only motion in the product that says
-  "you are now here", and it maps to the manual's thumb index — a tab that
-  physically protrudes past its neighbours.
-- *Continuity:* the wizard's three steps. The step row is the only place a
-  horizontal transition is allowed, because the user is moving through a
-  sequence.
-- *Feedback:* the progress bar and the `WRITE` field's enabled state. Nothing
-  else acknowledges input with motion.
-- *Budget:* a 4px translate and a background fill. No blur, no shadow, no
-  layout animation. The map redraws on pan/zoom and is the only expensive
-  surface; it never animates on its own.
-
-Reduced motion keeps the tab's 4px offset as a static state and removes the
-transition; the progress bar updates without easing.
+- *Focal moment:* the drawer's seam opening — one edge moving, and the map
+  reclaiming the width behind it. It is the only motion in the product that says
+  "the layout is about the map".
+- *Continuity:* the firmware wizard's three steps, and the selection moving along
+  the track.
+- *Feedback:* the progress bar, a button's hover face, the `WRITE` field's gate.
+  Nothing else acknowledges input with motion.
+- *Budget:* a fill change and a width change. The map redraws on pan/zoom and is
+  the only expensive surface; it never animates on its own. Reduced motion keeps
+  every end state and removes the transition.
 
 ## 4. The signature move
 
 ```
  ┌──────────────────────────────────────────────────────────────┐
- │ ▌接続        │                                               │
- │   ▌ログ      │   content                                     │
- │     ▌ファーム│                                               │
- │       ▌設定  │                                               │
+ │ m241   ログ                                  接続なし   [開く]│ 56 RAISED
+ ├────┬───────────────────────────────────┬──────────────────────┤
+ │ 接 │                                   │ トラック 写真 速度   │ 44 tab strip
+ │ 続 │           地図キャンバス          │ 書き出し 操作        │
+ │    │                                   ├──────────────────────┤
+ │ ロ │        (SUNKEN, the page)         │  drawer body         │
+ │ グ │                                   │  (SURFACE/RAISED)    │
+ │    │                                   │                      │
+ │フ  │                                   │                      │
+ │ァ  │                                   ├──────────────────────┤
+ │ム  │                                   │ [GPX][KML][KMZ]      │
+ │    │                                   │                      │
+ ├────┴───────────────────────────────────┴──────────────────────┤
+ │ 10,399 点 · 42.3 km · 2h18m                  zoom 6.1 · OSM    │ 24
  └──────────────────────────────────────────────────────────────┘
+          ↑ one vertical rule: the drawer's seam
 ```
 
-Each tab is indented 8px more than the one above it, so the rail's outer edge is
-a staircase. The active tab is filled with `panel` and extends flush to the
-content edge, joining the content panel; the others sit on `rail` and do not.
-Stepping happens on selection over 150 ms.
+**The rule.** There is exactly one full-height vertical rule in the product: the
+1px `LINE` where the drawer meets the page. The navigation rail is a `WINDOW`
+surface, not a ruled column; a card is a fill, not a boxed outline; a block is
+separated by 24–32pt of space or by moving to a new surface, not by a rule. A
+horizontal `LINE` remains correct in exactly two places: under a data row (a
+figure row, a table row) and at the header's bottom edge, where the chrome ends.
 
-Consequences for the build: this is a custom-painted rail, not `SidePanel` with
-buttons. Route the whole navigation through one widget so the step appears
-nowhere else.
+Consequences for the build:
+
+- Navigation is a 64pt rail of drawn 20×20 icons with 12pt labels, not the
+  stepped thumb index. The staircase is gone with the manual: a tab that protrudes
+  was the signature of a world view this design replaces.
+- The drawer is a surface (`RAISED` when docked, `OVERLAY` + `POPUP_SHADOW` when
+  it floats), and its edge is the seam. Its tabs are `choice_button`s on a 44pt
+  strip inside it, so the only full-height rule stays the one.
+- Everything drawn over the map — the transport, the zoom, the credit, the
+  selected point — is a plate: `OVERLAY`, 1px `LINE`, the one radius, a fixed
+  height. A plate is a floating layer, so it is the one place a card-like frame
+  may carry the shadow.
+
 
 ## 5. Screens
 
@@ -395,6 +454,98 @@ This section records every place the build departs from the world above. It adds
 no token and changes none; it exists so a reviewer can tell a deliberate
 approximation from a mistake.
 
+### The previous generation, removed
+
+The 2026-11-23 review diagnosed the old build as **a printed form on a dark
+desk**: one flat ground (`#14181A`) for almost every surface, a 1px rule around
+every block, 11pt text carrying most of the screen, an input field that was a hole
+with no border, and a port ComboBox that painted egui's default `#323232` block.
+Eight symptoms, and the fix was not to re-tune the colours but to replace the
+grammar. This pass does that at the token and component level; the screen pass
+(§5) applies it.
+
+| Old symptom | What replaced it |
+|---|---|
+| Panels had a border and no fill | `common::card`: `SURFACE` fill + 1px `LINE` edge + `RADIUS` + 20pt inside |
+| Surface hierarchy was 1.03–1.13:1 of nearly one colour | Five surfaces, each step 1.10–1.14:1, plus `SUNKEN` wells for inputs and the map |
+| 11pt was the de-facto body size | The scale starts at 12; 14 is the working size |
+| Inputs were invisible (`extreme_bg` was a near-black rail, no border) | `SUNKEN` well + `LINE_STRONG` edge; the theme derives the TextEdit frame so every field shares it |
+| The ComboBox was an undesigned `#323232` block | Every `widgets.*` face is set explicitly (`RAISED` / `OVERLAY` / `SURFACE`) |
+| Text-only buttons with no hover or focus | Four button classes, six states each, each with a fill, an edge and a 2px ink focus ring |
+| No shadows at all, so a popup looked flat | One `POPUP_SHADOW`, only for floating layers |
+| Rules did everything | A rule is a data boundary; blocks separate by surface and 20–32pt of space |
+
+### Why these tokens
+
+- **Five surfaces instead of three.** Three could not express "the page", "a card",
+  "the chrome above a card", "a floating layer" and "a well *below* the page" at
+  once, which is why the old build put cards and the window on one tone. The five
+  are close in luminance on purpose (1.10–1.14:1); the card reads as a surface
+  because of its fill *and* its 1px edge *and* its 20pt inner margin.
+- **`SUNKEN` for inputs, not `RAISED`.** A field is a well: it takes an answer, so
+  it sits below the sheet. A raised field reads as a button. §3 of the design
+  direction names `SUNKEN`; the brief that commissioned this pass said `RAISED`
+  in two places and `SUNKEN` in one — the well is the resolved choice, because
+  the same document's input grammar (`well()`) is a `SUNKEN` frame and because a
+  raised field would have re-created the input/button confusion the review found.
+- **`LINE_STRONG` exists because `LINE` is a divider.** A control's edge is a
+  WCAG 1.4.11 component boundary and needs 3:1; a card's edge is decoration and
+  must stay quiet. One token for both would force one of the two wrong.
+- **`FAINT` exists because dimming `MUTE` cannot be done safely.** egui's
+  `disabled_alpha` would take a 6:1 caption under 4.5:1. A third tone is defined
+  against all five surfaces and clears AA on every one.
+- **`DATA_MAP` exists because the map is the one light surface.** `DATA` measures
+  1.7:1 on OSM land; the track over tiles is `#1A6E82` (5.09 land / 3.64 water)
+  over a `WINDOW` casing.
+- **`RADIUS` is 6, not 2.** The invariant is "one radius", not "2px"; the value
+  changed with the direction. The gate still rejects a literal `CornerRadius`.
+- **The one shadow is a popup shadow.** Elevation is declared as *is this layer
+  floating?*; the in-app chrome has no OS window, so `window_shadow` stays
+  `Shadow::NONE` and a second `Shadow` literal is rejected by
+  `tests/design_invariants.rs`.
+
+### This pass's unfinished edges
+
+- **The map's track still paints `DATA`, not `DATA_MAP`.** The token is defined,
+  measured and pinned, but choosing the colour per surface (tiles vs the offline
+  grid) belongs to the Log screen pass; on the offline grid `DATA_MAP` would be
+  2.4:1 against `WINDOW`, so it cannot simply be swapped everywhere.
+- **The navigation rail is still the old 176pt staircase.** It now paints
+  `WINDOW` with an `OVERLAY` selected tab, but the 64pt drawn-icon rail of §4 is
+  the screen pass's work. The rail's public geometry (`rail::STEP`, `tab_left`)
+  is unchanged, so its five tests still describe the staircase.
+- **The objects the type scale moved.** Raising `CAPTION` 11 → 12 and `UI`
+  13 → 14 grew every existing screen by roughly 8%. The map plates' fixed heights,
+  the settings page's fold and the Log screen's empty-state plate were laid out
+  for the old scale; this pass re-measures the plates and records the change, and
+  the screen pass replaces those layouts with §4's geometry. `common::heading`
+  moved to 20 (`TITLE`), so a screen's title no longer shares 24 with the shell's
+  own title.
+- **`DISPLAY` (28) has no consumer yet.** It is the ending screen's step; no
+  screen is an ending screen today, so the token and the `Heading` style are
+  defined and the ordinary screens stay on 20.
+- **Icons are not drawn yet.** §3 asks for a 20×20 drawn-icon set; this pass has
+  the `metric::ICON` / `ICON_STROKE` figures only. Every control is still words or
+  a drawn shape from the previous build.
+- **The drawer is not built.** Its surface tokens (`RAISED` docked, `OVERLAY`
+  floating, `POPUP_SHADOW`) are defined and the existing drawer column uses
+  `RAISED`; its 44pt tab strip and the seam are the Log pass.
+- **Plates do not carry the shadow yet.** They are `OVERLAY` at the existing 0.92
+  channel weight (opaque, not translucent — `gamma_multiply` scales the channels,
+  it does not composite) and a `LINE` edge; adopting `POPUP_SHADOW` on the plates
+  is part of the same screen pass that restructures them.
+
+### Superseded language in §5–§9 (to be fixed by the screen pass)
+
+- §4 previously described the staircase; it now describes the seam. §5's Log
+  figure, §6's rail/drawer states, §7's "rail blocks are ruled, not boxed" and
+  §8's review protocol still use the staircase vocabulary and the old 24pt/11pt
+  type names, and §7's "no shadows anywhere" is superseded by the one
+  `POPUP_SHADOW`. They are listed here rather than edited, so that one pass owns
+  the screens and the document together.
+- §3's old palette table (`ground` / `panel` / `rail` / `rule`) is gone; a
+  reviewer quoting those names from memory is quoting the previous direction.
+
 ### Type
 
 - **No font file is committed or fetched.** `theme::install` promotes the OS's
@@ -410,8 +561,8 @@ approximation from a mistake.
   build never fetches a font at run time.
 - **Weights.** The OS faces are installed at one weight and `egui` does not
   synthesise a bold, so Barlow's 600 / 500 / 400 are approximated with size and
-  the `ink` / `mute` pair: 24 and 20 are `ink`; 16, 13 and 11 choose by role.
-  The five sizes are exact; the weight step between them is not.
+  the `ink` / `mute` / `faint` tones: 28 and 20 are `ink`; 16, 14 and 12 choose by
+  role. The five sizes are exact; the weight step between them is not.
 - **Tabular figures.** `0x402F6` and `0x402F7` line up because every figure is
   monospace on the header's own column fractions (`common::table_header`,
   `common::table_row`), not because the proportional face happens to have
@@ -420,8 +571,9 @@ approximation from a mistake.
 ### Density and composition
 
 - `common::figure_row` (height 32) and `common::figure_row_compact` (height 28)
-  draw the caption at the left edge, the figure at the right edge and one `rule`
-  hairline underneath; `common::table_header` is 28.
+  draw the caption at the left edge, the figure at the right edge and one `line`
+  hairline underneath; `common::table_header` is 28. The rule is a data boundary,
+  which is the only thing a rule is for (§2).
 - The Log page's map takes the remaining height: the content's height minus the
   40pt tool row (`metric::TOOL_ROW`) and, when a track is loaded, the 32pt
   selected-point strip (one `metric::ROW`). The old fixed 160pt map and the
@@ -472,25 +624,31 @@ approximation from a mistake.
 
 ### Buttons
 
-- primary = `ink` face with a `ground` word; secondary = `rule` outline, no
-  fill; destructive = the amber 書き込む, still the only amber-filled control.
-  A disabled primary becomes an outline with a `mute` word instead of a dimmed
-  bone face, so its label keeps the contrast pair it was designed for.
-- Focus is the theme's 2pt `ink` outline. Selection uses the `data` tint
-  (export-format chips) or an `ink` outline (segmented settings choices), never
-  amber.
-- A fourth, compact class (`common::tool_button`) covers the Log map's playback
-  controls and the export-format chips: a `rule` outline at 28pt, selected as an
-  `ink` outline, never a filled face. Leaving those on egui's default fill made
-  the toolbar the brightest surface on the page and gave the Log screen a second
-  primary action beside 中止. Step 1/2's 参照 / 吸い出す / 開く / 保存 also moved
-  to the secondary/primary classes, so only the destructive amber control is a
-  filled button.
-- An input field is the raised surface: `visuals.text_edit_bg_color` is `panel`,
-  one step above `ground`, so a path field reads as an editable box rather than
-  as another heading (the theme sets it once, in `theme::apply`). egui's default
-  left a TextEdit as a hole slightly darker than the page, which is the
-  input/heading distinction the design direction asked for.
+- primary = `INK` face with a `WINDOW` word, 40pt high; secondary = a
+  transparent face with a `LINE_STRONG` edge, 40pt; a tool = a `RAISED` face at
+  36pt, selected as an `OVERLAY` face with an `INK` word; destructive = the amber
+  書き込む, still the only amber-filled control. A disabled class drops its face
+  (to `WINDOW`), keeps a `FAINT` word and a `LINE` edge, and stays above 4.5:1 —
+  dimming a designed contrast pair with egui's `disabled_alpha` is how the
+  previous build took the disabled label under AA.
+- Focus is the theme's 2pt `ink` outline on every control; a focused TextEdit
+  gets egui's 1px `DATA` frame (0.37 derives it from `selection.stroke`), which
+  is visible at 7.9:1 on the well. Selection uses an `OVERLAY` face plus an `INK`
+  word (chips, segmented choices, the selected point's row) and never amber.
+- The button classes set their state faces in a scoped `widgets.*` override
+  rather than with `Button::fill()`. An explicit fill freezes a button at one
+  state, which is why the previous build's buttons had no hover or pressed
+  feedback at all — the "text-only button" symptom had a mechanical cause.
+- An input field is a **well**: `visuals.text_edit_bg_color` is `SUNKEN`,
+  `visuals.extreme_bg_color` is `SUNKEN`, and the theme's `inactive.bg_stroke` is
+  `LINE_STRONG` because egui 0.37 derives a TextEdit's frame stroke from it. The
+  shared grammar is `common::text_field` / `common::labelled_field`, so the
+  caption position, the fill and the border are one decision; `common::well` is
+  the frame for read-only content that belongs inside the page.
+- egui 0.37's combo box, checkbox, slider and plain button all read
+  `visuals.widgets.*`, so the port ComboBox now paints `RAISED` with a
+  `LINE_STRONG` edge instead of the toolkit's `#323232`. This is the concrete fix
+  behind "the controls look borrowed from Windows".
 - The firmware write button is armed by its gates, and pressing it runs the same
   session the CLI uses (`m241_flash::flow`) after the user types `WRITE`: the
   range is the fixed constant, the unit is compared with the backup, the image
@@ -579,10 +737,12 @@ approximation from a mistake.
   through the OS cache directory, and the size row is measured from it. The
   clear action deletes only that directory; it is not amber, because deleting a
   local cache is not a destructive device action.
-- The port ComboBox and hover tooltips carry no drop shadow, and the rail's tab
-  transition is 150 ms ease-out (quadratic); reduced motion drops it to 0. These
-  are the design's own values, recorded because §3's motion and elevation rules
-  are easy to lose to a toolkit default.
+- The port ComboBox and hover tooltips carry the one `POPUP_SHADOW`; before this
+  pass they carried none and the ComboBox wore egui's `#323232` default, because
+  `theme::apply` set only the panel fill. The rail's tab transition is still
+  150 ms ease-out (quadratic) because the staircase is still in the build —
+  reduced motion drops it to 0. These are the design's own values, recorded
+  because §3's motion and elevation rules are easy to lose to a toolkit default.
 - The map's polyline is one `data` line, but the plotted records carry the
   ten-colour cycle in `theme::TRACK_PALETTE` (DESIGN.md §3 does not list it).
   This is inherited from the pre-GUI build and the ezTour reference spec
