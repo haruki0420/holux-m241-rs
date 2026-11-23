@@ -678,12 +678,13 @@ pub fn match_photos(loaded: &mut LoadedLog, photos: Vec<LoadedPhoto>, options: &
             .then_some(options.group_distance_meters),
         ..GeotagOptions::default()
     };
-    // One signed shift puts both clocks on one timeline: the log offset moves
-    // the track (`--utc-offset-days` adds days to it) and the camera offset moves
-    // the photo. The constants are seconds per unit, and the comparison itself
-    // stays in `i64` so a 7168-day log offset cannot wrap a `u32`.
-    let photo_to_track_shift =
-        i64::from(options.log_offset_days) * 86_400 - i64::from(options.camera_offset_minutes) * 60;
+    // Move the track into the photo's clock: `--utc-offset-days` shifts the
+    // track by whole days, and `camera_offset_minutes` shifts it by the
+    // camera's offset from UTC (e.g. +540 for JST, where `DateTimeOriginal` is
+    // 9 hours ahead of UTC). Staying in `i64` avoids wrapping `u32` on a
+    // 7168-day rollover offset.
+    let track_to_photo_shift =
+        i64::from(options.log_offset_days) * 86_400 + i64::from(options.camera_offset_minutes) * 60;
     let timed: Vec<(usize, i64)> = loaded
         .track
         .points
@@ -692,7 +693,7 @@ pub fn match_photos(loaded: &mut LoadedLog, photos: Vec<LoadedPhoto>, options: &
         .filter_map(|(index, point)| {
             point
                 .utc
-                .map(|utc| (index, i64::from(utc) + photo_to_track_shift))
+                .map(|utc| (index, i64::from(utc) + track_to_photo_shift))
         })
         .collect();
 
@@ -1658,7 +1659,7 @@ mod tests {
         let directory = temp_dir("m241-app-photo-offset");
         let photo = directory.join("jst.jpg");
         write_jpeg(&photo);
-        set_modified(&photo, SAMPLE_START - 9 * 3_600);
+        set_modified(&photo, SAMPLE_START + 9 * 3_600);
 
         let mut loaded = sample();
         let matched = load_photos(
@@ -1670,6 +1671,17 @@ mod tests {
         assert_eq!(
             matched.photos[0].point_index, None,
             "a JST capture must not match a UTC track without the offset"
+        );
+
+        let inverted = PhotoOptions {
+            camera_offset_minutes: -540,
+            ..PhotoOptions::default()
+        };
+        let wrong_sign = load_photos(&mut loaded, &directory.display().to_string(), &inverted)
+            .expect("load with the inverted offset");
+        assert_eq!(
+            wrong_sign.photos[0].point_index, None,
+            "a negative offset must move away from a UTC+9 photo, not toward it"
         );
 
         let options = PhotoOptions {

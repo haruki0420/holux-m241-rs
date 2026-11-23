@@ -117,8 +117,9 @@ export function LogScreen({ log }: { log: LogController }) {
         />
         {/* The toolbar floats over the map instead of taking a band of its
             own: the map is the screen, and every row above it is chrome over
-            the same surface. */}
-        <div className="absolute inset-x-0 top-14 z-map">
+            the same surface. Sits at z-popover (30), above .map-popup (20) and
+            below .z-header (40), so ExportMenu is never trapped under a popup. */}
+        <div className="absolute inset-x-0 top-14 z-popover">
           <LogToolbar log={log} tiles={tiles} onToggleTiles={() => setTiles((on) => !on)} />
         </div>
       </div>
