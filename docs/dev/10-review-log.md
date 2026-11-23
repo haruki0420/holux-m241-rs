@@ -1975,9 +1975,9 @@ fixture テスト 4 本としても固定した。
 
 ### 検証
 
-- `./tools/check.sh`（head `23dc60f`）: **6/6**（fmt / clippy / test / docs / design / safety、120s）。
-- クリーン複製 `/var/tmp/pr43-clean`（`git worktree add --detach`、`ui/dist` を削除、head `23dc60f`）:
-  `check.sh` が `prepare: … running pnpm install + build` → `prepare: built …` を出し **6/6**（90s、test 78.1s）。
+- `./tools/check.sh`（head `c8e8b9e`）: **6/6**（fmt / clippy / test / docs / design / safety、115s）。
+- クリーン複製 `/var/tmp/pr43-clean`（`git worktree add --detach`、`ui/dist` を削除、head `c8e8b9e`）:
+  `check.sh` が `prepare: … running pnpm install + build` → `prepare: built …` を出し **6/6**（101s、test 88.5s）。
 - `cargo test -p m241-app`: **28 passed**。`cargo test -p m241-flash --test safety_gate`: **35 passed**
   （うち 4 本が新しい `m241-app` 条項）。
 - `pnpm --dir crates/m241-app/ui typecheck` / `build`: 成功。
