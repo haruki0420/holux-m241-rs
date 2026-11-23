@@ -1007,7 +1007,7 @@ impl ConnectScreen {
             painter.hline(
                 rect.x_range(),
                 rect.bottom(),
-                egui::Stroke::new(metric::HAIRLINE, theme::RULE),
+                egui::Stroke::new(metric::HAIRLINE, theme::LINE),
             );
         }
 

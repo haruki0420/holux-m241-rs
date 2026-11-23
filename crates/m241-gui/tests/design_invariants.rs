@@ -123,9 +123,11 @@ fn amber_appears_exactly_three_times_and_only_in_the_firmware_screen() {
 }
 
 #[test]
-fn the_coordinates_of_the_six_tokens_come_from_the_theme_module_only() {
-    // A colour written by hand is a second palette. `theme.rs` is the only file that
-    // may spell one out; every other file names a token.
+fn the_coordinates_of_the_fifteen_tokens_come_from_the_theme_module_only() {
+    // A colour written by hand is a second palette. `theme.rs` is the only file
+    // that may spell one out; every other file names a token — and that includes
+    // the derived forms (`from_black_alpha`, `from_gray`, `from_rgba`), because a
+    // shadow or a dimmed tone is still a colour decision.
     for path in sources() {
         if path.ends_with("theme.rs") {
             continue;
@@ -133,7 +135,11 @@ fn the_coordinates_of_the_six_tokens_come_from_the_theme_module_only() {
         let text = read(&path);
         for (number, line) in production(&text).lines().enumerate() {
             assert!(
-                !line.contains("Color32::from_rgb") && !line.contains("Color32::from_rgba"),
+                !line.contains("Color32::from_rgb")
+                    && !line.contains("Color32::from_rgba")
+                    && !line.contains("Color32::from_black_alpha")
+                    && !line.contains("Color32::from_white_alpha")
+                    && !line.contains("Color32::from_gray"),
                 "{}:{}: a colour literal outside theme.rs: {line}",
                 path.display(),
                 number + 1
@@ -143,8 +149,54 @@ fn the_coordinates_of_the_six_tokens_come_from_the_theme_module_only() {
 }
 
 #[test]
+fn the_one_shadow_lives_in_the_theme_module_only() {
+    // DESIGN.md §3: elevation is a fill plus a 1px edge; exactly one shadow exists
+    // (`theme::POPUP_SHADOW`) and it means "this layer floats". A second `Shadow`
+    // literal is a second elevation language, the same failure the corner-radius
+    // gate exists to catch.
+    for path in sources() {
+        if path.ends_with("theme.rs") {
+            continue;
+        }
+        let text = read(&path);
+        assert!(
+            !production(&text).contains("egui::epaint::Shadow {")
+                && !production(&text).contains("epaint::Shadow {")
+                && !production(&text).contains("Shadow {"),
+            "{}: a shadow literal outside theme.rs; use theme::POPUP_SHADOW instead",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn the_previous_generation_s_token_names_are_gone() {
+    // `GROUND` / `PANEL` / `RAIL` / `RULE` were the printed-form palette. They
+    // were removed with the direction, and a screen that reintroduces one has
+    // reintroduced a second vocabulary for the same surface.
+    for path in sources() {
+        let text = read(&path);
+        for (number, line) in production(&text).lines().enumerate() {
+            for old in [
+                "theme::GROUND",
+                "theme::PANEL",
+                "theme::RAIL",
+                "theme::RULE",
+            ] {
+                assert!(
+                    !line.contains(old),
+                    "{}:{}: the old token name {old} is back: {line}",
+                    path.display(),
+                    number + 1
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn the_only_corner_radius_is_the_token() {
-    // DESIGN.md §3: 2px, square-cut. A literal that happens to equal the token is
+    // DESIGN.md §3: 6px, one token. A literal that happens to equal the token is
     // still a violation: the next person changes the token and this one keeps the old
     // shape.
     for path in sources() {
@@ -162,7 +214,7 @@ fn the_only_corner_radius_is_the_token() {
 
 #[test]
 fn type_sizes_and_spacing_come_from_the_scale() {
-    // DESIGN.md §3 fixes five type steps (11/13/16/20/24) and a 4px spacing scale.
+    // DESIGN.md §3 fixes five type steps (12/14/16/20/28) and a 4px spacing scale.
     // A raw `13.0` in a `RichText` is how a sixth step appears, and the mistake is
     // invisible in review because 13 is a legal-looking number.
     const ALLOWED: [&str; 5] = [

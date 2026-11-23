@@ -76,11 +76,12 @@ impl App {
     /// not part of any stable API promise.
     pub fn draw(&mut self, ui: &mut egui::Ui) {
         // Title bar: the product name and the one sentence that explains why the
-        // user is here. No menu bar until a screen needs one.
+        // user is here. It is a `RAISED` band, one step above the page, so the
+        // header reads as chrome rather than as the top of the form.
         egui::Panel::top("title")
             .frame(
                 egui::Frame::new()
-                    .fill(theme::GROUND)
+                    .fill(theme::RAISED)
                     .inner_margin(space::L),
             )
             .show(ui, |ui| {
@@ -112,7 +113,7 @@ impl App {
         egui::Panel::left("rail")
             .exact_size(rail::WIDTH)
             .show_separator_line(false)
-            .frame(egui::Frame::new().fill(theme::RAIL))
+            .frame(egui::Frame::new().fill(theme::WINDOW))
             .show(ui, |ui| {
                 if let Some(next) = rail::rail_with_transition(ui, self.current, transition_secs) {
                     self.current = next;
@@ -129,7 +130,7 @@ impl App {
 
         egui::CentralPanel::no_frame().show(ui, |ui| {
             egui::Frame::new()
-                .fill(theme::GROUND)
+                .fill(theme::WINDOW)
                 .inner_margin(space::XL)
                 .show(ui, |ui| match current {
                     Screen::Connect => connect.ui(ui),

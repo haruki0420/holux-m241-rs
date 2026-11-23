@@ -203,8 +203,8 @@ fn installing_the_theme_twice_is_idempotent() {
         );
         assert_eq!(
             style.visuals.panel_fill,
-            theme::GROUND,
-            "{name} theme kept egui's panel fill instead of theme::GROUND"
+            theme::WINDOW,
+            "{name} theme kept egui's panel fill instead of theme::WINDOW"
         );
         assert!(
             style.visuals.dark_mode,
@@ -406,7 +406,7 @@ fn waiting_for_the_power_cycle_holds_the_progress_bar_at_one_hundred_percent() {
     let (track, fill) = flat
         .iter()
         .filter_map(|shape| match shape {
-            egui::Shape::Rect(rect) if rect.fill == theme::RAIL && rect.rect.width() > 200.0 => {
+            egui::Shape::Rect(rect) if rect.fill == theme::SUNKEN && rect.rect.width() > 200.0 => {
                 Some(rect.rect)
             }
             _ => None,
@@ -415,7 +415,7 @@ fn waiting_for_the_power_cycle_holds_the_progress_bar_at_one_hundred_percent() {
             flat.iter()
                 .filter_map(|shape| match shape {
                     egui::Shape::Rect(rect)
-                        if rect.fill != theme::RAIL
+                        if rect.fill != theme::SUNKEN
                             && (rect.rect.min - track.min).length() < 0.5
                             && (rect.rect.height() - track.height()).abs() < 0.5 =>
                     {
@@ -715,7 +715,7 @@ fn the_rail_keeps_its_fixed_width_across_every_screen() {
                 .iter()
                 .filter_map(|shape| match shape {
                     egui::Shape::Rect(rect)
-                        if rect.fill == theme::RAIL
+                        if rect.fill == theme::WINDOW
                             && rect.rect.left().abs() < 0.5
                             && rect.rect.height() > 100.0 =>
                     {
@@ -1150,8 +1150,8 @@ fn the_selected_point_is_a_ground_halo_an_ink_disc_and_a_ring() {
     const RING: f32 = 3.0;
     let dot = theme::metric::POINT_DOT;
     let (halo_index, halo) =
-        find(&|circle| circle.fill == theme::GROUND && (circle.radius - dot * HALO).abs() < 0.01)
-            .expect("the selection's ground halo did not render");
+        find(&|circle| circle.fill == theme::WINDOW && (circle.radius - dot * HALO).abs() < 0.01)
+            .expect("the selection's window halo did not render");
     let (disc_index, disc) =
         find(&|circle| circle.fill == theme::INK && (circle.radius - dot * DISC).abs() < 0.01)
             .expect("the selection's ink disc did not render");
@@ -1178,12 +1178,12 @@ fn the_selected_point_is_a_ground_halo_an_ink_disc_and_a_ring() {
 }
 
 #[test]
-fn the_map_plates_are_rail_at_ninety_two_percent() {
-    // The plate alpha is the contract that makes `ink` readable over a bright OSM
+fn the_map_plates_are_overlay_at_ninety_two_percent() {
+    // The plate weight is the contract that makes `ink` readable over a bright OSM
     // tile (design review 2026-11-23, M1). Read from the painted rects rather than
-    // from the constant: a plate that stopped being translucent, or a second
-    // alpha (the credit used 0.9 before the token was unified), fails here.
-    let plate_fill = theme::RAIL.gamma_multiply(0.92);
+    // from the constant: a plate that left the plate weight, or a second one (the
+    // credit used 0.9 before the token was unified), fails here.
+    let plate_fill = theme::OVERLAY.gamma_multiply(0.92);
     let ctx = context();
     // With the drawer open the toggle and the three map plates are four plates at
     // 1280; below `NARROW` the floating drawer adds a fifth.
@@ -1245,7 +1245,7 @@ fn the_map_track_is_five_points_of_data_over_a_seven_point_ground_casing() {
         .iter()
         .find_map(|shape| match shape {
             egui::Shape::Circle(circle)
-                if circle.fill == theme::GROUND
+                if circle.fill == theme::WINDOW
                     && (circle.radius - (theme::metric::POINT_DOT + theme::metric::HAIRLINE))
                         .abs()
                         < 0.01 =>
@@ -1254,7 +1254,7 @@ fn the_map_track_is_five_points_of_data_over_a_seven_point_ground_casing() {
             }
             _ => None,
         })
-        .expect("no plotted record was painted with a ground casing");
+        .expect("no plotted record was painted with a window casing");
     assert_eq!(
         casing_dot.stroke.color,
         egui::Color32::TRANSPARENT,
@@ -1270,7 +1270,7 @@ fn the_map_track_is_five_points_of_data_over_a_seven_point_ground_casing() {
             egui::Shape::Circle(circle)
                 if (circle.radius - theme::metric::POINT_DOT).abs() < 0.01
                     && circle.fill != egui::Color32::TRANSPARENT
-                    && circle.fill != theme::GROUND =>
+                    && circle.fill != theme::WINDOW =>
             {
                 Some(circle.fill.to_array())
             }
@@ -1296,8 +1296,8 @@ fn the_map_track_is_five_points_of_data_over_a_seven_point_ground_casing() {
         .expect("the track casing did not render");
     assert_eq!(
         casing.stroke.color,
-        egui::epaint::ColorMode::Solid(theme::GROUND),
-        "the casing under the track is not the ground colour"
+        egui::epaint::ColorMode::Solid(theme::WINDOW),
+        "the casing under the track is not the window colour"
     );
     let line = tracks
         .iter()

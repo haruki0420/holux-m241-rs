@@ -186,7 +186,7 @@ pub fn render(app: &mut App, screen: Screen, size: Vec2) -> Image {
     let mut image = Image::filled(
         size.x.round().max(1.0) as u32,
         size.y.round().max(1.0) as u32,
-        theme::GROUND,
+        theme::WINDOW,
     );
 
     let mut atlas = Atlas::default();
@@ -838,8 +838,8 @@ mod tests {
                 screen.label()
             );
             assert!(
-                image.contains_colour(theme::GROUND, 4),
-                "{} has no ground; the image was cleared to something else",
+                image.contains_colour(theme::WINDOW, 4),
+                "{} has no window ground; the image was cleared to something else",
                 screen.label()
             );
         }
@@ -859,7 +859,7 @@ mod tests {
 
     #[test]
     fn the_text_shows_up_as_bone_on_graphite() {
-        // `theme::INK` on `theme::GROUND`. If the font atlas were sampled with the
+        // `theme::INK` on `theme::WINDOW`. If the font atlas were sampled with the
         // wrong filter or the colour premultiplied twice, the glyphs would come out
         // dark and this would fail.
         let image = frame(Screen::Connect);
@@ -868,8 +868,8 @@ mod tests {
             "no pixel is close to theme::INK; the text did not rasterise"
         );
         assert!(
-            image.contains_colour(theme::GROUND, 4),
-            "the ground is missing; the image was cleared to something else"
+            image.contains_colour(theme::WINDOW, 4),
+            "the window ground is missing; the image was cleared to something else"
         );
     }
 

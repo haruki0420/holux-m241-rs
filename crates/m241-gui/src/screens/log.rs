@@ -1763,9 +1763,9 @@ impl LogScreen {
 
     /// 地図: the canvas. Tiles, the track over them, and the picker.
     ///
-    /// The map is the product's one light surface (DESIGN.md §5), so everything on
-    /// it carries a `ground` casing: the polyline is 5pt of `data` over a 7pt
-    /// `ground` edge, and each record is a palette hue over a `ground` disc. The
+    /// The map is the product's one light surface (DESIGN.md §5), so everything
+    /// on it carries a `window` casing: the polyline is 5pt of `data` over a 7pt
+    /// `window` edge, and each record is a palette hue over a `window` disc. The
     /// draw order is the contract — grid, tiles, casing, line, records, start/end,
     /// photos, selection, and the credit last in `map_overlays` — because a
     /// marker drawn before its background disappears under it. The OSM credit is
@@ -1780,7 +1780,7 @@ impl LogScreen {
         settings: &AppSettings,
     ) -> drawer::Canvas {
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, theme::RADIUS, theme::RAIL);
+        painter.rect_filled(rect, theme::RADIUS, theme::SUNKEN);
 
         let view = self.sync_fit_zoom(rect);
         let plotted: Vec<(usize, egui::Pos2)> = self.plotted_points(rect);
@@ -1827,11 +1827,11 @@ impl LogScreen {
             if self.selected == Some(*index) {
                 continue;
             }
-            // A record: a `ground` casing under the cycle's colour. On the offline
+            // A record: a `window` casing under the cycle's colour. On the offline
             // grid the palette hue carries the sequence (07-eztour §5); on an OSM
             // tile those hues measure under 2:1 against land, so the casing is what
             // keeps the marker visible there (design review 2026-11-23, M1).
-            painter.circle_filled(*pos, metric::POINT_DOT + metric::HAIRLINE, theme::GROUND);
+            painter.circle_filled(*pos, metric::POINT_DOT + metric::HAIRLINE, theme::WINDOW);
             painter.circle_filled(*pos, metric::POINT_DOT, metric::track::record_fill(*index));
             // Waypoints are the device's own POI button: a second, wider ring so
             // they read as a place rather than as another sample.
@@ -1861,7 +1861,7 @@ impl LogScreen {
                 && self.selected != Some(index)
                 && let Some((_, pos)) = plotted.iter().find(|(idx, _)| *idx == index)
             {
-                painter.circle_filled(*pos, radius, theme::GROUND);
+                painter.circle_filled(*pos, radius, theme::WINDOW);
                 painter.circle_stroke(*pos, radius, Stroke::new(metric::HAIRLINE, theme::INK));
             }
         }
@@ -1875,7 +1875,7 @@ impl LogScreen {
                 let active_photo = self.selected_photo == Some(photo_idx);
                 let marker_size = if active_photo { space::S } else { space::XS };
                 let marker_rect = Rect::from_center_size(*pos, Vec2::splat(marker_size));
-                painter.rect_filled(marker_rect, theme::RADIUS, theme::GROUND);
+                painter.rect_filled(marker_rect, theme::RADIUS, theme::WINDOW);
                 painter.rect_stroke(
                     marker_rect,
                     theme::RADIUS,
@@ -1895,7 +1895,7 @@ impl LogScreen {
         if let Some(selected_idx) = self.selected
             && let Some((_, pos)) = plotted.iter().find(|(idx, _)| *idx == selected_idx)
         {
-            painter.circle_filled(*pos, metric::POINT_DOT * 3.5, theme::GROUND);
+            painter.circle_filled(*pos, metric::POINT_DOT * 3.5, theme::WINDOW);
             painter.circle_filled(*pos, metric::POINT_DOT * 2.0, theme::INK);
             painter.circle_stroke(
                 *pos,
@@ -1987,13 +1987,13 @@ impl LogScreen {
             );
             let painter = ui.painter_at(rect);
             let y = rect.center().y;
-            // The empty track is `rule` at the line width, not a hairline: a 1pt
-            // rule on `ground` measured about 1:1, which is not a track at all
+            // The empty track is `line` at the line width, not a hairline: a 1pt
+            // line on `window` measured about 1:1, which is not a track at all
             // (design review 2026-11-23, the progress-bar finding).
             painter.hline(
                 rect.x_range(),
                 y,
-                Stroke::new(metric::TRACK_LINE, theme::RULE),
+                Stroke::new(metric::TRACK_LINE, theme::LINE),
             );
             if max_idx > 0 {
                 let thumb_x = rect.left() + rect.width() * (pos as f32 / max_idx as f32);
@@ -2074,7 +2074,7 @@ impl LogScreen {
                     egui::pos2(rect.left(), baseline),
                     egui::pos2(rect.right(), baseline),
                 ],
-                Stroke::new(metric::HAIRLINE, theme::RULE),
+                Stroke::new(metric::HAIRLINE, theme::LINE),
             );
             let step = rect.width() / (indexed_speeds.len().max(2) - 1) as f32;
             let path: Vec<(usize, egui::Pos2)> = indexed_speeds
@@ -2174,7 +2174,8 @@ impl LogScreen {
         let (rect, response) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), metric::ROW), Sense::click());
         if selected {
-            ui.painter().rect_filled(rect, theme::RADIUS, theme::PANEL);
+            ui.painter()
+                .rect_filled(rect, theme::RADIUS, theme::OVERLAY);
         }
         let colour = if selected { theme::INK } else { theme::MUTE };
         let font = FontId::monospace(size::CAPTION);
@@ -2203,7 +2204,7 @@ impl LogScreen {
         ui.painter().hline(
             rect.x_range(),
             rect.bottom(),
-            Stroke::new(metric::HAIRLINE, theme::RULE),
+            Stroke::new(metric::HAIRLINE, theme::LINE),
         );
         // Rows are focusable (Sense::click); without this the keyboard's position
         // in a 10,000-row list was invisible (design review, Must 1).
@@ -2971,7 +2972,7 @@ fn find_matching_point_index(track: &Track, plan: &GeotagPlan) -> Option<usize> 
 /// Faint grid, so a track with a straight edge can be read as geography rather
 /// than as a rectangle that got painted.
 fn draw_grid(painter: &egui::Painter, rect: Rect) {
-    let stroke = Stroke::new(metric::HAIRLINE, theme::RULE.gamma_multiply(0.6));
+    let stroke = Stroke::new(metric::HAIRLINE, theme::LINE.gamma_multiply(0.6));
     for step in 1..4 {
         let fraction = step as f32 / 4.0;
         let x = rect.left() + rect.width() * fraction;
@@ -4106,8 +4107,8 @@ mod tests {
             .expect("the track casing did not render");
         assert_eq!(
             casing.stroke.color,
-            egui::epaint::ColorMode::Solid(theme::GROUND),
-            "the casing under the track is not the ground colour"
+            egui::epaint::ColorMode::Solid(theme::WINDOW),
+            "the casing under the track is not the window colour"
         );
         let line = tracks
             .iter()

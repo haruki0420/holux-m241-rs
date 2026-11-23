@@ -1150,7 +1150,7 @@ impl FirmwareScreen {
             .map(|index| egui::pos2(rect.left() + padding + step_width * index as f32, line_y))
             .collect();
         if let (Some(first), Some(last)) = (positions.first(), positions.last()) {
-            painter.line_segment([*first, *last], Stroke::new(metric::HAIRLINE, theme::RULE));
+            painter.line_segment([*first, *last], Stroke::new(metric::HAIRLINE, theme::LINE));
             if let Some(current) = positions.get(self.step.index()) {
                 painter.line_segment(
                     [*first, *current],
@@ -1910,9 +1910,9 @@ fn file_label(path: &str) -> String {
 #[must_use]
 fn confirm_button_colours(amber: Color32, armed: bool) -> (Color32, Color32) {
     if armed {
-        (amber, theme::GROUND)
+        (amber, theme::WINDOW)
     } else {
-        (theme::GROUND, theme::INK)
+        (theme::WINDOW, theme::INK)
     }
 }
 
@@ -1977,10 +1977,10 @@ mod tests {
     }
 
     #[test]
-    fn a_step_label_is_never_a_rule_colour() {
+    fn a_step_label_is_never_a_line_colour() {
         for step in Step::ALL {
             for current in Step::ALL {
-                assert_ne!(StepMarker::of(step, current).label_colour(), theme::RULE);
+                assert_ne!(StepMarker::of(step, current).label_colour(), theme::LINE);
             }
         }
     }

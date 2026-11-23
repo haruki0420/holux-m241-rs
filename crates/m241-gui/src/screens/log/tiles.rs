@@ -1181,7 +1181,7 @@ pub(crate) fn draw_attribution(painter: &Painter, area: Rect) -> Rect {
     painter.rect_filled(
         plate,
         theme::RADIUS,
-        theme::RAIL.gamma_multiply(super::drawer::PLATE_ALPHA),
+        theme::OVERLAY.gamma_multiply(super::drawer::PLATE_ALPHA),
     );
     painter.galley(origin, galley, theme::INK);
     plate

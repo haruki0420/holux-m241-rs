@@ -10,7 +10,7 @@
 use egui::{Color32, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2, pos2};
 
 use crate::screens::Screen;
-use crate::theme::{self, INK, MUTE, PANEL, metric, size, space};
+use crate::theme::{self, INK, MUTE, OVERLAY, metric, size, space};
 
 /// How far each successive tab steps to the right.
 pub const STEP: f32 = 8.0;
@@ -182,11 +182,11 @@ fn tab(ui: &mut Ui, screen: Screen, progress: f32) -> Response {
     );
 
     let fill = if progress >= 0.99 {
-        PANEL
+        OVERLAY
     } else if progress > 0.0 {
-        PANEL.gamma_multiply(progress)
+        OVERLAY.gamma_multiply(progress)
     } else if response.hovered() {
-        theme::PANEL.gamma_multiply(0.6)
+        OVERLAY.gamma_multiply(0.6)
     } else {
         Color32::TRANSPARENT
     };

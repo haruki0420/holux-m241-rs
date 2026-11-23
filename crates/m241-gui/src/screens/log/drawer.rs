@@ -12,10 +12,10 @@
 //! 2026-11-23, Must 1).
 //!
 //! Two rules keep the canvas readable on its light surface (design review
-//! 2026-11-23, M1): every plate is [`theme::RAIL`] at [`PLATE_ALPHA`], which keeps
-//! [`theme::INK`] above 11:1 over whatever tile is beneath it, and the map's own
-//! line and markers carry a `ground` casing so they read over land and water alike
-//! (the casing itself is painted by the map in `log.rs`).
+//! 2026-11-23, M1): every plate is [`theme::OVERLAY`] at [`PLATE_ALPHA`], which
+//! keeps [`theme::INK`] above 11:1 over whatever tile is beneath it, and the map's
+//! own line and markers carry a `window` casing so they read over land and water
+//! alike (the casing itself is painted by the map in `log.rs`).
 
 use egui::{Align, Layout, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use m241_core::log::ParseReport;
@@ -28,11 +28,12 @@ use super::{LogScreen, LogTab, sample_track};
 
 /// Opacity of a plate over the map.
 ///
-/// `theme::RAIL` (#111416) at 0.92 over OSM land (#F2EFE9) composites to about
-/// #23262A by the WCAG formula, so `theme::INK` on it clears 11:1 — the tile is
-/// bright, and a lower alpha would let it raise the background behind the text.
-/// The OSM credit uses the same value (`tiles::draw_attribution`), so "the plate
-/// the attribution uses" is one number and not a second guess.
+/// `theme::OVERLAY` (#262E34) at 0.92 is #232A2F, so `theme::INK` on it clears
+/// 12:1 — the tile is bright, and the plate has to be dark enough that the tile
+/// cannot raise the background behind the text. The value scales the token's
+/// channels: the plate is opaque, it does not let the tile through. The OSM credit
+/// uses the same value (`tiles::draw_attribution`), so "the plate the attribution
+/// uses" is one number and not a second guess.
 pub(super) const PLATE_ALPHA: f32 = 0.92;
 
 /// The narrowest the credit is wrapped to before it moves above the zoom plate.
@@ -103,8 +104,17 @@ impl Plates {
         );
 
         let zoom_width = 300.0_f32.min(map.width() - 2.0 * space::M);
+        // The control row is one 36pt tool button high; the map-state note is one
+        // 12pt line below it (its `CAPTION` line is ~14pt tall on the OS face).
+        // The frame's 8pt margin and 1px edge are part of the plate's own height,
+        // because `overlay` measures the painted frame, not the content.
+        let zoom_note_height = if zoom_note {
+            space::S + size::CAPTION * 1.2
+        } else {
+            0.0
+        };
         let zoom_height =
-            metric::ROW_COMPACT + if zoom_note { space::XS + 16.0 } else { 0.0 } + 2.0 * space::S;
+            metric::DOCK_ROW + zoom_note_height + 2.0 * space::S + 2.0 * metric::HAIRLINE;
         let zoom = Rect::from_min_size(
             egui::pos2(
                 map.right() - space::M - zoom_width,
@@ -114,12 +124,18 @@ impl Plates {
         );
 
         let playback_width = (map.width() - 2.0 * space::M).min(720.0);
-        // Transport row and timeline row, plus the two rows' spacing. The playing
-        // point's own figures live in the selected-point strip under the canvas,
-        // so this plate reserves (and draws) two rows; the height is the measured
-        // content — 28 + 4 + 30 — plus the frame margin, with no third row left
-        // blank.
-        let playback_height = metric::ROW_COMPACT + space::XS + 30.0 + 2.0 * space::S;
+        // Two rows: the transport (one 36pt tool row) and the timeline (a slider
+        // row, which a horizontal layout sizes to `interact_size.y`, 36), plus the
+        // 8pt block gap, the 4pt explicit space and the frame's own margin and
+        // edge. The playing point's figures live in the selected-point strip under
+        // the canvas, so no third row is reserved. Measured through `App::draw`:
+        // 102pt, which is what makes the plate clear the zoom plate by 8pt.
+        let playback_height = metric::DOCK_ROW
+            + space::S
+            + space::XS
+            + metric::DOCK_ROW
+            + 2.0 * space::S
+            + 2.0 * metric::HAIRLINE;
         let playback = Rect::from_min_size(
             egui::pos2(
                 map.center().x - playback_width / 2.0,
@@ -238,12 +254,13 @@ impl LogScreen {
                 .max_rect(rect)
                 .layout(Layout::left_to_right(Align::Center)),
         );
-        // The screen title is the design's `display` step, one per screen
-        // (DESIGN.md §3): the rail says where you are and this row says which
-        // page, so the two share the type size they always had.
+        // The screen title is the design's `title` step (20), one per screen
+        // (DESIGN.md §3). It used to be the 24pt display step; 28 is now reserved
+        // for an ending screen, so a screen title asks for `TITLE` like the other
+        // three screens' headings.
         row.label(
             egui::RichText::new("ログ")
-                .size(size::DISPLAY)
+                .size(size::TITLE)
                 .color(theme::INK)
                 .strong(),
         );
@@ -262,7 +279,7 @@ impl LogScreen {
         ui.painter().hline(
             rect.x_range(),
             rect.bottom(),
-            Stroke::new(metric::HAIRLINE, theme::RULE),
+            Stroke::new(metric::HAIRLINE, theme::LINE),
         );
         rect
     }
@@ -397,7 +414,12 @@ impl LogScreen {
                 .color(theme::INK),
             );
             ui.add_space(space::S);
-            ui.horizontal(|ui| {
+            // `horizontal_wrapped`, not `horizontal`: the action and its checkbox
+            // are wider than this plate on a narrow canvas now that the caption is
+            // 12pt and the button 14pt. A non-wrapping row grew the frame past the
+            // plate and under the floating drawer (the overlap the layout test
+            // caught); wrapping keeps the plate inside the width it reserved.
+            ui.horizontal_wrapped(|ui| {
                 if common::secondary_button(ui, "ログ操作を開く", true).clicked() {
                     self.open_drawer(LogTab::Ops);
                 }
@@ -429,11 +451,11 @@ impl LogScreen {
     /// row that does not wrap into a panel below the fold.
     pub(super) fn selection_strip(&self, ui: &Ui, rect: Rect, settings: &AppSettings) {
         let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, theme::RADIUS, theme::GROUND);
+        painter.rect_filled(rect, theme::RADIUS, theme::WINDOW);
         painter.hline(
             rect.x_range(),
             rect.top(),
-            Stroke::new(metric::HAIRLINE, theme::RULE),
+            Stroke::new(metric::HAIRLINE, theme::LINE),
         );
         let text = self
             .selected
@@ -514,7 +536,7 @@ impl LogScreen {
             .show_separator_line(false)
             .frame(
                 egui::Frame::new()
-                    .fill(theme::GROUND)
+                    .fill(theme::RAISED)
                     .inner_margin(egui::Margin {
                         left: space::L as i8,
                         right: space::M as i8,
@@ -543,8 +565,8 @@ impl LogScreen {
                 .layout(Layout::top_down(Align::LEFT)),
         );
         egui::Frame::new()
-            .fill(theme::RAIL.gamma_multiply(PLATE_ALPHA))
-            .stroke(Stroke::new(metric::HAIRLINE, theme::RULE))
+            .fill(theme::OVERLAY.gamma_multiply(PLATE_ALPHA))
+            .stroke(Stroke::new(metric::HAIRLINE, theme::LINE))
             .corner_radius(theme::RADIUS)
             .inner_margin(space::L)
             .show(&mut child, |ui| self.drawer_contents(ui, settings));
@@ -554,7 +576,7 @@ impl LogScreen {
 
 /// A plate over the canvas.
 ///
-/// `theme::RAIL` fill, `rule` hairline, the product's one corner radius, and a
+/// `theme::OVERLAY` fill, `line` hairline, the product's one corner radius, and a
 /// fixed size: the caller computes the plate, so two anchored plates cannot grow
 /// into each other when a caption is translated. Returns the rect the frame used
 /// so a test can hold the no-overlap promise without reading pixels.
@@ -567,8 +589,8 @@ fn overlay(ui: &mut Ui, plate: Rect, body: impl FnOnce(&mut Ui)) -> Rect {
     let clip = plate.intersect(ui.clip_rect());
     child.set_clip_rect(clip);
     egui::Frame::new()
-        .fill(theme::RAIL.gamma_multiply(PLATE_ALPHA))
-        .stroke(Stroke::new(metric::HAIRLINE, theme::RULE))
+        .fill(theme::OVERLAY.gamma_multiply(PLATE_ALPHA))
+        .stroke(Stroke::new(metric::HAIRLINE, theme::LINE))
         .corner_radius(theme::RADIUS)
         .inner_margin(space::S)
         .show(&mut child, |ui| {
