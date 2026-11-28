@@ -1,15 +1,11 @@
 import { Pause, Play } from "lucide-react";
 import { useMemo } from "react";
 
-import { formatUtcDateTime } from "../../lib/format";
+import { formatHeight, formatSpeed, formatUtcDateTime } from "../../lib/format";
 import type { PointDto } from "../../lib/ipc";
 
 /**
- * The scrubber along the bottom of the map.
- *
- * It moves the cursor, not the camera: the map follows only while 追従 is on.
- * The range input is the keyboard path to every point (arrow keys move one
- * point, Home/End jump to the ends).
+ * Floating bottom playback bar over the map.
  */
 export function Timeline({
   points,
@@ -35,25 +31,36 @@ export function Timeline({
   const disabled = points.length < 2;
 
   return (
-    <div className="timeline z-map" role="group" aria-label="再生位置">
+    <div
+      role="group"
+      aria-label="再生位置"
+      className="z-map absolute inset-x-3 bottom-3 flex items-center gap-3 rounded-lg border border-[var(--dads-border-control)] bg-white/95 px-3 py-2 text-[13px] shadow-lg backdrop-blur"
+    >
       <button
         type="button"
+        className="dads-btn shrink-0"
+        data-variant="outline"
+        data-size="xs"
         aria-label={playing ? "一時停止" : "再生"}
-        title={playing ? "一時停止" : "再生"}
         onClick={onTogglePlay}
         disabled={disabled}
-        className="flex size-8 shrink-0 items-center justify-center rounded-control text-ink-2 hover:bg-raise hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
       >
         {playing ? (
-          <Pause size={16} strokeWidth={1.5} aria-hidden="true" />
+          <>
+            <Pause size={13} strokeWidth={2} aria-hidden="true" />
+            <span>停止</span>
+          </>
         ) : (
-          <Play size={16} strokeWidth={1.5} aria-hidden="true" />
+          <>
+            <Play size={13} strokeWidth={2} aria-hidden="true" />
+            <span>再生</span>
+          </>
         )}
       </button>
 
       <input
         type="range"
-        className="timeline-range min-w-0 flex-1"
+        className="min-w-0 flex-1 cursor-pointer"
         min={0}
         max={Math.max(points.length - 1, 0)}
         step={1}
@@ -71,13 +78,14 @@ export function Timeline({
         }}
       />
 
-      <div className="w-[132px] shrink-0 text-right">
-        <p className="mono text-xs text-ink">
-          {current?.utc == null ? "—" : `${formatUtcDateTime(current.utc).slice(11)} UTC`}
-        </p>
-        <p className="mono text-[11px] text-ink-3">
-          {points.length === 0 ? "0 点" : `${position + 1} / ${points.length} 点`}
-        </p>
+      <div className="mono shrink-0 whitespace-nowrap text-right text-[12px] font-bold text-[var(--dads-ink)]">
+        <span>{current?.utc == null ? "—" : `${formatUtcDateTime(current.utc)} UTC`}</span>
+        <span className="ml-2 text-[var(--dads-ink-sub)]">
+          {formatSpeed(current?.speedKmh ?? null)} · {formatHeight(current?.heightM ?? null)}
+        </span>
+        <span className="ml-2 text-[var(--dads-ink-meta)]">
+          ({points.length === 0 ? "0 点" : `${position + 1}/${points.length}`})
+        </span>
       </div>
     </div>
   );

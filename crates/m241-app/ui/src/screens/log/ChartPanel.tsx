@@ -4,18 +4,9 @@ import type { LogController } from "../../hooks/useLogDocument";
 import { formatUtcTime } from "../../lib/format";
 import type { PointDto } from "../../lib/ipc";
 
-const WIDTH = 240;
-const PAD_X = 2;
-const PAD_Y = 6;
-
-/**
- * A gap longer than this is compressed to a fixed sliver on the time axis.
- *
- * The sample (and a real log left running overnight) can span a day with two
- * hour-long sessions in it. Plotting 24 hours literally squeezes both sessions
- * into a few pixels; compressing the overnight gap keeps each session readable
- * while the axis still says which day it starts and ends on.
- */
+const WIDTH = 260;
+const PAD_X = 4;
+const PAD_Y = 8;
 const GAP_SECONDS = 600;
 
 type Sample = { x: number; value: number; breakBefore: boolean };
@@ -27,7 +18,6 @@ type Axis = {
   end: number | null;
 };
 
-/** The compressed time axis shared by both charts and the cursor. */
 function buildAxis(points: readonly PointDto[]): Axis {
   const timed = points.filter((point) => point.utc !== null);
   const xByIndex = new Map<number, number>();
@@ -65,7 +55,6 @@ function buildAxis(points: readonly PointDto[]): Axis {
   };
 }
 
-/** One line series, with a break wherever the value or the time axis breaks. */
 function series(
   points: readonly PointDto[],
   axis: Axis,
@@ -100,7 +89,6 @@ function yOf(value: number, min: number, max: number, height: number): number {
   return PAD_Y + (1 - (value - min) / span) * (height - PAD_Y * 2);
 }
 
-/** The polyline, starting a new subpath at each break. */
 function linePath(
   samples: Sample[],
   min: number,
@@ -120,7 +108,6 @@ function linePath(
     .join(" ");
 }
 
-/** The accent wash under each continuous run. */
 function areaPath(
   samples: Sample[],
   min: number,
@@ -172,8 +159,6 @@ function rangeOf(
   if (!Number.isFinite(min) || !Number.isFinite(max)) {
     return zeroBased ? { min: 0, max: fallbackMax } : { min: -1, max: fallbackMax };
   }
-  // Speed starts at zero because "0 km/h" is a value an operator reads; a flat
-  // altitude still needs a band to sit in.
   if (zeroBased) {
     return { min: 0, max: Math.max(max, 1) };
   }
@@ -184,12 +169,8 @@ function rangeOf(
 }
 
 /**
- * Speed and altitude over time, drawn twice rather than overlaid.
- *
- * Two units on one axis is the kind of chart that needs a legend to read; the
- * panel instead gives speed the accent (the series the operator checks against
- * the log) and altitude a quiet ink line, sharing one compressed time axis and
- * one cursor. Clicking or dragging either chart moves the cursor.
+ * Interactive altitude & speed chart using DADS colors.
+ * Clicking or dragging moves the active cursor across the track.
  */
 export function ChartPanel({ log }: { log: LogController }) {
   const points = log.points;
@@ -232,76 +213,57 @@ export function ChartPanel({ log }: { log: LogController }) {
   const selected = log.selectedPoint;
 
   return (
-    <div>
-      <dl className="grid grid-cols-2 gap-x-3 gap-y-2 border-b border-hair pb-3">
+    <div className="space-y-3">
+      <dl className="grid grid-cols-2 gap-3 rounded-lg border border-[var(--dads-border-control)] bg-[var(--dads-surface-50)] p-3">
         <div>
-          <dt className="text-[11px] text-ink-3">速度</dt>
-          <dd className="mono mt-0.5 text-sm text-ink">
+          <dt className="text-[11px] font-bold text-[var(--dads-ink-sub)]">現在速度</dt>
+          <dd className="mono mt-0.5 text-sm font-bold text-[var(--dads-ink)]">
             {selected?.speedKmh == null ? "—" : `${selected.speedKmh.toFixed(1)} km/h`}
           </dd>
         </div>
         <div>
-          <dt className="text-[11px] text-ink-3">高度</dt>
-          <dd className="mono mt-0.5 text-sm text-ink">
+          <dt className="text-[11px] font-bold text-[var(--dads-ink-sub)]">現在高度</dt>
+          <dd className="mono mt-0.5 text-sm font-bold text-[var(--dads-ink)]">
             {selected?.heightM == null ? "—" : `${Math.round(selected.heightM)} m`}
           </dd>
         </div>
       </dl>
 
       <Chart
-        label="速度"
-        unit="km/h"
-        samples={speed}
-        range={speedRange}
-        height={82}
-        cursor={cursor}
-        accent
-        onSeek={(index) => log.seek(index)}
-        onSample={seekFromPointer}
-      />
-      <Chart
-        label="高度"
+        label="高度 (m)"
         unit="m"
         samples={altitude}
         range={altitudeRange}
-        height={64}
+        height={96}
         cursor={cursor}
+        stroke="var(--dads-blue)"
         onSeek={(index) => log.seek(index)}
         onSample={seekFromPointer}
       />
 
-      <div className="mt-1 flex justify-between text-[11px] text-ink-3">
-        <span className="mono">
-          {axis.start === null ? "—" : formatUtcTime(axis.start)}
-        </span>
-        <span className="mono">{axis.end === null ? "—" : formatUtcTime(axis.end)}</span>
-      </div>
-      <p className="mt-1 text-[11px] text-ink-3">10 分以上の間隔は詰めて表示しています</p>
+      <Chart
+        label="速度 (km/h)"
+        unit="km/h"
+        samples={speed}
+        range={speedRange}
+        height={88}
+        cursor={cursor}
+        stroke="var(--dads-warning-border)"
+        onSeek={(index) => log.seek(index)}
+        onSample={seekFromPointer}
+      />
 
-      <dl className="mt-3 flex flex-col gap-1.5 border-t border-hair pt-3">
-        <Row
-          label="平均 / 最高"
-          value={
-            log.summary?.averageSpeedKmh == null
-              ? "—"
-              : `${log.summary.averageSpeedKmh.toFixed(1)} / ${
-                  log.summary.maxSpeedKmh == null
-                    ? "—"
-                    : log.summary.maxSpeedKmh.toFixed(1)
-                } km/h`
-          }
-        />
-        <Row
-          label="高度の幅"
-          value={
-            log.summary?.minAltitudeM == null || log.summary.maxAltitudeM == null
-              ? "—"
-              : `${Math.round(log.summary.minAltitudeM)}–${Math.round(
-                  log.summary.maxAltitudeM,
-                )} m`
-          }
-        />
-      </dl>
+      <div className="flex justify-between text-[11px] text-[var(--dads-ink-meta)]">
+        <span className="mono">
+          {axis.start === null ? "—" : `${formatUtcTime(axis.start)} UTC`}
+        </span>
+        <span className="mono">
+          {axis.end === null ? "—" : `${formatUtcTime(axis.end)} UTC`}
+        </span>
+      </div>
+      <p className="text-[11px] text-[var(--dads-ink-meta)]">
+        クリックまたはドラッグで再生位置を移動できます（10分以上の休止間隔は圧縮表示）。
+      </p>
     </div>
   );
 }
@@ -313,7 +275,7 @@ function Chart({
   range,
   height,
   cursor,
-  accent = false,
+  stroke,
   onSeek,
   onSample,
 }: {
@@ -323,7 +285,7 @@ function Chart({
   range: { min: number; max: number };
   height: number;
   cursor: number | null;
-  accent?: boolean;
+  stroke: string;
   onSeek: (index: number) => void;
   onSample: (event: ReactPointerEvent<SVGSVGElement>) => number | null;
 }) {
@@ -342,18 +304,18 @@ function Chart({
       : PAD_Y + (1 - (cursorSample.value - range.min) / span) * (height - PAD_Y * 2);
 
   return (
-    <section className="mt-3" aria-label={`${label}の推移`}>
-      <div className="flex items-baseline justify-between text-[11px] text-ink-3">
-        <span>{label}</span>
-        <span className="mono">
+    <section aria-label={`${label}の推移`} className="rounded-lg border border-[var(--dads-border-divider)] bg-white p-2.5">
+      <div className="flex items-baseline justify-between text-[12px]">
+        <span className="font-bold text-[var(--dads-ink)]">{label}</span>
+        <span className="mono text-[11px] text-[var(--dads-ink-sub)]">
           {Math.round(range.min)}–{Math.round(range.max)} {unit}
         </span>
       </div>
       <svg
         viewBox={`0 0 ${WIDTH} ${height}`}
-        className="mt-1 block h-auto w-full touch-none"
+        className="mt-1.5 block h-auto w-full cursor-crosshair touch-none"
         role="img"
-        aria-label={`${label}の推移。クリックで再生位置を移動できます`}
+        aria-label={`${label}の推移グラフ`}
         onPointerDown={(event) => {
           const index = onSample(event);
           if (index !== null) {
@@ -376,23 +338,17 @@ function Chart({
             x2={WIDTH - PAD_X}
             y1={PAD_Y + fraction * (height - PAD_Y * 2)}
             y2={PAD_Y + fraction * (height - PAD_Y * 2)}
-            stroke="var(--hair)"
-            strokeWidth={1}
+            stroke="var(--dads-border-divider)"
+            strokeWidth={0.8}
           />
         ))}
-        {area === "" ? null : (
-          <path
-            d={area}
-            fill={accent ? "var(--accent)" : "var(--ink-3)"}
-            opacity={accent ? 0.1 : 0.06}
-          />
-        )}
+        {area === "" ? null : <path d={area} fill={stroke} opacity={0.12} />}
         {line === "" ? null : (
           <path
             d={line}
             fill="none"
-            stroke={accent ? "var(--accent)" : "var(--ink-3)"}
-            strokeWidth={accent ? 1.6 : 1.2}
+            stroke={stroke}
+            strokeWidth={1.6}
             strokeLinejoin="round"
             strokeLinecap="round"
           />
@@ -404,17 +360,12 @@ function Chart({
               x2={cursor}
               y1={PAD_Y}
               y2={height - PAD_Y}
-              stroke="var(--ink-3)"
+              stroke="var(--dads-ink)"
               strokeWidth={1}
-              opacity={0.55}
+              opacity={0.7}
             />
             {cursorY === null ? null : (
-              <circle
-                cx={cursor}
-                cy={cursorY}
-                r={2}
-                fill={accent ? "var(--accent)" : "var(--ink-3)"}
-              />
+              <circle cx={cursor} cy={cursorY} r={2.5} fill={stroke} />
             )}
           </g>
         )}
@@ -423,7 +374,7 @@ function Chart({
             x={WIDTH / 2}
             y={height / 2}
             textAnchor="middle"
-            fill="var(--ink-3)"
+            fill="var(--dads-ink-meta)"
             fontSize={10}
           >
             記録なし
@@ -431,14 +382,5 @@ function Chart({
         ) : null}
       </svg>
     </section>
-  );
-}
-
-function Row({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="flex items-baseline justify-between gap-2">
-      <dt className="text-xs text-ink-3">{label}</dt>
-      <dd className="mono text-xs text-ink-2">{value}</dd>
-    </div>
   );
 }
