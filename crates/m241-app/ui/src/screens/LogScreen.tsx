@@ -127,6 +127,7 @@ export function LogScreen({
     return (
       <LogFailure
         log={log}
+        activePort={device.activePort}
         message={state.message}
         hint={state.hint}
         dragging={dragging}
@@ -164,6 +165,17 @@ export function LogScreen({
           onDownloadDevice={() => void handleDownloadDevice()}
           onOpenFileDialog={() => void handleOpenFileDialog()}
         />
+
+        {log.downloadError ? (
+          <div className="pointer-events-auto absolute left-3 top-16 z-popover max-w-md shadow-md">
+            <DadsBanner type="error" title="本体からの取得に失敗しました">
+              <p className="font-bold">{log.downloadError.message}</p>
+              {log.downloadError.hint ? (
+                <p className="mt-1 text-[var(--dads-ink)]">{log.downloadError.hint}</p>
+              ) : null}
+            </DadsBanner>
+          </div>
+        ) : null}
 
         <Timeline
           points={log.points}
@@ -219,10 +231,15 @@ function LogStart({
               data-variant="solid-fill"
               data-size="md"
               onClick={onDownloadDevice}
-              disabled={log.downloading}
+              disabled={log.downloading || activePort === ""}
+              title={
+                activePort !== ""
+                  ? `${activePort} からログを取得`
+                  : "上部ヘッダーでポートを選択または手動入力してください"
+              }
             >
               <Usb size={16} strokeWidth={2} aria-hidden="true" />
-              <span>本体から取得</span>
+              <span>{log.downloading ? "取得中…" : "本体から取得"}</span>
             </button>
             <button
               type="button"
@@ -255,6 +272,15 @@ function LogStart({
               現在の取得対象ポート: <span className="mono font-bold">{activePort}</span>
             </p>
           )}
+
+          {log.downloadError ? (
+            <DadsBanner type="error" title="本体からの取得に失敗しました">
+              <p className="font-bold">{log.downloadError.message}</p>
+              {log.downloadError.hint ? (
+                <p className="mt-1 text-[var(--dads-ink)]">{log.downloadError.hint}</p>
+              ) : null}
+            </DadsBanner>
+          ) : null}
 
           <div className="border-t border-[var(--dads-border-divider)] pt-4 space-y-1.5">
             <label htmlFor="log-manual-path" className="block text-[12px] font-bold text-[var(--dads-ink-sub)]">
@@ -339,6 +365,7 @@ function LogLoading({ label }: { label: string }) {
 
 function LogFailure({
   log,
+  activePort,
   message,
   hint,
   dragging,
@@ -346,6 +373,7 @@ function LogFailure({
   onOpenFileDialog,
 }: {
   log: LogController;
+  activePort: string;
   message: string;
   hint: string | null;
   dragging: boolean;
@@ -366,6 +394,15 @@ function LogFailure({
           {hint ? <p className="mt-1 text-[var(--dads-ink)]">{hint}</p> : null}
         </DadsBanner>
 
+        {log.downloadError && log.downloadError.message !== message ? (
+          <DadsBanner type="error" title="本体からの取得エラー">
+            <p className="font-bold">{log.downloadError.message}</p>
+            {log.downloadError.hint ? (
+              <p className="mt-1 text-[var(--dads-ink)]">{log.downloadError.hint}</p>
+            ) : null}
+          </DadsBanner>
+        ) : null}
+
         {dragging ? (
           <DadsBanner type="info">ファイルを離すと読み込みます。</DadsBanner>
         ) : null}
@@ -376,6 +413,12 @@ function LogFailure({
             className="dads-btn"
             data-variant="solid-fill"
             data-size="sm"
+            disabled={log.downloading || activePort === ""}
+            title={
+              activePort !== ""
+                ? `${activePort} からログを取得`
+                : "上部ヘッダーでポートを選択または手動入力してください"
+            }
             onClick={onDownloadDevice}
           >
             本体から再取得

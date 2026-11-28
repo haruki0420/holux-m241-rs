@@ -1,5 +1,5 @@
 import { FolderOpen, RefreshCw, ShieldAlert, Usb } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { DadsBanner } from "../components/DadsBanner";
 import type { DeviceProbeController } from "../hooks/useDeviceProbe";
@@ -101,9 +101,14 @@ export function FirmwareScreen({ device }: { device: DeviceProbeController }) {
     null,
   );
 
+  const inspectTicket = useRef(0);
+
   const runInspect = useCallback(async (img: string, bak: string) => {
+    const ticket = inspectTicket.current + 1;
+    inspectTicket.current = ticket;
     const trimmedImg = img.trim();
     if (trimmedImg === "") {
+      setInspecting(false);
       setInspect(null);
       setInspectError(null);
       return;
@@ -112,14 +117,22 @@ export function FirmwareScreen({ device }: { device: DeviceProbeController }) {
     setInspectError(null);
     try {
       const result = await fwInspect(trimmedImg, bak.trim() === "" ? null : bak.trim());
+      if (inspectTicket.current !== ticket) {
+        return;
+      }
       setInspect(result);
       setMode(result.recommendedMode);
       setRiskAgreed(false);
     } catch (error) {
+      if (inspectTicket.current !== ticket) {
+        return;
+      }
       setInspect(null);
       setInspectError(splitError(error));
     } finally {
-      setInspecting(false);
+      if (inspectTicket.current === ticket) {
+        setInspecting(false);
+      }
     }
   }, []);
 

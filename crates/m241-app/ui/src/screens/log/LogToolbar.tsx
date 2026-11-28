@@ -89,9 +89,13 @@ export function LogToolbar({
           className="dads-btn"
           data-variant="solid-fill"
           data-size="sm"
-          disabled={log.downloading}
+          disabled={log.downloading || activePort === ""}
           onClick={onDownloadDevice}
-          title={activePort ? `${activePort} からログを取得` : "ポートを選択してから本体から取得"}
+          title={
+            activePort !== ""
+              ? `${activePort} からログを取得`
+              : "上部ヘッダーでポートを選択または手動入力してください"
+          }
         >
           <Usb size={14} strokeWidth={2} aria-hidden="true" />
           <span>{log.downloading ? "取得中…" : "本体から取得"}</span>

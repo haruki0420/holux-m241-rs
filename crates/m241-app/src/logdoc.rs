@@ -1466,12 +1466,12 @@ fn plan_geotag(
     let photos = geotag_image_files(&dir_path)?;
     let log_shift_seconds = i64::from(options.log_offset_days) * 86_400;
     let camera_shift_seconds = i64::from(options.camera_offset_minutes) * 60;
-    let matching_track = shift_track_for_geotag(track, log_shift_seconds + camera_shift_seconds);
+    let matching_track = shift_track_for_geotag(track, log_shift_seconds);
 
     let core_options = GeotagOptions {
         max_gap_seconds: options.max_gap_seconds,
         keep_backup: options.keep_backup,
-        photo_shift_seconds: 0,
+        photo_shift_seconds: -camera_shift_seconds,
         group_distance_meters: (options.group_distance_meters.is_finite()
             && options.group_distance_meters > 0.0)
             .then_some(options.group_distance_meters),
@@ -1479,23 +1479,11 @@ fn plan_geotag(
         rewrite_datetime_original: options.rewrite_datetime_original,
     };
 
-    let mut plans = geotag::plan(&photos, &matching_track, &core_options).map_err(|error| {
+    let plans = geotag::plan(&photos, &matching_track, &core_options).map_err(|error| {
         format!(
             "ジオタグ計画を作成できません（{error}）\n対処: フォルダ内の写真と読み取り権限を確認してください。"
         )
     })?;
-
-    // Move matched track point UTC back from camera local clock to true UTC
-    // while keeping `log_offset_days` applied (same convention as `m241 log geotag`).
-    if camera_shift_seconds != 0 {
-        for plan in &mut plans {
-            if let Some(point) = &mut plan.point {
-                point.utc = point
-                    .utc
-                    .and_then(|utc| u32::try_from(i64::from(utc) - camera_shift_seconds).ok());
-            }
-        }
-    }
 
     Ok((dir_path, plans))
 }
@@ -1521,9 +1509,7 @@ pub fn geotag_preview(
 ) -> Result<GeotagPreviewDto, String> {
     let (dir_path, plans) = plan_geotag(&loaded.track, directory, options)?;
     let log_shift_seconds = i64::from(options.log_offset_days) * 86_400;
-    let camera_shift_seconds = i64::from(options.camera_offset_minutes) * 60;
-    let matching_track =
-        shift_track_for_geotag(&loaded.track, log_shift_seconds + camera_shift_seconds);
+    let matching_track = shift_track_for_geotag(&loaded.track, log_shift_seconds);
 
     let mut items = Vec::with_capacity(plans.len());
     let mut matched = 0usize;
@@ -2181,6 +2167,48 @@ mod tests {
             geotag_apply(&loaded, &directory.display().to_string(), &options).expect("apply 2");
         assert_eq!(second.written, 1);
         assert_eq!(second.backups_created, 0);
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn geotag_apply_rewrites_datetime_original_with_camera_offset() {
+        let directory = temp_dir("m241-app-geotag-tz");
+        let photo = directory.join("jst.jpg");
+        write_jpeg(&photo);
+        let raw = std::fs::read(&photo).expect("read raw jpeg");
+        let camera_local = SAMPLE_START + 540 * 60;
+        let with_exif = m241_core::log::write_datetime_original(&raw, camera_local)
+            .expect("write EXIF DateTimeOriginal");
+        std::fs::write(&photo, &with_exif).expect("write jpeg with EXIF time");
+
+        let loaded = sample();
+        let options = GeotagOptionsDto {
+            camera_offset_minutes: 540,
+            log_offset_days: 0,
+            group_distance_meters: 0.0,
+            max_gap_seconds: 60,
+            keep_backup: false,
+            rewrite_datetime_original: true,
+        };
+
+        let preview =
+            geotag_preview(&loaded, &directory.display().to_string(), &options).expect("preview");
+        assert_eq!(preview.matched, 1);
+        assert_eq!(preview.items[0].captured_at, Some(SAMPLE_START));
+        assert_eq!(preview.items[0].point_index, Some(0));
+        assert_eq!(preview.items[0].gap_seconds, Some(0));
+
+        let outcome =
+            geotag_apply(&loaded, &directory.display().to_string(), &options).expect("apply");
+        assert_eq!(outcome.written, 1);
+        assert!(outcome.errors.is_empty());
+
+        let updated = std::fs::read(&photo).expect("read updated photo");
+        assert_eq!(
+            read_datetime_original(&updated).expect("parse DateTimeOriginal"),
+            Some(SAMPLE_START)
+        );
 
         std::fs::remove_dir_all(&directory).ok();
     }

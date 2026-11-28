@@ -46,6 +46,7 @@ export function GeotagScreen({
   const [keepBackup, setKeepBackup] = useState(true);
 
   const [preview, setPreview] = useState<GeotagPreviewDto | null>(null);
+  const [previewedKey, setPreviewedKey] = useState<string | null>(null);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<{ message: string; hint: string | null } | null>(
     null,
@@ -80,21 +81,45 @@ export function GeotagScreen({
     ],
   );
 
+  const currentPreviewKey = JSON.stringify({
+    directory: directory.trim(),
+    source: log.summary?.source ?? null,
+    cameraOffsetMinutes: Number.isFinite(cameraOffsetMinutes) ? Math.round(cameraOffsetMinutes) : 0,
+    logOffsetDays: Number.isFinite(logOffsetDays) ? Math.round(logOffsetDays) : 0,
+    groupDistanceMeters: Math.max(
+      0,
+      Number.isFinite(groupDistanceMeters) ? Math.round(groupDistanceMeters) : 0,
+    ),
+    maxGapSeconds: Math.max(1, Number.isFinite(maxGapSeconds) ? Math.round(maxGapSeconds) : 300),
+  });
+  const previewStale = preview !== null && previewedKey !== currentPreviewKey;
+
   const runPreview = useCallback(
     async (targetDir: string) => {
       const trimmed = targetDir.trim();
       if (trimmed === "" || log.summary === null) {
         return;
       }
+      const options = buildOptions();
+      const requestKey = JSON.stringify({
+        directory: trimmed,
+        source: log.summary.source,
+        cameraOffsetMinutes: options.cameraOffsetMinutes,
+        logOffsetDays: options.logOffsetDays,
+        groupDistanceMeters: options.groupDistanceMeters,
+        maxGapSeconds: options.maxGapSeconds,
+      });
       setPreviewLoading(true);
       setPreviewError(null);
       setConfirmOpen(false);
       try {
-        const result = await geotagPreview(trimmed, buildOptions());
+        const result = await geotagPreview(trimmed, options);
         setPreview(result);
+        setPreviewedKey(requestKey);
       } catch (error) {
         setPreviewError(splitError(error));
         setPreview(null);
+        setPreviewedKey(null);
       } finally {
         setPreviewLoading(false);
       }
@@ -414,7 +439,7 @@ export function GeotagScreen({
                   checked={keepBackup}
                   onChange={(event) => setKeepBackup(event.target.checked)}
                 />
-                <span className="font-bold">元の写真をバックアップ (.bak)</span>
+                <span className="font-bold">元の写真をバックアップ (_original)</span>
               </label>
             </div>
 
@@ -556,11 +581,19 @@ export function GeotagScreen({
 
         {/* Batch Apply Action Bar */}
         <div className="space-y-3 rounded-lg border border-[var(--dads-border-control)] bg-[var(--dads-surface-50)] p-4">
+          {previewStale ? (
+            <DadsBanner type="warning" title="照合条件が変更されています">
+              フォルダまたは時刻・距離オプションが変更されたため、「プレビューを更新」を押して再照合してから一括書き込みを実行してください。
+            </DadsBanner>
+          ) : null}
+
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="text-[13px] text-[var(--dads-ink-sub)]">
-              {preview
-                ? `一致した ${formatCount(preview.matched)} 枚に GPS 座標を書き込みます（スキップ ${formatCount(preview.skipped)} 件）。`
-                : "プレビュー後に一括書き込みを実行できます。"}
+              {previewStale
+                ? "再照合後に一括書き込みを実行できます。"
+                : preview
+                  ? `一致した ${formatCount(preview.matched)} 枚に GPS 座標を書き込みます（スキップ ${formatCount(preview.skipped)} 件）。`
+                  : "プレビュー後に一括書き込みを実行できます。"}
             </div>
 
             <button
@@ -571,6 +604,7 @@ export function GeotagScreen({
               disabled={
                 applying ||
                 preview === null ||
+                previewStale ||
                 preview.matched === 0 ||
                 directory.trim() === "" ||
                 summary === null
@@ -579,11 +613,11 @@ export function GeotagScreen({
             >
               {applying
                 ? "書き込み実行中…"
-                : `一括書き込みを実行 (${preview ? formatCount(preview.matched) : 0} 枚)`}
+                : `一括書き込みを実行 (${preview && !previewStale ? formatCount(preview.matched) : 0} 枚)`}
             </button>
           </div>
 
-          {confirmOpen && preview ? (
+          {confirmOpen && preview && !previewStale ? (
             <DadsBanner type="info" title="書き込み内容の確認">
               <p>
                 対象フォルダ <span className="mono font-bold">{preview.directory}</span> 内の一致写真{" "}
@@ -591,7 +625,7 @@ export function GeotagScreen({
               </p>
               <ul className="mt-1.5 list-disc pl-5 text-[12px] text-[var(--dads-ink)]">
                 <li>
-                  元ファイルバックアップ (.bak):{" "}
+                  元ファイルバックアップ (_original):{" "}
                   <strong>{keepBackup ? "作成する" : "作成しない"}</strong>
                 </li>
                 <li>

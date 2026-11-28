@@ -622,7 +622,7 @@ pub fn fw_inspect(image_path: &str, backup_path: Option<&str>) -> Result<FwInspe
             ));
             if profile.name == PROFILE_V1_12.name {
                 warnings.push(String::from(
-                    "V1.12 ベンダーイメージの実機書き込みは未検証です（現在の固定書き込み長は V1.13 用の 406,620 バイトです）。",
+                    "V1.12 ベンダーイメージ（406,312 バイト）の実機書き込みは未検証です。書き込み前に必ずバックアップを採取してください。",
                 ));
             }
             (
