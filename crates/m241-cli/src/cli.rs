@@ -229,12 +229,18 @@ pub struct FlashOptions {
     #[arg(long, conflicts_with = "dry_run")]
     pub recover: bool,
 
-    /// Allow the pinned official V1.13 vendor image, identified by its full
-    /// SHA-256. This is not the normal backup-diff path: it overwrites the
+    /// Allow the pinned official V1.13 or V1.12 vendor image, identified by its
+    /// full SHA-256. This is not the normal backup-diff path: it overwrites the
     /// unit's per-unit data. A real write requires `--yes`; `--dry-run` does
     /// not. `AGENTS.md` §2.3 / §2.5.
-    #[arg(long, conflicts_with = "recover")]
+    #[arg(long, conflicts_with_all = ["recover", "allow_unverified"])]
     pub allow_vendor: bool,
+
+    /// Allow any physically valid image (non-empty, even length, <= 512 KiB)
+    /// that is outside the strict backup-diff and official vendor gates.
+    /// Unverified by this project; a real write requires `--yes`.
+    #[arg(long, conflicts_with_all = ["recover", "allow_vendor"])]
+    pub allow_unverified: bool,
 
     /// Confirm the write. There is no typed prompt in this build, so this is
     /// the only confirmation input; `AGENTS.md` §2.5 governs who may pass it.
@@ -1590,6 +1596,7 @@ mod tests {
         assert!(flash.dry_run);
         assert!(!flash.recover);
         assert!(!flash.allow_vendor);
+        assert!(!flash.allow_unverified);
         assert!(!flash.yes);
         assert!(!flash.assume_brom);
         assert_eq!(flash.port, "auto");
@@ -1621,6 +1628,7 @@ mod tests {
         assert!(!flash.dry_run);
         assert!(flash.recover);
         assert!(!flash.allow_vendor);
+        assert!(!flash.allow_unverified);
         assert_eq!(
             flash.da,
             Some(PathBuf::from("DA_v3.8.4.bin")),
@@ -1746,6 +1754,44 @@ mod tests {
         ])
         .expect_err("--allow-vendor and --recover must conflict");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn fw_flash_allow_unverified_parses_and_conflicts_with_recover_and_vendor() {
+        let cli = Cli::try_parse_from([
+            "m241",
+            "fw",
+            "flash",
+            "custom.bin",
+            "--backup",
+            "backup.bin",
+            "--allow-unverified",
+            "--dry-run",
+        ])
+        .expect("--allow-unverified with a dry run");
+        let Command::Fw {
+            command: FwCommand::Flash(flash),
+        } = cli.command
+        else {
+            panic!("expected fw flash");
+        };
+        assert!(flash.allow_unverified);
+        assert!(!flash.allow_vendor);
+
+        for conflicting in ["--recover", "--allow-vendor"] {
+            let err = Cli::try_parse_from([
+                "m241",
+                "fw",
+                "flash",
+                "custom.bin",
+                "--backup",
+                "backup.bin",
+                "--allow-unverified",
+                conflicting,
+            ])
+            .expect_err("--allow-unverified must conflict with other mode flags");
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]

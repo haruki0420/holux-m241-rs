@@ -346,6 +346,11 @@ pub struct FakeDa {
     /// the first thing that notices. Applied once, inside the BootROM read, so a
     /// test can reach the mismatch-then-recover sequence without a second fake.
     readback_damage: Option<(u32, u8)>,
+    /// Four bytes the fake restores at `0x5C..0x60` when `0xD9` boots firmware.
+    ///
+    /// Models the real M-241 firmware restoring those four per-unit bytes on
+    /// boot after a non-backup write (`docs/dev/06-open-questions.md` §8).
+    restore_per_unit: Option<[u8; 4]>,
     /// A line being assembled while the fake's firmware is running.
     firmware_line: Vec<u8>,
     /// Whether this firmware segment has already emitted its one NMEA sentence.
@@ -439,6 +444,7 @@ impl FakeDa {
             read_polls: 0,
             clear_input_fails: false,
             readback_damage: None,
+            restore_per_unit: None,
             firmware_line: Vec::new(),
             firmware_served: false,
             nmea_after_restart: true,
@@ -713,6 +719,21 @@ impl FakeDa {
     /// is the state recovery exists for.
     pub fn damaging_readback(&mut self, da_address: u32, mask: u8) {
         self.readback_damage = Some((da_address, mask));
+    }
+
+    /// Restore `bytes` at `0x5C..0x60` when `0xD9` boots the firmware.
+    ///
+    /// Models the real M-241 firmware restoring its four firmware-managed
+    /// per-unit bytes before the post-`0xD9` read-back runs.
+    #[must_use]
+    pub fn restoring_per_unit_bytes(mut self, bytes: [u8; 4]) -> Self {
+        self.restore_per_unit = Some(bytes);
+        self
+    }
+
+    /// Set or clear the `0x5C..0x60` per-unit restore bytes on an existing fake.
+    pub fn set_restoring_per_unit_bytes(&mut self, bytes: Option<[u8; 4]>) {
+        self.restore_per_unit = bytes;
     }
 
     /// The last `0xD6` range as `(start, bytes the fake prepared)`.
@@ -1424,7 +1445,7 @@ impl FakeDa {
                 // failure land somewhere other than the assertion that is
                 // about it, and `wrote_an_empty_range` is what the safety tests
                 // assert stays false.
-                let (start, _end) = self.da_range;
+                let (start, end) = self.da_range;
                 self.queue_bytes(&[ACK]);
                 self.erase_failed = false;
                 if self.da_range == (0, 0) {
@@ -1439,6 +1460,10 @@ impl FakeDa {
                     self.queue_bytes(&[NAK]);
                     return;
                 } else {
+                    let needed_len = (end as usize).saturating_add(1).min(FLASH_SIZE as usize);
+                    if self.memory.len() < needed_len {
+                        self.memory.resize(needed_len, 0xFF);
+                    }
                     self.erase_sector(start);
                 }
                 self.da_cursor = start;
@@ -1646,6 +1671,13 @@ impl Transport for FakeDa {
         if buf == [OPCODE_RESTART] {
             self.restart_requests = self.restart_requests.saturating_add(1);
             self.restarted = true;
+            // Real M-241 firmware restores `0x5C..0x60` on boot before the
+            // read-back re-enters BootROM (`docs/dev/06-open-questions.md` §8).
+            if let Some(restored) = self.restore_per_unit
+                && let Some(slot) = self.memory.get_mut(0x5C..0x60)
+            {
+                slot.copy_from_slice(&restored);
+            }
             // A half-word that failed to program without the DA noticing: the
             // read-back after this restart is the first thing that can see it.
             if let Some((target, mask)) = self.readback_damage.take()

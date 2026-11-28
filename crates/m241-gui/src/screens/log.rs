@@ -566,6 +566,7 @@ impl LogScreen {
                     skipped: None,
                     keep_backup: self.photo_keep_backup,
                     group_id: None,
+                    rewrite_datetime_original: true,
                 },
             ));
         }
@@ -3741,6 +3742,7 @@ mod tests {
             skipped: None,
             keep_backup: false,
             group_id: None,
+            rewrite_datetime_original: true,
         };
         assert_eq!(
             find_matching_point_index(&track, &plan),

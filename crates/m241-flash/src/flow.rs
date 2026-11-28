@@ -32,8 +32,8 @@ use m241_core::{Error, Result};
 
 use crate::da::{
     Confirmation, DaDigest, DaLoadId, DaLoader, DownloadAgent, FLASH_WRITE_LENGTH,
-    FLASH_WRITE_START, PROBE_ADDRESSES, PendingWrite, VECTOR, VendorImage, WriteReport,
-    check_da_image_against, read_candidates,
+    FLASH_WRITE_START, PROBE_ADDRESSES, PendingWrite, ReadBackPolicy, UnverifiedImage, VECTOR,
+    VendorImage, WriteReport, check_da_image_against, read_candidates,
 };
 
 /// Bytes a GUI dump reads: the shipped firmware range.
@@ -211,6 +211,8 @@ pub struct FlashRequest<'a> {
     pub assume_brom: bool,
     /// The vendor token when `--allow-vendor` applies.
     pub vendor: Option<VendorImage<'a>>,
+    /// The unverified token when `--allow-unverified` applies.
+    pub unverified: Option<UnverifiedImage<'a>>,
 }
 
 /// Check the DA without opening a port, so a bad file is refused first.
@@ -224,14 +226,19 @@ pub fn check_da(da: &[u8]) -> Result<()> {
 
 /// The image this request writes, for the read-back comparison.
 fn written_image<'a>(request: &FlashRequest<'a>) -> &'a [u8] {
-    match request.vendor {
-        Some(vendor) => vendor.image(),
-        None if request.recover => request.backup,
-        None => request.image,
+    if let Some(vendor) = request.vendor {
+        vendor.image()
+    } else if let Some(unverified) = &request.unverified {
+        unverified.image()
+    } else if request.recover {
+        request.backup
+    } else {
+        request.image
     }
 }
 
-/// One `0xD3` + `0xD5` attempt on the strict, recovery or vendor path.
+/// One `0xD3` + `0xD5` attempt on the strict, recovery, vendor or unverified
+/// path.
 ///
 /// Every arm reports progress: a recovery write is the moment the user most needs
 /// to see that packets are moving, and a bar that stays at 0 % because the sink
@@ -249,25 +256,24 @@ fn write_once<T: Transport>(
             total,
         });
     };
-    match request.vendor {
-        Some(vendor) => da.write_vendor_with_progress(
-            request.confirmation,
-            request.backup,
-            vendor,
-            &mut progress,
-        ),
-        None if request.recover => da.write_with_progress(
+    if let Some(vendor) = request.vendor {
+        da.write_vendor_with_progress(request.confirmation, request.backup, vendor, &mut progress)
+    } else if let Some(unverified) = &request.unverified {
+        da.write_unverified_with_progress(request.confirmation, unverified, &mut progress)
+    } else if request.recover {
+        da.write_with_progress(
             request.confirmation,
             request.backup,
             request.backup,
             &mut progress,
-        ),
-        None => da.write_with_progress(
+        )
+    } else {
+        da.write_with_progress(
             request.confirmation,
             request.backup,
             request.image,
             &mut progress,
-        ),
+        )
     }
 }
 
@@ -379,11 +385,17 @@ pub fn flash<T: Transport>(
         }
     };
     on_event(Event::Stage(Stage::ReadingBack));
-    pending.verify_written(
+    let policy = if request.vendor.is_some() || request.unverified.is_some() {
+        ReadBackPolicy::AllowPerUnitRestore
+    } else {
+        ReadBackPolicy::Strict
+    };
+    pending.verify_written_with_policy(
         da,
         written_image(request),
         FLASH_WRITE_START,
         reenter_for_read_back,
+        policy,
     )
 }
 
@@ -598,6 +610,7 @@ mod tests {
             recover,
             assume_brom: true,
             vendor: None,
+            unverified: None,
         }
     }
 

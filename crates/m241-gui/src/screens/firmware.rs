@@ -2174,6 +2174,7 @@ mod tests {
                 length: FLASH_WRITE_LENGTH,
                 packets: FLASH_WRITE_LENGTH.div_ceil(PACKET_SIZE),
                 verified: FLASH_WRITE_LENGTH,
+                restored_per_unit_bytes: 0,
             }),
         );
         assert_eq!(
@@ -2304,6 +2305,7 @@ mod tests {
                 length: FLASH_WRITE_LENGTH,
                 packets: FLASH_WRITE_LENGTH.div_ceil(PACKET_SIZE),
                 verified: FLASH_WRITE_LENGTH,
+                restored_per_unit_bytes: 0,
             }),
         );
         let (status, text) = screen.message.clone().expect("a result message was set");

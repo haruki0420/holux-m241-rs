@@ -474,6 +474,7 @@ fn run(job: Job, tx: &Sender<JobEvent>) -> Result<()> {
                 recover: job.recover,
                 assume_brom: job.assume_brom,
                 vendor,
+                unverified: None,
             };
             let report = flow::flash(transport, &request, &mut |event| {
                 let _ = tx.send(JobEvent::Flow(event));

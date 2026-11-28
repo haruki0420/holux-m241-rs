@@ -57,19 +57,20 @@ Twelve checks, each for a different way the split can rot:
    user's own backup or differs from it at the recorded patch offsets. A digest
    branch in `check_image` / `all_within` would be a second acceptance route
    that weakens that check. The vendor image is a **separate** fixed-SHA gate
-   (`accept_vendor_image`), pinned to one V1.13 release and tested separately;
-   this check deliberately does not treat that function as the strict path.
-   The rule is textual because a synthetic fixture never hashes to the real
-   vendor digest, so an end-to-end test alone cannot catch the old strict-path
-   branch coming back.
+   (`accept_vendor_image`), pinned to the official V1.13 and V1.12 releases and
+   tested separately; this check deliberately does not treat that function as
+   the strict path. The rule is textual because a synthetic fixture never hashes
+   to the real vendor digest, so an end-to-end test alone cannot catch the old
+   strict-path branch coming back.
 7. **Every public writer runs the layout gate.** `crates/m241-flash/src/da.rs`'s
    public functions that reach `write_range` or `write_range_accepted` must call
    `check_layout()?` at their own brace depth, before that range call. That call
    is what refuses every start other than the settled `0`; without it the fixed
-   range is a comment. Both `DownloadAgent::write` and `write_vendor` are
-   covered, and a future public writer is found by its range call rather than by
-   its name. The check looks inside each body only, so a call in another
-   function, a comment, or an uncalled nested function does not satisfy it.
+   range is a comment. `DownloadAgent::write`, `write_vendor` and
+   `write_unverified` are all covered, and any future public writer is found by
+   its range call rather than by its name. The check looks inside each body
+   only, so a call in another function, a comment, or an uncalled nested
+   function does not satisfy it.
 8. **The GUI's write goes through the shared session and its own typed word.**
    `crates/m241-gui/src/device.rs` must call `flow::flash(`, and the firmware
    screen must build the confirmation from its own typed word

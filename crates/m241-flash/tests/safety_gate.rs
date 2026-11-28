@@ -643,6 +643,28 @@ fn removing_check_layout_from_the_real_write_vendor_body_is_reported() {
 }
 
 #[test]
+fn removing_check_layout_from_the_real_write_unverified_body_is_reported() {
+    let real = std::fs::read_to_string(
+        repo_root()
+            .join("crates")
+            .join("m241-flash")
+            .join("src")
+            .join("da.rs"),
+    )
+    .expect("crates/m241-flash/src/da.rs is missing");
+    let without = without_layout_gate_in(&real, "write_unverified_with_progress");
+    assert_ne!(without, real.replace("\r\n", "\n"));
+    assert!(
+        without.contains("        check_layout()?;\n"),
+        "the strict and vendor writers' layout-gate lines must remain for this mutation"
+    );
+
+    let repo = FakeRepo::new("da-real-minus-unverified-layout", &[]);
+    repo.write_flash_da(&without);
+    repo.assert_reports("`pub fn write_unverified_with_progress` does not call `check_layout()?`");
+}
+
+#[test]
 fn a_crlf_checkout_detects_the_removed_layout_gate() {
     // windows-latest checks the file out with CRLF. The gate itself reads
     // either ending, but a mutation test that matched only `\n` panicked

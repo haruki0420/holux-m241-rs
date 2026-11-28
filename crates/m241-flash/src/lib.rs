@@ -67,8 +67,11 @@ pub mod simulator;
 
 pub use da::DownloadAgent;
 pub use da::{
-    AcceptedImage, VENDOR_PER_UNIT_DATA_BYTES, VENDOR_V1_13_SHA256, VendorImage, WritePlan,
-    accept_vendor_image, check_image, write_plan, write_plan_vendor,
+    AcceptedImage, FIRMWARE_RESTORED_OFFSETS, FLASH_CAPACITY_BYTES, ImageClassification,
+    ReadBackPolicy, UnverifiedImage, UnverifiedWritePlan, VENDOR_PER_UNIT_DATA_BYTES,
+    VENDOR_V1_12_SHA256, VENDOR_V1_13_SHA256, VendorImage, WritePlan, accept_unverified_image,
+    accept_vendor_image, check_image, check_physical_image, classify_image, write_plan,
+    write_plan_unverified, write_plan_vendor,
 };
 pub use da::{DaDigest, DaLoadId, DaLoader};
 pub use erase::{BackupProof, ERASE_SUBCOMMAND, LogEraser};

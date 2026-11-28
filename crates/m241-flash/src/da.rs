@@ -352,7 +352,24 @@ pub const FLASH_WRITE_START: u32 = 0x0000_0000;
 /// re-adding a candidate closes the gate again instead of being a comment.
 pub const UNRESOLVED_STARTS: [u32; 0] = [];
 
-/// Bytes this driver writes: the V1.13 image size.
+/// Physical capacity of the MT3318 MX29LV400CB flash part in bytes (512 KiB).
+///
+/// The DA reports `0x0008_0000` in its 20-byte info report. Any write whose end
+/// address exceeds `FLASH_CAPACITY_BYTES - 1` cannot fit in the mapped flash.
+pub const FLASH_CAPACITY_BYTES: usize = 0x0008_0000;
+
+/// Offsets (`0x5C..0x60`) that the M-241 firmware restores on boot after `0xD9`.
+///
+/// Observed in the 2026-11-22 hardware session (`docs/dev/06-open-questions.md`
+/// §8): when writing a non-backup image (an official vendor release or an
+/// unverified image), the booted firmware restores these four per-unit bytes
+/// before BootROM re-entry runs the read-back. Under
+/// [`ReadBackPolicy::AllowPerUnitRestore`], differences strictly inside this
+/// range are recorded in [`WriteReport::restored_per_unit_bytes`] rather than
+/// failing the read-back.
+pub const FIRMWARE_RESTORED_OFFSETS: std::ops::Range<usize> = 0x5C..0x60;
+
+/// Bytes this driver writes by default: the V1.13 image size.
 ///
 /// `measured elsewhere:` `docs/dev/03-hardware-facts.md` "V1.13 size" — 406,620
 /// bytes (`0x6345C`), read back twice with the same SHA-256 in
@@ -1354,6 +1371,19 @@ pub struct PendingWrite {
     pub progress: Progress,
 }
 
+/// How [`PendingWrite::verify_written_with_policy`] treats bytes that differ on
+/// read-back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadBackPolicy {
+    /// Every byte in the written span must match `image` identically (used for
+    /// strict backup/patch writes and `--recover`).
+    Strict,
+    /// Bytes inside [`FIRMWARE_RESTORED_OFFSETS`] (`0x5C..0x60`) may be restored
+    /// by the firmware across the `0xD9` reboot (`docs/dev/06-open-questions.md`
+    /// §8 Decision A); any difference outside that 4-byte range still fails.
+    AllowPerUnitRestore,
+}
+
 /// A write that was read back through the BootROM and matched the image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WriteReport {
@@ -1366,6 +1396,11 @@ pub struct WriteReport {
     /// Bytes read back through the BootROM and compared; the same value as
     /// `length`, which [`PendingWrite::verify_written`] checks separately.
     pub verified: usize,
+    /// Number of bytes inside [`FIRMWARE_RESTORED_OFFSETS`] (`0..=4`) that the
+    /// booted firmware restored before read-back when using
+    /// [`ReadBackPolicy::AllowPerUnitRestore`]. Always `0` under
+    /// [`ReadBackPolicy::Strict`].
+    pub restored_per_unit_bytes: usize,
 }
 
 /// Read `length` bytes through the BootROM in frames no larger than [`DUMP_CHUNK`].
@@ -1441,6 +1476,30 @@ impl PendingWrite {
         da_start: u32,
         prepare: impl FnOnce(T) -> Result<T>,
     ) -> Result<WriteReport> {
+        self.verify_written_with_policy(da, image, da_start, prepare, ReadBackPolicy::Strict)
+    }
+
+    /// Restart the chip, re-read the span through `m241_core`'s BootROM client,
+    /// and compare it with `image` according to `policy`.
+    ///
+    /// Under [`ReadBackPolicy::Strict`], any differing byte fails with
+    /// [`Error::Framing`]. Under [`ReadBackPolicy::AllowPerUnitRestore`],
+    /// differences strictly within [`FIRMWARE_RESTORED_OFFSETS`] (`0x5C..0x60`)
+    /// are counted in [`WriteReport::restored_per_unit_bytes`] (`0..=4`), while
+    /// any difference outside that 4-byte window still fails (`0x5B`, `0x60`,
+    /// etc.).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::verify_written`].
+    pub fn verify_written_with_policy<T: Transport>(
+        self,
+        da: DownloadAgent<T>,
+        image: &[u8],
+        da_start: u32,
+        prepare: impl FnOnce(T) -> Result<T>,
+        policy: ReadBackPolicy,
+    ) -> Result<WriteReport> {
         let unfinished = PartialWrite {
             progress: self.progress,
             start: self.start,
@@ -1467,13 +1526,17 @@ impl PendingWrite {
         let read = read_bootrom_chunked(&mut rom, BASE_ADDR_FIRMWARE + da_start, self.length)
             .map_err(|err| after_write(err, read_back))?;
 
-        let mismatch = read
-            .iter()
-            .zip(image.iter())
-            .position(|(unit, wanted)| unit != wanted);
-        if let Some(offset) = mismatch {
-            let unit = read.get(offset).copied().unwrap_or(0);
-            let wanted = image.get(offset).copied().unwrap_or(0);
+        let mut restored_per_unit_bytes = 0usize;
+        for (offset, (&unit, &wanted)) in read.iter().zip(image.iter()).enumerate() {
+            if unit == wanted {
+                continue;
+            }
+            if policy == ReadBackPolicy::AllowPerUnitRestore
+                && FIRMWARE_RESTORED_OFFSETS.contains(&offset)
+            {
+                restored_per_unit_bytes += 1;
+                continue;
+            }
             return Err(after_write(
                 Error::Framing {
                     what: format!(
@@ -1508,6 +1571,7 @@ impl PendingWrite {
             length: self.length,
             packets: self.packets,
             verified: read.len(),
+            restored_per_unit_bytes,
         })
     }
 }
@@ -1759,16 +1823,7 @@ impl<T: Transport> DownloadAgent<T> {
     /// the same profile, so a different-length backup is refused twice rather
     /// than read past the image.
     pub fn verify_device(rom: &mut MtkBootRom<T>, backup: &[u8]) -> Result<()> {
-        if backup.len() != FLASH_WRITE_LENGTH {
-            return Err(Error::Safety {
-                reason: format!(
-                    "the backup is {} bytes; the shipped write range reads {} bytes from \
-                     0x{FLASH_WRITE_START:08X}. Nothing was written",
-                    backup.len(),
-                    FLASH_WRITE_LENGTH
-                ),
-            });
-        }
+        check_physical_image(backup)?;
         Self::verify_device_at(rom, backup, FLASH_WRITE_START)
     }
 
@@ -1979,26 +2034,62 @@ impl<T: Transport> DownloadAgent<T> {
             });
         }
         check_layout()?;
-        if vendor.profile().name != PROFILE_V1_13.name {
+        check_valid_backup(backup)?;
+        self.write_range_accepted_with_progress(FLASH_WRITE_START, vendor.image(), on_progress)
+    }
+
+    /// `0xD3` + `0xD5` for an unverified / custom image that passed
+    /// [`accept_unverified_image`].
+    ///
+    /// This path accepts any physically valid image (non-empty, even length,
+    /// `<= FLASH_CAPACITY_BYTES`) when the caller has explicitly opted into an
+    /// unverified write (`--allow-unverified`). It still runs [`check_layout`]
+    /// first and writes from [`FLASH_WRITE_START`].
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Safety`] from the confirmation or [`check_layout`]. Nothing
+    ///   was sent.
+    /// * The same DA errors as [`Self::write`] once the range is recorded.
+    pub fn write_unverified(
+        &mut self,
+        confirmation: Confirmation,
+        unverified: &UnverifiedImage<'_>,
+    ) -> Result<PendingWrite> {
+        self.write_unverified_with_progress(confirmation, unverified, &mut |_, _| {})
+    }
+
+    /// [`Self::write_unverified`], reporting every accepted packet to
+    /// `on_progress`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write_unverified`].
+    pub fn write_unverified_with_progress(
+        &mut self,
+        confirmation: Confirmation,
+        unverified: &UnverifiedImage<'_>,
+        on_progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<PendingWrite> {
+        if !confirmation.is_given() {
             return Err(Error::Safety {
-                reason: format!(
-                    "the vendor token is for {}, but the shipped range is V1.13",
-                    vendor.profile().name
+                reason: String::from(
+                    "DownloadAgent::write_unverified was given a confirmation token that was \
+                     never granted",
                 ),
             });
         }
-        // The backup is not the image here; it only has to be a structurally
-        // valid V1.13 dump. `verify_device` is the caller's step.
-        check_image(vendor.profile(), backup, backup)?;
-        self.write_range_accepted_with_progress(FLASH_WRITE_START, vendor.image(), on_progress)
+        check_layout()?;
+        self.write_range_accepted_with_progress(FLASH_WRITE_START, unverified.image(), on_progress)
     }
 
     /// The strict write at an explicit start; test-only.
     ///
     /// Private and **strict**: it runs [`check_image`] against `backup`, which
-    /// is `AGENTS.md` §2.3's backup-diff rule. Vendor images do not come through
-    /// this function; [`Self::write_vendor`] reaches
-    /// `write_range_accepted_with_progress` only with a [`VendorImage`] token.
+    /// is `AGENTS.md` §2.3's backup-diff rule. Vendor and unverified images do
+    /// not come through this function; [`Self::write_vendor`] and
+    /// [`Self::write_unverified`] reach `write_range_accepted_with_progress`
+    /// only with their respective tokens.
     #[cfg(test)]
     fn write_range(&mut self, backup: &[u8], start: u32, image: &[u8]) -> Result<PendingWrite> {
         self.write_range_with_progress(backup, start, image, &mut |_, _| {})
@@ -2012,11 +2103,8 @@ impl<T: Transport> DownloadAgent<T> {
         image: &[u8],
         on_progress: &mut dyn FnMut(usize, usize),
     ) -> Result<PendingWrite> {
-        // The shipped range is V1.13's ([`check_layout`] refuses any other
-        // length), so the profile accepting the image is that one. A V1.12 or
-        // V1.14 image cannot arrive here: `check_image` refuses a length that is
-        // not the profile's, and the profile is V1.13.
-        let accepted = check_image(&PROFILE_V1_13, backup, image)?;
+        let profile = strict_profile_for(backup, image)?;
+        let accepted = check_image(profile, backup, image)?;
         self.write_range_accepted_with_progress(start, accepted.image, on_progress)
     }
 
@@ -2027,10 +2115,11 @@ impl<T: Transport> DownloadAgent<T> {
         image: &[u8],
         on_progress: &mut dyn FnMut(usize, usize),
     ) -> Result<PendingWrite> {
+        check_physical_image(image)?;
         self.program_started = false;
         let mut packets = 0usize;
         let mut progress = Progress::NothingWritten;
-        let end = range_end(start);
+        let end = range_end(start, image.len())?;
         // A refused `0xD3` records nothing and no packet was sent, so its error
         // stands on its own. Wrapping it in the partial-write paragraph would
         // tell the user the range is "now only partly erased and programmed"
@@ -2162,10 +2251,12 @@ impl<T: Transport> DownloadAgent<T> {
             self.await_packet_reply(index, start, chunk.len())?;
             *packets = index.saturating_add(1);
             // `UpTo` is exclusive, which is exactly the address the next packet
-            // would start at, so `bytes(start)` counts the accepted payloads.
+            // would start at, so `bytes(start, image.len())` counts the accepted
+            // payloads.
+            let length_u32 = u32::try_from(image.len()).unwrap_or(u32::MAX);
             *progress = Progress::UpTo(
                 packet_address(index.saturating_add(1), start)
-                    .min(start.saturating_add(FLASH_WRITE_LENGTH as u32)),
+                    .min(start.saturating_add(length_u32)),
             );
             on_progress(*packets, progress.bytes(start, image.len()));
         }
@@ -2339,9 +2430,67 @@ fn after_write(err: Error, unfinished: PartialWrite) -> Error {
     }
 }
 
-/// The inclusive last address of a range of [`FLASH_WRITE_LENGTH`] at `start`.
-fn range_end(start: u32) -> u32 {
-    start.saturating_add(FLASH_WRITE_LENGTH as u32 - 1)
+/// Check that `image` satisfies the physical flash constraints alone:
+/// non-empty, at most [`FLASH_CAPACITY_BYTES`] (512 KiB), and even length (as
+/// `0xD3` requires `end = start + length - 1` to be odd for 16-bit half-word
+/// alignment).
+///
+/// # Errors
+///
+/// [`Error::Safety`] when the image is empty, larger than 512 KiB, or has an
+/// odd byte length.
+pub fn check_physical_image(image: &[u8]) -> Result<()> {
+    if image.is_empty() {
+        return Err(Error::Safety {
+            reason: String::from(
+                "the image is empty (0 bytes); a non-empty, even-length image up to 524,288 bytes \
+                 (512 KiB) is required. Nothing was written",
+            ),
+        });
+    }
+    if image.len() > FLASH_CAPACITY_BYTES {
+        return Err(Error::Safety {
+            reason: format!(
+                "the image is {} bytes, which exceeds the 512 KiB flash capacity \
+                 ({FLASH_CAPACITY_BYTES} bytes). Nothing was written",
+                image.len()
+            ),
+        });
+    }
+    if !image.len().is_multiple_of(2) {
+        return Err(Error::Safety {
+            reason: format!(
+                "the image is {} bytes (odd length); 0xD3 requires an even byte count so the \
+                 inclusive end address is odd. Nothing was written",
+                image.len()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// The inclusive last address of a range of `length` bytes starting at `start`.
+///
+/// # Errors
+///
+/// [`Error::Safety`] when `length` is zero or `start + length - 1` overflows
+/// 32-bit DA addressing.
+pub fn range_end(start: u32, length: usize) -> Result<u32> {
+    let span_minus_one = length
+        .checked_sub(1)
+        .ok_or_else(|| Error::Safety {
+            reason: String::from("cannot compute write range end for an empty (0-byte) image"),
+        })
+        .and_then(|value| {
+            u32::try_from(value).map_err(|_| Error::Safety {
+                reason: format!("image length {length} overflows 32-bit DA addressing"),
+            })
+        })?;
+    start
+        .checked_add(span_minus_one)
+        .ok_or_else(|| Error::Safety {
+            reason: format!("write range 0x{start:08X} + {length} overflows 32-bit DA addressing"),
+        })
 }
 
 /// The DA address packet `index` starts at: `start + index * PACKET_SIZE`.
@@ -2483,7 +2632,7 @@ fn check_layout_of(
             ),
         });
     }
-    if FLASH_WRITE_END != range_end(expected_start) {
+    if range_end(expected_start, expected_length)? != FLASH_WRITE_END {
         return Err(Error::Safety {
             reason: String::from(
                 "FLASH_WRITE_END is not start + length - 1; 0xD3 would record the wrong span",
@@ -2539,12 +2688,14 @@ pub struct AcceptedImage<'a> {
 
 /// The full SHA-256 of the one official V1.13 vendor image this build accepts.
 ///
-/// `AGENTS.md` §2.3's vendor gate is deliberately a single fixed digest, not a
-/// profile list: this is the file measured for V1.13 (406,620 bytes), and a
-/// different vendor build must be added by name, length and digest with its own
-/// review. V1.12 is not accepted by this gate yet.
+/// `AGENTS.md` §2.3's vendor gate accepts only the pinned V1.13 and V1.12
+/// official releases by their exact length and full SHA-256.
 pub const VENDOR_V1_13_SHA256: &str =
     "32fe52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435";
+
+/// The full SHA-256 of the official V1.12 vendor image (`406,312` bytes).
+pub const VENDOR_V1_12_SHA256: &str =
+    "4103601a29f256ae5da771bbcbc3ca85a89deb6268ce74865dc84b2583ae98f7";
 
 /// How many per-unit bytes differ between the vendor image and a unit's dump.
 ///
@@ -2567,7 +2718,7 @@ pub struct VendorImage<'a> {
 }
 
 impl<'a> VendorImage<'a> {
-    /// The profile the vendor image belongs to (V1.13).
+    /// The profile the vendor image belongs to (`V1.13` or `V1.12`).
     #[must_use]
     pub fn profile(self) -> &'static FirmwareProfile {
         self.profile
@@ -2580,56 +2731,246 @@ impl<'a> VendorImage<'a> {
     }
 }
 
-/// Accept an official V1.13 vendor image by its fixed full SHA-256.
+fn pinned_vendor_sha256(profile: &FirmwareProfile) -> Option<&'static str> {
+    if profile.name == PROFILE_V1_13.name
+        && profile.size == PROFILE_V1_13.size
+        && profile.sha256.eq_ignore_ascii_case(VENDOR_V1_13_SHA256)
+    {
+        Some(VENDOR_V1_13_SHA256)
+    } else if profile.name == PROFILE_V1_12.name
+        && profile.size == PROFILE_V1_12.size
+        && profile.sha256.eq_ignore_ascii_case(VENDOR_V1_12_SHA256)
+    {
+        Some(VENDOR_V1_12_SHA256)
+    } else {
+        None
+    }
+}
+
+/// Accept an official V1.13 or V1.12 vendor image by its fixed full SHA-256.
 ///
-/// `AGENTS.md` §2.3's vendor gate: the image must be the one pinned V1.13
-/// release, at the profile's length, with the exact digest. There is no
-/// "close enough" hash, no prefix match and no other profile: V1.12 and any
-/// other vendor build are refused. The returned token is the only input
-/// [`DownloadAgent::write_vendor`] accepts.
+/// `AGENTS.md` §2.3's vendor gate: the image must be one of the pinned official
+/// releases (`V1.13` or `V1.12`), at the profile's length, with the exact
+/// digest. The returned token is the only input [`DownloadAgent::write_vendor`]
+/// accepts.
 ///
 /// This is intentionally separate from [`check_image`]. The strict function
 /// never gains a digest branch; the safety gate pins that separation.
 ///
 /// # Errors
 ///
-/// [`Error::Safety`] when `profile` is not the pinned V1.13 profile, when
-/// `image` is not that profile's length, or when its full SHA-256 is not
-/// [`VENDOR_V1_13_SHA256`].
+/// [`Error::Safety`] when `profile` is not one of the pinned vendor profiles,
+/// when `image` is not that profile's length, or when its full SHA-256 does not
+/// match the pinned vendor digest.
 pub fn accept_vendor_image<'a>(
     profile: &'static FirmwareProfile,
     image: &'a [u8],
 ) -> Result<VendorImage<'a>> {
-    if profile.name != PROFILE_V1_13.name
-        || profile.size != PROFILE_V1_13.size
-        || !profile.sha256.eq_ignore_ascii_case(VENDOR_V1_13_SHA256)
-    {
+    let Some(expected_sha256) = pinned_vendor_sha256(profile) else {
         return Err(Error::Safety {
             reason: format!(
-                "the vendor gate is pinned to V1.13 ({} bytes, SHA-256 {VENDOR_V1_13_SHA256}); \
-                 profile {} is not that release. V1.12 and other vendor builds are not supported",
-                PROFILE_V1_13.size, profile.name
+                "the vendor gate is pinned to V1.13 ({} bytes) and V1.12 ({} bytes); profile {} \
+                 is not one of those official releases",
+                PROFILE_V1_13.size, PROFILE_V1_12.size, profile.name
             ),
         });
-    }
-    if image.len() != PROFILE_V1_13.size {
+    };
+    if image.len() != profile.size {
         return Err(Error::Safety {
             reason: format!(
-                "the vendor image is {} bytes; the pinned V1.13 image is {} bytes",
+                "the vendor image is {} bytes; the pinned {} image is {} bytes",
                 image.len(),
-                PROFILE_V1_13.size
+                profile.name,
+                profile.size
             ),
         });
     }
-    if !matches(image, VENDOR_V1_13_SHA256) {
+    if !matches(image, expected_sha256) {
         return Err(Error::Safety {
             reason: format!(
-                "the image's SHA-256 is not the pinned V1.13 vendor digest \
-                 {VENDOR_V1_13_SHA256}. Only that exact official image may use --allow-vendor"
+                "the image's SHA-256 is not the pinned {} vendor digest {expected_sha256}. Only \
+                 that exact official image may use --allow-vendor",
+                profile.name
             ),
         });
     }
     Ok(VendorImage { profile, image })
+}
+
+/// A physically valid image that passed [`accept_unverified_image`].
+///
+/// The fields are private and [`accept_unverified_image`] is the only public
+/// constructor, guaranteeing [`check_physical_image`] ran before the image can
+/// be handed to [`DownloadAgent::write_unverified`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnverifiedImage<'a> {
+    image: &'a [u8],
+    sha256: String,
+    has_arm_vector: bool,
+}
+
+impl<'a> UnverifiedImage<'a> {
+    /// The underlying image bytes.
+    #[must_use]
+    pub fn image(&self) -> &'a [u8] {
+        self.image
+    }
+
+    /// Length in bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.image.len()
+    }
+
+    /// Always `false`: [`accept_unverified_image`] refuses empty images.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.image.is_empty()
+    }
+
+    /// Full lowercase SHA-256 hex digest of the image.
+    #[must_use]
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// Whether the image starts with the ARM reset vector [`VECTOR`].
+    #[must_use]
+    pub fn has_arm_vector(&self) -> bool {
+        self.has_arm_vector
+    }
+}
+
+/// Validate physical flash constraints and build an [`UnverifiedImage`] token.
+///
+/// # Errors
+///
+/// [`Error::Safety`] when [`check_physical_image`] rejects the image (empty,
+/// larger than 512 KiB, or odd byte length).
+pub fn accept_unverified_image<'a>(image: &'a [u8]) -> Result<UnverifiedImage<'a>> {
+    check_physical_image(image)?;
+    Ok(UnverifiedImage {
+        image,
+        sha256: sha256_hex(image),
+        has_arm_vector: image.starts_with(&VECTOR),
+    })
+}
+
+/// Four-tier classification of a candidate firmware image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageClassification {
+    /// Matches a known profile's backup or WNRO patch of that backup.
+    VerifiedBackupOrPatch {
+        /// The profile of the matched backup/patch pair.
+        profile: &'static FirmwareProfile,
+        /// Number of bytes differing from the backup (0 or 3).
+        differing_bytes: usize,
+    },
+    /// Matches an unmodified official vendor release by full SHA-256.
+    OfficialVendor {
+        /// The vendor release profile (`V1.13` or `V1.12`).
+        profile: &'static FirmwareProfile,
+    },
+    /// Physically writable (even, 2..=512 KiB), but not verified by backup diff
+    /// or official vendor digest.
+    Unverified {
+        /// Image length in bytes.
+        size: usize,
+        /// Full lowercase SHA-256 hex digest.
+        sha256: String,
+        /// Whether the image begins with [`VECTOR`].
+        has_arm_vector: bool,
+    },
+    /// Violates physical flash constraints and cannot be written at all.
+    Blocked {
+        /// Human-readable reason from [`check_physical_image`].
+        reason: String,
+    },
+}
+
+/// Classify `image` (optionally against `backup`) into one of the four tiers.
+///
+/// Checks physical constraints first, then strict backup/patch equivalence,
+/// then official vendor SHA-256, falling back to `Unverified`.
+#[must_use]
+pub fn classify_image(backup: Option<&[u8]>, image: &[u8]) -> ImageClassification {
+    if let Err(err) = check_physical_image(image) {
+        return ImageClassification::Blocked {
+            reason: err.to_string(),
+        };
+    }
+    if let Some(backup) = backup {
+        for profile in [&PROFILE_V1_13, &PROFILE_V1_12] {
+            if image.len() == profile.size
+                && backup.len() == profile.size
+                && check_image(profile, backup, image).is_ok()
+            {
+                let differing_bytes = backup
+                    .iter()
+                    .zip(image.iter())
+                    .filter(|(saved, wanted)| saved != wanted)
+                    .count();
+                return ImageClassification::VerifiedBackupOrPatch {
+                    profile,
+                    differing_bytes,
+                };
+            }
+        }
+    }
+    for profile in [&PROFILE_V1_13, &PROFILE_V1_12] {
+        if accept_vendor_image(profile, image).is_ok() {
+            return ImageClassification::OfficialVendor { profile };
+        }
+    }
+    ImageClassification::Unverified {
+        size: image.len(),
+        sha256: sha256_hex(image),
+        has_arm_vector: image.starts_with(&VECTOR),
+    }
+}
+
+/// Choose the known profile for the strict backup-diff path.
+fn strict_profile_for(backup: &[u8], image: &[u8]) -> Result<&'static FirmwareProfile> {
+    for profile in [&PROFILE_V1_13, &PROFILE_V1_12] {
+        if image.len() == profile.size {
+            return Ok(profile);
+        }
+    }
+    for profile in [&PROFILE_V1_13, &PROFILE_V1_12] {
+        if backup.len() == profile.size {
+            return Ok(profile);
+        }
+    }
+    Err(Error::Safety {
+        reason: format!(
+            "the image is {} bytes and the backup is {} bytes; the strict backup-diff path \
+             accepts only V1.13 ({} bytes) or V1.12 ({} bytes) images (pass --allow-unverified for \
+             custom sizes)",
+            image.len(),
+            backup.len(),
+            PROFILE_V1_13.size,
+            PROFILE_V1_12.size
+        ),
+    })
+}
+
+/// Verify that `backup` is a structurally valid M-241 dump (`V1.13` or `V1.12`).
+fn check_valid_backup(backup: &[u8]) -> Result<&'static FirmwareProfile> {
+    check_physical_image(backup)?;
+    let backup_profile = [&PROFILE_V1_13, &PROFILE_V1_12]
+        .into_iter()
+        .find(|profile| profile.size == backup.len())
+        .ok_or_else(|| Error::Safety {
+            reason: format!(
+                "the backup is {} bytes; expected a valid M-241 dump ({} bytes for V1.13 or {} \
+                 bytes for V1.12)",
+                backup.len(),
+                PROFILE_V1_13.size,
+                PROFILE_V1_12.size
+            ),
+        })?;
+    check_image(backup_profile, backup, backup)?;
+    Ok(backup_profile)
 }
 
 /// How many differing offsets [`WritePlan`] keeps.
@@ -2818,18 +3159,79 @@ pub fn write_plan_vendor(
     backup: &[u8],
     vendor: VendorImage<'_>,
 ) -> Result<WritePlan> {
-    if vendor.profile().name != profile.name || profile.name != PROFILE_V1_13.name {
+    if vendor.profile().name != profile.name || pinned_vendor_sha256(profile).is_none() {
         return Err(Error::Safety {
             reason: format!(
-                "the vendor token is for profile {} but the plan is for {}; the vendor gate is \
-                 V1.13 only",
+                "the vendor token is for profile {} but the plan is for {}",
                 vendor.profile().name,
                 profile.name
             ),
         });
     }
-    check_image(profile, backup, backup)?;
+    check_valid_backup(backup)?;
     Ok(build_write_plan(profile, backup, vendor.image(), true))
+}
+
+/// Everything `fw flash --dry-run` reports for an unverified / custom image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnverifiedWritePlan {
+    /// Image size in bytes.
+    pub size: usize,
+    /// Full lowercase SHA-256 hex digest.
+    pub sha256: String,
+    /// Whether the image starts with [`VECTOR`].
+    pub has_arm_vector: bool,
+    /// The DA-side start address ([`FLASH_WRITE_START`]).
+    pub start: u32,
+    /// Bytes a write would program.
+    pub write_length: usize,
+    /// `0xD5` packet count for `write_length`.
+    pub packets: usize,
+    /// Differing byte count from `backup` when `backup` has the same length.
+    pub differing_bytes: Option<usize>,
+    /// First differing offsets (capped at [`PLAN_DIFF_LIMIT`]) when `backup` is provided.
+    pub differing_offsets: Vec<usize>,
+}
+
+/// Build a dry-run write plan for an image that passed [`accept_unverified_image`].
+#[must_use]
+pub fn write_plan_unverified(
+    backup: Option<&[u8]>,
+    unverified: &UnverifiedImage<'_>,
+) -> UnverifiedWritePlan {
+    let image = unverified.image();
+    let (differing_bytes, differing_offsets) = match backup {
+        Some(backup) => {
+            let offsets: Vec<usize> = backup
+                .iter()
+                .zip(image.iter())
+                .enumerate()
+                .filter(|(_offset, (saved, wanted))| saved != wanted)
+                .map(|(offset, _)| offset)
+                .take(PLAN_DIFF_LIMIT)
+                .collect();
+            let count = (backup.len() == image.len()).then(|| {
+                backup
+                    .iter()
+                    .zip(image.iter())
+                    .filter(|(saved, wanted)| saved != wanted)
+                    .count()
+            });
+            (count, offsets)
+        }
+        None => (None, Vec::new()),
+    };
+    let write_length = image.len();
+    UnverifiedWritePlan {
+        size: write_length,
+        sha256: unverified.sha256().to_owned(),
+        has_arm_vector: unverified.has_arm_vector(),
+        start: FLASH_WRITE_START,
+        write_length,
+        packets: write_length.div_ceil(PACKET_SIZE),
+        differing_bytes,
+        differing_offsets,
+    }
 }
 
 /// The shared plan arithmetic. The caller has already accepted `image`.
@@ -4383,25 +4785,33 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_device_check_refuses_a_backup_that_is_not_the_pinned_length() {
-        // `verify_device` reads the shipped V1.13 span. A backup of another
-        // length must be refused before the first read rather than compared
-        // against fewer bytes than the write range covers.
+    fn the_shipped_device_check_refuses_physically_invalid_backups_and_accepts_v1_12() {
+        // `verify_device` checks physical constraints before opening the wire,
+        // and reads `backup.len()` bytes so both V1.13 (406,620) and V1.12
+        // (406,312) backups work.
         let backup = stock_image();
-        let short = backup[..FLASH_WRITE_LENGTH - 2].to_vec();
-        let mut rom = MtkBootRom::new(FakeDa::with_firmware(&backup));
-        let err = DownloadAgent::verify_device(&mut rom, &short).expect_err("wrong length");
-        assert!(matches!(err, Error::Safety { .. }), "got {err}");
-        let text = format!("{err}");
-        assert!(
-            text.contains("406618") && text.contains("406620"),
-            "the refusal names both lengths: {text}"
-        );
-        assert_eq!(
-            rom.transport_mut().read_bytes(),
-            0,
-            "the length guard runs before any 0xA2 frame"
-        );
+        let odd = backup[..FLASH_WRITE_LENGTH - 1].to_vec();
+        let too_big = vec![0xFFu8; FLASH_CAPACITY_BYTES + 2];
+        for (label, bad) in [
+            ("empty", Vec::new()),
+            ("odd", odd),
+            ("over 512 KiB", too_big),
+        ] {
+            let mut rom = MtkBootRom::new(FakeDa::with_firmware(&backup));
+            let err = DownloadAgent::verify_device(&mut rom, &bad)
+                .expect_err("physically invalid backup must be refused");
+            assert!(matches!(err, Error::Safety { .. }), "{label}: got {err}");
+            assert_eq!(
+                rom.transport_mut().read_bytes(),
+                0,
+                "{label}: the physical guard runs before any 0xA2 frame"
+            );
+        }
+
+        let v112 = stock_image_of(&PROFILE_V1_12);
+        let mut rom = MtkBootRom::new(FakeDa::with_firmware(&v112));
+        DownloadAgent::verify_device(&mut rom, &v112)
+            .expect("a V1.12 backup passes verify_device at its own length");
     }
 
     #[test]
@@ -4469,16 +4879,17 @@ mod tests {
     }
 
     #[test]
-    fn the_vendor_gate_accepts_only_the_pinned_v1_13_digest() {
+    fn the_vendor_gate_accepts_only_the_pinned_v1_13_and_v1_12_digests() {
         assert_eq!(VENDOR_PER_UNIT_DATA_BYTES, 14);
         assert_eq!(VENDOR_V1_13_SHA256, PROFILE_V1_13.sha256);
+        assert_eq!(VENDOR_V1_12_SHA256, PROFILE_V1_12.sha256);
 
         let stock = stock_image();
         let err = accept_vendor_image(&PROFILE_V1_13, &stock).expect_err("not the vendor digest");
         assert!(matches!(err, Error::Safety { .. }), "got {err}");
         assert!(
             format!("{err}").contains(VENDOR_V1_13_SHA256),
-            "the refusal names the pinned digest: {err}"
+            "the refusal names the pinned V1.13 digest: {err}"
         );
 
         let short = &stock[..FLASH_WRITE_LENGTH - 2];
@@ -4488,11 +4899,23 @@ mod tests {
         );
 
         let v112 = stock_image_of(&PROFILE_V1_12);
-        let err = accept_vendor_image(&PROFILE_V1_12, &v112).expect_err("V1.12 is out of scope");
+        let err = accept_vendor_image(&PROFILE_V1_12, &v112).expect_err("not the V1.12 digest");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
         assert!(
-            format!("{err}").contains("V1.13"),
-            "the refusal says the gate is V1.13 only: {err}"
+            format!("{err}").contains(VENDOR_V1_12_SHA256),
+            "the refusal names the pinned V1.12 digest: {err}"
         );
+
+        static UNKNOWN_PROFILE: FirmwareProfile = FirmwareProfile {
+            name: "V1.99",
+            size: 406_620,
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            version_marker: 0x59C28,
+            device_type: "01017-00F",
+        };
+        let err = accept_vendor_image(&UNKNOWN_PROFILE, &stock)
+            .expect_err("unknown profile must be refused");
+        assert!(matches!(err, Error::Safety { .. }), "got {err}");
 
         if let Some(vendor) = vendor_image() {
             let token =
@@ -4500,6 +4923,250 @@ mod tests {
             assert_eq!(token.image(), vendor.as_slice());
             assert_eq!(token.profile().name, PROFILE_V1_13.name);
         }
+    }
+
+    #[test]
+    fn a_v1_12_patched_backup_writes_the_v1_12_range_and_verifies() {
+        let backup = stock_image_of(&PROFILE_V1_12);
+        let image = patched_image_of(&PROFILE_V1_12);
+        let mut device = FakeDa::with_firmware(&backup);
+        let report = enter_download_agent(&mut device);
+        assert_eq!(report.first().copied(), Some(0xC0));
+        let mut da = DownloadAgent::new(device);
+        let pending = da
+            .write(Confirmation::granted(), &backup, &image)
+            .expect("V1.12 patched backup writes through the strict path");
+        assert_eq!(pending.length, V1_12_WRITE_LENGTH);
+        assert_eq!(pending.packets, V1_12_WRITE_LENGTH.div_ceil(PACKET_SIZE));
+        assert_eq!(
+            da.transport_mut().recorded_range(),
+            (0, (V1_12_WRITE_LENGTH as u32) - 1)
+        );
+        let written_report = pending
+            .verify_written(da, &image, FLASH_WRITE_START, reenter)
+            .expect("V1.12 read-back matches");
+        assert_eq!(written_report.verified, V1_12_WRITE_LENGTH);
+        assert_eq!(written_report.restored_per_unit_bytes, 0);
+    }
+
+    #[test]
+    fn a_v1_12_vendor_write_accepts_a_v1_13_backup_and_writes_the_v1_12_span() {
+        let backup = stock_image_of(&PROFILE_V1_13);
+        let v112_vendor = stock_image_of(&PROFILE_V1_12);
+        // `VendorImage` is private outside `da.rs`; inside module tests we can
+        // exercise the full V1.12 vendor plan and write path without committing
+        // the vendor binary (`AGENTS.md` §6).
+        let token = VendorImage {
+            profile: &PROFILE_V1_12,
+            image: &v112_vendor,
+        };
+        let plan = write_plan_vendor(&PROFILE_V1_12, &backup, token)
+            .expect("V1.12 vendor plan with V1.13 backup succeeds");
+        assert!(plan.vendor);
+        assert_eq!(plan.write_length, V1_12_WRITE_LENGTH);
+        assert_eq!(plan.differing_bytes, None);
+
+        let mut device = FakeDa::with_firmware(&backup);
+        assert_eq!(
+            enter_download_agent(&mut device).first().copied(),
+            Some(0xC0)
+        );
+        let mut da = DownloadAgent::new(device);
+        let pending = da
+            .write_vendor(Confirmation::granted(), &backup, token)
+            .expect("V1.12 vendor write succeeds");
+        assert_eq!(pending.length, V1_12_WRITE_LENGTH);
+        assert_eq!(
+            da.transport_mut().recorded_range(),
+            (0, (V1_12_WRITE_LENGTH as u32) - 1)
+        );
+        let report = pending
+            .verify_written_with_policy(
+                da,
+                &v112_vendor,
+                FLASH_WRITE_START,
+                reenter,
+                ReadBackPolicy::AllowPerUnitRestore,
+            )
+            .expect("V1.12 vendor read-back succeeds");
+        assert_eq!(report.verified, V1_12_WRITE_LENGTH);
+    }
+
+    #[test]
+    fn physical_constraints_and_unverified_write_path() {
+        assert!(check_physical_image(&[]).is_err(), "empty image blocked");
+        assert!(
+            check_physical_image(&[0u8; 406_619]).is_err(),
+            "odd length blocked"
+        );
+        assert!(
+            check_physical_image(&vec![0xFFu8; FLASH_CAPACITY_BYTES + 2]).is_err(),
+            "over 512 KiB blocked"
+        );
+        assert!(
+            check_physical_image(&vec![0xFFu8; FLASH_CAPACITY_BYTES]).is_ok(),
+            "exact 512 KiB even length allowed"
+        );
+        assert_eq!(
+            range_end(0, FLASH_CAPACITY_BYTES).expect("512 KiB range end"),
+            0x0007_FFFF
+        );
+
+        let odd = vec![0xAAu8; 1025];
+        assert!(accept_unverified_image(&odd).is_err());
+        assert!(matches!(
+            classify_image(None, &odd),
+            ImageClassification::Blocked { .. }
+        ));
+
+        // Arbitrary even-length image larger than V1.13 (412,000 bytes).
+        let backup = stock_image();
+        let mut custom = vec![0x5Au8; 412_000];
+        custom[..VECTOR.len()].copy_from_slice(&VECTOR);
+        let token = accept_unverified_image(&custom).expect("412,000 B is physically valid");
+        assert!(token.has_arm_vector());
+        assert_eq!(token.len(), 412_000);
+        assert!(matches!(
+            classify_image(Some(&backup), &custom),
+            ImageClassification::Unverified {
+                size: 412_000,
+                has_arm_vector: true,
+                ..
+            }
+        ));
+
+        let plan = write_plan_unverified(Some(&backup), &token);
+        assert_eq!(plan.write_length, 412_000);
+        assert_eq!(plan.packets, 412_000usize.div_ceil(PACKET_SIZE));
+        assert_eq!(plan.differing_bytes, None);
+
+        let mut device = FakeDa::with_firmware(&backup);
+        assert_eq!(
+            enter_download_agent(&mut device).first().copied(),
+            Some(0xC0)
+        );
+        let mut da = DownloadAgent::new(device);
+        let pending = da
+            .write_unverified(Confirmation::granted(), &token)
+            .expect("unverified custom-length write succeeds");
+        assert_eq!(pending.length, 412_000);
+        assert_eq!(da.transport_mut().recorded_range(), (0, 411_999));
+        let report = pending
+            .verify_written_with_policy(
+                da,
+                &custom,
+                FLASH_WRITE_START,
+                reenter,
+                ReadBackPolicy::AllowPerUnitRestore,
+            )
+            .expect("unverified custom-length read-back verifies");
+        assert_eq!(report.verified, 412_000);
+        assert_eq!(report.restored_per_unit_bytes, 0);
+    }
+
+    #[test]
+    fn allow_per_unit_restore_accepts_0x5c_to_0x5f_and_rejects_any_other_offset() {
+        let backup = stock_image();
+        let mut custom = stock_image();
+        custom[0x1000] = 0x42; // differs from backup, so it's unverified
+        custom[0x5C..0x60].copy_from_slice(&[0xFF; 4]);
+        let token = accept_unverified_image(&custom).expect("physically valid");
+
+        // 1) Firmware restores 0x5C..0x60 on reboot -> AllowPerUnitRestore succeeds
+        //    and counts the 4 restored bytes.
+        let mut device =
+            FakeDa::with_firmware(&backup).restoring_per_unit_bytes([0x91, 0x1B, 0xD4, 0xCF]);
+        assert_eq!(
+            enter_download_agent(&mut device).first().copied(),
+            Some(0xC0)
+        );
+        let mut da = DownloadAgent::new(device);
+        let pending = da
+            .write_unverified(Confirmation::granted(), &token)
+            .expect("write");
+        let report = pending
+            .verify_written_with_policy(
+                da,
+                &custom,
+                FLASH_WRITE_START,
+                reenter,
+                ReadBackPolicy::AllowPerUnitRestore,
+            )
+            .expect("0x5C..0x60 restore is tolerated under AllowPerUnitRestore");
+        assert_eq!(report.restored_per_unit_bytes, 4);
+
+        // 2) Strict policy refuses the same 0x5C difference.
+        let mut device =
+            FakeDa::with_firmware(&backup).restoring_per_unit_bytes([0x91, 0x1B, 0xD4, 0xCF]);
+        assert_eq!(
+            enter_download_agent(&mut device).first().copied(),
+            Some(0xC0)
+        );
+        let mut da = DownloadAgent::new(device);
+        let pending = da
+            .write_unverified(Confirmation::granted(), &token)
+            .expect("write");
+        let err = pending
+            .verify_written(da, &custom, FLASH_WRITE_START, reenter)
+            .expect_err("Strict must refuse 0x5C");
+        assert!(format!("{err}").contains("0x5C"), "got {err}");
+
+        // 3) AllowPerUnitRestore still refuses any difference outside 0x5C..0x60
+        //    (e.g. 0x5B or 0x60), even when 0x5C..0x60 also changed.
+        for bad_offset in [0x5Busize, 0x60usize, 0x2000usize] {
+            let mut device =
+                FakeDa::with_firmware(&backup).restoring_per_unit_bytes([0x91, 0x1B, 0xD4, 0xCF]);
+            assert_eq!(
+                enter_download_agent(&mut device).first().copied(),
+                Some(0xC0)
+            );
+            let mut da = DownloadAgent::new(device);
+            let pending = da
+                .write_unverified(Confirmation::granted(), &token)
+                .expect("write");
+            da.transport_mut().damage(bad_offset as u32, 0x01);
+            let err = pending
+                .verify_written_with_policy(
+                    da,
+                    &custom,
+                    FLASH_WRITE_START,
+                    reenter,
+                    ReadBackPolicy::AllowPerUnitRestore,
+                )
+                .expect_err("difference outside 0x5C..0x60 must still fail");
+            assert!(
+                format!("{err}").contains(&format!("0x{bad_offset:X}")),
+                "expected offset 0x{bad_offset:X} in error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_image_covers_verified_and_unverified_tiers() {
+        let backup = stock_image();
+        let patched = patched_image();
+        assert!(matches!(
+            classify_image(Some(&backup), &backup),
+            ImageClassification::VerifiedBackupOrPatch {
+                differing_bytes: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_image(Some(&backup), &patched),
+            ImageClassification::VerifiedBackupOrPatch {
+                differing_bytes: 3,
+                ..
+            }
+        ));
+        assert!(matches!(
+            classify_image(None, &patched),
+            ImageClassification::Unverified {
+                size: 406_620,
+                has_arm_vector: true,
+                ..
+            }
+        ));
     }
 
     #[test]

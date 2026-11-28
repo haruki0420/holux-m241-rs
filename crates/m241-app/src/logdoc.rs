@@ -715,6 +715,7 @@ pub fn match_photos(loaded: &mut LoadedLog, photos: Vec<LoadedPhoto>, options: &
             skipped: None,
             keep_backup: false,
             group_id: None,
+            rewrite_datetime_original: true,
         };
         let Some(captured) = photo.captured_at else {
             plan.skipped = Some(String::from("no capture time"));

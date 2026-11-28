@@ -189,32 +189,46 @@ Rules:
 ### 2.3 Take a dump before writing anything
 
 Any image whose differing bytes fall outside the patch offsets of the user's own
-backup is refused. An image identical to the backup is accepted. Do not weaken
-that check.
+backup is refused on the strict path. An image identical to the backup is
+accepted. Do not weaken that check (`check_image` supports both V1.13 `406,620`
+bytes and V1.12 `406,312` bytes on the strict path).
 
-**Official vendor image gate (explicit user decision, 2026-11-22).** The user
-has explicitly decided that writing the *unmodified* official V1.13 vendor
-image is allowed, accepting that its 14 bytes of per-unit data overwrite this
-unit's values. This is a separate gate, never a digest branch inside the backup
-check:
+**Official vendor image gate (explicit user decision, 2026-11-22; extended
+2026-11-28).** The user has explicitly decided that writing the *unmodified*
+official V1.13 or V1.12 vendor image is allowed, accepting that its 14 bytes of
+per-unit data overwrite this unit's values. This is a separate gate, never a
+digest branch inside the backup check:
 
-* only the V1.13 vendor image whose full SHA-256 is
-  `32fe52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435` and whose
-  length is 406,620 bytes. V1.12 and every other build are refused;
+* only the pinned V1.13 vendor image (`32fe52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435`,
+  406,620 bytes) or V1.12 vendor image (`4103601a29f256ae5da771bbcbc3ca85a89deb6268ce74865dc84b2583ae98f7`,
+  406,312 bytes; hardware write ⚠️ 未検証); any other build is refused;
 * `--allow-vendor` and `--yes` are both required, and `--backup` and `--da` stay
-  required;
+  required (`--backup` must be a valid M-241 dump, allowing cross-profile
+  official writes such as V1.12 onto a V1.13 unit);
 * the unit must still match that backup before the DA is loaded
   (`verify_device`), and the written range is read back and compared with the
-  vendor image;
+  vendor image under `ReadBackPolicy::AllowPerUnitRestore` (decision A,
+  2026-11-28: firmware-restored bytes strictly inside `0x5C..0x60` are counted
+  in `restored_per_unit_bytes`, while any difference outside `0x5C..0x60` fails);
 * the command prints which per-unit data is overwritten before writing and on
   success;
-* the vendor V1.13 image is the **stock, unpatched** release: epoch
-  `315964800`, marker `V1.13`. Writing it leaves the date 7168 days behind
-  until the image is patched, so the dry run, the pre-write warning and the
-  success output all say so;
+* the vendor V1.13 / V1.12 images are the **stock, unpatched** releases: epoch
+  `315964800`, marker `V1.13` / `V1.12`. Writing them leaves the date 7168 days
+  behind until patched, so the dry run, the pre-write warning and the success
+  output all say so;
 * `--allow-vendor --yes` is inside §2.5. The strict `check_image` must not gain a
   digest branch: `accept_vendor_image` is the only way to obtain the
   `VendorImage` token `write_vendor` accepts.
+
+**Unverified / flexible image gate (explicit user decision, 2026-11-28).** The
+user has explicitly decided that `--allow-unverified` (`accept_unverified_image`
+/ `write_unverified`) may write any physically valid image (`check_physical_image`:
+non-empty, even byte length, `<= FLASH_CAPACITY_BYTES` = 512 KiB) from
+`FLASH_WRITE_START = 0`, subject to `--yes`, pre-write warnings (SHA-256 and ARM
+reset vector check), `verify_device` against `--backup`, and read-back under
+`ReadBackPolicy::AllowPerUnitRestore` (`0x5C..0x60` restore tolerated; any other
+difference fails). Physical constraints (`check_physical_image`) remain hard
+refusals that no flag can bypass.
 
 ### 2.4 Never commit personal data
 
@@ -298,40 +312,49 @@ the reviewer independently verifies:
   names `--recover` explicitly; without it, the normal `verify_device` path
   applies;
 * for `fw flash --allow-vendor --yes`, the image's **full** SHA-256 must equal
-  `32fe52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435`
-  (V1.13, 406,620 bytes). Any other vendor build, a prefix, or a V1.12 image is
+  either `32fe52690db9947bdbfa58caa6dba450b3f4222b23f2e045f606252649159435`
+  (V1.13, 406,620 bytes) or
+  `4103601a29f256ae5da771bbcbc3ca85a89deb6268ce74865dc84b2583ae98f7`
+  (V1.12, 406,312 bytes; ⚠️ 未検証 on hardware). Any other digest or length is
   a refusal. The request must state that the user knows the vendor image
   overwrites the unit's 14 bytes of per-unit data, and must include the same
   backup and unit-identity artifacts as a normal write. The normal
   `verify_device` is still required; `--allow-vendor` does not skip it;
+* for `fw flash --allow-unverified --yes`, the image must pass
+  `check_physical_image` (non-empty, even length, `<= 0x0008_0000` bytes), with
+  its SHA-256 and ARM vector status explicitly reported before writing, and
+  `verify_device` against `--backup` still required;
 * the exact full command line to run, including `--yes`, the resolved `--port`,
-  `--da`, the image path, and the backup path, plus `--recover` or
-  `--allow-vendor` when used. `fw flash` implements these flags; re-check the
-  command against `m241 fw flash --help` before approving.
+  `--da`, the image path, and the backup path, plus `--recover`,
+  `--allow-vendor`, or `--allow-unverified` when used. `fw flash` implements
+  these flags; re-check the command against `m241 fw flash --help` before
+  approving.
 
 **Approval is per execution.** A previous approval covers one invocation of
-the command in this section (`fw flash`, including `--recover` / `--allow-vendor`,
-or `fw probe-da`) only. Before every invocation the preparer asks an independent
-reviewer, as in the delegation paragraph above, for the exact command, image,
-backup, DA, unit, port, flags and retry behaviour, and passes `--yes` only after
-that reviewer records `"approved"`. A changed image, backup, DA, unit, port,
-flag, range or retry policy needs a fresh approval.
+the command in this section (`fw flash`, including `--recover` / `--allow-vendor`
+/ `--allow-unverified`, or `fw probe-da`) only. Before every invocation the
+preparer asks an independent reviewer, as in the delegation paragraph above, for
+the exact command, image, backup, DA, unit, port, flags and retry behaviour, and
+passes `--yes` only after that reviewer records `"approved"`. A changed image,
+backup, DA, unit, port, flag, range or retry policy needs a fresh approval.
 
 **The reviewer must independently show that the write cannot leave the pinned
-range.** Each of these is a refusal condition:
+bounds.** Each of these is a refusal condition:
 
-* the range comes only from `FLASH_WRITE_START = 0` and
-  `FLASH_WRITE_LENGTH = 0x6345C`; no image, backup, flag, environment variable
-  or user input may change it;
-* `0xD3` records exactly `0` .. `0x6345B` (`end = start + length - 1`) and
-  `0xD5` programs only that range (sector erase granularity is §2.2);
+* the write start comes only from `FLASH_WRITE_START = 0` and the write length
+  comes from the checked image (`image.len()`, bounded by
+  `FLASH_CAPACITY_BYTES = 0x0008_0000` and even-length alignment via
+  `check_physical_image`); no flag, environment variable or user input may move
+  the start address or exceed 512 KiB;
+* `0xD3` records exactly `0` .. `image.len() - 1` (`end = range_end(start,
+  image.len())`) and `0xD5` programs only that range (sector erase granularity
+  is §2.2);
 * if the implementation retries automatically, the retry re-enters the BootROM
   and re-runs the same command and the same range; it may not extend, shift or
   recompute the range;
-* the image length equals `FLASH_WRITE_LENGTH`; a shorter or longer image (V1.12
-  or any other profile) is refused;
-* `check_layout` and `check_image` (or the vendor token) run before the first
-  `0xD3`, and the reviewer has seen the call path.
+* `check_layout` and `check_image` (or `accept_vendor_image` /
+  `accept_unverified_image`) run before the first `0xD3`, and the reviewer has
+  seen the call path.
 
 A missing item, a hash or byte-diff mismatch, an unsettled
 `FLASH_WRITE_START`, `--port auto`, or a non-independent/forked reviewer is a

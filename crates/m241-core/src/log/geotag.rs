@@ -153,6 +153,11 @@ pub struct GeotagOptions {
     /// an argument to the conversion so the option a user sets once travels
     /// with the rest of the geotag settings. [`None`] embeds the original bytes.
     pub max_photo_edge_pixels: Option<u32>,
+    /// When `true` (the default), [`apply`] writes the matched
+    /// [`CaptureTime::Exif`] value back into `DateTimeOriginal` so a shifted
+    /// clock is persisted (`07-eztour-spec.ja.md` §6.2). Set to `false` to
+    /// match using [`Self::photo_shift_seconds`] while writing GPS tags only.
+    pub rewrite_datetime_original: bool,
 }
 
 impl Default for GeotagOptions {
@@ -163,6 +168,7 @@ impl Default for GeotagOptions {
             photo_shift_seconds: 0,
             group_distance_meters: None,
             max_photo_edge_pixels: None,
+            rewrite_datetime_original: true,
         }
     }
 }
@@ -352,6 +358,10 @@ pub struct GeotagPlan {
     /// Cluster identifier assigned by [`group_matched_plans`] when distance
     /// grouping is enabled.
     pub group_id: Option<usize>,
+    /// Whether [`apply`] should rewrite `DateTimeOriginal` when
+    /// [`Self::capture_time`] is [`CaptureTime::Exif`]. Copied from
+    /// [`GeotagOptions::rewrite_datetime_original`].
+    pub rewrite_datetime_original: bool,
 }
 
 impl GeotagPlan {
@@ -623,9 +633,13 @@ pub fn apply(plans: &[GeotagPlan]) -> Result<Vec<PathBuf>> {
         // The shift moves the match; the same shift must move the photo's own
         // clock, or the tag and the time it was chosen for disagree and the
         // next run starts from the un-shifted time again.
-        let capture_time = match plan.capture_time {
-            Some(CaptureTime::Exif(utc)) => Some(utc),
-            Some(CaptureTime::FileModified(_)) | None => None,
+        let capture_time = if plan.rewrite_datetime_original {
+            match plan.capture_time {
+                Some(CaptureTime::Exif(utc)) => Some(utc),
+                Some(CaptureTime::FileModified(_)) | None => None,
+            }
+        } else {
+            None
         };
         let bytes = std::fs::read(&plan.photo)
             .map_err(|source| Error::io(plan.photo.display().to_string(), source))?;
@@ -774,7 +788,16 @@ fn write_backup_if_missing(photo: &Path, original_bytes: &[u8]) -> Result<()> {
 fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) -> GeotagPlan {
     let raw_captured = match capture_time(photo, bytes) {
         Ok(captured) => captured,
-        Err(reason) => return skipped(photo, None, None, options.keep_backup, reason),
+        Err(reason) => {
+            return skipped(
+                photo,
+                None,
+                None,
+                options.keep_backup,
+                options.rewrite_datetime_original,
+                reason,
+            );
+        }
     };
     let Some(captured) = shift_capture_time(raw_captured, options.photo_shift_seconds) else {
         return skipped(
@@ -782,6 +805,7 @@ fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) 
             None,
             None,
             options.keep_backup,
+            options.rewrite_datetime_original,
             format!(
                 "shifting the capture time by {} s would put it outside the Unix \
                  range 1970-2106",
@@ -795,6 +819,7 @@ fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) 
             Some(captured),
             None,
             options.keep_backup,
+            options.rewrite_datetime_original,
             String::from("the track has no point with both a time and a position to compare with"),
         );
     };
@@ -804,6 +829,7 @@ fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) 
             Some(captured),
             Some(gap),
             options.keep_backup,
+            options.rewrite_datetime_original,
             format!(
                 "the nearest track point is {gap} s from the capture time, past the \
                  {} s limit",
@@ -820,6 +846,7 @@ fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) 
             Some(captured),
             Some(gap),
             options.keep_backup,
+            options.rewrite_datetime_original,
             String::from("the chosen track point has no complete coordinate"),
         );
     };
@@ -829,6 +856,7 @@ fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) 
             Some(captured),
             Some(gap),
             options.keep_backup,
+            options.rewrite_datetime_original,
             format!("the photo's Exif block cannot be rewritten: {err}"),
         );
     }
@@ -840,6 +868,7 @@ fn plan_one(photo: &Path, bytes: &[u8], track: &Track, options: &GeotagOptions) 
         skipped: None,
         keep_backup: options.keep_backup,
         group_id: None,
+        rewrite_datetime_original: options.rewrite_datetime_original,
     }
 }
 
@@ -869,6 +898,7 @@ fn skipped(
     capture_time: Option<CaptureTime>,
     gap_seconds: Option<u32>,
     keep_backup: bool,
+    rewrite_datetime_original: bool,
     reason: String,
 ) -> GeotagPlan {
     GeotagPlan {
@@ -879,6 +909,7 @@ fn skipped(
         skipped: Some(reason),
         keep_backup,
         group_id: None,
+        rewrite_datetime_original,
     }
 }
 
@@ -2535,5 +2566,39 @@ mod tests {
         assert_eq!(plans[1].group_id, Some(0));
         assert_eq!(plans[2].group_id, Some(1));
         assert_eq!(plans[3].group_id, None);
+    }
+
+    #[test]
+    fn rewrite_datetime_original_false_matches_shifted_time_without_rewriting_tag() {
+        let dir = TempDir::new("no-rewrite-dto");
+        let original_utc = SHUTTER - 3_600;
+        let photo = dir.photo("camera.jpg", &photo_taken_at(original_utc));
+        let track = track_at(&[SHUTTER]);
+        let opts = GeotagOptions {
+            photo_shift_seconds: 3_600,
+            rewrite_datetime_original: false,
+            ..GeotagOptions::default()
+        };
+
+        let plans = plan(std::slice::from_ref(&photo), &track, &opts).expect("plan");
+        assert!(plans[0].will_write(), "shifted time must match the track");
+        assert_eq!(plans[0].gap_seconds, Some(0));
+        assert!(!plans[0].rewrite_datetime_original);
+
+        let written = apply(&plans).expect("apply");
+        assert_eq!(written, vec![photo.clone()]);
+
+        let tagged = std::fs::read(&photo).expect("read tagged photo");
+        assert_eq!(
+            exif::read_datetime_original(&tagged).expect("read DateTimeOriginal"),
+            Some(original_utc),
+            "DateTimeOriginal must stay unchanged when rewrite_datetime_original is false"
+        );
+        assert!(
+            exif::read_gps(&tagged)
+                .expect("read GPS")
+                .is_some_and(|tags| tags.latitude.is_some()),
+            "GPS coordinates must still be written"
+        );
     }
 }

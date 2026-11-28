@@ -35,9 +35,10 @@ use m241_core::protocol::port::Transport;
 use m241_core::{Error, FirmwareProfile, PatchPlan, Result};
 use m241_flash::da::{
     Confirmation, DaDigest, DaLoadId, DaLoader, DownloadAgent, FLASH_WRITE_START, PROBE_ADDRESSES,
-    PROBE_PAGE_SIZE, PendingWrite, VECTOR, VENDOR_PER_UNIT_DATA_BYTES, VendorImage, WritePlan,
-    WriteReport, accept_vendor_image, check_da_image_against, check_image, check_layout,
-    read_candidates, write_plan, write_plan_vendor,
+    PROBE_PAGE_SIZE, PendingWrite, ReadBackPolicy, UnverifiedImage, UnverifiedWritePlan, VECTOR,
+    VENDOR_PER_UNIT_DATA_BYTES, VendorImage, WritePlan, WriteReport, accept_unverified_image,
+    accept_vendor_image, check_da_image_against, check_layout, check_physical_image,
+    read_candidates, write_plan, write_plan_unverified, write_plan_vendor,
 };
 
 use crate::Session;
@@ -604,62 +605,103 @@ fn plan_document(report: &PatchReport, written: Option<&std::path::Path>) -> ser
 /// * [`Error::Timeout`] / [`Error::Framing`] / [`Error::Rejected`] from the
 ///   BootROM, the DA, the write or the read-back; each carries the crate's
 ///   recovery paragraph once anything has been sent.
+enum PlannedFlash<'a> {
+    Profile {
+        plan: WritePlan,
+        vendor: Option<VendorImage<'a>>,
+    },
+    Unverified {
+        plan: UnverifiedWritePlan,
+        token: UnverifiedImage<'a>,
+    },
+}
+
+impl PlannedFlash<'_> {
+    fn write_length(&self) -> usize {
+        match self {
+            Self::Profile { plan, .. } => plan.write_length,
+            Self::Unverified { plan, .. } => plan.write_length,
+        }
+    }
+
+    fn packets(&self) -> usize {
+        match self {
+            Self::Profile { plan, .. } => plan.packets,
+            Self::Unverified { plan, .. } => plan.packets,
+        }
+    }
+
+    fn read_back_policy(&self) -> ReadBackPolicy {
+        match self {
+            Self::Profile { vendor: None, .. } => ReadBackPolicy::Strict,
+            Self::Profile {
+                vendor: Some(_), ..
+            }
+            | Self::Unverified { .. } => ReadBackPolicy::AllowPerUnitRestore,
+        }
+    }
+}
+
 pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
     let backup = fileio::read(&options.backup)?;
     let image = fileio::read(&options.image)?;
 
-    // Identify the image; it decides the profile a plan is made against. The
-    // backup is not identified: `write_plan` checks its length against that
-    // profile and compares it with the image byte for byte.
-    let image_view = FirmwareImage::new(&image)?;
-    let profile = identify(&image_view)?.profile;
+    // Physical flash bounds always apply first (non-empty, even, <= 512 KiB).
+    check_physical_image(&image)?;
 
-    // Strict first: the backup-diff rule is the normal path. A vendor image
-    // fails that diff by design, so it reaches the separate fixed-SHA gate only
-    // when `--allow-vendor` is set. The strict `check_image` never grows a
-    // digest branch.
-    let strict_plan = write_plan(profile, &backup, &image);
-    let (plan, vendor) = match strict_plan {
-        Ok(plan) => (plan, None),
-        Err(strict_err) => {
-            if !options.allow_vendor {
-                return Err(strict_err);
-            }
-            let token = accept_vendor_image(profile, &image)?;
-            let plan = write_plan_vendor(profile, &backup, token)?;
-            (plan, Some(token))
-        }
-    };
-
-    // The plan may describe a V1.12 or V1.14 image, but the driver programs the
-    // pinned V1.13 range. Run its own acceptance rule now so a dry run can say a
-    // write would be refused, and a real run stops before opening a port.
-    // A vendor token already carries its own acceptance; the strict path still
-    // runs `check_image` against the pinned V1.13 range.
-    let writable = if vendor.is_some() {
-        Ok(())
+    let planned = if options.allow_unverified {
+        let token = accept_unverified_image(&image)?;
+        let plan = write_plan_unverified(Some(&backup), &token);
+        PlannedFlash::Unverified { plan, token }
     } else {
-        check_image(&PROFILE_V1_13, &backup, &image).map(|_| ())
+        // Identify the image; it decides the profile a plan is made against.
+        // The backup is verified structurally against its own profile when
+        // using `--allow-vendor`, or byte-for-byte on the strict path.
+        let image_view = FirmwareImage::new(&image)?;
+        let profile = identify(&image_view)?.profile;
+
+        // Strict first: the backup-diff rule is the normal path. A vendor image
+        // fails that diff by design, so it reaches the separate fixed-SHA gate
+        // only when `--allow-vendor` is set. The strict `check_image` never
+        // grows a digest branch.
+        let strict_plan = write_plan(profile, &backup, &image);
+        let (plan, vendor) = match strict_plan {
+            Ok(plan) => (plan, None),
+            Err(strict_err) => {
+                if !options.allow_vendor {
+                    return Err(strict_err);
+                }
+                let token = accept_vendor_image(profile, &image)?;
+                let plan = write_plan_vendor(profile, &backup, token)?;
+                (plan, Some(token))
+            }
+        };
+        PlannedFlash::Profile { plan, vendor }
     };
 
     if options.dry_run {
-        print_write_plan(
-            options,
-            session.console,
-            &plan,
-            writable.as_ref().err().map(ToString::to_string).as_deref(),
-        )?;
+        match &planned {
+            PlannedFlash::Profile { plan, .. } => {
+                print_write_plan(options, session.console, plan, None)?;
+            }
+            PlannedFlash::Unverified { plan, .. } => {
+                print_unverified_write_plan(options, session.console, plan)?;
+            }
+        }
         session.console.note(&dry_run_note());
         return Ok(());
     }
 
     // A real write. Everything that can be decided without a port is decided
     // first, in the order a person would want to be told: the confirmation,
-    // then the layout and the files the write needs.
+    // warnings, then the layout and the files the write needs.
     let confirmation = Confirmation::of_command_line(options.yes)?;
-    warn_vendor_write(session.console, &plan);
+    match &planned {
+        PlannedFlash::Profile { plan, .. } => warn_vendor_write(session.console, plan),
+        PlannedFlash::Unverified { plan, .. } => warn_unverified_write(session.console, plan),
+    }
     check_layout()?;
-    writable?;
+    check_physical_image(&backup)?;
     if options.recover && image != backup {
         return Err(Error::Safety {
             reason: String::from(
@@ -692,7 +734,7 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
     let port = link::resolve(session.links, &options.port)?;
     session.console.note(&format!(
         "writing {} bytes to {port}; the backup at {} is not modified",
-        plan.write_length,
+        planned.write_length(),
         options.backup.display()
     ));
 
@@ -724,9 +766,15 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
         "DA v{}.{} answered; programming {} bytes in {} packets",
         id.version >> 8,
         id.version & 0xFF,
-        plan.write_length,
-        plan.packets
+        planned.write_length(),
+        planned.packets()
     ));
+
+    let read_back_policy = planned.read_back_policy();
+    let (vendor, unverified) = match &planned {
+        PlannedFlash::Profile { vendor, .. } => (*vendor, None),
+        PlannedFlash::Unverified { token, .. } => (None, Some(token.clone())),
+    };
 
     let mut da_session = DownloadAgent::new(rom.into_transport());
     let attempt = WriteAttempt {
@@ -735,6 +783,7 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
         image: &image,
         da: &da,
         vendor,
+        unverified,
     };
     let (pending, da_session) = match attempt.write(&mut da_session) {
         Ok(pending) => (pending, da_session),
@@ -744,9 +793,13 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
         "every packet was acknowledged; restarting the unit and reading the written range back",
     );
 
-    let report = match pending.verify_written(da_session, &image, FLASH_WRITE_START, |transport| {
-        reenter_bootrom(transport, session, Reentry::ReadBack)
-    }) {
+    let report = match pending.verify_written_with_policy(
+        da_session,
+        &image,
+        FLASH_WRITE_START,
+        |transport| reenter_bootrom(transport, session, Reentry::ReadBack),
+        read_back_policy,
+    ) {
         Ok(report) => report,
         Err(err) => {
             note_write_failure(session.console, &options.backup);
@@ -754,7 +807,14 @@ pub fn flash(options: &FlashOptions, session: Session<'_>) -> Result<()> {
         }
     };
 
-    print_write_report(options, session.console, &port, &plan, &report)
+    match &planned {
+        PlannedFlash::Profile { plan, .. } => {
+            print_write_report(options, session.console, &port, plan, &report)
+        }
+        PlannedFlash::Unverified { plan, .. } => {
+            print_unverified_write_report(options, session.console, &port, plan, &report)
+        }
+    }
 }
 
 /// The note appended when the automatic `0xD9` restart succeeded but no write
@@ -808,14 +868,18 @@ struct WriteAttempt<'a> {
     image: &'a [u8],
     da: &'a [u8],
     vendor: Option<VendorImage<'a>>,
+    unverified: Option<UnverifiedImage<'a>>,
 }
 
 impl WriteAttempt<'_> {
-    /// Run one DA write: the strict backup-diff path, or the vendor path.
+    /// Run one DA write: the strict backup-diff, vendor, or unverified path.
     fn write<T: Transport>(&self, da: &mut DownloadAgent<T>) -> Result<PendingWrite> {
-        match self.vendor {
-            Some(token) => da.write_vendor(self.confirmation, self.backup, token),
-            None => da.write(self.confirmation, self.backup, self.image),
+        if let Some(token) = self.vendor {
+            da.write_vendor(self.confirmation, self.backup, token)
+        } else if let Some(unverified) = &self.unverified {
+            da.write_unverified(self.confirmation, unverified)
+        } else {
+            da.write(self.confirmation, self.backup, self.image)
         }
     }
 }
@@ -1099,13 +1163,33 @@ fn warn_vendor_write(console: &dyn Console, plan: &WritePlan) {
     if !plan.vendor {
         return;
     }
+    let hardware_note = if plan.profile.name == PROFILE_V1_12.name {
+        "; V1.12 has not been verified on hardware (未検証)"
+    } else {
+        ""
+    };
     console.warn(&format!(
         "warning: this is the official vendor image, not this unit's backup. Writing it \
          replaces the unit's {} bytes of per-unit data with the vendor values and leaves the \
-         WNRO fix off: the vendor V1.13 epoch is 315964800 and its marker is V1.13, so dates \
-         are 7168 days behind until the image is patched. The backup is still required and is \
-         compared with the unit before the DA is loaded",
-        VENDOR_PER_UNIT_DATA_BYTES
+         WNRO fix off: the vendor {} epoch is 315964800 and its marker is {}, so dates \
+         are 7168 days behind until the image is patched{hardware_note}. The backup is still \
+         required and is compared with the unit before the DA is loaded",
+        VENDOR_PER_UNIT_DATA_BYTES, plan.profile.name, plan.profile.name
+    ));
+}
+
+/// Warn before writing an unverified / custom image.
+fn warn_unverified_write(console: &dyn Console, plan: &UnverifiedWritePlan) {
+    let vector_note = if plan.has_arm_vector {
+        "ARM reset vector (18 F0 9F E5): present"
+    } else {
+        "ARM reset vector (18 F0 9F E5): ABSENT — the unit may not boot if this is not a valid \
+         firmware image"
+    };
+    console.warn(&format!(
+        "warning: unverified image (--allow-unverified, 未検証): {} bytes, SHA-256 {}. \
+         {vector_note}. This image has not been verified by this project; keep your backup safe",
+        plan.size, plan.sha256
     ));
 }
 
@@ -1152,6 +1236,7 @@ fn print_write_report(
             "length": report.length,
             "packets": report.packets,
             "verified": report.verified,
+            "restored_per_unit_bytes": report.restored_per_unit_bytes,
             "verified_matches_image": true,
             "flash_write": true,
             "power_cycle_required": true,
@@ -1175,8 +1260,8 @@ fn print_write_report(
             "vendor image", VENDOR_PER_UNIT_DATA_BYTES
         ));
         console.result(&format!(
-            "{:<12}: no (the vendor V1.13 image is unpatched; dates are 7168 days behind)",
-            "wnro patch"
+            "{:<12}: no (the vendor {} image is unpatched; dates are 7168 days behind)",
+            "wnro patch", plan.profile.name
         ));
     }
     console.result(&format!("{:<12}: 0x{:08X}", "start", report.start));
@@ -1186,6 +1271,81 @@ fn print_write_report(
         "{:<12}: {} bytes read back and identical",
         "verified", report.verified
     ));
+    if report.restored_per_unit_bytes > 0 {
+        console.note(&format!(
+            "note: {} byte(s) in 0x5C..0x60 were restored by the booted firmware on reboot",
+            report.restored_per_unit_bytes
+        ));
+    }
+    console.result(&format!("{:<12}: yes", "flash write"));
+    console.result(&format!(
+        "{:<12}: remove the battery for about ten seconds, put it back, and switch the unit on; \
+         the read-back left it in the BootROM",
+        "next"
+    ));
+    Ok(())
+}
+
+/// Show the completed write for an `--allow-unverified` image.
+fn print_unverified_write_report(
+    options: &FlashOptions,
+    console: &dyn Console,
+    port: &str,
+    plan: &UnverifiedWritePlan,
+    report: &WriteReport,
+) -> Result<()> {
+    if options.json {
+        return console.json(&serde_json::json!({
+            "dry_run": false,
+            "port": port,
+            "image": options.image.display().to_string(),
+            "backup": options.backup.display().to_string(),
+            "profile": serde_json::Value::Null,
+            "acceptance": "unverified",
+            "unverified_image": true,
+            "sha256": plan.sha256,
+            "has_arm_vector": plan.has_arm_vector,
+            "start": format!("0x{:08X}", report.start),
+            "length": report.length,
+            "packets": report.packets,
+            "verified": report.verified,
+            "restored_per_unit_bytes": report.restored_per_unit_bytes,
+            "verified_matches_image": true,
+            "flash_write": true,
+            "power_cycle_required": true,
+        }));
+    }
+    console.result(&format!("{:<12}: {port}", "port"));
+    console.result(&format!("{:<12}: {}", "image", options.image.display()));
+    console.result(&format!("{:<12}: {}", "backup", options.backup.display()));
+    console.result(&format!(
+        "{:<12}: unverified ({} bytes)",
+        "profile", plan.size
+    ));
+    console.result(&format!("{:<12}: unverified image", "accepted as"));
+    console.result(&format!("{:<12}: {}", "sha256", plan.sha256));
+    console.result(&format!(
+        "{:<12}: {}",
+        "arm vector",
+        if plan.has_arm_vector {
+            "yes (18 F0 9F E5)"
+        } else {
+            "no"
+        }
+    ));
+    console.result(&format!("{:<12}: 0x{:08X}", "start", report.start));
+    console.result(&format!("{:<12}: {}", "length", report.length));
+    console.result(&format!("{:<12}: {}", "packets", report.packets));
+    console.result(&format!(
+        "{:<12}: {} bytes read back and identical",
+        "verified", report.verified
+    ));
+    if report.restored_per_unit_bytes > 0 {
+        console.note(&format!(
+            "note: {} byte(s) in 0x5C..0x60 were restored by the booted firmware on reboot",
+            report.restored_per_unit_bytes
+        ));
+    }
     console.result(&format!("{:<12}: yes", "flash write"));
     console.result(&format!(
         "{:<12}: remove the battery for about ten seconds, put it back, and switch the unit on; \
@@ -1295,11 +1455,108 @@ fn print_write_plan(
             "vendor image", VENDOR_PER_UNIT_DATA_BYTES
         ));
         console.result(&format!(
-            "{:<12}: no (the vendor V1.13 image is unpatched; dates are 7168 days behind)",
-            "wnro patch"
+            "{:<12}: no (the vendor {} image is unpatched; dates are 7168 days behind)",
+            "wnro patch", plan.profile.name
         ));
         warn_vendor_write(console, plan);
     }
+    console.result(&format!(
+        "{:<12}: {} bytes ({} packets of {} bytes)",
+        "write range",
+        plan.write_length,
+        plan.packets,
+        m241_flash::da::PACKET_SIZE
+    ));
+    console.result(&format!(
+        "{:<12}: 0x{:08X} (settled DA-side base)",
+        "start", plan.start
+    ));
+    console.result(&format!("{:<12}: {differing_line}", "diff"));
+    console.result(&format!("{:<12}: {write_line}", "actual write"));
+    console.result(&format!("{:<12}: no (this was --dry-run)", "port opened"));
+    console.result(&format!(
+        "{:<12}: no (0xD3/0xD4/0xD5/0xD9 were not sent)",
+        "flash write"
+    ));
+    Ok(())
+}
+
+/// Format the `--dry-run` plan for an `--allow-unverified` image.
+fn print_unverified_write_plan(
+    options: &FlashOptions,
+    console: &dyn Console,
+    plan: &UnverifiedWritePlan,
+) -> Result<()> {
+    let differing_line = match plan.differing_bytes {
+        Some(count) => format!(
+            "{count} byte(s) differ from the backup{}",
+            if plan.differing_offsets.is_empty() {
+                String::new()
+            } else {
+                let shown: Vec<String> = plan
+                    .differing_offsets
+                    .iter()
+                    .map(|offset| format!("0x{offset:X}"))
+                    .collect();
+                format!("; first at {}", shown.join(", "))
+            }
+        ),
+        None => String::from("the backup is a different length"),
+    };
+    let write_line = match check_layout() {
+        Err(err) => format!("refused: {err}"),
+        Ok(()) => String::from(
+            "permitted; a real run still needs --yes, compares the unit with the backup, and \
+             reads the range back before reporting success",
+        ),
+    };
+    let write_refused = check_layout().is_err();
+
+    if options.json {
+        return console.json(&serde_json::json!({
+            "dry_run": true,
+            "image": options.image.display().to_string(),
+            "backup": options.backup.display().to_string(),
+            "profile": serde_json::Value::Null,
+            "acceptance": "unverified",
+            "unverified_image": true,
+            "sha256": plan.sha256,
+            "has_arm_vector": plan.has_arm_vector,
+            "size": plan.size,
+            "write_length": plan.write_length,
+            "start": format!("0x{:08X}", plan.start),
+            "packets": plan.packets,
+            "differing_bytes": plan.differing_bytes,
+            "differing_offsets": plan
+                .differing_offsets
+                .iter()
+                .map(|offset| format!("0x{offset:X}"))
+                .collect::<Vec<_>>(),
+            "opens_port": false,
+            "wrote_flash": false,
+            "actual_write_refused": write_refused,
+            "actual_write": write_line,
+        }));
+    }
+
+    console.result(&format!("{:<12}: {}", "image", options.image.display()));
+    console.result(&format!("{:<12}: {}", "backup", options.backup.display()));
+    console.result(&format!(
+        "{:<12}: unverified ({} bytes)",
+        "profile", plan.size
+    ));
+    console.result(&format!("{:<12}: unverified image", "accepted as"));
+    console.result(&format!("{:<12}: {}", "sha256", plan.sha256));
+    console.result(&format!(
+        "{:<12}: {}",
+        "arm vector",
+        if plan.has_arm_vector {
+            "yes (18 F0 9F E5)"
+        } else {
+            "no"
+        }
+    ));
+    warn_unverified_write(console, plan);
     console.result(&format!(
         "{:<12}: {} bytes ({} packets of {} bytes)",
         "write range",
@@ -2944,6 +3201,7 @@ mod tests {
             dry_run: true,
             recover: false,
             allow_vendor: false,
+            allow_unverified: false,
             yes: false,
             assume_brom: false,
             port: String::from("auto"),
@@ -3013,9 +3271,8 @@ mod tests {
             "a V1.12 plan must print V1.12's length: {stdout}"
         );
         assert!(
-            stdout.contains("actual write: refused"),
-            "the driver writes only the pinned V1.13 range, so the plan must not promise a V1.12 \
-             write: {stdout}"
+            stdout.contains("actual write: permitted"),
+            "V1.12 is now writable via the variable-length strict path: {stdout}"
         );
     }
 
@@ -3670,7 +3927,7 @@ mod tests {
     }
 
     #[test]
-    fn flash_allow_vendor_rejects_a_v1_12_candidate() {
+    fn flash_allow_vendor_rejects_a_non_vendor_v1_12_digest() {
         let image = flash_image(&PROFILE_V1_12, false);
         let mut backup = image.clone();
         backup[0x1000] ^= 0xFF;
@@ -3682,12 +3939,132 @@ mod tests {
         let mut options = flash_options(&case);
         options.allow_vendor = true;
 
-        let err = flash(&options, session).expect_err("V1.12 is not in this gate");
+        let err = flash(&options, session).expect_err("not the pinned V1.12 vendor digest");
         assert!(matches!(err, Error::Safety { .. }), "got {err}");
         let text = format!("{err}");
         assert!(
-            text.contains("V1.13") && text.contains("not supported"),
-            "the refusal says the gate is V1.13 only: {text}"
+            text.contains("SHA-256") && text.contains(m241_flash::VENDOR_V1_12_SHA256),
+            "the refusal names the pinned V1.12 vendor digest: {text}"
+        );
+    }
+
+    #[test]
+    fn flash_v1_12_patched_backup_writes_and_verifies() {
+        let scratch = crate::testing::Scratch::new("flash-v112-e2e");
+        let backup = flash_image(&PROFILE_V1_12, false);
+        let image = flash_image(&PROFILE_V1_12, true);
+        let case = flash_case(&scratch, &image, &backup);
+        let chip = m241_flash::FakeDa::with_firmware(&backup);
+        let links = da_write::DaWritePorts::new(chip);
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.yes = true;
+        options.da = Some(da_file(scratch.path()));
+
+        flash(&options, session).expect("V1.12 strict write succeeds");
+        let chip = chip.borrow();
+        assert_eq!(chip.recorded_range(), (0, (PROFILE_V1_12.size as u32) - 1));
+        assert_eq!(
+            &chip.memory()[..PROFILE_V1_12.size],
+            &image[..],
+            "flash holds the V1.12 patched image"
+        );
+        let stdout = console.stdout();
+        assert!(stdout.contains("profile     : V1.12"), "got {stdout}");
+        assert!(stdout.contains("verified    : 406312"), "got {stdout}");
+    }
+
+    #[test]
+    fn flash_allow_unverified_rejects_physical_violations_before_opening_a_port() {
+        let scratch = crate::testing::Scratch::new("flash-unverified-blocked");
+        let backup = flash_image(&PROFILE_V1_13, false);
+        for (label, bad) in [
+            ("empty", Vec::new()),
+            ("odd", vec![0xAAu8; 406_619]),
+            (
+                "too-large",
+                vec![0xFFu8; m241_flash::FLASH_CAPACITY_BYTES + 2],
+            ),
+        ] {
+            let image_path = scratch.join(&format!("{label}.bin"));
+            let backup_path = scratch.join(&format!("{label}-bak.bin"));
+            fileio::write(&image_path, &bad).expect("write bad image");
+            fileio::write(&backup_path, &backup).expect("write backup");
+            let console = RecordingConsole::default();
+            let links = FakePorts::empty();
+            let session = Session::new(&links, &console, &AutoConfirm);
+            let mut options = flash_options(&(image_path, backup_path));
+            options.allow_unverified = true;
+            let err = flash(&options, session).expect_err("physical constraint must be refused");
+            assert!(matches!(err, Error::Safety { .. }), "{label}: got {err}");
+        }
+    }
+
+    #[test]
+    fn flash_allow_unverified_dry_run_warns_when_arm_vector_is_absent() {
+        let scratch = crate::testing::Scratch::new("flash-unverified-dry");
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let custom = vec![0x5Au8; 1_024]; // valid even length, no ARM vector
+        let case = flash_case(&scratch, &custom, &backup);
+        let console = RecordingConsole::default();
+        let links = FakePorts::empty();
+        let session = Session::new(&links, &console, &AutoConfirm);
+        let mut options = flash_options(&case);
+        options.allow_unverified = true;
+
+        flash(&options, session).expect("unverified dry-run succeeds");
+        let stdout = console.stdout();
+        assert!(stdout.contains("unverified (1024 bytes)"), "got {stdout}");
+        assert!(stdout.contains("arm vector  : no"), "got {stdout}");
+        assert!(
+            console.stderr().contains("ABSENT"),
+            "warning must highlight missing ARM vector: {}",
+            console.stderr()
+        );
+    }
+
+    #[test]
+    fn flash_allow_unverified_writes_custom_length_and_tolerates_0x5c_restore() {
+        let scratch = crate::testing::Scratch::new("flash-unverified-e2e");
+        let backup = flash_image(&PROFILE_V1_13, false);
+        let mut custom = vec![0x5Au8; 412_000];
+        custom[..4].copy_from_slice(&VECTOR);
+        custom[0x5C..0x60].copy_from_slice(&[0xFF; 4]);
+        let case = flash_case(&scratch, &custom, &backup);
+        let chip = m241_flash::FakeDa::with_firmware(&backup)
+            .restoring_per_unit_bytes([0x91, 0x1B, 0xD4, 0xCF]);
+        let links = da_write::DaWritePorts::new(chip);
+        let chip = links.chip();
+        let console = RecordingConsole::default();
+        let session = Session::new(&links, &console, &AutoConfirm).with_timings(Timings::fast());
+        let mut options = flash_options(&case);
+        options.dry_run = false;
+        options.allow_unverified = true;
+        options.yes = true;
+        options.json = true;
+        options.da = Some(da_file(scratch.path()));
+
+        flash(&options, session).expect("unverified custom write and 0x5C..0x60 restore succeed");
+        {
+            let chip = chip.borrow();
+            assert_eq!(chip.recorded_range(), (0, 411_999));
+            assert_eq!(chip.memory().len(), 412_000);
+        }
+        let document: serde_json::Value =
+            serde_json::from_str(&console.stdout()).expect("one JSON object");
+        assert_eq!(document["acceptance"], "unverified");
+        assert_eq!(document["unverified_image"], true);
+        assert_eq!(document["length"], 412_000);
+        assert_eq!(document["verified"], 412_000);
+        assert_eq!(document["restored_per_unit_bytes"], 4);
+        assert_eq!(document["has_arm_vector"], true);
+        assert!(
+            console.stderr().contains("unverified image"),
+            "warning must appear before port open: {}",
+            console.stderr()
         );
     }
 
@@ -4237,6 +4614,7 @@ mod tests {
             length: FLASH_WRITE_LENGTH,
             packets: plan.packets,
             verified: FLASH_WRITE_LENGTH,
+            restored_per_unit_bytes: 0,
         };
         let console = RecordingConsole::default();
         let options = FlashOptions {
@@ -4246,6 +4624,7 @@ mod tests {
             dry_run: false,
             recover: false,
             allow_vendor: false,
+            allow_unverified: false,
             yes: true,
             assume_brom: false,
             port: String::from("auto"),

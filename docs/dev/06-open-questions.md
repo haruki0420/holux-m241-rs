@@ -9,9 +9,9 @@ always `0x00`, and it is not sent at all when the command is refused. That page
 still says "§3" when it closes the question; the number is the old one, before
 this renumbering.
 
-One question is a decision rather than a measurement: §8 records the options for
-the `--allow-vendor` read-back and leaves the choice to the user. Nothing in the
-code or in the safety gate has been changed while the decision is open.
+One decision recorded below has now been resolved: §8 records the options for
+the `--allow-vendor` read-back; **Option A was adopted by the user on
+2026-11-28**.
 
 ## 1. Where does the log actually live?
 
@@ -119,8 +119,12 @@ Open because: no ezTour KMZ output has been inspected.
 
 ## 8. Should `--allow-vendor`'s read-back skip the firmware-managed per-unit bytes?
 
-This one is waiting on a decision, not a measurement. Nothing has been changed in
-the code or in the safety gate: the merged behaviour is C.
+**Decided (2026-11-28): Option A adopted.** `ReadBackPolicy::AllowPerUnitRestore`
+is used for `--allow-vendor` and `--allow-unverified`, tolerating differences
+strictly inside `FIRMWARE_RESTORED_OFFSETS` (`0x5C..0x60`) and recording
+`restored_per_unit_bytes` on `WriteReport`, while `ReadBackPolicy::Strict`
+remains enforced for strict backup/patch writes and `--recover`. Any difference
+outside `0x5C..0x60` still fails read-back.
 
 What the 2026-11-22 hardware session established
 (`docs/dev/05-verification.md` §1.5):
@@ -215,14 +219,14 @@ be byte-identical to the backup, which `--recover` checks; it skips
   after the 99%-complete write, not after a vendor write; restoring a pre-vendor
   backup over a vendor-written unit has not been run.
 
-### Recommendation
+### Decision (2026-11-28)
 
-**A**, with B rejected and C as the state until the user decides. A is the only
-option that keeps the read-back as a post-write check: every byte the firmware
-does not rewrite is still compared, and only the comparison that cannot pass is
-removed. It is a relaxation of `AGENTS.md` §2.3, so it needs the user's decision;
-establishing the origin of the four restored bytes first would turn A's "what it
-gives up" paragraph into a measured statement.
+**Adopted: Option A** (`ReadBackPolicy::AllowPerUnitRestore` for `--allow-vendor`
+and `--allow-unverified`; `ReadBackPolicy::Strict` for strict backup/patch and
+`--recover`). Previously A was recommended with C as the pre-decision state. B
+was rejected because demoting read-back would leave `--recover` and the
+remaining bytes unverified. The origin of the four restored bytes at
+`0x5C`–`0x5F` remains unestablished; `AGENTS.md` §2.3 records the qualification.
 
 A fourth route exists and is not one of the three. The DA is still in its command
 loop after `0xD5`, so a `0xD6` read **before** `0xD9` would see the programmed
