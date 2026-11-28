@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
+  downloadLog,
   exportLog,
   loadPhotos,
   logPoints,
@@ -8,14 +9,17 @@ import {
   openSample,
   splitError,
   type Bounds,
-  type ExportOutcome,
   type DaySummary,
+  type DownloadLogOutcome,
+  type ExportOutcome,
   type LogExportFormat,
   type LogSummary,
   type MediaItemDto,
   type PhotoDto,
+  type PhotoOptionsDto,
   type PointDto,
 } from "../lib/ipc";
+import { baseName } from "../lib/format";
 
 /** The Log screen's document state. */
 export type LogState =
@@ -30,31 +34,18 @@ const POINT_CHUNK = 50_000;
 /** Milliseconds between two points during playback. */
 const PLAY_INTERVAL_MS = 80;
 
-/** How photos are matched to the track: the §6.1 clock and grouping settings. */
-export type PhotoMatchOptions = {
-  /** Camera clock minus UTC, in minutes (UTC+9 = 540). */
-  cameraOffsetMinutes: number;
-  /** Whole days added to the track before matching (`--utc-offset-days`). */
-  logOffsetDays: number;
-  /** Photos closer than this many metres share a group; 0 disables grouping. */
-  groupDistanceMeters: number;
-};
-
-/** The defaults: no clock correction and no grouping, as ezTour starts. */
-const DEFAULT_PHOTO_OPTIONS: PhotoMatchOptions = {
-  cameraOffsetMinutes: 0,
+/** Default photo matching options. */
+export const DEFAULT_PHOTO_OPTIONS: PhotoOptionsDto = {
+  cameraOffsetMinutes: 540,
   logOffsetDays: 0,
   groupDistanceMeters: 0,
+  maxGapSeconds: 300,
 };
 
 /**
- * Owns the Log screen: the document, its points, the selection, the photos and
- * the export.
- *
- * The Rust side keeps the parsed track; this hook keeps only what the screen
- * renders. Every command is called with the `source` the summary reported, so a
- * late reply from a previous document cannot be mistaken for the current one —
- * `request` is bumped on every open and stale replies are dropped.
+ * Owns the active track document, its points, playback state, loaded photo pins,
+ * device log download, and export. Shared above the tabs so the Geotag tab can
+ * immediately work against the currently loaded track.
  */
 export function useLogDocument() {
   const [state, setState] = useState<LogState>({ kind: "empty" });
@@ -71,11 +62,15 @@ export function useLogDocument() {
   const [photoError, setPhotoError] = useState<string | null>(null);
   const [photoLoading, setPhotoLoading] = useState(false);
   const [photoIndex, setPhotoIndex] = useState<number | null>(null);
-  const [photoOptions, setPhotoOptions] = useState<PhotoMatchOptions>(DEFAULT_PHOTO_OPTIONS);
+  const [photoOptions, setPhotoOptions] = useState<PhotoOptionsDto>(DEFAULT_PHOTO_OPTIONS);
 
-  // A request from the dock to frame one day. The map owns the camera; this is
-  // the one-way message that asks it to move.
   const [fitTarget, setFitTarget] = useState<{ bounds: Bounds; key: number } | null>(null);
+
+  const [downloading, setDownloading] = useState(false);
+  const [downloadOutcome, setDownloadOutcome] = useState<DownloadLogOutcome | null>(null);
+  const [downloadError, setDownloadError] = useState<{ message: string; hint: string | null } | null>(
+    null,
+  );
 
   const [exporting, setExporting] = useState(false);
   const [exportOutcome, setExportOutcome] = useState<ExportOutcome | null>(null);
@@ -105,13 +100,15 @@ export function useLogDocument() {
     setPhotoIndex(null);
     setExportOutcome(null);
     setExportError(null);
+    setDownloadOutcome(null);
+    setDownloadError(null);
   }, []);
 
-  const fetchPoints = useCallback(async (source: string, total: number) => {
+  const fetchPoints = useCallback(async (total: number) => {
     const all: PointDto[] = [];
     for (let from = 0; from < total; from += POINT_CHUNK) {
       const to = Math.min(from + POINT_CHUNK, total);
-      const slice = await logPoints(source, from, to);
+      const slice = await logPoints(from, to);
       all.push(...slice);
     }
     return all;
@@ -124,14 +121,14 @@ export function useLogDocument() {
       reset();
       setState({
         kind: "loading",
-        label: source === "sample" ? "見本" : fileName(source),
+        label: source === "sample" ? "サンプルデータ" : baseName(source),
       });
       try {
         const loaded = source === "sample" ? await openSample() : await openLog(source);
         if (request.current !== ticket) {
           return;
         }
-        const loadedPoints = await fetchPoints(loaded.source, loaded.points);
+        const loadedPoints = await fetchPoints(loaded.points);
         if (request.current !== ticket) {
           return;
         }
@@ -155,8 +152,8 @@ export function useLogDocument() {
       if (trimmed === "") {
         setState({
           kind: "error",
-          message: "ログのパスが空です",
-          hint: "絶対パスを入力するか、ファイルを画面にドロップしてください",
+          message: "ログファイルのパスが指定されていません",
+          hint: "ファイルダイアログから .bin / .gpx / .kml / .kmz を選択してください。",
         });
         return;
       }
@@ -168,6 +165,57 @@ export function useLogDocument() {
   const openSampling = useCallback(() => {
     void openSource("sample");
   }, [openSource]);
+
+  const downloadFromDevice = useCallback(
+    async (port: string, destination: string): Promise<boolean> => {
+      const targetPort = port.trim();
+      const dest = destination.trim();
+      if (targetPort === "") {
+        setDownloadError({
+          message: "シリアルポートが選択されていません",
+          hint: "上部ヘッダーからシリアルポートを選択または手動入力してください。",
+        });
+        return false;
+      }
+      if (dest === "") {
+        return false;
+      }
+
+      const ticket = request.current + 1;
+      request.current = ticket;
+      setDownloading(true);
+      setDownloadError(null);
+      setDownloadOutcome(null);
+      setState({ kind: "loading", label: `${targetPort} から取得中…` });
+      try {
+        const outcome = await downloadLog(targetPort, dest);
+        if (request.current !== ticket) {
+          return false;
+        }
+        const loadedPoints = await fetchPoints(outcome.summary.points);
+        if (request.current !== ticket) {
+          return false;
+        }
+        reset();
+        setPoints(loadedPoints);
+        setSelectedIndex(loadedPoints[0]?.index ?? null);
+        setDownloadOutcome(outcome);
+        setState({ kind: "ready", summary: outcome.summary });
+        return true;
+      } catch (error) {
+        if (request.current !== ticket) {
+          return false;
+        }
+        const split = splitError(error);
+        setDownloadError(split);
+        setState({ kind: "error", message: split.message, hint: split.hint });
+        return false;
+      } finally {
+        setDownloading(false);
+      }
+    },
+    [fetchPoints, reset],
+  );
 
   const close = useCallback(() => {
     request.current += 1;
@@ -202,8 +250,6 @@ export function useLogDocument() {
     setPlaying((current) => !current);
   }, []);
 
-  // Playback advances the cursor one point per tick. It is the only timer on the
-  // screen and it exists only while the operator is playing.
   useEffect(() => {
     if (!playing) {
       return;
@@ -215,14 +261,15 @@ export function useLogDocument() {
     const timer = window.setInterval(() => {
       setSelectedIndex((current) => {
         if (current === null) {
-          return 0;
+          return points[0]?.index ?? 0;
         }
-        const next = current + 1;
-        if (next >= points.length) {
+        const pos = points.findIndex((pt) => pt.index === current);
+        const nextPos = pos < 0 ? 0 : pos + 1;
+        if (nextPos >= points.length) {
           setPlaying(false);
           return points[points.length - 1]?.index ?? current;
         }
-        return next;
+        return points[nextPos]?.index ?? current;
       });
     }, PLAY_INTERVAL_MS);
     return () => window.clearInterval(timer);
@@ -238,8 +285,6 @@ export function useLogDocument() {
       if (photo?.pointIndex != null) {
         setSelectedIndex(photo.pointIndex);
         setPopupIndex(null);
-        // Jumping to a photo has to move the camera even if follow was off;
-        // otherwise the dock would claim a jump the map did not make.
         setFollow(true);
       }
     },
@@ -298,26 +343,20 @@ export function useLogDocument() {
   );
 
   const readPhotoFolder = useCallback(
-    async (directory: string, options?: PhotoMatchOptions): Promise<boolean> => {
+    async (directory: string, options?: PhotoOptionsDto): Promise<boolean> => {
       if (summary === null) {
         return false;
       }
       const trimmed = directory.trim();
       if (trimmed === "") {
-        setPhotoError("パスが空です\n対処: 写真が入っているフォルダの絶対パスを入力してください。");
+        setPhotoError("写真フォルダのパスが空です");
         return false;
       }
       const chosen = options ?? photoOptions;
       setPhotoLoading(true);
       setPhotoError(null);
       try {
-        const loaded = await loadPhotos(
-          summary.source,
-          trimmed,
-          chosen.cameraOffsetMinutes,
-          chosen.logOffsetDays,
-          chosen.groupDistanceMeters,
-        );
+        const loaded = await loadPhotos(trimmed, chosen);
         setPhotoOptions(chosen);
         setPhotos(loaded.photos);
         setMedia(loaded.media);
@@ -341,23 +380,26 @@ export function useLogDocument() {
   );
 
   const writeExport = useCallback(
-    async (format: LogExportFormat, destination: string) => {
+    async (format: LogExportFormat, destination: string): Promise<ExportOutcome | null> => {
       if (summary === null) {
-        return;
+        return null;
       }
-      if (destination.trim() === "") {
+      const dest = destination.trim();
+      if (dest === "") {
         setExportError("保存先が空です");
-        return;
+        return null;
       }
       setExporting(true);
       setExportError(null);
       setExportOutcome(null);
       try {
-        const outcome = await exportLog(summary.source, format, destination.trim());
+        const outcome = await exportLog(dest, format);
         setExportOutcome(outcome);
+        return outcome;
       } catch (error) {
         const { message, hint } = splitError(error);
         setExportError(hint === null ? message : `${message}\n${hint}`);
+        return null;
       } finally {
         setExporting(false);
       }
@@ -398,11 +440,15 @@ export function useLogDocument() {
     fitTarget,
     fitWhole,
     fitDay,
+    downloading,
+    downloadOutcome,
+    downloadError,
     exporting,
     exportOutcome,
     exportError,
     openFile,
     openSample: openSampling,
+    downloadFromDevice,
     close,
     selectPoint,
     openPopup,
@@ -418,9 +464,3 @@ export function useLogDocument() {
 }
 
 export type LogController = ReturnType<typeof useLogDocument>;
-
-/** The last path segment, for the loading line. */
-function fileName(path: string): string {
-  const parts = path.split(/[\\/]/);
-  return parts[parts.length - 1] ?? path;
-}

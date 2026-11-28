@@ -52,7 +52,7 @@ export type ReportDto = {
   unparsedBytes: number;
 };
 
-/** The summary `open_log` returns; it deliberately carries no point list. */
+/** The summary `open_log` / `open_sample` / `download_log` returns. */
 export type LogSummary = {
   source: string;
   name: string;
@@ -74,7 +74,14 @@ export type LogSummary = {
   report: ReportDto;
 };
 
-/** One point as the map and the timeline draw it. */
+/** Outcome of `download_log`. */
+export type DownloadLogOutcome = {
+  destination: string;
+  bytes: number;
+  summary: LogSummary;
+};
+
+/** One point as the map, chart and table draw it. */
 export type PointDto = {
   index: number;
   utc: number | null;
@@ -85,12 +92,20 @@ export type PointDto = {
   waypoint: boolean;
 };
 
+/** Options for `load_photos`. */
+export type PhotoOptionsDto = {
+  cameraOffsetMinutes: number;
+  logOffsetDays: number;
+  groupDistanceMeters: number;
+  maxGapSeconds: number;
+};
+
 /** One photo matched to the track. */
 export type PhotoDto = {
   path: string;
   name: string;
   capturedAt: number | null;
-  timeSource: "exif" | "file" | null;
+  timeSource: "exif" | "file" | string | null;
   pointIndex: number | null;
   lat: number | null;
   lon: number | null;
@@ -119,12 +134,12 @@ export type PhotoLoad = {
 export type LogExportFormat =
   | "gpx"
   | "kml"
-  | "csv"
-  | "nmea"
-  | "json"
   | "kmz"
   | "html"
-  | "rtf";
+  | "rtf"
+  | "csv"
+  | "nmea"
+  | "json";
 
 /** What `export_log` returns. */
 export type ExportOutcome = {
@@ -133,19 +148,121 @@ export type ExportOutcome = {
   bytes: number;
 };
 
+/** Options for `geotag_preview` and `geotag_apply`. */
+export type GeotagOptionsDto = {
+  cameraOffsetMinutes: number;
+  logOffsetDays: number;
+  groupDistanceMeters: number;
+  maxGapSeconds: number;
+  keepBackup: boolean;
+  rewriteDatetimeOriginal: boolean;
+};
+
+/** One item in `geotag_preview`. */
+export type GeotagItemDto = {
+  path: string;
+  name: string;
+  capturedAt: number | null;
+  timeSource: string | null;
+  pointIndex: number | null;
+  lat: number | null;
+  lon: number | null;
+  gapSeconds: number | null;
+  groupId: number | null;
+  thumbnail: string | null;
+  skippedReason: string | null;
+};
+
+/** Result of `geotag_preview`. */
+export type GeotagPreviewDto = {
+  directory: string;
+  matched: number;
+  skipped: number;
+  items: GeotagItemDto[];
+};
+
+/** Result of `geotag_apply`. */
+export type GeotagApplyOutcome = {
+  written: number;
+  skipped: number;
+  backupsCreated: number;
+  errors: string[];
+};
+
+/** Result of `fw_dump`. */
+export type FwDumpOutcome = {
+  destination: string;
+  bytes: number;
+  sha256: string;
+  profile: string | null;
+  wnroPatched: boolean | null;
+};
+
+/** Result of `fw_patch`. */
+export type FwPatchOutcome = {
+  outputPath: string;
+  bytes: number;
+  sha256: string;
+  changedOffsets: number[];
+};
+
+/** Firmware flash mode. */
+export type FlashMode = "strict" | "recover" | "vendor" | "unverified";
+
+/** Result of `fw_inspect`. */
+export type FwInspectDto = {
+  imageBytes: number;
+  imageSha256: string;
+  backupBytes: number | null;
+  backupSha256: string | null;
+  profile: string | null;
+  wnroPatched: boolean | null;
+  diffCount: number | null;
+  outsidePatchOffsets: boolean | null;
+  armVectorOk: boolean;
+  isVendorV113: boolean;
+  isVendorV112: boolean;
+  recommendedMode: FlashMode;
+  warnings: string[];
+};
+
+/** Result of `fw_probe_da`. */
+export type FwProbeDaOutcome = {
+  port: string;
+  flashId: string;
+  flashManufacturer: number;
+  flashDevice: number;
+  flashSizeBytes: number;
+  daVersion: string;
+};
+
+/** Result of `fw_flash`. */
+export type FwFlashOutcome = {
+  port: string;
+  mode: string;
+  bytesWritten: number;
+  imageSha256: string;
+  verifiedReadBack: boolean;
+  restoredPerUnitBytes: number;
+  elapsedMs: number;
+};
+
 /** `list_ports` — read-only enumeration; never opens a port. */
 export function listPorts(): Promise<PortInfo[]> {
   return invoke<PortInfo[]>("list_ports");
 }
 
-/**
- * `device_info` — the one IPC round trip that touches hardware.
- *
- * The Rust side opens the port at the NMEA baud and sends only read requests.
- * Nothing in this module can write, erase or change a setting.
- */
+/** `device_info` — read-only device probe at NMEA baud. */
 export function readDeviceInfo(port: string): Promise<DeviceInfo> {
   return invoke<DeviceInfo>("device_info", { port });
+}
+
+/** `download_log` — fetch binary track log from device to destination file. */
+export function downloadLog(
+  port: string,
+  destination: string,
+): Promise<DownloadLogOutcome> {
+  return invoke<DownloadLogOutcome>("download_log", { port, destination });
 }
 
 /** `open_log` — read a saved document from an absolute path. */
@@ -158,47 +275,100 @@ export function openSample(): Promise<LogSummary> {
   return invoke<LogSummary>("open_sample");
 }
 
-/** `log_points` — the `[from, to)` slice of the loaded track. */
-export function logPoints(
-  path: string,
-  from: number,
-  to: number,
-): Promise<PointDto[]> {
-  return invoke<PointDto[]>("log_points", { path, from, to });
+/** `log_points` — the `[from, to)` slice of the currently loaded track. */
+export function logPoints(from: number, to: number): Promise<PointDto[]> {
+  return invoke<PointDto[]>("log_points", { from, to });
 }
 
 /** `load_photos` — read a folder and match its photos to the loaded track. */
 export function loadPhotos(
-  path: string,
   directory: string,
-  cameraOffsetMinutes: number,
-  logOffsetDays: number,
-  groupDistanceMeters: number,
+  options: PhotoOptionsDto,
 ): Promise<PhotoLoad> {
-  return invoke<PhotoLoad>("load_photos", {
-    path,
-    directory,
-    cameraOffsetMinutes,
-    logOffsetDays,
-    groupDistanceMeters,
+  return invoke<PhotoLoad>("load_photos", { directory, options });
+}
+
+/** `export_log` — write the currently loaded track to an absolute destination. */
+export function exportLog(
+  destination: string,
+  format: string,
+): Promise<ExportOutcome> {
+  return invoke<ExportOutcome>("export_log", { destination, format });
+}
+
+/** `geotag_preview` — preview photo geotagging against the loaded track. */
+export function geotagPreview(
+  directory: string,
+  options: GeotagOptionsDto,
+): Promise<GeotagPreviewDto> {
+  return invoke<GeotagPreviewDto>("geotag_preview", { directory, options });
+}
+
+/** `geotag_apply` — write GPS EXIF tags to matched photos. */
+export function geotagApply(
+  directory: string,
+  options: GeotagOptionsDto,
+): Promise<GeotagApplyOutcome> {
+  return invoke<GeotagApplyOutcome>("geotag_apply", { directory, options });
+}
+
+/** `fw_dump` — read device firmware backup to destination file. */
+export function fwDump(
+  port: string,
+  destination: string,
+  assumeBrom: boolean,
+): Promise<FwDumpOutcome> {
+  return invoke<FwDumpOutcome>("fw_dump", { port, destination, assumeBrom });
+}
+
+/** `fw_patch` — apply WNRO rollover patch to backup firmware image. */
+export function fwPatch(
+  inputPath: string,
+  outputPath: string,
+): Promise<FwPatchOutcome> {
+  return invoke<FwPatchOutcome>("fw_patch", { inputPath, outputPath });
+}
+
+/** `fw_inspect` — inspect firmware image and optional backup before flashing. */
+export function fwInspect(
+  imagePath: string,
+  backupPath: string | null,
+): Promise<FwInspectDto> {
+  return invoke<FwInspectDto>("fw_inspect", { imagePath, backupPath });
+}
+
+/** `fw_probe_da` — verify BootROM + Download Agent handshake with PROBE confirmation. */
+export function fwProbeDa(
+  port: string,
+  daPath: string,
+  assumeBrom: boolean,
+  confirmWord: string,
+): Promise<FwProbeDaOutcome> {
+  return invoke<FwProbeDaOutcome>("fw_probe_da", {
+    port,
+    daPath,
+    assumeBrom,
+    confirmWord,
   });
 }
 
-/** `export_log` — write the loaded track to an absolute destination. */
-export function exportLog(
-  path: string,
-  format: LogExportFormat,
-  destination: string,
-): Promise<ExportOutcome> {
-  return invoke<ExportOutcome>("export_log", { path, format, destination });
+/** `fw_flash` — write firmware image to device flash with WRITE confirmation. */
+export function fwFlash(params: {
+  port: string;
+  imagePath: string;
+  backupPath: string;
+  daPath: string;
+  mode: FlashMode;
+  assumeBrom: boolean;
+  confirmWord: string;
+}): Promise<FwFlashOutcome> {
+  return invoke<FwFlashOutcome>("fw_flash", params);
 }
 
 /**
  * Split the two-line error the Rust side returns.
  *
  * Line 1 is the device's or OS's own message; line 2 is `対処: <next action>`.
- * The screen shows them in different places because they answer different
- * questions ("what happened" vs "what do I do").
  */
 export function splitError(raw: unknown): { message: string; hint: string | null } {
   const text =

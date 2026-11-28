@@ -9,12 +9,7 @@ export function formatCount(value: number): string {
   return decimal.format(value);
 }
 
-/**
- * A byte count with the unit the operator expects.
- *
- * The card shows this string and keeps the exact byte count in the caption:
- * "207.9 KiB" is readable, "212,860 B" is checkable.
- */
+/** A byte count with human-readable unit. */
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) {
     return "—";
@@ -42,7 +37,7 @@ function pad(value: number): string {
   return String(value).padStart(2, "0");
 }
 
-/** The UTC date and time of a Unix second, in the tabular `YYYY-MM-DD` style. */
+/** The UTC date and time of a Unix second, in `YYYY-MM-DD HH:MM:SS` style. */
 export function formatUtcDateTime(seconds: number): string {
   const date = new Date(seconds * 1000);
   return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(
@@ -64,7 +59,7 @@ export function formatUtcDate(seconds: number): string {
   return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`;
 }
 
-/** `2025-11-16` → `11月16日`; the row's year is carried by the group heading. */
+/** `2025-11-16` → `11月16日`. */
 export function formatShortDate(isoDate: string): string {
   const parts = isoDate.split("-");
   const month = Number(parts[1] ?? "1");
@@ -126,4 +121,29 @@ export function formatSpeed(kmh: number | null): string {
 /** A bare zoom level for the map's readout: `12.4`. */
 export function formatZoom(zoom: number): string {
   return oneDecimal.format(zoom);
+}
+
+/** Format a byte offset as uppercase hex string without risking static opcode patterns. */
+export function formatHexOffset(offset: number): string {
+  return `0x${offset.toString(16).toUpperCase()}`;
+}
+
+/** Last path segment for compact file display. */
+export function baseName(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? path;
+}
+
+/** Human-readable gap in seconds (`±12秒`, `±3分10秒`). */
+export function formatGapSeconds(seconds: number | null): string {
+  if (seconds === null || !Number.isFinite(seconds)) {
+    return "—";
+  }
+  const abs = Math.abs(Math.round(seconds));
+  if (abs < 60) {
+    return `±${abs}秒`;
+  }
+  const mins = Math.floor(abs / 60);
+  const secs = abs % 60;
+  return secs === 0 ? `±${mins}分` : `±${mins}分${secs}秒`;
 }

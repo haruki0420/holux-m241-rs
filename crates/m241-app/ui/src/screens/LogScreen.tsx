@@ -1,7 +1,10 @@
-import { FolderOpen, TriangleAlert } from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
+import { FolderOpen, Sparkles, TriangleAlert, Usb } from "lucide-react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 
+import { DadsBanner } from "../components/DadsBanner";
+import type { DeviceProbeController } from "../hooks/useDeviceProbe";
 import type { LogController } from "../hooks/useLogDocument";
+import { pickOpenFile, pickSaveFile } from "../lib/dialog";
 import { Dock } from "./log/Dock";
 import { LogToolbar } from "./log/LogToolbar";
 import { MapCanvas } from "./log/MapCanvas";
@@ -10,16 +13,20 @@ import { Timeline } from "./log/Timeline";
 const TILES_STORAGE_KEY = "m241.log.tiles";
 
 /**
- * The Log screen.
- *
- * The map is the screen; the right dock is the five panels that answer questions
- * about it (when, how fast, where the photos were taken). Before a document is
- * open the whole area is the invitation to open one, because five empty panels
- * would be five empty panels.
+ * Tab 1: ログ (Log viewer, device download, MapLibre map, KPI summary, day table,
+ * parser diagnostics disclosure, speed/altitude chart, track points table, export).
  */
-export function LogScreen({ log }: { log: LogController }) {
-  // Tiles are on by default (the README records the network use). The switch is
-  // persisted so an offline operator turns them off once.
+export function LogScreen({
+  log,
+  device,
+  onNavigateGeotag,
+  onNavigateFirmware,
+}: {
+  log: LogController;
+  device: DeviceProbeController;
+  onNavigateGeotag: () => void;
+  onNavigateFirmware: () => void;
+}) {
   const [tiles, setTiles] = useState(() => {
     try {
       return window.localStorage.getItem(TILES_STORAGE_KEY) !== "off";
@@ -27,18 +34,17 @@ export function LogScreen({ log }: { log: LogController }) {
       return true;
     }
   });
+  const [drawerOpen, setDrawerOpen] = useState(true);
   const [dragging, setDragging] = useState(false);
 
   useEffect(() => {
     try {
       window.localStorage.setItem(TILES_STORAGE_KEY, tiles ? "on" : "off");
     } catch {
-      // A webview without storage keeps the switch for this run only.
+      // Ignore storage failures in restricted webviews.
     }
   }, [tiles]);
 
-  // Dropping a file anywhere on the screen opens it. The Tauri webview owns the
-  // drag event; a browser preview has no bridge and simply gets no drop target.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
@@ -63,7 +69,7 @@ export function LogScreen({ log }: { log: LogController }) {
           }
         });
       } catch {
-        // Running outside Tauri (the browser preview); no drop target.
+        // Ignore when running outside Tauri webview.
       }
     })();
     return () => {
@@ -72,10 +78,47 @@ export function LogScreen({ log }: { log: LogController }) {
     };
   }, [log.openFile]);
 
+  const handleOpenFileDialog = useCallback(async () => {
+    const selected = await pickOpenFile({
+      title: "トラックログを開く",
+      filters: [
+        { name: "ログファイル", extensions: ["bin", "gpx", "kml", "kmz"] },
+        { name: "すべて", extensions: ["*"] },
+      ],
+    });
+    if (selected) {
+      log.openFile(selected);
+    }
+  }, [log]);
+
+  const handleDownloadDevice = useCallback(async () => {
+    if (device.activePort === "") {
+      await log.downloadFromDevice("", "m241_log.bin");
+      return;
+    }
+    const stamp = new Date().toISOString().slice(0, 10);
+    const destination = await pickSaveFile({
+      title: "M-241 から取得したログの保存先を選択",
+      defaultPath: `m241_log_${stamp}.bin`,
+      filters: [{ name: "M-241 バイナリログ (.bin)", extensions: ["bin"] }],
+    });
+    if (destination) {
+      await log.downloadFromDevice(device.activePort, destination);
+    }
+  }, [device.activePort, log]);
+
   const state = log.state;
 
   if (state.kind === "empty") {
-    return <LogStart log={log} dragging={dragging} />;
+    return (
+      <LogStart
+        log={log}
+        activePort={device.activePort}
+        dragging={dragging}
+        onDownloadDevice={() => void handleDownloadDevice()}
+        onOpenFileDialog={() => void handleOpenFileDialog()}
+      />
+    );
   }
   if (state.kind === "loading") {
     return <LogLoading label={state.label} />;
@@ -87,6 +130,8 @@ export function LogScreen({ log }: { log: LogController }) {
         message={state.message}
         hint={state.hint}
         dragging={dragging}
+        onDownloadDevice={() => void handleDownloadDevice()}
+        onOpenFileDialog={() => void handleOpenFileDialog()}
       />
     );
   }
@@ -108,6 +153,18 @@ export function LogScreen({ log }: { log: LogController }) {
           onClosePopup={log.closePopup}
           onToggleFollow={log.toggleFollow}
         />
+
+        <LogToolbar
+          log={log}
+          activePort={device.activePort}
+          tiles={tiles}
+          drawerOpen={drawerOpen}
+          onToggleTiles={() => setTiles((on) => !on)}
+          onToggleDrawer={() => setDrawerOpen((open) => !open)}
+          onDownloadDevice={() => void handleDownloadDevice()}
+          onOpenFileDialog={() => void handleOpenFileDialog()}
+        />
+
         <Timeline
           points={log.points}
           selectedIndex={log.selectedIndex}
@@ -115,86 +172,136 @@ export function LogScreen({ log }: { log: LogController }) {
           onSeek={log.seek}
           onTogglePlay={log.togglePlaying}
         />
-        {/* The toolbar floats over the map instead of taking a band of its
-            own: the map is the screen, and every row above it is chrome over
-            the same surface. Sits at z-popover (30), above .map-popup (20) and
-            below .z-header (40), so ExportMenu is never trapped under a popup. */}
-        <div className="absolute inset-x-0 top-14 z-popover">
-          <LogToolbar log={log} tiles={tiles} onToggleTiles={() => setTiles((on) => !on)} />
-        </div>
       </div>
-      <Dock log={log} />
+
+      {drawerOpen ? (
+        <Dock
+          log={log}
+          onNavigateGeotag={onNavigateGeotag}
+          onNavigateFirmware={onNavigateFirmware}
+        />
+      ) : null}
     </div>
   );
 }
 
-/** The invitation shown before a document is open. */
-function LogStart({ log, dragging }: { log: LogController; dragging: boolean }) {
-  const [path, setPath] = useState("");
-  const open = () => {
-    log.openFile(path);
-  };
+function LogStart({
+  log,
+  activePort,
+  dragging,
+  onDownloadDevice,
+  onOpenFileDialog,
+}: {
+  log: LogController;
+  activePort: string;
+  dragging: boolean;
+  onDownloadDevice: () => void;
+  onOpenFileDialog: () => void;
+}) {
+  const [manualPath, setManualPath] = useState("");
 
   return (
-    <div className="relative flex min-h-0 flex-1 flex-col overflow-y-auto pt-14">
+    <div className="relative flex min-h-0 flex-1 flex-col overflow-y-auto bg-white">
       <div aria-hidden="true" className="contour absolute inset-0" />
-      <div className="relative mx-auto flex w-full max-w-4xl flex-1 flex-col justify-center gap-10 px-10 py-10 lg:flex-row lg:items-center lg:justify-between lg:gap-16">
-        <div className="w-full max-w-md">
-          <h1 className="text-xl font-medium text-ink">ログ</h1>
-          <p className="mt-2 text-sm text-ink-2">
-            吸い出した記録を開き、地図で日付・速度・写真を確かめます
-          </p>
+      <div className="relative mx-auto flex w-full max-w-4xl flex-1 flex-col justify-center gap-8 px-8 py-10 lg:flex-row lg:items-center lg:justify-between">
+        <div className="w-full max-w-lg space-y-5 rounded-lg border border-[var(--dads-border-control)] bg-white p-6 shadow-md">
+          <div>
+            <h1 className="text-[20px] font-bold text-[var(--dads-ink)]">トラックログ</h1>
+            <p className="mt-1 text-[13px] leading-relaxed text-[var(--dads-ink-sub)]">
+              M-241 本体から直接ログを取得するか、保存済みのログファイルを開いて軌跡・日時・速度・診断情報を確認します。
+            </p>
+          </div>
 
-          <div className="mt-8">
-            <label htmlFor="log-path" className="text-xs text-ink-3">
-              ログファイル
+          <div className="flex flex-wrap gap-2.5">
+            <button
+              type="button"
+              className="dads-btn"
+              data-variant="solid-fill"
+              data-size="md"
+              onClick={onDownloadDevice}
+              disabled={log.downloading}
+            >
+              <Usb size={16} strokeWidth={2} aria-hidden="true" />
+              <span>本体から取得</span>
+            </button>
+            <button
+              type="button"
+              className="dads-btn"
+              data-variant="outline"
+              data-size="md"
+              onClick={onOpenFileDialog}
+            >
+              <FolderOpen size={16} strokeWidth={2} aria-hidden="true" />
+              <span>ファイルを開く</span>
+            </button>
+            <button
+              type="button"
+              className="dads-btn"
+              data-variant="neutral"
+              data-size="md"
+              onClick={log.openSample}
+            >
+              <Sparkles size={16} strokeWidth={2} aria-hidden="true" />
+              <span>サンプルを開く</span>
+            </button>
+          </div>
+
+          {activePort === "" ? (
+            <p className="text-[12px] text-[var(--dads-ink-meta)]">
+              ※ 本体から取得する場合は、上部ヘッダーでシリアルポートを選択または手動入力してください。
+            </p>
+          ) : (
+            <p className="text-[12px] text-[var(--dads-ink-sub)]">
+              現在の取得対象ポート: <span className="mono font-bold">{activePort}</span>
+            </p>
+          )}
+
+          <div className="border-t border-[var(--dads-border-divider)] pt-4 space-y-1.5">
+            <label htmlFor="log-manual-path" className="block text-[12px] font-bold text-[var(--dads-ink-sub)]">
+              パスを直接入力して開く（またはウィンドウへドロップ）
             </label>
-            <div className="mt-1 flex gap-2">
+            <div className="flex gap-2">
               <input
-                id="log-path"
-                className="field"
-                placeholder="/home/user/log.bin"
-                value={path}
-                onChange={(event) => setPath(event.target.value)}
+                id="log-manual-path"
+                className="dads-field mono min-w-0 flex-1"
+                placeholder="/path/to/track.bin"
+                value={manualPath}
+                onChange={(event) => setManualPath(event.target.value)}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    open();
+                  if (event.key === "Enter" && manualPath.trim() !== "") {
+                    log.openFile(manualPath);
                   }
                 }}
               />
               <button
                 type="button"
-                className="btn btn-primary shrink-0"
-                onClick={open}
-                disabled={path.trim() === ""}
+                className="dads-btn shrink-0"
+                data-variant="outline"
+                data-size="sm"
+                disabled={manualPath.trim() === ""}
+                onClick={() => log.openFile(manualPath)}
               >
-                <FolderOpen size={16} strokeWidth={1.5} aria-hidden="true" />
                 開く
               </button>
             </div>
-            <p className="mt-2 text-xs text-ink-3">
-              .bin / .gpx / .kml / .kmz · この画面にドロップしても開けます
-            </p>
             {dragging ? (
-              <p className="mt-2 text-xs font-medium text-accent">離すと開きます</p>
+              <DadsBanner type="info" className="mt-2">
+                ファイルを離すと読み込みます。
+              </DadsBanner>
             ) : null}
-
-            <button type="button" className="btn-quiet -ml-2 mt-3" onClick={log.openSample}>
-              見本で試す
-            </button>
           </div>
         </div>
 
-        <aside className="w-full max-w-xs shrink-0 border-t border-hair pt-5 lg:border-l lg:border-t-0 lg:py-1 lg:pl-8">
-          <dl className="flex flex-col gap-4">
-            <Fact label="対応形式">
-              <span className="mono">.bin / .gpx / .kml / .kmz</span>
-            </Fact>
-            <Fact label="読み取り専用">記録を書き換えません</Fact>
-            <Fact label="地図タイル">
-              既定でオン。オフにするとタイルを要求せず、軌跡だけを描きます
-            </Fact>
-          </dl>
+        <aside className="w-full max-w-xs shrink-0 space-y-4 rounded-lg border border-[var(--dads-border-divider)] bg-white/95 p-5">
+          <Fact label="対応形式">
+            <span className="mono font-bold">.bin / .gpx / .kml / .kmz</span>
+          </Fact>
+          <Fact label="書き出し形式">
+            <span className="mono">GPX / KML / KMZ / HTML / RTF / CSV / NMEA / JSON</span>
+          </Fact>
+          <Fact label="地図タイル">
+            OpenStreetMap タイルは設定スイッチでいつでもオフにできます（オフ時はネットワーク通信なし）。
+          </Fact>
         </aside>
       </div>
     </div>
@@ -204,72 +311,101 @@ function LogStart({ log, dragging }: { log: LogController; dragging: boolean }) 
 function Fact({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div>
-      <dt className="text-xs text-ink-3">{label}</dt>
-      <dd className="mt-1 text-sm text-ink-2">{children}</dd>
+      <dt className="text-[12px] font-bold text-[var(--dads-ink-sub)]">{label}</dt>
+      <dd className="mt-1 text-[13px] text-[var(--dads-ink)]">{children}</dd>
     </div>
   );
 }
 
-/** The quiet loading state: a label and a static trail, no loop. */
 function LogLoading({ label }: { label: string }) {
   return (
     <div
-      className="relative flex min-h-0 flex-1 flex-col items-center justify-center gap-3 pt-14"
+      className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 bg-white"
       role="status"
       aria-busy="true"
     >
-      <div aria-hidden="true" className="flex w-40 items-center gap-1">
-        <span className="h-px flex-1 bg-hair" />
-        <span className="h-0.5 w-10 bg-accent" />
-        <span className="h-px flex-1 bg-hair" />
+      <div aria-hidden="true" className="flex w-44 items-center gap-1">
+        <span className="h-px flex-1 bg-[var(--dads-border-divider)]" />
+        <span className="h-1 w-12 rounded-full bg-[var(--dads-blue)]" />
+        <span className="h-px flex-1 bg-[var(--dads-border-divider)]" />
       </div>
-      <p className="text-sm text-ink">読み込み中</p>
-      <p className="mono max-w-xs truncate text-xs text-ink-3" title={label}>
+      <p className="text-[14px] font-bold text-[var(--dads-ink)]">読み込み中…</p>
+      <p className="mono max-w-sm truncate text-[12px] text-[var(--dads-ink-sub)]" title={label}>
         {label}
       </p>
     </div>
   );
 }
 
-/** The failure state: what happened, what to do, and the way back. */
 function LogFailure({
   log,
   message,
   hint,
   dragging,
+  onDownloadDevice,
+  onOpenFileDialog,
 }: {
   log: LogController;
   message: string;
   hint: string | null;
   dragging: boolean;
+  onDownloadDevice: () => void;
+  onOpenFileDialog: () => void;
 }) {
   return (
-    <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-y-auto px-8 pb-10 pt-[96px]">
+    <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-y-auto bg-white px-6 py-10">
       <div aria-hidden="true" className="contour absolute inset-0" />
-      <div className="relative w-full max-w-md" role="alert">
-        <p className="flex items-center gap-2 text-sm font-medium text-ink">
-          <TriangleAlert size={16} strokeWidth={1.5} aria-hidden="true" className="text-error" />
-          ログを開けません
-        </p>
-        <div className="mt-3 rounded-control bg-error-wash p-3">
-          <p className="text-xs text-ink-3">読み込みの結果</p>
-          <p className="mt-1 text-sm break-words text-ink">{message}</p>
+      <div className="relative w-full max-w-lg space-y-4 rounded-lg border-2 border-[var(--dads-ink)] bg-white p-6 shadow-lg">
+        <div className="flex items-center gap-2 text-[16px] font-bold text-[var(--dads-error)]">
+          <TriangleAlert size={18} strokeWidth={2} aria-hidden="true" />
+          <span>ログを読み込めませんでした</span>
         </div>
-        {hint === null ? null : (
-          <div className="mt-3">
-            <p className="text-xs text-ink-3">対処</p>
-            <p className="mt-1 text-sm text-ink-2">{hint}</p>
-          </div>
-        )}
+
+        <DadsBanner type="error" title="エラー詳細">
+          <p className="font-bold">{message}</p>
+          {hint ? <p className="mt-1 text-[var(--dads-ink)]">{hint}</p> : null}
+        </DadsBanner>
+
         {dragging ? (
-          <p className="mt-3 text-xs font-medium text-accent">離すと開きます</p>
+          <DadsBanner type="info">ファイルを離すと読み込みます。</DadsBanner>
         ) : null}
-        <div className="mt-5 flex gap-2">
-          <button type="button" className="btn btn-primary" onClick={log.close}>
-            別のログを開く
+
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            className="dads-btn"
+            data-variant="solid-fill"
+            data-size="sm"
+            onClick={onDownloadDevice}
+          >
+            本体から再取得
           </button>
-          <button type="button" className="btn-quiet" onClick={log.openSample}>
-            見本で試す
+          <button
+            type="button"
+            className="dads-btn"
+            data-variant="outline"
+            data-size="sm"
+            onClick={onOpenFileDialog}
+          >
+            別のファイルを開く
+          </button>
+          <button
+            type="button"
+            className="dads-btn"
+            data-variant="neutral"
+            data-size="sm"
+            onClick={log.openSample}
+          >
+            サンプルを開く
+          </button>
+          <button
+            type="button"
+            className="dads-btn"
+            data-variant="text"
+            data-size="sm"
+            onClick={log.close}
+          >
+            最初に戻る
           </button>
         </div>
       </div>

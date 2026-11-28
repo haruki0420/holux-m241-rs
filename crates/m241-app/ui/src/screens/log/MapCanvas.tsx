@@ -28,47 +28,32 @@ import {
 } from "../../lib/format";
 import type { Bounds, LogSummary, PhotoDto, PointDto } from "../../lib/ipc";
 
-/** OSM's raster tile endpoint, used only while the tile switch is on. */
+/** OSM raster tile endpoint, used only when the tile switch is on. */
 const OSM_TILES = ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"];
-/** The mandatory OSM credit; the map shows it in MapLibre's attribution control. */
 const OSM_ATTRIBUTION =
   '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
 
-/** Cartographic tokens, matching styles.css. MapLibre paint needs literals. */
-const ACCENT = "#145f75";
-const INK = "#171a1c";
+/** DADS palette tokens for MapLibre paint expressions. */
+const DADS_BLUE = "#1e4e8c";
+const DADS_SUCCESS = "#197a4b";
+const DADS_ERROR = "#ec0000";
+const DADS_WARNING = "#c77700";
 const WHITE = "#ffffff";
 
-/** How close, in screen pixels, a click or hover counts as "on the track". */
 const HIT_PIXELS = 20;
+const FIT_PADDING = { top: 72, bottom: 80, left: 56, right: 56 };
 
-/**
- * Room for the chrome that floats over the map: the 56 px header, the 48 px
- * toolbar below it, and the timeline at the bottom. `fitBounds` fits the track
- * into the uncovered rectangle, not the whole canvas, so nothing is framed
- * under the header.
- */
-const FIT_PADDING = { top: 120, bottom: 72, left: 56, right: 56 };
-
-/**
- * A quiet basemap: the track is the only saturated element on the map.
- *
- * OSM's default raster is full colour — pink motorways, green parks, coloured
- * POI icons — and at 5 px the accent track loses the "one light element"
- * contest (DESIGN.md: the map is a pale surface). Desaturating almost to grey
- * and capping the brightness keeps roads and labels readable while leaving the
- * accent as the only colour that means something.
- */
 const RASTER_PAINT = {
   "raster-opacity": 0.9,
-  "raster-saturation": -0.7,
-  "raster-brightness-max": 0.85,
+  "raster-saturation": -0.5,
+  "raster-brightness-max": 0.9,
 } as const;
 
 type Basemap = { readonly tiles: boolean };
 
-/** The map's empty style: either a raster OSM basemap or no network at all. */
-function baseStyle({ tiles }: Basemap): NonNullable<Parameters<maplibregl.Map["setStyle"]>[0]> {
+function baseStyle({
+  tiles,
+}: Basemap): NonNullable<Parameters<maplibregl.Map["setStyle"]>[0]> {
   return {
     version: 8,
     sources: tiles
@@ -104,7 +89,6 @@ function baseStyle({ tiles }: Basemap): NonNullable<Parameters<maplibregl.Map["s
 
 type Positioned = PointDto & { lat: number; lon: number };
 
-/** A point that carries a position. The locator and the map both need one. */
 function isPositioned(point: PointDto): point is Positioned {
   return point.lat !== null && point.lon !== null;
 }
@@ -113,7 +97,9 @@ type Collection = {
   type: "FeatureCollection";
   features: Array<{
     type: "Feature";
-    geometry: { type: "LineString"; coordinates: Position[] } | { type: "Point"; coordinates: Position };
+    geometry:
+      | { type: "LineString"; coordinates: Position[] }
+      | { type: "Point"; coordinates: Position };
     properties: Record<string, string | number>;
   }>;
 };
@@ -138,14 +124,16 @@ function dotCollection(
 ): Collection {
   return {
     type: "FeatureCollection",
-    features: entries.filter((entry) => isPositioned(entry.point)).map((entry) => ({
-      type: "Feature",
-      geometry: {
-        type: "Point",
-        coordinates: [entry.point.lon as number, entry.point.lat as number] as Position,
-      },
-      properties: { role: entry.role ?? "point" },
-    })),
+    features: entries
+      .filter((entry) => isPositioned(entry.point))
+      .map((entry) => ({
+        type: "Feature",
+        geometry: {
+          type: "Point",
+          coordinates: [entry.point.lon as number, entry.point.lat as number] as Position,
+        },
+        properties: { role: entry.role ?? "point" },
+      })),
   };
 }
 
@@ -216,10 +204,6 @@ export function MapCanvas({
     pendingPopupFocusRef.current = popupPoint !== null;
   }, [popupPoint]);
 
-  // A dialog that opens without moving focus leaves the keyboard on the map
-  // behind it. The popup is positioned by `popupAt` one render later, so the
-  // focus waits for the first placement; `pendingPopupFocusRef` keeps later
-  // placements (every map move) from stealing the caret back.
   useEffect(() => {
     if (pendingPopupFocusRef.current && popupAt !== null) {
       pendingPopupFocusRef.current = false;
@@ -230,7 +214,7 @@ export function MapCanvas({
   const photoForPoint = useMemo(() => {
     const map = new Map<number, PhotoDto>();
     for (const photo of photos) {
-      if (photo.pointIndex !== null && photo.thumbnail !== null) {
+      if (photo.pointIndex !== null) {
         map.set(photo.pointIndex, photo);
       }
     }
@@ -255,9 +239,6 @@ export function MapCanvas({
     [summary.bounds],
   );
 
-  // Create the map once. The style is built from the initial tile switch; later
-  // changes add or remove the raster source instead of rebuilding the style,
-  // which would drop the track layers.
   useEffect(() => {
     const container = containerRef.current;
     if (container === null) {
@@ -268,10 +249,13 @@ export function MapCanvas({
       map = new maplibregl.Map({
         container,
         style: baseStyle({ tiles }),
-        center: summary.bounds === null ? [139.767125, 35.681236] : [
-          (summary.bounds.west + summary.bounds.east) / 2,
-          (summary.bounds.south + summary.bounds.north) / 2,
-        ],
+        center:
+          summary.bounds === null
+            ? [139.767125, 35.681236]
+            : [
+                (summary.bounds.west + summary.bounds.east) / 2,
+                (summary.bounds.south + summary.bounds.north) / 2,
+              ],
         zoom: 12,
         maxZoom: 19,
         minZoom: 1,
@@ -285,15 +269,16 @@ export function MapCanvas({
       return;
     }
     mapRef.current = map;
-    // The wrapper is the one keyboard surface (`role="application"` with the key
-    // help in its label). MapLibre's canvas is a second tab stop with no visible
-    // outline, so it is removed from the tab order and from the accessibility
-    // tree; the wrapper speaks for the map.
     map.getCanvas().tabIndex = -1;
     map.getCanvas().setAttribute("aria-hidden", "true");
-    map.addControl(new maplibregl.ScaleControl({ maxWidth: 110, unit: "metric" }), "bottom-right");
-    // Not compact: the OSM credit has to be readable without a click.
-    map.addControl(new maplibregl.AttributionControl({ compact: false }), "bottom-right");
+    map.addControl(
+      new maplibregl.ScaleControl({ maxWidth: 110, unit: "metric" }),
+      "bottom-right",
+    );
+    map.addControl(
+      new maplibregl.AttributionControl({ compact: false }),
+      "bottom-right",
+    );
 
     map.on("load", () => {
       map.addSource("track", {
@@ -305,39 +290,29 @@ export function MapCanvas({
       map.addSource("ends", { type: "geojson", data: emptyCollection() as never });
       map.addSource("selected", { type: "geojson", data: emptyCollection() as never });
 
-      const add = (layer: Parameters<maplibregl.Map["addLayer"]>[0]) => map.addLayer(layer);
+      const add = (layer: Parameters<maplibregl.Map["addLayer"]>[0]) =>
+        map.addLayer(layer);
       add({
         id: "track-casing",
         type: "line",
         source: "track",
         layout: { "line-join": "round", "line-cap": "round" },
-        paint: { "line-color": WHITE, "line-width": 7, "line-opacity": 0.9 },
+        paint: { "line-color": WHITE, "line-width": 7, "line-opacity": 0.92 },
       });
       add({
         id: "track-line",
         type: "line",
         source: "track",
         layout: { "line-join": "round", "line-cap": "round" },
-        paint: { "line-color": ACCENT, "line-width": 5, "line-opacity": 0.94 },
-      });
-      add({
-        id: "photo-dot",
-        type: "circle",
-        source: "photos",
-        paint: {
-          "circle-radius": 5,
-          "circle-color": WHITE,
-          "circle-stroke-color": ACCENT,
-          "circle-stroke-width": 2,
-        },
+        paint: { "line-color": DADS_BLUE, "line-width": 4.2, "line-opacity": 0.95 },
       });
       add({
         id: "waypoint-dot",
         type: "circle",
         source: "waypoints",
         paint: {
-          "circle-radius": 4,
-          "circle-color": ACCENT,
+          "circle-radius": 4.5,
+          "circle-color": DADS_BLUE,
           "circle-stroke-color": WHITE,
           "circle-stroke-width": 1.5,
         },
@@ -347,10 +322,21 @@ export function MapCanvas({
         type: "circle",
         source: "ends",
         paint: {
-          "circle-radius": 4,
-          "circle-color": ["match", ["get", "role"], "start", INK, ACCENT],
+          "circle-radius": 5.5,
+          "circle-color": ["match", ["get", "role"], "start", DADS_SUCCESS, DADS_ERROR],
           "circle-stroke-color": WHITE,
-          "circle-stroke-width": 1.5,
+          "circle-stroke-width": 2,
+        },
+      });
+      add({
+        id: "photo-dot",
+        type: "circle",
+        source: "photos",
+        paint: {
+          "circle-radius": 6.5,
+          "circle-color": DADS_WARNING,
+          "circle-stroke-color": WHITE,
+          "circle-stroke-width": 2,
         },
       });
       add({
@@ -358,8 +344,8 @@ export function MapCanvas({
         type: "circle",
         source: "selected",
         paint: {
-          "circle-radius": 6.5,
-          "circle-color": ACCENT,
+          "circle-radius": 7,
+          "circle-color": DADS_BLUE,
           "circle-stroke-color": WHITE,
           "circle-stroke-width": 2.5,
         },
@@ -414,16 +400,8 @@ export function MapCanvas({
       mapRef.current = null;
       setReady(false);
     };
-    // The map is created once per document; the effects below handle the data.
   }, [summary.source]);
 
-  // Fit the whole track once the style has loaded, then leave the camera alone.
-  //
-  // The first selection (point 0, set when the document opens) also fires the
-  // follow effect below. If it won, it would ease the camera to point 0 at zoom
-  // 14 and the fit would be thrown away — the review saw the second session
-  // clipped off the top. The fit therefore suppresses exactly one follow pass;
-  // every later selection change still follows.
   const fittedRef = useRef<string | null>(null);
   const suppressFollowOnceRef = useRef(false);
   useEffect(() => {
@@ -435,8 +413,6 @@ export function MapCanvas({
     fitAll(0);
   }, [ready, summary.source, fitAll]);
 
-  // Frame a day when the dock asks for it. The key makes two clicks on the same
-  // day two requests, so the second one still moves the camera.
   useEffect(() => {
     const map = mapRef.current;
     if (!ready || map === null || fitTarget === null) {
@@ -512,8 +488,6 @@ export function MapCanvas({
     );
   }, [selectedIndex, ready]);
 
-  // Place the popup when it opens; the map's own move/zoom handler keeps it
-  // anchored while the camera moves.
   useEffect(() => {
     const map = mapRef.current;
     if (!ready || map === null) {
@@ -527,16 +501,12 @@ export function MapCanvas({
     setPopupAt({ x: projected.x, y: projected.y });
   }, [popupPoint, ready]);
 
-  // Keep the current point on screen while following. Playback jumps instead of
-  // animating because a 300 ms ease per point would lag the cursor.
   useEffect(() => {
     const map = mapRef.current;
     if (!ready || map === null || !follow || selectedIndex === null) {
       return;
     }
     if (suppressFollowOnceRef.current) {
-      // The document was just fitted; this selection is the fit's own point 0,
-      // not the operator asking to follow a point.
       suppressFollowOnceRef.current = false;
       return;
     }
@@ -551,7 +521,6 @@ export function MapCanvas({
     });
   }, [selectedIndex, follow, ready]);
 
-  // Add or remove the raster basemap without touching the track layers.
   useEffect(() => {
     const map = mapRef.current;
     if (!ready || map === null) {
@@ -572,7 +541,7 @@ export function MapCanvas({
               id: "osm",
               type: "raster",
               source: "osm",
-              paint: { "raster-opacity": 0.9 },
+              paint: { ...RASTER_PAINT },
             },
             "track-casing",
           );
@@ -581,7 +550,7 @@ export function MapCanvas({
             id: "osm",
             type: "raster",
             source: "osm",
-            paint: { "raster-opacity": 0.9 },
+            paint: { ...RASTER_PAINT },
           });
         }
       }
@@ -656,7 +625,7 @@ export function MapCanvas({
   const popupPhoto = popupPoint === null ? undefined : photoForPoint.get(popupPoint.index);
 
   return (
-    <div className="relative min-h-0 flex-1 overflow-hidden bg-paper">
+    <div className="relative min-h-0 flex-1 overflow-hidden bg-[var(--dads-surface-50)]">
       <div
         aria-hidden="true"
         className="contour absolute inset-0"
@@ -676,42 +645,42 @@ export function MapCanvas({
       />
 
       <div className="pointer-events-none absolute inset-0">
-        <div className="pointer-events-auto absolute right-3 top-[120px] flex flex-col gap-1">
+        <div className="pointer-events-auto absolute right-3 top-16 flex flex-col gap-1.5">
           <MapButton label="拡大" onClick={() => mapRef.current?.zoomIn({ duration: 160 })}>
-            <Plus size={16} strokeWidth={1.5} aria-hidden="true" />
+            <Plus size={16} strokeWidth={2} aria-hidden="true" />
           </MapButton>
           <MapButton label="縮小" onClick={() => mapRef.current?.zoomOut({ duration: 160 })}>
-            <Minus size={16} strokeWidth={1.5} aria-hidden="true" />
+            <Minus size={16} strokeWidth={2} aria-hidden="true" />
           </MapButton>
-          <MapButton label="全点表示" onClick={() => fitAll(420)}>
-            <Maximize size={16} strokeWidth={1.5} aria-hidden="true" />
+          <MapButton label="全体表示" onClick={() => fitAll(420)}>
+            <Maximize size={15} strokeWidth={2} aria-hidden="true" />
           </MapButton>
           <button
             type="button"
             aria-pressed={follow}
             onClick={onToggleFollow}
             className="map-control"
-            title="追従"
+            title="再生中の点に追従"
           >
-            <span aria-hidden="true" className="size-1.5 rounded-full bg-current" />
-            <span className="text-xs">追従</span>
+            <span aria-hidden="true" className="size-2 rounded-full bg-current" />
+            <span>追従</span>
           </button>
         </div>
 
         {hover === null ? null : (
           <div className="map-readout">
-            <p className="mono">
+            <p className="mono font-bold text-[var(--dads-ink)]">
               {hover.point === null
                 ? formatLatLon(hover.lat, hover.lon)
                 : formatLatLon(hover.point.lat, hover.point.lon)}
             </p>
             {hover.point === null || hover.point.utc === null ? null : (
-              <p className="mono text-ink-2">
+              <p className="mono text-[var(--dads-ink-sub)]">
                 {formatUtcTime(hover.point.utc)} UTC
                 {hover.point.speedKmh === null ? "" : ` · ${formatSpeed(hover.point.speedKmh)}`}
               </p>
             )}
-            <p className="mono text-ink-3">ズーム {formatZoom(hover.zoom)}</p>
+            <p className="mono text-[var(--dads-ink-meta)]">ズーム {formatZoom(hover.zoom)}</p>
           </div>
         )}
       </div>
@@ -731,48 +700,69 @@ export function MapCanvas({
           <div className="flex items-start justify-between gap-3">
             <div>
               {popupPoint.utc === null ? null : (
-                <p className="mono text-xs text-ink">{formatUtcDateTime(popupPoint.utc)} UTC</p>
+                <p className="mono text-xs font-bold text-[var(--dads-ink)]">
+                  {formatUtcDateTime(popupPoint.utc)} UTC
+                </p>
               )}
-              {popupPoint.waypoint ? <p className="mt-1 text-xs text-ink-3">目印</p> : null}
+              {popupPoint.waypoint ? (
+                <span className="mt-1 inline-block rounded border border-[var(--dads-blue)] bg-[var(--dads-blue-tint)] px-1.5 py-0.5 text-[11px] font-bold text-[var(--dads-blue)]">
+                  ウェイポイント
+                </span>
+              ) : null}
             </div>
             <button
               ref={popupCloseRef}
               type="button"
               onClick={onClosePopup}
               aria-label="閉じる"
-              className="-mr-1 -mt-1 flex size-6 items-center justify-center rounded-tag text-ink-3 hover:bg-raise hover:text-ink"
+              className="-mr-1 -mt-1 flex size-6 items-center justify-center rounded text-[var(--dads-ink-sub)] hover:bg-[var(--dads-surface-50)] hover:text-[var(--dads-ink)] cursor-pointer"
             >
-              <X size={16} strokeWidth={1.5} aria-hidden="true" />
+              <X size={16} strokeWidth={2} aria-hidden="true" />
             </button>
           </div>
-          <p className="mono mt-2 text-xs text-ink-2">
+          <p className="mono mt-2 text-xs text-[var(--dads-ink-sub)]">
             {formatLatLon(popupPoint.lat, popupPoint.lon)}
           </p>
-          <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
-            <span className="text-ink-3">標高</span>
-            <span className="mono text-right text-ink-2">{formatHeight(popupPoint.heightM)}</span>
-            <span className="text-ink-3">速度</span>
-            <span className="mono text-right text-ink-2">{formatSpeed(popupPoint.speedKmh)}</span>
+          <div className="mt-2 grid grid-cols-2 gap-1.5 text-xs">
+            <span className="text-[var(--dads-ink-meta)]">標高</span>
+            <span className="mono text-right font-bold text-[var(--dads-ink)]">
+              {formatHeight(popupPoint.heightM)}
+            </span>
+            <span className="text-[var(--dads-ink-meta)]">速度</span>
+            <span className="mono text-right font-bold text-[var(--dads-ink)]">
+              {formatSpeed(popupPoint.speedKmh)}
+            </span>
           </div>
-          {popupPhoto?.thumbnail == null ? null : (
-            <div className="mt-2 flex items-center gap-2 border-t border-hair pt-2">
-              <img
-                src={popupPhoto.thumbnail}
-                alt={popupPhoto.name}
-                className="size-11 rounded-tag object-cover"
-              />
-              <p className="min-w-0 truncate text-xs text-ink-3">{popupPhoto.name}</p>
+          {popupPhoto == null ? null : (
+            <div className="mt-2 flex items-center gap-2 border-t border-[var(--dads-border-divider)] pt-2">
+              {popupPhoto.thumbnail ? (
+                <img
+                  src={popupPhoto.thumbnail}
+                  alt={popupPhoto.name}
+                  className="size-11 rounded object-cover"
+                />
+              ) : null}
+              <p className="min-w-0 truncate text-xs font-bold text-[var(--dads-ink)]">
+                {popupPhoto.name}
+              </p>
             </div>
           )}
         </div>
       )}
 
-      <p className="pointer-events-none absolute bottom-3 left-3 max-w-[240px] text-xs text-ink-3">
-        {ready ? null : "地図を準備しています"}
-      </p>
+      {!tiles ? (
+        <p className="pointer-events-none absolute bottom-20 left-3 rounded border border-[var(--dads-border-control)] bg-white/90 px-2.5 py-1 text-xs font-bold text-[var(--dads-ink-sub)]">
+          地図タイル オフ（軌跡のみ表示）
+        </p>
+      ) : null}
+
+      {!ready ? (
+        <p className="pointer-events-none absolute bottom-20 left-3 text-xs text-[var(--dads-ink-meta)]">
+          地図を準備しています…
+        </p>
+      ) : null}
     </div>
   );
-
 }
 
 function MapButton({
@@ -797,85 +787,83 @@ function MapButton({
   );
 }
 
-/** Where to put the popup so it stays inside the map panel. */
 function popupPlacementFor(
   at: { x: number; y: number } | null,
   size: { width: number; height: number },
-  hasPopup: boolean,
+  visible: boolean,
 ): { style: CSSProperties } | null {
-  if (at === null || !hasPopup) {
+  if (!visible || at === null) {
     return null;
   }
-  const half = 120;
-  const x = Math.min(Math.max(at.x, half + 8), Math.max(size.width - half - 8, half + 8));
-  const below = at.y < 210;
-  const y = below
-    ? Math.min(at.y + 14, Math.max(size.height - 24, 0))
-    : Math.max(at.y - 14, 24);
+  const width = 248;
+  const margin = 12;
+  const clampedX = Math.min(
+    Math.max(at.x, width / 2 + margin),
+    Math.max(width / 2 + margin, size.width - width / 2 - margin),
+  );
+  const above = at.y > 190;
   return {
     style: {
-      left: `${x}px`,
-      top: `${y}px`,
-      transform: below ? "translate(-50%, 0)" : "translate(-50%, -100%)",
+      left: `${clampedX}px`,
+      top: `${above ? at.y - 14 : at.y + 14}px`,
+      transform: above ? "translate(-50%, -100%)" : "translate(-50%, 0)",
     },
   };
 }
 
-/**
- * The last resort when WebGL is unavailable: the same track drawn as SVG.
- *
- * The map is the screen's main surface, so a webview without WebGL should still
- * show where the walk went. This fallback has no tiles, no pan and no zoom; it
- * says why in one line.
- */
 function FallbackTrack({
   points,
   bounds,
   reason,
 }: {
   points: PointDto[];
-  bounds: LogSummary["bounds"];
+  bounds: Bounds | null;
   reason: string;
 }) {
-  const box = boundsOf(points) ?? bounds;
-  const width = 800;
-  const height = 560;
-  const positions: Position[] = points.filter(isPositioned).map((point) => [
-    point.lon,
-    point.lat,
-  ]);
-  const spanLon = Math.max((box?.east ?? 0) - (box?.west ?? 0), 1e-6);
-  const spanLat = Math.max((box?.north ?? 0) - (box?.south ?? 0), 1e-6);
-  const project = ([lon, lat]: Position): [number, number] => [
-    24 + (((lon - (box?.west ?? 0)) / spanLon) * (width - 48) || 0),
-    24 + ((((box?.north ?? 0) - lat) / spanLat) * (height - 48) || 0),
-  ];
-  const path = positions
-    .map((position, index) => {
-      const [x, y] = project(position);
-      return `${index === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .join(" ");
+  const effective = bounds ?? boundsOf(points);
+  const paths = useMemo(() => {
+    if (effective === null) {
+      return [];
+    }
+    const lonSpan = Math.max(effective.east - effective.west, 1e-5);
+    const latSpan = Math.max(effective.north - effective.south, 1e-5);
+    const project = ([lon, lat]: Position): [number, number] => [
+      24 + ((lon - effective.west) / lonSpan) * 552,
+      24 + (1 - (lat - effective.south) / latSpan) * 352,
+    ];
+    return trackSegments(points).map((segment) =>
+      segment
+        .map((position, index) => {
+          const [x, y] = project(position);
+          return `${index === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`;
+        })
+        .join(" "),
+    );
+  }, [points, effective]);
+
   return (
-    <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden bg-paper">
+    <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center bg-white p-6">
       <div aria-hidden="true" className="contour absolute inset-0" />
       <svg
+        viewBox="0 0 600 400"
+        className="relative max-h-[70vh] w-full max-w-3xl"
         role="img"
-        aria-label="軌跡の概形"
-        viewBox={`0 0 ${width} ${height}`}
-        className="relative m-auto max-h-full w-full max-w-[900px] p-6"
+        aria-label="軌跡の概略図"
       >
-        <path
-          d={path}
-          fill="none"
-          stroke={ACCENT}
-          strokeWidth={2}
-          strokeLinejoin="round"
-          strokeLinecap="round"
-        />
+        {paths.map((d, index) => (
+          <path
+            key={index}
+            d={d}
+            fill="none"
+            stroke={DADS_BLUE}
+            strokeWidth={3}
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
+        ))}
       </svg>
-      <p className="relative m-3 text-xs text-ink-3">
-        地図を表示できません（{reason}）。軌跡の概形のみ表示しています
+      <p className="relative mt-4 text-xs text-[var(--dads-ink-sub)]">
+        地図描画を初期化できませんでした（{reason}）。軌跡の概略図を表示しています。
       </p>
     </div>
   );

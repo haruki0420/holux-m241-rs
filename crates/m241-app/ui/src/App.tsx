@@ -1,41 +1,35 @@
 import { useState } from "react";
 
-import { Header } from "./components/Header";
-import { Sidebar, type ScreenId } from "./components/Sidebar";
+import { Header, type ScreenTabId } from "./components/Header";
 import { useDeviceProbe } from "./hooks/useDeviceProbe";
 import { useLogDocument } from "./hooks/useLogDocument";
-import { ConnectScreen } from "./screens/ConnectScreen";
+import { FirmwareScreen } from "./screens/FirmwareScreen";
+import { GeotagScreen } from "./screens/GeotagScreen";
 import { LogScreen } from "./screens/LogScreen";
 
 export default function App() {
-  const controller = useDeviceProbe();
-  // The loaded document lives above the screens so switching to 接続 and back
-  // keeps the track, its photos and the camera position.
+  const device = useDeviceProbe();
   const log = useLogDocument();
-  const [screen, setScreen] = useState<ScreenId>("connect");
+  const [tab, setTab] = useState<ScreenTabId>("log");
 
   return (
-    <div className="flex h-dvh flex-col bg-paper text-ink">
-      {/* The header floats over the map so the map can own the full window
-          height; the screens that are not a map pad their own content below it. */}
-      <Header controller={controller} />
-      <div className="flex min-h-0 flex-1">
-        <Sidebar
-          controller={controller}
-          current={screen}
-          available={["connect", "log"]}
-          onSelect={setScreen}
-        />
-        <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-          {screen === "connect" ? (
-            <div className="flex min-h-0 flex-1 flex-col pt-14">
-              <ConnectScreen controller={controller} onOpenLog={() => setScreen("log")} />
-            </div>
-          ) : (
-            <LogScreen log={log} />
-          )}
-        </main>
-      </div>
+    <div className="flex h-dvh flex-col bg-white text-[var(--dads-ink)]">
+      <Header controller={device} currentTab={tab} onSelectTab={setTab} />
+
+      <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        {tab === "log" ? (
+          <LogScreen
+            log={log}
+            device={device}
+            onNavigateGeotag={() => setTab("geotag")}
+            onNavigateFirmware={() => setTab("firmware")}
+          />
+        ) : null}
+        {tab === "geotag" ? (
+          <GeotagScreen log={log} onNavigateLog={() => setTab("log")} />
+        ) : null}
+        {tab === "firmware" ? <FirmwareScreen device={device} /> : null}
+      </main>
     </div>
   );
 }

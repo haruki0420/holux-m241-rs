@@ -8,28 +8,27 @@ import {
   type PortInfo,
 } from "../lib/ipc";
 
-/** What the Connect card is showing right now. */
+/** Current device probe state. */
 export type ProbeState =
   | { kind: "idle" }
   | { kind: "probing"; port: string }
   | { kind: "connected"; info: DeviceInfo }
   | { kind: "error"; message: string; hint: string | null };
 
-/** The header chip's four states (`error` still means "not connected"). */
+/** Status tone for the header badge (always paired with a text label). */
 export type ConnectionTone = "idle" | "probing" | "connected" | "error";
 
 /**
- * Owns the Connect screen's state: the port list, the chosen port and the last
- * probe. The state lives above the screen because the header and the status bar
- * both show the connection, and three copies would drift.
+ * Owns serial port discovery, manual port entry (e.g. `/dev/rfcomm0` or `COM3`),
+ * and `device_info` connection verification across all three tabs.
  */
 export function useDeviceProbe() {
   const [ports, setPorts] = useState<PortInfo[]>([]);
   const [portsLoading, setPortsLoading] = useState(true);
   const [selectedPort, setSelectedPort] = useState("");
+  const [manualMode, setManualMode] = useState(false);
   const [manualPort, setManualPort] = useState("");
   const [state, setState] = useState<ProbeState>({ kind: "idle" });
-  const [sample, setSample] = useState(false);
 
   const refresh = useCallback(async () => {
     setPortsLoading(true);
@@ -43,9 +42,6 @@ export function useDeviceProbe() {
         return found.find((port) => port.likely)?.name ?? found[0]?.name ?? "";
       });
     } catch {
-      // `list_ports` returns an empty list when enumeration fails; a rejected
-      // invoke means the bridge itself is unavailable. Either way the screen
-      // offers the manual field, so an empty list is the honest state.
       setPorts([]);
     } finally {
       setPortsLoading(false);
@@ -58,25 +54,29 @@ export function useDeviceProbe() {
 
   const selectPort = useCallback((name: string) => {
     setSelectedPort(name);
-    setManualPort("");
   }, []);
 
-  // A typed port wins over the picker: it is how a port the OS does not list
-  // (or one that is about to appear) can still be addressed, and it is what
-  // makes the failure path testable without a device.
-  const activePort = manualPort.trim() !== "" ? manualPort.trim() : selectedPort;
+  const toggleManualMode = useCallback(() => {
+    setManualMode((prev) => {
+      if (!prev && manualPort.trim() === "" && selectedPort !== "") {
+        setManualPort(selectedPort);
+      }
+      return !prev;
+    });
+  }, [manualPort, selectedPort]);
+
+  const activePort = manualMode ? manualPort.trim() : selectedPort;
 
   const connect = useCallback(async () => {
     const target = activePort;
     if (target === "") {
       setState({
         kind: "error",
-        message: "ポートが選ばれていません",
-        hint: "一覧からポートを選ぶか、ポート名を入力してから「端末情報を読む」を押してください",
+        message: "シリアルポートが選択されていません",
+        hint: "一覧からポートを選ぶか、「手動入力」に切り替えてポート名を入力してください。",
       });
       return;
     }
-    setSample(false);
     setState({ kind: "probing", port: target });
     try {
       const info = await readDeviceInfo(target);
@@ -86,10 +86,6 @@ export function useDeviceProbe() {
       setState({ kind: "error", message, hint });
     }
   }, [activePort]);
-
-  const toggleSample = useCallback(() => {
-    setSample((current) => !current);
-  }, []);
 
   const tone: ConnectionTone = useMemo(() => {
     switch (state.kind) {
@@ -110,14 +106,14 @@ export function useDeviceProbe() {
     refresh,
     selectedPort,
     selectPort,
+    manualMode,
+    toggleManualMode,
     manualPort,
     setManualPort,
     activePort,
     state,
     connect,
     tone,
-    sample,
-    toggleSample,
   };
 }
 
