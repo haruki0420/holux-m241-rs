@@ -44,8 +44,8 @@ fi
 
 gates=(
   "fmt|cargo fmt --all -- --check"
-  "clippy|cargo clippy --all-targets $app_exclude -- -D warnings"
-  "test|cargo test --workspace $app_exclude"
+  "clippy|cargo clippy --workspace --exclude m241-gui --all-targets $app_exclude -- -D warnings"
+  "test|cargo test --workspace --exclude m241-gui $app_exclude"
   "docs|python3 tools/check_docs.py"
   "design|python3 tools/check_design.py"
   "safety|python3 tools/check_safety.py"

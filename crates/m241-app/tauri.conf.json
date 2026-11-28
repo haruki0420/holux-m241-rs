@@ -11,9 +11,9 @@
       {
         "label": "main",
         "title": "Holux M-241",
-        "width": 1280,
-        "height": 800,
-        "minWidth": 1024,
+        "width": 1200,
+        "height": 820,
+        "minWidth": 960,
         "minHeight": 640,
         "resizable": true,
         "center": true

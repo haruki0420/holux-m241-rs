@@ -387,6 +387,110 @@ pub struct ExportOutcome {
     pub bytes: u64,
 }
 
+/// Photo matching options from the Log screen IPC contract.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhotoOptionsDto {
+    /// Minutes added to each photo's capture time relative to UTC.
+    pub camera_offset_minutes: i32,
+    /// Whole days added to every track timestamp before matching.
+    pub log_offset_days: i32,
+    /// Photos closer than this many metres share a group (`0` disables).
+    pub group_distance_meters: f64,
+    /// Maximum allowed gap between capture time and nearest track point, in seconds.
+    #[serde(default = "default_photo_max_gap_seconds")]
+    pub max_gap_seconds: u32,
+}
+
+fn default_photo_max_gap_seconds() -> u32 {
+    PHOTO_MAX_GAP_SECONDS
+}
+
+impl From<PhotoOptionsDto> for PhotoOptions {
+    fn from(dto: PhotoOptionsDto) -> Self {
+        Self {
+            camera_offset_minutes: dto.camera_offset_minutes,
+            log_offset_days: dto.log_offset_days,
+            group_distance_meters: dto.group_distance_meters,
+            max_gap_seconds: dto.max_gap_seconds,
+        }
+    }
+}
+
+/// Options accepted by `geotag_preview` and `geotag_apply`.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeotagOptionsDto {
+    /// Minutes added to each photo's capture time relative to UTC.
+    pub camera_offset_minutes: i32,
+    /// Whole days added to every track timestamp before matching.
+    pub log_offset_days: i32,
+    /// Photos closer than this many metres share a group (`0` disables).
+    pub group_distance_meters: f64,
+    /// Maximum allowed gap between capture time and nearest track point, in seconds.
+    pub max_gap_seconds: u32,
+    /// Whether `geotag_apply` writes a `<photo>_original` backup before rewriting.
+    pub keep_backup: bool,
+    /// Whether `geotag_apply` rewrites `DateTimeOriginal` for EXIF-timed photos.
+    pub rewrite_datetime_original: bool,
+}
+
+/// One photo row in a `geotag_preview` response.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeotagItemDto {
+    /// Absolute path to the photo.
+    pub path: String,
+    /// Display file name.
+    pub name: String,
+    /// Capture time as Unix seconds.
+    pub captured_at: Option<u32>,
+    /// `exif`, `file` or `null`.
+    pub time_source: Option<String>,
+    /// Matched track point index in the loaded track.
+    pub point_index: Option<usize>,
+    /// Matched latitude.
+    pub lat: Option<f64>,
+    /// Matched longitude.
+    pub lon: Option<f64>,
+    /// Gap in seconds to the nearest point.
+    pub gap_seconds: Option<u32>,
+    /// Cluster id when distance grouping is enabled.
+    pub group_id: Option<usize>,
+    /// Optional JPEG thumbnail data URL.
+    pub thumbnail: Option<String>,
+    /// Reason the photo was skipped, when `point_index` is `None`.
+    pub skipped_reason: Option<String>,
+}
+
+/// Response returned by `geotag_preview`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeotagPreviewDto {
+    /// Canonical directory path inspected.
+    pub directory: String,
+    /// Number of photos matched to a track point.
+    pub matched: usize,
+    /// Number of photos skipped.
+    pub skipped: usize,
+    /// Per-photo plan items.
+    pub items: Vec<GeotagItemDto>,
+}
+
+/// Response returned by `geotag_apply`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeotagApplyOutcome {
+    /// Number of photos whose EXIF tags were updated.
+    pub written: usize,
+    /// Number of photos skipped or failed.
+    pub skipped: usize,
+    /// Number of `<photo>_original` backups newly created by this run.
+    pub backups_created: usize,
+    /// Per-file error messages, if any write failed.
+    pub errors: Vec<String>,
+}
+
 /// Read `source` into a loaded document.
 ///
 /// `source` is [`SAMPLE_SOURCE`] or an absolute path ending in `.bin`, `.gpx`,
@@ -1303,6 +1407,232 @@ fn internal(what: &str, hint: &str) -> String {
     format!("ログ画面の内部状態が不正です（{what}）\n対処: {hint}")
 }
 
+fn shift_track_for_geotag(track: &Track, delta_seconds: i64) -> Track {
+    let mut shifted = track.clone();
+    if delta_seconds != 0 {
+        for point in &mut shifted.points {
+            point.utc = point
+                .utc
+                .and_then(|utc| u32::try_from(i64::from(utc) + delta_seconds).ok());
+        }
+    }
+    shifted
+}
+
+fn nearest_point_index(track: &Track, utc: u32) -> Option<usize> {
+    let mut best: Option<(usize, u32)> = None;
+    for (index, point) in track.points.iter().enumerate() {
+        let (Some(point_utc), true) = (point.utc, point.has_position()) else {
+            continue;
+        };
+        let gap = point_utc.abs_diff(utc);
+        if best.is_none_or(|(_, best_gap)| gap < best_gap) {
+            best = Some((index, gap));
+        }
+    }
+    best.map(|(index, _)| index)
+}
+
+fn geotag_image_files(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(directory)
+        .map_err(|error| {
+            format!(
+                "{} を読めません（{error}）\n対処: フォルダのパスと読み取り権限を確認してください。",
+                directory.display()
+            )
+        })?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|entry| entry.is_file())
+        .filter(|entry| {
+            let ext = entry
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            is_image(&ext)
+        })
+        .collect();
+    entries.sort();
+    Ok(entries)
+}
+
+fn plan_geotag(
+    track: &Track,
+    directory: &str,
+    options: &GeotagOptionsDto,
+) -> Result<(PathBuf, Vec<GeotagPlan>), String> {
+    let dir_path = absolute_directory(directory)?;
+    let photos = geotag_image_files(&dir_path)?;
+    let log_shift_seconds = i64::from(options.log_offset_days) * 86_400;
+    let camera_shift_seconds = i64::from(options.camera_offset_minutes) * 60;
+    let matching_track = shift_track_for_geotag(track, log_shift_seconds + camera_shift_seconds);
+
+    let core_options = GeotagOptions {
+        max_gap_seconds: options.max_gap_seconds,
+        keep_backup: options.keep_backup,
+        photo_shift_seconds: 0,
+        group_distance_meters: (options.group_distance_meters.is_finite()
+            && options.group_distance_meters > 0.0)
+            .then_some(options.group_distance_meters),
+        max_photo_edge_pixels: None,
+        rewrite_datetime_original: options.rewrite_datetime_original,
+    };
+
+    let mut plans = geotag::plan(&photos, &matching_track, &core_options).map_err(|error| {
+        format!(
+            "ジオタグ計画を作成できません（{error}）\n対処: フォルダ内の写真と読み取り権限を確認してください。"
+        )
+    })?;
+
+    // Move matched track point UTC back from camera local clock to true UTC
+    // while keeping `log_offset_days` applied (same convention as `m241 log geotag`).
+    if camera_shift_seconds != 0 {
+        for plan in &mut plans {
+            if let Some(point) = &mut plan.point {
+                point.utc = point
+                    .utc
+                    .and_then(|utc| u32::try_from(i64::from(utc) - camera_shift_seconds).ok());
+            }
+        }
+    }
+
+    Ok((dir_path, plans))
+}
+
+fn backup_path_for(photo: &Path) -> Option<PathBuf> {
+    let file_name = photo.file_name()?;
+    let mut backup_name = file_name.to_os_string();
+    backup_name.push("_original");
+    Some(photo.with_file_name(backup_name))
+}
+
+/// Preview EXIF geotagging decisions for every image in `directory`.
+///
+/// Never modifies any photo file.
+///
+/// # Errors
+///
+/// A Japanese two-line string when `directory` is invalid or unreadable.
+pub fn geotag_preview(
+    loaded: &LoadedLog,
+    directory: &str,
+    options: &GeotagOptionsDto,
+) -> Result<GeotagPreviewDto, String> {
+    let (dir_path, plans) = plan_geotag(&loaded.track, directory, options)?;
+    let log_shift_seconds = i64::from(options.log_offset_days) * 86_400;
+    let camera_shift_seconds = i64::from(options.camera_offset_minutes) * 60;
+    let matching_track =
+        shift_track_for_geotag(&loaded.track, log_shift_seconds + camera_shift_seconds);
+
+    let mut items = Vec::with_capacity(plans.len());
+    let mut matched = 0usize;
+    let mut skipped = 0usize;
+
+    for plan in plans {
+        let name = plan
+            .photo
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_else(|| plan.photo.display().to_string());
+        let (captured_at, time_source) = match plan.capture_time {
+            Some(CaptureTime::Exif(utc)) => (Some(utc), Some(String::from("exif"))),
+            Some(CaptureTime::FileModified(utc)) => (Some(utc), Some(String::from("file"))),
+            None => (None, None),
+        };
+        let point_index = if plan.point.is_some() {
+            captured_at.and_then(|utc| nearest_point_index(&matching_track, utc))
+        } else {
+            None
+        };
+        let (lat, lon) = match plan.point.and_then(|point| point.position()) {
+            Some((lat, lon)) => (Some(lat), Some(lon)),
+            None => (None, None),
+        };
+        if plan.will_write() {
+            matched += 1;
+        } else {
+            skipped += 1;
+        }
+        let thumb = std::fs::metadata(&plan.photo)
+            .ok()
+            .filter(|meta| usize::try_from(meta.len()).unwrap_or(usize::MAX) <= MAX_PHOTO_BYTES)
+            .and_then(|_| std::fs::read(&plan.photo).ok())
+            .and_then(|bytes| thumbnail(&bytes));
+        items.push(GeotagItemDto {
+            path: plan.photo.display().to_string(),
+            name,
+            captured_at,
+            time_source,
+            point_index,
+            lat,
+            lon,
+            gap_seconds: plan.gap_seconds,
+            group_id: plan.group_id,
+            thumbnail: thumb,
+            skipped_reason: plan.skipped,
+        });
+    }
+
+    Ok(GeotagPreviewDto {
+        directory: dir_path.display().to_string(),
+        matched,
+        skipped,
+        items,
+    })
+}
+
+/// Apply EXIF GPS geotags to matched photos in `directory` via `m241_core::log::geotag`.
+///
+/// # Errors
+///
+/// A Japanese two-line string when `directory` is invalid or planning fails.
+pub fn geotag_apply(
+    loaded: &LoadedLog,
+    directory: &str,
+    options: &GeotagOptionsDto,
+) -> Result<GeotagApplyOutcome, String> {
+    let (_dir_path, plans) = plan_geotag(&loaded.track, directory, options)?;
+    let mut written = 0usize;
+    let mut skipped = 0usize;
+    let mut backups_created = 0usize;
+    let mut errors = Vec::new();
+
+    for plan in &plans {
+        if !plan.will_write() {
+            skipped += 1;
+            continue;
+        }
+        let backup_path = backup_path_for(&plan.photo);
+        let had_backup = backup_path.as_deref().is_some_and(Path::exists);
+        match geotag::apply(std::slice::from_ref(plan)) {
+            Ok(paths) if !paths.is_empty() => {
+                written += 1;
+                if plan.keep_backup
+                    && !had_backup
+                    && backup_path.as_deref().is_some_and(Path::exists)
+                {
+                    backups_created += 1;
+                }
+            }
+            Ok(_) => {
+                skipped += 1;
+            }
+            Err(error) => {
+                skipped += 1;
+                errors.push(format!("{}: {error}", plan.photo.display()));
+            }
+        }
+    }
+
+    Ok(GeotagApplyOutcome {
+        written,
+        skipped,
+        backups_created,
+        errors,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1787,6 +2117,71 @@ mod tests {
                 .all(|photo| photo.group_id.is_none()),
             "grouping is off by default"
         );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn geotag_preview_and_apply_write_gps_and_backup_once() {
+        let directory = temp_dir("m241-app-geotag");
+        let photo = directory.join("matched.jpg");
+        write_jpeg(&photo);
+        set_modified(&photo, SAMPLE_START);
+        let png = directory.join("ignore.png");
+        std::fs::write(&png, b"not a jpeg").expect("write png");
+
+        let loaded = sample();
+        let options = GeotagOptionsDto {
+            camera_offset_minutes: 0,
+            log_offset_days: 0,
+            group_distance_meters: 0.0,
+            max_gap_seconds: 300,
+            keep_backup: true,
+            rewrite_datetime_original: false,
+        };
+
+        let preview =
+            geotag_preview(&loaded, &directory.display().to_string(), &options).expect("preview");
+        assert_eq!(preview.matched, 1);
+        assert_eq!(preview.skipped, 1);
+        assert_eq!(preview.items.len(), 2);
+
+        let matched_item = preview
+            .items
+            .iter()
+            .find(|item| item.name == "matched.jpg")
+            .expect("matched item");
+        assert_eq!(matched_item.point_index, Some(0));
+        assert!(matched_item.lat.is_some());
+        assert!(matched_item.lon.is_some());
+        assert_eq!(matched_item.gap_seconds, Some(0));
+        assert!(matched_item.skipped_reason.is_none());
+
+        let outcome =
+            geotag_apply(&loaded, &directory.display().to_string(), &options).expect("apply");
+        assert_eq!(outcome.written, 1);
+        assert_eq!(outcome.skipped, 1);
+        assert_eq!(outcome.backups_created, 1);
+        assert!(outcome.errors.is_empty());
+
+        let backup = directory.join("matched.jpg_original");
+        assert!(backup.exists(), "backup must be created");
+
+        let bytes = std::fs::read(&photo).expect("read tagged photo");
+        let gps = m241_core::log::read_gps(&bytes)
+            .expect("exif gps parses")
+            .expect("gps tags written");
+        assert!(
+            (gps.latitude.expect("gps latitude") - loaded.track.points[0].latitude.unwrap()).abs()
+                < 1e-4
+        );
+
+        // Second run must skip `_original` backup and not create a second backup.
+        set_modified(&photo, SAMPLE_START);
+        let second =
+            geotag_apply(&loaded, &directory.display().to_string(), &options).expect("apply 2");
+        assert_eq!(second.written, 1);
+        assert_eq!(second.backups_created, 0);
+
         std::fs::remove_dir_all(&directory).ok();
     }
 }

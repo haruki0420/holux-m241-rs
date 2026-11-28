@@ -94,21 +94,32 @@ m241-core = { path = \"../m241-core\" }
 m241-flash = { path = \"../m241-flash\" }
 ";
 
-/// The Tauri app fixture: read-only until P3, so no write crate, and exactly
-/// one serial path (`device.rs::probe`). The gate's `m241-app` clauses read
-/// these files as text; the workspace member exists so `cargo tree` resolves.
+/// The Tauri app fixture: links `m241-flash` and routes all flash writes and
+/// port opens through `device.rs` with `WRITE` / `PROBE` guards.
 const CLEAN_APP_TOML: &str = "\
 [package]
 name = \"m241-app\"
 version = \"0.1.0\"
 edition = \"2024\"
+
+[dependencies]
+m241-core = { path = \"../m241-core\" }
+m241-flash = { path = \"../m241-flash\" }
 ";
 
 const CLEAN_APP_DEVICE_RS: &str = "\
 use m241_core::protocol::Port;
 
+pub const WRITE_CONFIRMATION: &str = \"WRITE\";
+pub const PROBE_CONFIRMATION: &str = \"PROBE\";
+
 pub fn probe(name: &str) {
     let _ = Port::open(name, 38_400);
+}
+
+pub fn go() {
+    let _ = Confirmation::granted();
+    m241_flash::flow::flash();
 }
 ";
 
@@ -1081,11 +1092,8 @@ edition = \"2024\"
 }
 
 #[test]
-fn app_linking_the_write_crate_is_reported() {
-    // P0-P2: `m241-app` must not be able to reach the erase. The manifest text
-    // and the resolved tree are both checked, so a declared-but-unused edge is a
-    // finding too.
-    let repo = FakeRepo::new("app-write-crate", &[]);
+fn app_without_flash_is_reported() {
+    let repo = FakeRepo::new("app-no-flash", &[]);
     repo.write_manifest(
         "m241-app",
         "\
@@ -1095,10 +1103,49 @@ version = \"0.1.0\"
 edition = \"2024\"
 
 [dependencies]
-m241-flash = { path = \"../m241-flash\" }
+m241-core = { path = \"../m241-core\" }
 ",
     );
-    repo.assert_reports("names `m241-flash` while APP_MAY_LINK_FLASH is False");
+    let (passed, report) = repo.run();
+    assert!(!passed, "app without flash was accepted:\n{report}");
+    assert!(report.contains("does not name `m241-flash`"), "{report}");
+    assert!(report.contains("does not contain m241-flash"), "{report}");
+}
+
+#[test]
+fn app_write_without_flow_flash_is_reported() {
+    let repo = FakeRepo::new("app-no-flow", &[]);
+    repo.write_app_file(
+        "src/device.rs",
+        "pub const WRITE_CONFIRMATION: &str = \"WRITE\";\n\
+         pub const PROBE_CONFIRMATION: &str = \"PROBE\";\n\
+         pub fn probe(name: &str) { let _ = Port::open(name, 38_400); }\n\
+         pub fn go() { let _ = Confirmation::granted(); }\n",
+    );
+    repo.assert_reports("no `flow::flash(` call");
+}
+
+#[test]
+fn app_confirmation_outside_device_rs_is_reported() {
+    let repo = FakeRepo::new("app-confirm-outside", &[]);
+    repo.write_app_file(
+        "src/commands.rs",
+        "pub fn device_info() { device::probe(\"tty\"); }\n\
+         pub fn bypass() { let _ = Confirmation::granted(); }\n",
+    );
+    repo.assert_reports("`Confirmation::granted(` outside crates/m241-app/src/device.rs");
+}
+
+#[test]
+fn app_confirmation_without_typed_words_is_reported() {
+    let repo = FakeRepo::new("app-no-write-word", &[]);
+    repo.write_app_file(
+        "src/device.rs",
+        "pub const PROBE_CONFIRMATION: &str = \"PROBE\";\n\
+         pub fn probe(name: &str) { let _ = Port::open(name, 38_400); }\n\
+         pub fn go() { let _ = Confirmation::granted(); m241_flash::flow::flash(); }\n",
+    );
+    repo.assert_reports("missing `\"WRITE\"` confirmation guard");
 }
 
 #[test]
@@ -1116,14 +1163,12 @@ fn app_frontend_destructive_opcode_is_reported() {
 }
 
 #[test]
-fn app_second_serial_open_is_reported() {
-    // One read path is the rule; a second `Port::open` is a route the gate
-    // cannot classify as a read.
+fn app_port_open_outside_device_rs_is_reported() {
     let repo = FakeRepo::new("app-second-open", &[]);
     repo.write_app_file(
         "src/commands.rs",
         "pub fn device_info() { device::probe(\"tty\"); }\n\
          fn extra() { let _ = Port::open(\"x\", 9_600); }\n",
     );
-    repo.assert_reports("opens a serial port in 2 places");
+    repo.assert_reports("`Port::open` outside src/device.rs");
 }

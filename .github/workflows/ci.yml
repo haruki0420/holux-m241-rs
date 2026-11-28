@@ -52,7 +52,7 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude m241-gui --all-targets -- -D warnings
       - name: Docs links
         run: python3 tools/check_docs.py
       - name: Design invariants
@@ -96,7 +96,7 @@ jobs:
           pnpm --dir crates/m241-app/ui install --frozen-lockfile
           pnpm --dir crates/m241-app/ui build
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude m241-gui
 
   # The Tauri v2 rewrite. Linux does a real `cargo build`; Windows and macOS are
   # compile checks, which is what the requirement asks for while the app is P0.
@@ -180,9 +180,8 @@ jobs:
           pnpm --dir crates/m241-app/ui install --frozen-lockfile
           pnpm --dir crates/m241-app/ui build
       - name: Build
-        # The Tauri app is not a release artifact yet (P0 is a debug-build
-        # proof); it is compiled by the `tauri` job below.
-        run: cargo build --release --workspace --exclude m241-app
+        # The Tauri app is compiled by the `tauri` job below; `m241-gui` is frozen.
+        run: cargo build --release --workspace --exclude m241-app --exclude m241-gui
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}

@@ -52,11 +52,19 @@ m241-core（読み取り専用）←── m241-flash（書き込み）
   Download Agent（[`01-da-protocol.md`](../reference/01-da-protocol.md)）。
   `m241-core` に依存してよい。**逆は禁止。**
 - **`m241-cli`** — 両方に依存する。`fw flash` と `log erase` があるため。
-- **`m241-gui`** — `m241-core` と `m241-flash` の両方に依存する。ユーザーの明示的な
-  指示（2026-11-23）で、GUI を主要な操作面にし、書き込み・復旧・`probe-da`・
-  `da-restart` を GUI から実行できるようにした。GUI は `m241_flash::flow` の
-  セッション（`DownloadAgent` の同じ安全経路）だけを通り、破壊的オペコードを
-  自分では持たない。
+- **`m241-gui`**（凍結中: `Cargo.toml` の `default-members`・`./tools/check.sh`・CI
+  `lint`/`test`/`build` からは除外、design/safety チェックのみ維持）— `m241-core` と
+  `m241-flash` の両方に依存する。ユーザーの明示的な指示（2026-11-23）で、GUI を
+  主要な操作面にし、書き込み・復旧・`probe-da`・`da-restart` を GUI から実行
+  できるようにした。GUI は `m241_flash::flow` のセッション（`DownloadAgent` の同じ
+  安全経路）だけを通り、破壊的オペコードを自分では持たない。
+- **`m241-app`**（Tauri v2 デスクトップアプリ）— Step 2A で `m241-flash` への
+  依存を解禁し（`tools/check_safety.py` の `APP_MAY_LINK_FLASH = True`）、
+  書き込み・`probe-da` を `m241_flash::flow` 経由で実行する。`Port::open` と
+  `Confirmation::granted`（`"WRITE"` / `"PROBE"` 文字列一致ガード付き）は
+  `crates/m241-app/src/device.rs` に集約し、`m241-app` の Rust / フロントエンド
+  コードには破壊的オペコード（`0xD3` / `0xD4` / `0xD5` / `0xD9` / `OPCODE_*` /
+  `$PMTK182,6`）を持たない。
 
 依存の向きが分離の土台なので、`✓` `cargo tree -p m241-core --edges normal,build,dev`
 に `m241-flash` が現れないこと、`m241-core/Cargo.toml` が `m241-flash` を名指し

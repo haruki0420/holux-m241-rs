@@ -57,6 +57,16 @@ escape or the PMTK erase string — while the screens' operator prose in strings
 and comments stays allowed. The reverse edge stays forbidden: `m241-core` still
 must not reach the write crate, so a read-only binary cannot erase or program.
 
+**The Tauri app (`m241-app`) writes too, and `m241-gui` is frozen (Step 2A).**
+`m241-gui` remains in `members` for `check_design.py` and `check_safety.py`,
+but is excluded from `default-members`, `./tools/check.sh` clippy/test, and CI
+lint/test/build. `m241-app` now links `m241-flash` (`APP_MAY_LINK_FLASH = True`
+in `tools/check_safety.py`), calls `m241_flash::flow::flash` from
+`crates/m241-app/src/device.rs`, centralises every `Port::open` in `device.rs`,
+requires typed `"WRITE"` / `"PROBE"` confirmation guards before
+`Confirmation::granted()`, and carries no destructive opcode of its own. The
+reverse edge stays forbidden: `m241-core` still must not reach `m241-flash`.
+
 **That new gate is weaker than the one it replaced, and this is deliberate.**
 The old rule was the dependency graph (`m241-gui` did not link `m241-flash`), so
 no edit inside the GUI could bypass it. The replacement is a text check; an edit

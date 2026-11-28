@@ -1,35 +1,41 @@
-//! The IPC commands the Connect and Log screens call.
+//! The IPC commands exposed to the Tauri frontend.
 //!
-//! The contract is intentionally small: the frontend can list ports, ask the
-//! Rust side to open one and read the identity, open a saved document, fetch a
-//! point slice, load a photo folder and write one export. There is no command
-//! that writes, erases or changes a device setting, and `m241-flash` is not a
-//! dependency of this crate.
-//!
-//! Every command that touches the filesystem or decodes images runs on Tauri's
-//! blocking pool (`spawn_blocking`), not on the webview thread. The blocking
-//! command takes an `Arc` of the shared document state, so the work can move to
-//! another thread without borrowing the managed state for its whole duration.
+//! Every command that touches the serial port, filesystem or images runs on
+//! Tauri's blocking pool (`spawn_blocking`), not on the webview thread.
 //!
 //! Errors cross the IPC boundary as one string whose **second line is the next
-//! action**, in Japanese. Tauri commands can return a richer error type, but a
-//! string keeps the contract in the task's shape (`Result<DeviceInfo, String>`)
-//! and lets the screen render the message and the recovery step in two places:
-//! the first line is what went wrong, the second is what to do about it.
+//! action**, in Japanese.
 
 use std::sync::{Arc, Mutex};
 
 use m241_core::Error as CoreError;
 use tauri::State;
 
-use crate::device;
-use crate::logdoc::{self, AppState, ExportOutcome, LoadedLog, LogSummary, PhotoLoad, PointDto};
+use crate::device::{
+    self, FwDumpOutcome, FwFlashOutcome, FwInspectDto, FwPatchOutcome, FwProbeDaOutcome,
+};
+use crate::logdoc::{
+    self, AppState, ExportOutcome, GeotagApplyOutcome, GeotagOptionsDto, GeotagPreviewDto,
+    LoadedLog, LogSummary, PhotoLoad, PhotoOptionsDto, PointDto,
+};
 
 /// One serial port as the picker displays it.
 pub use crate::device::PortInfo;
 
 /// The identity and log usage read from one unit.
 pub use crate::device::DeviceInfo;
+
+/// Outcome returned by `download_log`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadLogOutcome {
+    /// Absolute path of the saved `.bin` dump.
+    pub destination: String,
+    /// Bytes downloaded and written.
+    pub bytes: u64,
+    /// Parsed log summary loaded into [`AppState`].
+    pub summary: LogSummary,
+}
 
 /// List the serial ports the OS knows about.
 #[tauri::command]
@@ -88,7 +94,7 @@ pub fn describe(error: &CoreError) -> String {
         }
         CoreError::Rejected { .. } => "端末を再起動し、ポートを選び直してから再試行してください。",
         CoreError::Safety { .. } => {
-            "この画面は読み取りのみです。表示された理由を確認してください。"
+            "安全チェックにより処理が停止されました。表示された理由と入力内容・選択ファイルを確認してください。"
         }
         CoreError::Firmware { .. } | CoreError::Profile { .. } | CoreError::Log { .. } => {
             "端末の応答が想定と異なります。端末を再起動してから再試行してください。"
@@ -102,6 +108,56 @@ pub fn describe(error: &CoreError) -> String {
         CoreError::Io { .. } => "書き込み先の権限と空き容量を確認してください。",
     };
     format!("{error}\n対処: {hint}")
+}
+
+/// Download the track log from `port`, save it to `destination`, and load it
+/// into [`AppState`].
+///
+/// # Errors
+///
+/// A Japanese two-line string on port, transfer, write, or parse failure.
+#[tauri::command]
+pub async fn download_log(
+    state: State<'_, AppState>,
+    port: String,
+    destination: String,
+) -> Result<DownloadLogOutcome, String> {
+    let trimmed_port = port.trim().to_owned();
+    if trimmed_port.is_empty() {
+        return Err(describe(&CoreError::Port {
+            message: String::from("no port name was given"),
+        }));
+    }
+    let dest_path =
+        device::prepare_output_path(&destination, "destination").map_err(|err| describe(&err))?;
+
+    let (byte_len, loaded) = tauri::async_runtime::spawn_blocking(move || {
+        let bytes = device::download_log_bytes(&trimmed_port).map_err(|err| describe(&err))?;
+        if bytes.is_empty() {
+            return Err(String::from(
+                "本体に記録されたログがありません（0 バイト）\n\
+                 対処: ログ記録が有効な状態で移動してから再度お試しください。",
+            ));
+        }
+        std::fs::write(&dest_path, &bytes).map_err(|error| {
+            format!(
+                "{} に書き込めません（{error}）\n対処: 保存先の権限と空き容量を確認してください。",
+                dest_path.display()
+            )
+        })?;
+        let loaded = logdoc::read(&dest_path.display().to_string())?;
+        Ok((bytes.len(), loaded))
+    })
+    .await
+    .map_err(|error| blocking_failed("ログの吸い出し", error))??;
+
+    let saved_path = loaded.source.clone();
+    let summary = open(&state, loaded)?;
+    Ok(DownloadLogOutcome {
+        destination: saved_path,
+        bytes: u64::try_from(byte_len).unwrap_or(u64::MAX),
+        summary,
+    })
 }
 
 /// Open a log document and return its summary.
@@ -146,9 +202,8 @@ fn open(state: &State<'_, AppState>, loaded: LoadedLog) -> Result<LogSummary, St
 
 /// Return the `[from, to)` slice of the loaded track.
 ///
-/// `path` must be the `source` the summary reported; it is compared rather than
-/// trusted so a point list cannot be read out of a document the screen did not
-/// open.
+/// When `path` is supplied it must match the loaded document's `source`; when
+/// omitted, the currently loaded document is read.
 ///
 /// # Errors
 ///
@@ -157,25 +212,18 @@ fn open(state: &State<'_, AppState>, loaded: LoadedLog) -> Result<LogSummary, St
 #[tauri::command]
 pub fn log_points(
     state: State<'_, AppState>,
-    path: String,
+    path: Option<String>,
     from: usize,
     to: usize,
 ) -> Result<Vec<PointDto>, String> {
-    with_log(&state, &path, |loaded| {
+    with_log(&state, path.as_deref(), |loaded| {
         logdoc::point_slice(loaded, from, to)
     })
 }
 
 /// Read a folder of photos and match them to the loaded track.
 ///
-/// The three numeric arguments are the §6.1 clock and grouping settings: the
-/// camera's offset from UTC in minutes, the track's whole-day offset (the same
-/// meaning as `--utc-offset-days`) and the grouping distance in metres
-/// (`0` disables grouping).
-///
-/// This is the heaviest command on the Log screen: every image in the folder is
-/// read, decoded, reduced to a 640 px thumbnail and re-encoded. It runs on the
-/// blocking pool for that reason.
+/// Accepts either `{ directory, options }` or the flat option arguments.
 ///
 /// # Errors
 ///
@@ -184,22 +232,26 @@ pub fn log_points(
 #[tauri::command]
 pub async fn load_photos(
     state: State<'_, AppState>,
-    path: String,
+    path: Option<String>,
     directory: String,
-    camera_offset_minutes: i32,
-    log_offset_days: i32,
-    group_distance_meters: f64,
+    options: Option<PhotoOptionsDto>,
+    camera_offset_minutes: Option<i32>,
+    log_offset_days: Option<i32>,
+    group_distance_meters: Option<f64>,
 ) -> Result<PhotoLoad, String> {
     let log = Arc::clone(&state.log);
-    let options = logdoc::PhotoOptions {
-        camera_offset_minutes,
-        log_offset_days,
-        group_distance_meters,
-        ..logdoc::PhotoOptions::default()
+    let resolved_options = match options {
+        Some(dto) => logdoc::PhotoOptions::from(dto),
+        None => logdoc::PhotoOptions {
+            camera_offset_minutes: camera_offset_minutes.unwrap_or(0),
+            log_offset_days: log_offset_days.unwrap_or(0),
+            group_distance_meters: group_distance_meters.unwrap_or(0.0),
+            ..logdoc::PhotoOptions::default()
+        },
     };
     tauri::async_runtime::spawn_blocking(move || {
-        with_log_mut(&log, &path, |loaded| {
-            logdoc::load_photos(loaded, &directory, &options)
+        with_log_mut(&log, path.as_deref(), |loaded| {
+            logdoc::load_photos(loaded, &directory, &resolved_options)
         })
     })
     .await
@@ -208,13 +260,6 @@ pub async fn load_photos(
 
 /// Write the loaded track to `destination` in `format`.
 ///
-/// `format` is one of GPX / KML / CSV / NMEA / JSON / KMZ / HTML / RTF.
-/// `destination` is an absolute path; the frontend proposes the source path with
-/// the new extension and lets the operator change it.
-///
-/// The document is already parsed, but encoding a KMZ and writing a multi-megabyte
-/// file is still filesystem work, so it runs on the blocking pool too.
-///
 /// # Errors
 ///
 /// A Japanese two-line message from [`logdoc::export`], or when no document is
@@ -222,13 +267,13 @@ pub async fn load_photos(
 #[tauri::command]
 pub async fn export_log(
     state: State<'_, AppState>,
-    path: String,
+    path: Option<String>,
     format: String,
     destination: String,
 ) -> Result<ExportOutcome, String> {
     let log = Arc::clone(&state.log);
     tauri::async_runtime::spawn_blocking(move || {
-        with_log_shared(&log, &path, |loaded| {
+        with_log_shared(&log, path.as_deref(), |loaded| {
             logdoc::export(loaded, &format, &destination)
         })
     })
@@ -236,15 +281,158 @@ pub async fn export_log(
     .map_err(|error| blocking_failed("書き出し", error))?
 }
 
-/// Run `action` against the loaded document named by `source`.
+/// Preview EXIF geotag matches for photos in `directory` against the loaded log.
+///
+/// # Errors
+///
+/// A Japanese two-line message when no log is loaded or `directory` is unreadable.
+#[tauri::command]
+pub async fn geotag_preview(
+    state: State<'_, AppState>,
+    directory: String,
+    options: GeotagOptionsDto,
+) -> Result<GeotagPreviewDto, String> {
+    let log = Arc::clone(&state.log);
+    tauri::async_runtime::spawn_blocking(move || {
+        with_log_shared(&log, None, |loaded| {
+            logdoc::geotag_preview(loaded, &directory, &options)
+        })
+    })
+    .await
+    .map_err(|error| blocking_failed("ジオタグのプレビュー", error))?
+}
+
+/// Apply EXIF geotags to matched photos in `directory` against the loaded log.
+///
+/// # Errors
+///
+/// A Japanese two-line message when no log is loaded or planning fails.
+#[tauri::command]
+pub async fn geotag_apply(
+    state: State<'_, AppState>,
+    directory: String,
+    options: GeotagOptionsDto,
+) -> Result<GeotagApplyOutcome, String> {
+    let log = Arc::clone(&state.log);
+    tauri::async_runtime::spawn_blocking(move || {
+        with_log_shared(&log, None, |loaded| {
+            logdoc::geotag_apply(loaded, &directory, &options)
+        })
+    })
+    .await
+    .map_err(|error| blocking_failed("ジオタグの書き込み", error))?
+}
+
+/// Dump firmware from `port` (read-only) to `destination`.
+///
+/// # Errors
+///
+/// A Japanese two-line message on port, BootROM, or file failure.
+#[tauri::command]
+pub async fn fw_dump(
+    port: String,
+    destination: String,
+    assume_brom: bool,
+) -> Result<FwDumpOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || device::fw_dump(&port, &destination, assume_brom))
+        .await
+        .map_err(|error| blocking_failed("ファームウェア吸い出し", error))?
+        .map_err(|error| describe(&error))
+}
+
+/// Apply the WNRO patch to `input_path` and write `output_path` (offline).
+///
+/// # Errors
+///
+/// A Japanese two-line message when the image cannot be patched or written.
+#[tauri::command]
+pub async fn fw_patch(input_path: String, output_path: String) -> Result<FwPatchOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || device::fw_patch(&input_path, &output_path))
+        .await
+        .map_err(|error| blocking_failed("WNRO パッチ適用", error))?
+        .map_err(|error| describe(&error))
+}
+
+/// Inspect a firmware image and optional backup (offline).
+///
+/// # Errors
+///
+/// A Japanese two-line message when reading the image or backup fails.
+#[tauri::command]
+pub async fn fw_inspect(
+    image_path: String,
+    backup_path: Option<String>,
+) -> Result<FwInspectDto, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        device::fw_inspect(&image_path, backup_path.as_deref())
+    })
+    .await
+    .map_err(|error| blocking_failed("ファームウェア検査", error))?
+    .map_err(|error| describe(&error))
+}
+
+/// Load the vendor DA into RAM and probe both candidate flash addresses.
+///
+/// # Errors
+///
+/// A Japanese two-line message on confirmation refusal, bad DA, or transport failure.
+#[tauri::command]
+pub async fn fw_probe_da(
+    port: String,
+    da_path: String,
+    assume_brom: bool,
+    confirm_word: String,
+) -> Result<FwProbeDaOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        device::fw_probe_da(&port, &da_path, assume_brom, &confirm_word)
+    })
+    .await
+    .map_err(|error| blocking_failed("DA 確認", error))?
+    .map_err(|error| describe(&error))
+}
+
+/// Program firmware through `m241_flash::flow::flash` and verify by read-back.
+///
+/// # Errors
+///
+/// A Japanese two-line message on confirmation/safety refusal or flash/read-back failure.
+#[tauri::command]
+pub async fn fw_flash(
+    port: String,
+    image_path: String,
+    backup_path: String,
+    da_path: String,
+    mode: String,
+    assume_brom: bool,
+    confirm_word: String,
+) -> Result<FwFlashOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        device::fw_flash(
+            &port,
+            &image_path,
+            &backup_path,
+            &da_path,
+            &mode,
+            assume_brom,
+            &confirm_word,
+        )
+    })
+    .await
+    .map_err(|error| blocking_failed("ファームウェア書き込み", error))?
+    .map_err(|error| describe(&error))
+}
+
+/// Run `action` against the loaded document (optionally verifying `source`).
 fn with_log<T>(
     state: &State<'_, AppState>,
-    source: &str,
+    source: Option<&str>,
     action: impl FnOnce(&LoadedLog) -> Result<T, String>,
 ) -> Result<T, String> {
     let guard = state.log.lock().map_err(|_| internal("log"))?;
     let loaded = guard.as_ref().ok_or_else(no_document)?;
-    if loaded.source != source {
+    if let Some(expected) = source
+        && loaded.source != expected
+    {
         return Err(source_changed());
     }
     action(loaded)
@@ -257,12 +445,14 @@ fn with_log<T>(
 /// inside the blocking closure.
 fn with_log_shared<T>(
     log: &Arc<Mutex<Option<LoadedLog>>>,
-    source: &str,
+    source: Option<&str>,
     action: impl FnOnce(&LoadedLog) -> Result<T, String>,
 ) -> Result<T, String> {
     let guard = log.lock().map_err(|_| internal("log"))?;
     let loaded = guard.as_ref().ok_or_else(no_document)?;
-    if loaded.source != source {
+    if let Some(expected) = source
+        && loaded.source != expected
+    {
         return Err(source_changed());
     }
     action(loaded)
@@ -272,12 +462,14 @@ fn with_log_shared<T>(
 /// replaces the photo rows).
 fn with_log_mut<T>(
     log: &Arc<Mutex<Option<LoadedLog>>>,
-    source: &str,
+    source: Option<&str>,
     action: impl FnOnce(&mut LoadedLog) -> Result<T, String>,
 ) -> Result<T, String> {
     let mut guard = log.lock().map_err(|_| internal("log"))?;
     let loaded = guard.as_mut().ok_or_else(no_document)?;
-    if loaded.source != source {
+    if let Some(expected) = source
+        && loaded.source != expected
+    {
         return Err(source_changed());
     }
     action(loaded)
@@ -381,5 +573,85 @@ mod tests {
             assert_eq!(text.lines().count(), 2, "got {text}");
             assert!(text.contains("\n対処: "), "got {text}");
         }
+    }
+
+    #[test]
+    fn ipc_dtos_serialize_with_camel_case_keys() {
+        let dl = serde_json::to_value(DownloadLogOutcome {
+            destination: String::from("/tmp/log.bin"),
+            bytes: 128,
+            summary: logdoc::summary(&logdoc::sample_log()),
+        })
+        .expect("serialize DownloadLogOutcome");
+        assert!(dl.get("destination").is_some());
+        assert!(dl.get("bytes").is_some());
+        assert!(dl.get("summary").is_some());
+
+        let inspect = serde_json::to_value(FwInspectDto {
+            image_bytes: 406_620,
+            image_sha256: String::from("abc"),
+            backup_bytes: Some(406_620),
+            backup_sha256: Some(String::from("def")),
+            profile: Some(String::from("V1.13")),
+            wnro_patched: Some(true),
+            diff_count: Some(3),
+            outside_patch_offsets: Some(false),
+            arm_vector_ok: true,
+            is_vendor_v113: false,
+            is_vendor_v112: false,
+            recommended_mode: device::FlashMode::Strict,
+            warnings: vec![],
+        })
+        .expect("serialize FwInspectDto");
+        for key in [
+            "imageBytes",
+            "imageSha256",
+            "backupBytes",
+            "backupSha256",
+            "wnroPatched",
+            "diffCount",
+            "outsidePatchOffsets",
+            "armVectorOk",
+            "isVendorV113",
+            "isVendorV112",
+            "recommendedMode",
+        ] {
+            assert!(inspect.get(key).is_some(), "missing {key}");
+        }
+        assert_eq!(inspect["recommendedMode"], "strict");
+
+        let flash = serde_json::to_value(FwFlashOutcome {
+            port: String::from("/dev/ttyUSB0"),
+            mode: device::FlashMode::Vendor,
+            bytes_written: 406_620,
+            image_sha256: String::from("abc"),
+            verified_read_back: true,
+            restored_per_unit_bytes: 4,
+            elapsed_ms: 1500,
+        })
+        .expect("serialize FwFlashOutcome");
+        for key in [
+            "port",
+            "mode",
+            "bytesWritten",
+            "imageSha256",
+            "verifiedReadBack",
+            "restoredPerUnitBytes",
+            "elapsedMs",
+        ] {
+            assert!(flash.get(key).is_some(), "missing {key}");
+        }
+        assert_eq!(flash["mode"], "vendor");
+    }
+
+    #[test]
+    fn with_log_shared_works_with_or_without_source_check() {
+        let log = Arc::new(Mutex::new(Some(logdoc::sample_log())));
+        let count = with_log_shared(&log, None, |loaded| Ok(loaded.track.points.len()))
+            .expect("no source check succeeds");
+        assert!(count > 0);
+        let err = with_log_shared(&log, Some("/other.bin"), |_| Ok(()))
+            .expect_err("mismatched source rejected");
+        assert!(err.contains("一致しません"));
     }
 }
